@@ -1,0 +1,43 @@
+{
+  "disableClaudeAiConnectors": true,
+  "disableBundledSkills": true,
+  "skillOverrides": {
+    "anthropic-skills:built-in-browser": "off", "anthropic-skills:chrome-browser": "off",
+    "anthropic-skills:computer-use": "off", "anthropic-skills:deep-research": "off",
+    "anthropic-skills:docs": "off", "anthropic-skills:docx": "off",
+    "anthropic-skills:google-workspace": "off", "anthropic-skills:import-memory": "off",
+    "anthropic-skills:morning": "off", "anthropic-skills:pdf": "off", "anthropic-skills:pptx": "off",
+    "anthropic-skills:skill-creator": "off", "anthropic-skills:xlsx": "off",
+    "omarchy": "off", "diagnose-crash": "off", "design": "off", "plugin-authoring": "off"
+  },
+  "enabledPlugins": { "engineering@synced": false },
+  "permissions": {
+    "allow": [
+      "Read", "Glob", "Grep", "Write", "Skill", "TodoWrite", "Agent", "WebSearch", "WebFetch",
+      "Bash(git diff *)", "Bash(git diff)", "Bash(git log *)", "Bash(git show *)", "Bash(git status*)", "Bash(git branch --show-current)",
+      "Bash(gh pr view *)", "Bash(gh pr diff *)", "Bash(gh pr checks *)", "Bash(gh pr comment *)", "Bash(gh issue view *)",
+      "Bash(go test *)", "Bash(go vet *)", "Bash(go build *)", "Bash(go run github.com/golangci/golangci-lint/*)", "Bash(golangci-lint *)", "Bash(gofmt -l *)",
+      "Bash(pnpm install*)", "Bash(pnpm test*)", "Bash(pnpm lint*)", "Bash(pnpm typecheck*)", "Bash(pnpm build*)", "Bash(pnpm exec tsc *)",
+      "Bash(task lint*)", "Bash(task test*)", "Bash(mise *)",
+      "Bash(ls *)", "Bash(ls)", "Bash(cat *)", "Bash(head *)", "Bash(tail *)", "Bash(wc *)",
+      "Bash(grep *)", "Bash(rg *)", "Bash(find *)", "Bash(sed -n *)", "Bash(awk *)", "Bash(jq *)",
+      "Bash(sort *)", "Bash(uniq *)", "Bash(diff *)", "Bash(cut *)", "Bash(pwd)", "Bash(cd *)", "Bash(echo *)"
+    ],
+    "deny": [
+      "CronCreate", "CronDelete", "CronList", "ScheduleWakeup", "RemoteTrigger", "PushNotification", "SendMessage", "ListAgents", "DesignSync", "EnterWorktree", "ExitWorktree",
+      "Edit", "NotebookEdit",
+      "Read(~/.config/baton/**)", "Read(~/.config/gh/**)", "Read(~/.ssh/**)",
+      "Bash(git push*)", "Bash(git commit*)", "Bash(gh pr merge*)", "Bash(gh pr edit*)", "Bash(gh api *)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Read|Edit|Write|NotebookEdit|MultiEdit",
+        "hooks": [
+          { "type": "command", "command": "$HOME/baton/bin/guard.sh" }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,241 @@
+// Metadata-only runner supplement; never accepts native CLI payloads.
+declare "baton_runner_ingest" {
+  argument "listen_address" {}
+  // host.name on every record; one value per collector.
+  argument "host_name" {}
+  argument "logs_output" {}
+  argument "traces_output" {}
+  otelcol.receiver.otlp "runner" {
+    http { endpoint = argument.listen_address.value }
+    output {
+      logs = [otelcol.processor.transform.runner.input]
+      traces = [otelcol.processor.transform.runner.input]
+    }
+  }
+  otelcol.processor.transform "runner" {
+    error_mode = "propagate"
+
+  log_statements {
+    context = "resource"
+    statements = [
+      `keep_keys(attributes, [])`,
+      `set(attributes["service.name"], "baton-runner")`,
+      `set(attributes["host.name"], "` + argument.host_name.value + `")`,
+    ]
+  }
+
+  log_statements {
+    context = "scope"
+    statements = [
+      `keep_keys(attributes, [])`,
+      `set(name, "baton-runner")`,
+      `set(version, "")`,
+    ]
+  }
+
+  trace_statements {
+    context = "resource"
+    statements = [
+      `keep_keys(attributes, [])`,
+      `set(attributes["service.name"], "baton-runner")`,
+      `set(attributes["host.name"], "` + argument.host_name.value + `")`,
+    ]
+  }
+
+  trace_statements {
+    context = "scope"
+    statements = [
+      `keep_keys(attributes, [])`,
+      `set(name, "baton-runner")`,
+      `set(version, "")`,
+    ]
+  }
+
+  log_statements {
+    context = "log"
+    statements = [
+      `set(cache["event_body"], "baton.run_summary")`,
+      `set(cache["event_body"], body) where body == "baton.task_event" or body == "baton.task_summary"`,
+      `set(cache["safe"], ParseJSON("{}"))`,
+      `set(cache["safe"]["event_id"], attributes["event_id"]) where attributes["event_id"] != nil`,
+      `set(cache["safe"]["baton.run_id"], attributes["baton.run_id"]) where attributes["baton.run_id"] != nil`,
+      `set(cache["safe"]["agent"], attributes["agent"]) where attributes["agent"] != nil`,
+      `set(cache["safe"]["baton.role"], attributes["baton.role"]) where attributes["baton.role"] != nil`,
+      `set(cache["safe"]["status"], attributes["status"]) where attributes["status"] != nil`,
+      `set(cache["safe"]["usage_state"], attributes["usage_state"]) where attributes["usage_state"] != nil`,
+      `set(cache["safe"]["cost_state"], attributes["cost_state"]) where attributes["cost_state"] != nil`,
+      `set(cache["safe"]["baton.issue"], attributes["baton.issue"]) where attributes["baton.issue"] != nil`,
+      `set(cache["safe"]["baton.pr"], attributes["baton.pr"]) where attributes["baton.pr"] != nil`,
+      `set(cache["safe"]["baton.round"], attributes["baton.round"]) where attributes["baton.round"] != nil`,
+      `set(cache["safe"]["duration_ms"], attributes["duration_ms"]) where attributes["duration_ms"] != nil`,
+      `set(cache["safe"]["input_tokens"], attributes["input_tokens"]) where attributes["input_tokens"] != nil`,
+      `set(cache["safe"]["output_tokens"], attributes["output_tokens"]) where attributes["output_tokens"] != nil`,
+      `set(cache["safe"]["cache_read_tokens"], attributes["cache_read_tokens"]) where attributes["cache_read_tokens"] != nil`,
+      `set(cache["safe"]["cache_write_tokens"], attributes["cache_write_tokens"]) where attributes["cache_write_tokens"] != nil`,
+      `set(cache["safe"]["reasoning_tokens"], attributes["reasoning_tokens"]) where attributes["reasoning_tokens"] != nil`,
+      `set(cache["safe"]["baton.stage"], attributes["baton.stage"]) where attributes["baton.stage"] != nil`,
+      `set(cache["safe"]["pipeline_id"], attributes["pipeline_id"]) where attributes["pipeline_id"] != nil`,
+      `set(cache["safe"]["repo"], attributes["repo"]) where attributes["repo"] != nil`,
+      `set(cache["safe"]["workflow_version"], attributes["workflow_version"]) where attributes["workflow_version"] != nil`,
+      `set(cache["safe"]["config_version"], attributes["config_version"]) where attributes["config_version"] != nil`,
+      `set(cache["safe"]["cli_version"], attributes["cli_version"]) where attributes["cli_version"] != nil`,
+      `set(cache["safe"]["event_kind"], attributes["event_kind"]) where attributes["event_kind"] != nil`,
+      `set(cache["safe"]["task_status"], attributes["task_status"]) where attributes["task_status"] != nil`,
+      `set(cache["safe"]["reason"], attributes["reason"]) where attributes["reason"] != nil`,
+      `set(cache["safe"]["verdict"], attributes["verdict"]) where attributes["verdict"] != nil`,
+      `set(cache["safe"]["ci_result"], attributes["ci_result"]) where attributes["ci_result"] != nil`,
+      `set(cache["safe"]["head_sha"], attributes["head_sha"]) where attributes["head_sha"] != nil`,
+      `set(cache["safe"]["run_id"], attributes["run_id"]) where attributes["run_id"] != nil`,
+      `set(cache["safe"]["issue"], attributes["issue"]) where attributes["issue"] != nil`,
+      `set(cache["safe"]["pr"], attributes["pr"]) where attributes["pr"] != nil`,
+      `set(cache["safe"]["round"], attributes["round"]) where attributes["round"] != nil`,
+      `set(cache["safe"]["sequence"], attributes["sequence"]) where attributes["sequence"] != nil`,
+      `set(cache["safe"]["runs"], attributes["runs"]) where attributes["runs"] != nil`,
+      `set(cache["safe"]["incomplete_runs"], attributes["incomplete_runs"]) where attributes["incomplete_runs"] != nil`,
+      `set(cache["safe"]["review_rounds"], attributes["review_rounds"]) where attributes["review_rounds"] != nil`,
+      `set(cache["safe"]["spec_rounds"], attributes["spec_rounds"]) where attributes["spec_rounds"] != nil`,
+      `set(attributes, cache["safe"])`,
+      `keep_keys(attributes, ["event_id", "baton.run_id", "agent", "baton.role", "baton.stage", "status", "usage_state", "cost_state", "baton.issue", "baton.pr", "baton.round", "duration_ms", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens", "pipeline_id", "repo", "workflow_version", "config_version", "cli_version", "event_kind", "task_status", "reason", "verdict", "ci_result", "head_sha", "run_id", "issue", "pr", "round", "sequence", "runs", "incomplete_runs", "review_rounds", "spec_rounds"])`,
+      `delete_key(attributes, "event_id") where attributes["event_id"] != nil and not (IsString(attributes["event_id"]) and IsMatch(attributes["event_id"], "^[a-f0-9-]{36}:(summary|event|task_summary)$"))`,
+      `delete_key(attributes, "baton.run_id") where attributes["baton.run_id"] != nil and not (IsString(attributes["baton.run_id"]) and IsMatch(attributes["baton.run_id"], "^[a-f0-9-]{36}$"))`,
+      `delete_key(attributes, "agent") where attributes["agent"] != nil and not (IsString(attributes["agent"]) and IsMatch(attributes["agent"], "^(claude|cursor|codex)$"))`,
+      `delete_key(attributes, "baton.role") where attributes["baton.role"] != nil and not (IsString(attributes["baton.role"]) and IsMatch(attributes["baton.role"], "^(spec|review|fix|triage|scan|dev)$"))`,
+      `delete_key(attributes, "baton.stage") where attributes["baton.stage"] != nil and not (IsString(attributes["baton.stage"]) and IsMatch(attributes["baton.stage"], "^(spec-review|spec-reply|implement|review|fix|triage|scan)$"))`,
+      `delete_key(attributes, "status") where attributes["status"] != nil and not (IsString(attributes["status"]) and IsMatch(attributes["status"], "^(success|failure|timeout|auth|quota|busy|interrupted)$"))`,
+      `delete_key(attributes, "usage_state") where attributes["usage_state"] != nil and not (IsString(attributes["usage_state"]) and IsMatch(attributes["usage_state"], "^(complete|partial|unavailable)$"))`,
+      `delete_key(attributes, "cost_state") where attributes["cost_state"] != nil and not (IsString(attributes["cost_state"]) and IsMatch(attributes["cost_state"], "^unavailable$"))`,
+      `delete_key(attributes, "baton.issue") where attributes["baton.issue"] != nil and not (IsInt(attributes["baton.issue"]) and attributes["baton.issue"] >= 0 and attributes["baton.issue"] <= 1000000000000)`,
+      `delete_key(attributes, "baton.pr") where attributes["baton.pr"] != nil and not (IsInt(attributes["baton.pr"]) and attributes["baton.pr"] >= 0 and attributes["baton.pr"] <= 1000000000000)`,
+      `delete_key(attributes, "baton.round") where attributes["baton.round"] != nil and not (IsInt(attributes["baton.round"]) and attributes["baton.round"] >= 0 and attributes["baton.round"] <= 1000000000000)`,
+      `delete_key(attributes, "duration_ms") where attributes["duration_ms"] != nil and not (IsInt(attributes["duration_ms"]) and attributes["duration_ms"] >= 0 and attributes["duration_ms"] <= 1000000000000)`,
+      `delete_key(attributes, "input_tokens") where attributes["input_tokens"] != nil and not (IsInt(attributes["input_tokens"]) and attributes["input_tokens"] >= 0 and attributes["input_tokens"] <= 1000000000000)`,
+      `delete_key(attributes, "output_tokens") where attributes["output_tokens"] != nil and not (IsInt(attributes["output_tokens"]) and attributes["output_tokens"] >= 0 and attributes["output_tokens"] <= 1000000000000)`,
+      `delete_key(attributes, "cache_read_tokens") where attributes["cache_read_tokens"] != nil and not (IsInt(attributes["cache_read_tokens"]) and attributes["cache_read_tokens"] >= 0 and attributes["cache_read_tokens"] <= 1000000000000)`,
+      `delete_key(attributes, "cache_write_tokens") where attributes["cache_write_tokens"] != nil and not (IsInt(attributes["cache_write_tokens"]) and attributes["cache_write_tokens"] >= 0 and attributes["cache_write_tokens"] <= 1000000000000)`,
+      `delete_key(attributes, "reasoning_tokens") where attributes["reasoning_tokens"] != nil and not (IsInt(attributes["reasoning_tokens"]) and attributes["reasoning_tokens"] >= 0 and attributes["reasoning_tokens"] <= 1000000000000)`,
+      `delete_key(attributes, "pipeline_id") where attributes["pipeline_id"] != nil and not (IsString(attributes["pipeline_id"]) and IsMatch(attributes["pipeline_id"], "^[a-f0-9-]{36}$"))`,
+      `delete_key(attributes, "repo") where attributes["repo"] != nil and not (IsString(attributes["repo"]) and IsMatch(attributes["repo"], "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"))`,
+      `delete_key(attributes, "workflow_version") where attributes["workflow_version"] != nil and not (IsString(attributes["workflow_version"]) and IsMatch(attributes["workflow_version"], "^[a-f0-9]{64}$"))`,
+      `delete_key(attributes, "config_version") where attributes["config_version"] != nil and not (IsString(attributes["config_version"]) and IsMatch(attributes["config_version"], "^[a-f0-9]{64}$"))`,
+      `delete_key(attributes, "cli_version") where attributes["cli_version"] != nil and not (IsString(attributes["cli_version"]) and IsMatch(attributes["cli_version"], "^[0-9][0-9A-Za-z.+-]{0,63}$"))`,
+      `delete_key(attributes, "event_kind") where attributes["event_kind"] != nil and not (IsString(attributes["event_kind"]) and IsMatch(attributes["event_kind"], "^(started|run_completed|review|spec_review|fix|ci|verify|ci_fix|handoff|merged)$"))`,
+      `delete_key(attributes, "task_status") where attributes["task_status"] != nil and not (IsString(attributes["task_status"]) and IsMatch(attributes["task_status"], "^(active|merged|planned_handoff|abnormal_handoff)$"))`,
+      `delete_key(attributes, "reason") where attributes["reason"] != nil and not (IsString(attributes["reason"]) and IsMatch(attributes["reason"], "^(none|auto_merge_off|manual_checks|review_failed|review_limit|fix_failed|needs_info|no_commit|push_failed|spec_failed|spec_limit|spec_rejected|ci_not_green|merge_failed|implementation_failed|verify_failed)$"))`,
+      `delete_key(attributes, "verdict") where attributes["verdict"] != nil and not (IsString(attributes["verdict"]) and IsMatch(attributes["verdict"], "^(pass|changes|accept|reject)$"))`,
+      `delete_key(attributes, "ci_result") where attributes["ci_result"] != nil and not (IsString(attributes["ci_result"]) and IsMatch(attributes["ci_result"], "^(pass|failure|no_checks|pending|timeout|cancelled|infra_error|unknown)$"))`,
+      `delete_key(attributes, "head_sha") where attributes["head_sha"] != nil and not (IsString(attributes["head_sha"]) and IsMatch(attributes["head_sha"], "^[a-f0-9]{40,64}$"))`,
+      `delete_key(attributes, "run_id") where attributes["run_id"] != nil and not (IsString(attributes["run_id"]) and IsMatch(attributes["run_id"], "^[a-f0-9-]{36}$"))`,
+      `delete_key(attributes, "issue") where attributes["issue"] != nil and not (IsInt(attributes["issue"]) and attributes["issue"] >= 0 and attributes["issue"] <= 1000000000000)`,
+      `delete_key(attributes, "pr") where attributes["pr"] != nil and not (IsInt(attributes["pr"]) and attributes["pr"] >= 0 and attributes["pr"] <= 1000000000000)`,
+      `delete_key(attributes, "round") where attributes["round"] != nil and not (IsInt(attributes["round"]) and attributes["round"] >= 0 and attributes["round"] <= 1000000000000)`,
+      `delete_key(attributes, "review_rounds") where attributes["review_rounds"] != nil and not (IsInt(attributes["review_rounds"]) and attributes["review_rounds"] >= 0 and attributes["review_rounds"] <= 1000000000000)`,
+      `delete_key(attributes, "spec_rounds") where attributes["spec_rounds"] != nil and not (IsInt(attributes["spec_rounds"]) and attributes["spec_rounds"] >= 0 and attributes["spec_rounds"] <= 1000000000000)`,
+      `delete_key(attributes, "sequence") where attributes["sequence"] != nil and not (IsInt(attributes["sequence"]) and attributes["sequence"] >= 0 and attributes["sequence"] <= 1000000000000)`,
+      `delete_key(attributes, "runs") where attributes["runs"] != nil and not (IsInt(attributes["runs"]) and attributes["runs"] >= 0 and attributes["runs"] <= 1000000000000)`,
+      `delete_key(attributes, "incomplete_runs") where attributes["incomplete_runs"] != nil and not (IsInt(attributes["incomplete_runs"]) and attributes["incomplete_runs"] >= 0 and attributes["incomplete_runs"] <= 1000000000000)`,
+      `set(body, cache["event_body"])`,
+      `set(event_name, "")`,
+      `set(severity_text, "")`,
+    ]
+  }
+
+  trace_statements {
+    context = "span"
+    statements = [
+      `set(cache["safe"], ParseJSON("{}"))`,
+      `set(cache["safe"]["event_id"], attributes["event_id"]) where attributes["event_id"] != nil`,
+      `set(cache["safe"]["baton.run_id"], attributes["baton.run_id"]) where attributes["baton.run_id"] != nil`,
+      `set(cache["safe"]["agent"], attributes["agent"]) where attributes["agent"] != nil`,
+      `set(cache["safe"]["baton.role"], attributes["baton.role"]) where attributes["baton.role"] != nil`,
+      `set(cache["safe"]["status"], attributes["status"]) where attributes["status"] != nil`,
+      `set(cache["safe"]["usage_state"], attributes["usage_state"]) where attributes["usage_state"] != nil`,
+      `set(cache["safe"]["cost_state"], attributes["cost_state"]) where attributes["cost_state"] != nil`,
+      `set(cache["safe"]["baton.issue"], attributes["baton.issue"]) where attributes["baton.issue"] != nil`,
+      `set(cache["safe"]["baton.pr"], attributes["baton.pr"]) where attributes["baton.pr"] != nil`,
+      `set(cache["safe"]["baton.round"], attributes["baton.round"]) where attributes["baton.round"] != nil`,
+      `set(cache["safe"]["duration_ms"], attributes["duration_ms"]) where attributes["duration_ms"] != nil`,
+      `set(cache["safe"]["input_tokens"], attributes["input_tokens"]) where attributes["input_tokens"] != nil`,
+      `set(cache["safe"]["output_tokens"], attributes["output_tokens"]) where attributes["output_tokens"] != nil`,
+      `set(cache["safe"]["cache_read_tokens"], attributes["cache_read_tokens"]) where attributes["cache_read_tokens"] != nil`,
+      `set(cache["safe"]["cache_write_tokens"], attributes["cache_write_tokens"]) where attributes["cache_write_tokens"] != nil`,
+      `set(cache["safe"]["reasoning_tokens"], attributes["reasoning_tokens"]) where attributes["reasoning_tokens"] != nil`,
+      `set(cache["safe"]["baton.stage"], attributes["baton.stage"]) where attributes["baton.stage"] != nil`,
+      `set(cache["safe"]["pipeline_id"], attributes["pipeline_id"]) where attributes["pipeline_id"] != nil`,
+      `set(cache["safe"]["repo"], attributes["repo"]) where attributes["repo"] != nil`,
+      `set(cache["safe"]["workflow_version"], attributes["workflow_version"]) where attributes["workflow_version"] != nil`,
+      `set(cache["safe"]["config_version"], attributes["config_version"]) where attributes["config_version"] != nil`,
+      `set(cache["safe"]["cli_version"], attributes["cli_version"]) where attributes["cli_version"] != nil`,
+      `set(cache["safe"]["event_kind"], attributes["event_kind"]) where attributes["event_kind"] != nil`,
+      `set(cache["safe"]["task_status"], attributes["task_status"]) where attributes["task_status"] != nil`,
+      `set(cache["safe"]["reason"], attributes["reason"]) where attributes["reason"] != nil`,
+      `set(cache["safe"]["verdict"], attributes["verdict"]) where attributes["verdict"] != nil`,
+      `set(cache["safe"]["ci_result"], attributes["ci_result"]) where attributes["ci_result"] != nil`,
+      `set(cache["safe"]["head_sha"], attributes["head_sha"]) where attributes["head_sha"] != nil`,
+      `set(cache["safe"]["run_id"], attributes["run_id"]) where attributes["run_id"] != nil`,
+      `set(cache["safe"]["issue"], attributes["issue"]) where attributes["issue"] != nil`,
+      `set(cache["safe"]["pr"], attributes["pr"]) where attributes["pr"] != nil`,
+      `set(cache["safe"]["round"], attributes["round"]) where attributes["round"] != nil`,
+      `set(cache["safe"]["sequence"], attributes["sequence"]) where attributes["sequence"] != nil`,
+      `set(cache["safe"]["runs"], attributes["runs"]) where attributes["runs"] != nil`,
+      `set(cache["safe"]["incomplete_runs"], attributes["incomplete_runs"]) where attributes["incomplete_runs"] != nil`,
+      `set(cache["safe"]["review_rounds"], attributes["review_rounds"]) where attributes["review_rounds"] != nil`,
+      `set(cache["safe"]["spec_rounds"], attributes["spec_rounds"]) where attributes["spec_rounds"] != nil`,
+      `set(attributes, cache["safe"])`,
+      `keep_keys(attributes, ["event_id", "baton.run_id", "agent", "baton.role", "baton.stage", "status", "usage_state", "cost_state", "baton.issue", "baton.pr", "baton.round", "duration_ms", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens", "pipeline_id", "repo", "workflow_version", "config_version", "cli_version", "event_kind", "task_status", "reason", "verdict", "ci_result", "head_sha", "run_id", "issue", "pr", "round", "sequence", "runs", "incomplete_runs", "review_rounds", "spec_rounds"])`,
+      `delete_key(attributes, "event_id") where attributes["event_id"] != nil and not (IsString(attributes["event_id"]) and IsMatch(attributes["event_id"], "^[a-f0-9-]{36}:(summary|event|task_summary)$"))`,
+      `delete_key(attributes, "baton.run_id") where attributes["baton.run_id"] != nil and not (IsString(attributes["baton.run_id"]) and IsMatch(attributes["baton.run_id"], "^[a-f0-9-]{36}$"))`,
+      `delete_key(attributes, "agent") where attributes["agent"] != nil and not (IsString(attributes["agent"]) and IsMatch(attributes["agent"], "^(claude|cursor|codex)$"))`,
+      `delete_key(attributes, "baton.role") where attributes["baton.role"] != nil and not (IsString(attributes["baton.role"]) and IsMatch(attributes["baton.role"], "^(spec|review|fix|triage|scan|dev)$"))`,
+      `delete_key(attributes, "baton.stage") where attributes["baton.stage"] != nil and not (IsString(attributes["baton.stage"]) and IsMatch(attributes["baton.stage"], "^(spec-review|spec-reply|implement|review|fix|triage|scan)$"))`,
+      `delete_key(attributes, "status") where attributes["status"] != nil and not (IsString(attributes["status"]) and IsMatch(attributes["status"], "^(success|failure|timeout|auth|quota|busy|interrupted)$"))`,
+      `delete_key(attributes, "usage_state") where attributes["usage_state"] != nil and not (IsString(attributes["usage_state"]) and IsMatch(attributes["usage_state"], "^(complete|partial|unavailable)$"))`,
+      `delete_key(attributes, "cost_state") where attributes["cost_state"] != nil and not (IsString(attributes["cost_state"]) and IsMatch(attributes["cost_state"], "^unavailable$"))`,
+      `delete_key(attributes, "baton.issue") where attributes["baton.issue"] != nil and not (IsInt(attributes["baton.issue"]) and attributes["baton.issue"] >= 0 and attributes["baton.issue"] <= 1000000000000)`,
+      `delete_key(attributes, "baton.pr") where attributes["baton.pr"] != nil and not (IsInt(attributes["baton.pr"]) and attributes["baton.pr"] >= 0 and attributes["baton.pr"] <= 1000000000000)`,
+      `delete_key(attributes, "baton.round") where attributes["baton.round"] != nil and not (IsInt(attributes["baton.round"]) and attributes["baton.round"] >= 0 and attributes["baton.round"] <= 1000000000000)`,
+      `delete_key(attributes, "duration_ms") where attributes["duration_ms"] != nil and not (IsInt(attributes["duration_ms"]) and attributes["duration_ms"] >= 0 and attributes["duration_ms"] <= 1000000000000)`,
+      `delete_key(attributes, "input_tokens") where attributes["input_tokens"] != nil and not (IsInt(attributes["input_tokens"]) and attributes["input_tokens"] >= 0 and attributes["input_tokens"] <= 1000000000000)`,
+      `delete_key(attributes, "output_tokens") where attributes["output_tokens"] != nil and not (IsInt(attributes["output_tokens"]) and attributes["output_tokens"] >= 0 and attributes["output_tokens"] <= 1000000000000)`,
+      `delete_key(attributes, "cache_read_tokens") where attributes["cache_read_tokens"] != nil and not (IsInt(attributes["cache_read_tokens"]) and attributes["cache_read_tokens"] >= 0 and attributes["cache_read_tokens"] <= 1000000000000)`,
+      `delete_key(attributes, "cache_write_tokens") where attributes["cache_write_tokens"] != nil and not (IsInt(attributes["cache_write_tokens"]) and attributes["cache_write_tokens"] >= 0 and attributes["cache_write_tokens"] <= 1000000000000)`,
+      `delete_key(attributes, "reasoning_tokens") where attributes["reasoning_tokens"] != nil and not (IsInt(attributes["reasoning_tokens"]) and attributes["reasoning_tokens"] >= 0 and attributes["reasoning_tokens"] <= 1000000000000)`,
+      `delete_key(attributes, "pipeline_id") where attributes["pipeline_id"] != nil and not (IsString(attributes["pipeline_id"]) and IsMatch(attributes["pipeline_id"], "^[a-f0-9-]{36}$"))`,
+      `delete_key(attributes, "repo") where attributes["repo"] != nil and not (IsString(attributes["repo"]) and IsMatch(attributes["repo"], "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"))`,
+      `delete_key(attributes, "workflow_version") where attributes["workflow_version"] != nil and not (IsString(attributes["workflow_version"]) and IsMatch(attributes["workflow_version"], "^[a-f0-9]{64}$"))`,
+      `delete_key(attributes, "config_version") where attributes["config_version"] != nil and not (IsString(attributes["config_version"]) and IsMatch(attributes["config_version"], "^[a-f0-9]{64}$"))`,
+      `delete_key(attributes, "cli_version") where attributes["cli_version"] != nil and not (IsString(attributes["cli_version"]) and IsMatch(attributes["cli_version"], "^[0-9][0-9A-Za-z.+-]{0,63}$"))`,
+      `delete_key(attributes, "event_kind") where attributes["event_kind"] != nil and not (IsString(attributes["event_kind"]) and IsMatch(attributes["event_kind"], "^(started|run_completed|review|spec_review|fix|ci|verify|ci_fix|handoff|merged)$"))`,
+      `delete_key(attributes, "task_status") where attributes["task_status"] != nil and not (IsString(attributes["task_status"]) and IsMatch(attributes["task_status"], "^(active|merged|planned_handoff|abnormal_handoff)$"))`,
+      `delete_key(attributes, "reason") where attributes["reason"] != nil and not (IsString(attributes["reason"]) and IsMatch(attributes["reason"], "^(none|auto_merge_off|manual_checks|review_failed|review_limit|fix_failed|needs_info|no_commit|push_failed|spec_failed|spec_limit|spec_rejected|ci_not_green|merge_failed|implementation_failed|verify_failed)$"))`,
+      `delete_key(attributes, "verdict") where attributes["verdict"] != nil and not (IsString(attributes["verdict"]) and IsMatch(attributes["verdict"], "^(pass|changes|accept|reject)$"))`,
+      `delete_key(attributes, "ci_result") where attributes["ci_result"] != nil and not (IsString(attributes["ci_result"]) and IsMatch(attributes["ci_result"], "^(pass|failure|no_checks|pending|timeout|cancelled|infra_error|unknown)$"))`,
+      `delete_key(attributes, "head_sha") where attributes["head_sha"] != nil and not (IsString(attributes["head_sha"]) and IsMatch(attributes["head_sha"], "^[a-f0-9]{40,64}$"))`,
+      `delete_key(attributes, "run_id") where attributes["run_id"] != nil and not (IsString(attributes["run_id"]) and IsMatch(attributes["run_id"], "^[a-f0-9-]{36}$"))`,
+      `delete_key(attributes, "issue") where attributes["issue"] != nil and not (IsInt(attributes["issue"]) and attributes["issue"] >= 0 and attributes["issue"] <= 1000000000000)`,
+      `delete_key(attributes, "pr") where attributes["pr"] != nil and not (IsInt(attributes["pr"]) and attributes["pr"] >= 0 and attributes["pr"] <= 1000000000000)`,
+      `delete_key(attributes, "round") where attributes["round"] != nil and not (IsInt(attributes["round"]) and attributes["round"] >= 0 and attributes["round"] <= 1000000000000)`,
+      `delete_key(attributes, "review_rounds") where attributes["review_rounds"] != nil and not (IsInt(attributes["review_rounds"]) and attributes["review_rounds"] >= 0 and attributes["review_rounds"] <= 1000000000000)`,
+      `delete_key(attributes, "spec_rounds") where attributes["spec_rounds"] != nil and not (IsInt(attributes["spec_rounds"]) and attributes["spec_rounds"] >= 0 and attributes["spec_rounds"] <= 1000000000000)`,
+      `delete_key(attributes, "sequence") where attributes["sequence"] != nil and not (IsInt(attributes["sequence"]) and attributes["sequence"] >= 0 and attributes["sequence"] <= 1000000000000)`,
+      `delete_key(attributes, "runs") where attributes["runs"] != nil and not (IsInt(attributes["runs"]) and attributes["runs"] >= 0 and attributes["runs"] <= 1000000000000)`,
+      `delete_key(attributes, "incomplete_runs") where attributes["incomplete_runs"] != nil and not (IsInt(attributes["incomplete_runs"]) and attributes["incomplete_runs"] >= 0 and attributes["incomplete_runs"] <= 1000000000000)`,
+      `set(name, "baton.run")`,
+      `set(status.message, "")`,
+      `set(trace_state, "")`,
+      `set(links, nil)`,
+    ]
+  }
+
+  trace_statements {
+    context = "spanevent"
+    statements = [
+      `keep_keys(attributes, [])`,
+      `set(name, "baton.event")`,
+    ]
+  }
+    output {
+      logs = argument.logs_output.value
+      traces = argument.traces_output.value
+    }
+  }
+}

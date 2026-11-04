@@ -1,0 +1,265 @@
+// Managed source for ADR-0004 / issue #142. No debug exporter or raw payload logs.
+// Codex-only OTLP HTTP entry point. Output consumers are wired by the caller.
+declare "baton_codex_ingest" {
+	argument "listen_address" { }
+	// host.name on every record; one value per collector.
+	argument "host_name" { }
+
+	argument "logs_output" { }
+
+	argument "traces_output" { }
+
+	argument "metrics_output" { }
+
+	otelcol.receiver.otlp "codex" {
+		http {
+			endpoint = argument.listen_address.value
+		}
+
+		output {
+			logs    = [otelcol.processor.transform.content.input]
+			traces  = [otelcol.processor.transform.content.input]
+			metrics = [otelcol.processor.filter.metrics.input]
+		}
+	}
+
+	// Propagate drops a malformed batch; ignore would forward unfiltered fields.
+	otelcol.processor.transform "content" {
+		error_mode = "propagate"
+
+		log_statements {
+			context    = "resource"
+			statements = [
+				`keep_keys(attributes, ["baton.run_id", "baton.pipeline_id", "baton.issue", "baton.pr", "conversation.id", "baton.role", "baton.stage", "model"])`,
+				`delete_key(attributes, "baton.run_id") where attributes["baton.run_id"] != nil and not (IsString(attributes["baton.run_id"]) and IsMatch(attributes["baton.run_id"], "^[a-f0-9-]{16,64}$"))`,
+				`delete_key(attributes, "baton.pipeline_id") where attributes["baton.pipeline_id"] != nil and not (IsString(attributes["baton.pipeline_id"]) and IsMatch(attributes["baton.pipeline_id"], "^[a-f0-9-]{16,64}$"))`,
+				`set(attributes["baton.issue"], Int(attributes["baton.issue"])) where IsString(attributes["baton.issue"]) and IsMatch(attributes["baton.issue"], "^[0-9]{1,9}$")`,
+				`delete_key(attributes, "baton.issue") where attributes["baton.issue"] != nil and not (IsInt(attributes["baton.issue"]) and attributes["baton.issue"] > 0)`,
+				`set(attributes["baton.pr"], Int(attributes["baton.pr"])) where IsString(attributes["baton.pr"]) and IsMatch(attributes["baton.pr"], "^[0-9]{1,9}$")`,
+				`delete_key(attributes, "baton.pr") where attributes["baton.pr"] != nil and not (IsInt(attributes["baton.pr"]) and attributes["baton.pr"] > 0)`,
+				`delete_key(attributes, "conversation.id") where attributes["conversation.id"] != nil and not (IsString(attributes["conversation.id"]) and IsMatch(attributes["conversation.id"], "^[a-f0-9-]{16,64}$"))`,
+				`delete_key(attributes, "baton.role") where attributes["baton.role"] != nil and not (IsString(attributes["baton.role"]) and IsMatch(attributes["baton.role"], "^(spec|review|fix|triage|scan|dev)$"))`,
+				`delete_key(attributes, "baton.stage") where attributes["baton.stage"] != nil and not (IsString(attributes["baton.stage"]) and IsMatch(attributes["baton.stage"], "^(spec-review|spec-reply|implement|review|fix|ci|merged|handoff)$"))`,
+				`delete_key(attributes, "model") where attributes["model"] != nil and not (IsString(attributes["model"]) and IsMatch(attributes["model"], "^(gpt-6[.]1-sol|gpt-6-sol|gpt-6-astra|gpt-6-luna|gpt-5[.]6-sol)$"))`,
+				`set(attributes["service.name"], "codex_exec")`,
+				`set(attributes["host.name"], "` + argument.host_name.value + `")`,
+				`set(attributes["agent"], "codex")`,
+			]
+		}
+
+		log_statements {
+			context    = "scope"
+			statements = [
+				`keep_keys(attributes, [])`,
+				`set(name, "baton.codex.metadata")`,
+				`set(version, "1")`,
+			]
+		}
+
+		trace_statements {
+			context    = "resource"
+			statements = [
+				`keep_keys(attributes, ["baton.run_id", "baton.pipeline_id", "baton.issue", "baton.pr", "conversation.id", "baton.role", "baton.stage", "model"])`,
+				`delete_key(attributes, "baton.run_id") where attributes["baton.run_id"] != nil and not (IsString(attributes["baton.run_id"]) and IsMatch(attributes["baton.run_id"], "^[a-f0-9-]{16,64}$"))`,
+				`delete_key(attributes, "baton.pipeline_id") where attributes["baton.pipeline_id"] != nil and not (IsString(attributes["baton.pipeline_id"]) and IsMatch(attributes["baton.pipeline_id"], "^[a-f0-9-]{16,64}$"))`,
+				`set(attributes["baton.issue"], Int(attributes["baton.issue"])) where IsString(attributes["baton.issue"]) and IsMatch(attributes["baton.issue"], "^[0-9]{1,9}$")`,
+				`delete_key(attributes, "baton.issue") where attributes["baton.issue"] != nil and not (IsInt(attributes["baton.issue"]) and attributes["baton.issue"] > 0)`,
+				`set(attributes["baton.pr"], Int(attributes["baton.pr"])) where IsString(attributes["baton.pr"]) and IsMatch(attributes["baton.pr"], "^[0-9]{1,9}$")`,
+				`delete_key(attributes, "baton.pr") where attributes["baton.pr"] != nil and not (IsInt(attributes["baton.pr"]) and attributes["baton.pr"] > 0)`,
+				`delete_key(attributes, "conversation.id") where attributes["conversation.id"] != nil and not (IsString(attributes["conversation.id"]) and IsMatch(attributes["conversation.id"], "^[a-f0-9-]{16,64}$"))`,
+				`delete_key(attributes, "baton.role") where attributes["baton.role"] != nil and not (IsString(attributes["baton.role"]) and IsMatch(attributes["baton.role"], "^(spec|review|fix|triage|scan|dev)$"))`,
+				`delete_key(attributes, "baton.stage") where attributes["baton.stage"] != nil and not (IsString(attributes["baton.stage"]) and IsMatch(attributes["baton.stage"], "^(spec-review|spec-reply|implement|review|fix|ci|merged|handoff)$"))`,
+				`delete_key(attributes, "model") where attributes["model"] != nil and not (IsString(attributes["model"]) and IsMatch(attributes["model"], "^(gpt-6[.]1-sol|gpt-6-sol|gpt-6-astra|gpt-6-luna|gpt-5[.]6-sol)$"))`,
+				`set(attributes["service.name"], "codex_exec")`,
+				`set(attributes["host.name"], "` + argument.host_name.value + `")`,
+				`set(attributes["agent"], "codex")`,
+			]
+		}
+
+		trace_statements {
+			context    = "scope"
+			statements = [
+				`keep_keys(attributes, [])`,
+				`set(name, "baton.codex.metadata")`,
+				`set(version, "1")`,
+			]
+		}
+
+		log_statements {
+			context    = "log"
+			statements = [
+				`keep_keys(attributes, ["baton.run_id", "baton.pipeline_id", "baton.issue", "baton.pr", "conversation.id", "baton.role", "baton.stage", "model", "duration_ms", "input_token_count", "output_token_count", "cached_token_count", "cache_write_token_count", "reasoning_token_count", "gen_ai.usage.input_tokens", "gen_ai.usage.cache_read.input_tokens", "gen_ai.usage.cache_write.input_tokens", "gen_ai.usage.output_tokens", "event.name", "tool_name", "tool", "success", "decision", "event.kind"])`,
+				`delete_key(attributes, "baton.run_id") where attributes["baton.run_id"] != nil and not (IsString(attributes["baton.run_id"]) and IsMatch(attributes["baton.run_id"], "^[a-f0-9-]{16,64}$"))`,
+				`delete_key(attributes, "baton.pipeline_id") where attributes["baton.pipeline_id"] != nil and not (IsString(attributes["baton.pipeline_id"]) and IsMatch(attributes["baton.pipeline_id"], "^[a-f0-9-]{16,64}$"))`,
+				`set(attributes["baton.issue"], Int(attributes["baton.issue"])) where IsString(attributes["baton.issue"]) and IsMatch(attributes["baton.issue"], "^[0-9]{1,9}$")`,
+				`delete_key(attributes, "baton.issue") where attributes["baton.issue"] != nil and not (IsInt(attributes["baton.issue"]) and attributes["baton.issue"] > 0)`,
+				`set(attributes["baton.pr"], Int(attributes["baton.pr"])) where IsString(attributes["baton.pr"]) and IsMatch(attributes["baton.pr"], "^[0-9]{1,9}$")`,
+				`delete_key(attributes, "baton.pr") where attributes["baton.pr"] != nil and not (IsInt(attributes["baton.pr"]) and attributes["baton.pr"] > 0)`,
+				`delete_key(attributes, "conversation.id") where attributes["conversation.id"] != nil and not (IsString(attributes["conversation.id"]) and IsMatch(attributes["conversation.id"], "^[a-f0-9-]{16,64}$"))`,
+				`delete_key(attributes, "baton.role") where attributes["baton.role"] != nil and not (IsString(attributes["baton.role"]) and IsMatch(attributes["baton.role"], "^(spec|review|fix|triage|scan|dev)$"))`,
+				`delete_key(attributes, "baton.stage") where attributes["baton.stage"] != nil and not (IsString(attributes["baton.stage"]) and IsMatch(attributes["baton.stage"], "^(spec-review|spec-reply|implement|review|fix|ci|merged|handoff)$"))`,
+				`delete_key(attributes, "model") where attributes["model"] != nil and not (IsString(attributes["model"]) and IsMatch(attributes["model"], "^(gpt-6[.]1-sol|gpt-6-sol|gpt-6-astra|gpt-6-luna|gpt-5[.]6-sol)$"))`,
+				`set(attributes["duration_ms"], Double(attributes["duration_ms"])) where IsString(attributes["duration_ms"]) and IsMatch(attributes["duration_ms"], "^[0-9]+([.][0-9]+)?$")`,
+				`delete_key(attributes, "duration_ms") where attributes["duration_ms"] != nil and not (IsInt(attributes["duration_ms"]) or IsDouble(attributes["duration_ms"]))`,
+				`set(attributes["input_token_count"], Double(attributes["input_token_count"])) where IsString(attributes["input_token_count"]) and IsMatch(attributes["input_token_count"], "^[0-9]+([.][0-9]+)?$")`,
+				`delete_key(attributes, "input_token_count") where attributes["input_token_count"] != nil and not (IsInt(attributes["input_token_count"]) or IsDouble(attributes["input_token_count"]))`,
+				`set(attributes["output_token_count"], Double(attributes["output_token_count"])) where IsString(attributes["output_token_count"]) and IsMatch(attributes["output_token_count"], "^[0-9]+([.][0-9]+)?$")`,
+				`delete_key(attributes, "output_token_count") where attributes["output_token_count"] != nil and not (IsInt(attributes["output_token_count"]) or IsDouble(attributes["output_token_count"]))`,
+				`set(attributes["cached_token_count"], Double(attributes["cached_token_count"])) where IsString(attributes["cached_token_count"]) and IsMatch(attributes["cached_token_count"], "^[0-9]+([.][0-9]+)?$")`,
+				`delete_key(attributes, "cached_token_count") where attributes["cached_token_count"] != nil and not (IsInt(attributes["cached_token_count"]) or IsDouble(attributes["cached_token_count"]))`,
+				`set(attributes["cache_write_token_count"], Double(attributes["cache_write_token_count"])) where IsString(attributes["cache_write_token_count"]) and IsMatch(attributes["cache_write_token_count"], "^[0-9]+([.][0-9]+)?$")`,
+				`delete_key(attributes, "cache_write_token_count") where attributes["cache_write_token_count"] != nil and not (IsInt(attributes["cache_write_token_count"]) or IsDouble(attributes["cache_write_token_count"]))`,
+				`set(attributes["reasoning_token_count"], Double(attributes["reasoning_token_count"])) where IsString(attributes["reasoning_token_count"]) and IsMatch(attributes["reasoning_token_count"], "^[0-9]+([.][0-9]+)?$")`,
+				`delete_key(attributes, "reasoning_token_count") where attributes["reasoning_token_count"] != nil and not (IsInt(attributes["reasoning_token_count"]) or IsDouble(attributes["reasoning_token_count"]))`,
+				`set(attributes["gen_ai.usage.input_tokens"], Double(attributes["gen_ai.usage.input_tokens"])) where IsString(attributes["gen_ai.usage.input_tokens"]) and IsMatch(attributes["gen_ai.usage.input_tokens"], "^[0-9]+([.][0-9]+)?$")`,
+				`delete_key(attributes, "gen_ai.usage.input_tokens") where attributes["gen_ai.usage.input_tokens"] != nil and not (IsInt(attributes["gen_ai.usage.input_tokens"]) or IsDouble(attributes["gen_ai.usage.input_tokens"]))`,
+				`set(attributes["gen_ai.usage.cache_read.input_tokens"], Double(attributes["gen_ai.usage.cache_read.input_tokens"])) where IsString(attributes["gen_ai.usage.cache_read.input_tokens"]) and IsMatch(attributes["gen_ai.usage.cache_read.input_tokens"], "^[0-9]+([.][0-9]+)?$")`,
+				`delete_key(attributes, "gen_ai.usage.cache_read.input_tokens") where attributes["gen_ai.usage.cache_read.input_tokens"] != nil and not (IsInt(attributes["gen_ai.usage.cache_read.input_tokens"]) or IsDouble(attributes["gen_ai.usage.cache_read.input_tokens"]))`,
+				`set(attributes["gen_ai.usage.cache_write.input_tokens"], Double(attributes["gen_ai.usage.cache_write.input_tokens"])) where IsString(attributes["gen_ai.usage.cache_write.input_tokens"]) and IsMatch(attributes["gen_ai.usage.cache_write.input_tokens"], "^[0-9]+([.][0-9]+)?$")`,
+				`delete_key(attributes, "gen_ai.usage.cache_write.input_tokens") where attributes["gen_ai.usage.cache_write.input_tokens"] != nil and not (IsInt(attributes["gen_ai.usage.cache_write.input_tokens"]) or IsDouble(attributes["gen_ai.usage.cache_write.input_tokens"]))`,
+				`set(attributes["gen_ai.usage.output_tokens"], Double(attributes["gen_ai.usage.output_tokens"])) where IsString(attributes["gen_ai.usage.output_tokens"]) and IsMatch(attributes["gen_ai.usage.output_tokens"], "^[0-9]+([.][0-9]+)?$")`,
+				`delete_key(attributes, "gen_ai.usage.output_tokens") where attributes["gen_ai.usage.output_tokens"] != nil and not (IsInt(attributes["gen_ai.usage.output_tokens"]) or IsDouble(attributes["gen_ai.usage.output_tokens"]))`,
+				`delete_key(attributes, "event.name") where attributes["event.name"] != nil and not (IsString(attributes["event.name"]) and IsMatch(attributes["event.name"], "^codex[.](conversation_starts|api_request|sse_event|websocket_request|websocket_connect|tool_decision|tool_result|user_prompt|startup_phase|turn_ttft)$"))`,
+				`delete_key(attributes, "tool_name") where attributes["tool_name"] != nil and not (IsString(attributes["tool_name"]) and IsMatch(attributes["tool_name"], "^(exec_command|write_stdin|apply_patch|shell|shell_command)$"))`,
+				`delete_key(attributes, "tool") where attributes["tool"] != nil and not (IsString(attributes["tool"]) and IsMatch(attributes["tool"], "^(exec_command|write_stdin|apply_patch|shell|shell_command)$"))`,
+				`delete_key(attributes, "success") where attributes["success"] != nil and not (IsBool(attributes["success"]))`,
+				`delete_key(attributes, "decision") where attributes["decision"] != nil and not (IsString(attributes["decision"]) and IsMatch(attributes["decision"], "^(approved|denied|approve|deny)$"))`,
+				`delete_key(attributes, "event.kind") where attributes["event.kind"] != nil and not (IsString(attributes["event.kind"]) and IsMatch(attributes["event.kind"], "^response[.](created|completed|failed|incomplete)$"))`,
+				`set(body, "codex.event")`,
+				`set(body, attributes["event.name"]) where attributes["event.name"] != nil`,
+				`set(severity_text, "")`,
+				`set(event_name, "codex.event")`,
+			]
+		}
+
+		trace_statements {
+			context    = "span"
+			statements = [
+				`keep_keys(attributes, ["baton.run_id", "baton.pipeline_id", "baton.issue", "baton.pr", "conversation.id", "baton.role", "baton.stage", "model", "duration_ms", "input_token_count", "output_token_count", "cached_token_count", "cache_write_token_count", "reasoning_token_count", "gen_ai.usage.input_tokens", "gen_ai.usage.cache_read.input_tokens", "gen_ai.usage.cache_write.input_tokens", "gen_ai.usage.output_tokens", "tool_name", "tool", "success", "decision", "event.kind"])`,
+				`delete_key(attributes, "baton.run_id") where attributes["baton.run_id"] != nil and not (IsString(attributes["baton.run_id"]) and IsMatch(attributes["baton.run_id"], "^[a-f0-9-]{16,64}$"))`,
+				`delete_key(attributes, "baton.pipeline_id") where attributes["baton.pipeline_id"] != nil and not (IsString(attributes["baton.pipeline_id"]) and IsMatch(attributes["baton.pipeline_id"], "^[a-f0-9-]{16,64}$"))`,
+				`set(attributes["baton.issue"], Int(attributes["baton.issue"])) where IsString(attributes["baton.issue"]) and IsMatch(attributes["baton.issue"], "^[0-9]{1,9}$")`,
+				`delete_key(attributes, "baton.issue") where attributes["baton.issue"] != nil and not (IsInt(attributes["baton.issue"]) and attributes["baton.issue"] > 0)`,
+				`set(attributes["baton.pr"], Int(attributes["baton.pr"])) where IsString(attributes["baton.pr"]) and IsMatch(attributes["baton.pr"], "^[0-9]{1,9}$")`,
+				`delete_key(attributes, "baton.pr") where attributes["baton.pr"] != nil and not (IsInt(attributes["baton.pr"]) and attributes["baton.pr"] > 0)`,
+				`delete_key(attributes, "conversation.id") where attributes["conversation.id"] != nil and not (IsString(attributes["conversation.id"]) and IsMatch(attributes["conversation.id"], "^[a-f0-9-]{16,64}$"))`,
+				`delete_key(attributes, "baton.role") where attributes["baton.role"] != nil and not (IsString(attributes["baton.role"]) and IsMatch(attributes["baton.role"], "^(spec|review|fix|triage|scan|dev)$"))`,
+				`delete_key(attributes, "baton.stage") where attributes["baton.stage"] != nil and not (IsString(attributes["baton.stage"]) and IsMatch(attributes["baton.stage"], "^(spec-review|spec-reply|implement|review|fix|ci|merged|handoff)$"))`,
+				`delete_key(attributes, "model") where attributes["model"] != nil and not (IsString(attributes["model"]) and IsMatch(attributes["model"], "^(gpt-6[.]1-sol|gpt-6-sol|gpt-6-astra|gpt-6-luna|gpt-5[.]6-sol)$"))`,
+				`set(attributes["duration_ms"], Double(attributes["duration_ms"])) where IsString(attributes["duration_ms"]) and IsMatch(attributes["duration_ms"], "^[0-9]+([.][0-9]+)?$")`,
+				`delete_key(attributes, "duration_ms") where attributes["duration_ms"] != nil and not (IsInt(attributes["duration_ms"]) or IsDouble(attributes["duration_ms"]))`,
+				`set(attributes["input_token_count"], Double(attributes["input_token_count"])) where IsString(attributes["input_token_count"]) and IsMatch(attributes["input_token_count"], "^[0-9]+([.][0-9]+)?$")`,
+				`delete_key(attributes, "input_token_count") where attributes["input_token_count"] != nil and not (IsInt(attributes["input_token_count"]) or IsDouble(attributes["input_token_count"]))`,
+				`set(attributes["output_token_count"], Double(attributes["output_token_count"])) where IsString(attributes["output_token_count"]) and IsMatch(attributes["output_token_count"], "^[0-9]+([.][0-9]+)?$")`,
+				`delete_key(attributes, "output_token_count") where attributes["output_token_count"] != nil and not (IsInt(attributes["output_token_count"]) or IsDouble(attributes["output_token_count"]))`,
+				`set(attributes["cached_token_count"], Double(attributes["cached_token_count"])) where IsString(attributes["cached_token_count"]) and IsMatch(attributes["cached_token_count"], "^[0-9]+([.][0-9]+)?$")`,
+				`delete_key(attributes, "cached_token_count") where attributes["cached_token_count"] != nil and not (IsInt(attributes["cached_token_count"]) or IsDouble(attributes["cached_token_count"]))`,
+				`set(attributes["cache_write_token_count"], Double(attributes["cache_write_token_count"])) where IsString(attributes["cache_write_token_count"]) and IsMatch(attributes["cache_write_token_count"], "^[0-9]+([.][0-9]+)?$")`,
+				`delete_key(attributes, "cache_write_token_count") where attributes["cache_write_token_count"] != nil and not (IsInt(attributes["cache_write_token_count"]) or IsDouble(attributes["cache_write_token_count"]))`,
+				`set(attributes["reasoning_token_count"], Double(attributes["reasoning_token_count"])) where IsString(attributes["reasoning_token_count"]) and IsMatch(attributes["reasoning_token_count"], "^[0-9]+([.][0-9]+)?$")`,
+				`delete_key(attributes, "reasoning_token_count") where attributes["reasoning_token_count"] != nil and not (IsInt(attributes["reasoning_token_count"]) or IsDouble(attributes["reasoning_token_count"]))`,
+				`set(attributes["gen_ai.usage.input_tokens"], Double(attributes["gen_ai.usage.input_tokens"])) where IsString(attributes["gen_ai.usage.input_tokens"]) and IsMatch(attributes["gen_ai.usage.input_tokens"], "^[0-9]+([.][0-9]+)?$")`,
+				`delete_key(attributes, "gen_ai.usage.input_tokens") where attributes["gen_ai.usage.input_tokens"] != nil and not (IsInt(attributes["gen_ai.usage.input_tokens"]) or IsDouble(attributes["gen_ai.usage.input_tokens"]))`,
+				`set(attributes["gen_ai.usage.cache_read.input_tokens"], Double(attributes["gen_ai.usage.cache_read.input_tokens"])) where IsString(attributes["gen_ai.usage.cache_read.input_tokens"]) and IsMatch(attributes["gen_ai.usage.cache_read.input_tokens"], "^[0-9]+([.][0-9]+)?$")`,
+				`delete_key(attributes, "gen_ai.usage.cache_read.input_tokens") where attributes["gen_ai.usage.cache_read.input_tokens"] != nil and not (IsInt(attributes["gen_ai.usage.cache_read.input_tokens"]) or IsDouble(attributes["gen_ai.usage.cache_read.input_tokens"]))`,
+				`set(attributes["gen_ai.usage.cache_write.input_tokens"], Double(attributes["gen_ai.usage.cache_write.input_tokens"])) where IsString(attributes["gen_ai.usage.cache_write.input_tokens"]) and IsMatch(attributes["gen_ai.usage.cache_write.input_tokens"], "^[0-9]+([.][0-9]+)?$")`,
+				`delete_key(attributes, "gen_ai.usage.cache_write.input_tokens") where attributes["gen_ai.usage.cache_write.input_tokens"] != nil and not (IsInt(attributes["gen_ai.usage.cache_write.input_tokens"]) or IsDouble(attributes["gen_ai.usage.cache_write.input_tokens"]))`,
+				`set(attributes["gen_ai.usage.output_tokens"], Double(attributes["gen_ai.usage.output_tokens"])) where IsString(attributes["gen_ai.usage.output_tokens"]) and IsMatch(attributes["gen_ai.usage.output_tokens"], "^[0-9]+([.][0-9]+)?$")`,
+				`delete_key(attributes, "gen_ai.usage.output_tokens") where attributes["gen_ai.usage.output_tokens"] != nil and not (IsInt(attributes["gen_ai.usage.output_tokens"]) or IsDouble(attributes["gen_ai.usage.output_tokens"]))`,
+				`delete_key(attributes, "tool_name") where attributes["tool_name"] != nil and not (IsString(attributes["tool_name"]) and IsMatch(attributes["tool_name"], "^(exec_command|write_stdin|apply_patch|shell|shell_command)$"))`,
+				`delete_key(attributes, "tool") where attributes["tool"] != nil and not (IsString(attributes["tool"]) and IsMatch(attributes["tool"], "^(exec_command|write_stdin|apply_patch|shell|shell_command)$"))`,
+				`delete_key(attributes, "success") where attributes["success"] != nil and not (IsBool(attributes["success"]))`,
+				`delete_key(attributes, "decision") where attributes["decision"] != nil and not (IsString(attributes["decision"]) and IsMatch(attributes["decision"], "^(approved|denied|approve|deny)$"))`,
+				`delete_key(attributes, "event.kind") where attributes["event.kind"] != nil and not (IsString(attributes["event.kind"]) and IsMatch(attributes["event.kind"], "^response[.](created|completed|failed|incomplete)$"))`,
+				`set(name, "codex.operation") where not IsMatch(name, "^codex[.](exec|sampling|tool_blocking|tool_call_received|tool_result_ready|turn_input|process[.]spawn|exec_server[.]http_request|code_mode[.]nested_tool_dispatched)$")`,
+				`set(status.message, "")`,
+				`set(trace_state, "")`,
+				`set(links, nil)`,
+			]
+		}
+
+		trace_statements {
+			context    = "spanevent"
+			statements = [
+				`keep_keys(attributes, [])`,
+				`set(name, "codex.event")`,
+			]
+		}
+
+		output {
+			logs   = argument.logs_output.value
+			traces = argument.traces_output.value
+		}
+	}
+
+	// Only documented, bounded native series are exported initially.
+	otelcol.processor.filter "metrics" {
+		error_mode = "propagate"
+
+		metrics {
+			metric = [`not IsMatch(name, "^codex[.](turn[.]token_usage|tool[.]call|tool[.]call[.]duration_ms|api_request|api_request[.]duration_ms|websocket[.]request|websocket[.]request[.]duration_ms)$")`]
+		}
+
+		output {
+			metrics = [otelcol.processor.transform.metrics.input]
+		}
+	}
+
+	otelcol.processor.transform "metrics" {
+		error_mode = "propagate"
+
+		metric_statements {
+			context    = "resource"
+			statements = [
+				`keep_keys(attributes, [])`,
+				`set(attributes["service.name"], "codex_exec")`,
+				`set(attributes["host.name"], "` + argument.host_name.value + `")`,
+				`set(attributes["agent"], "codex")`,
+			]
+		}
+
+		metric_statements {
+			context    = "scope"
+			statements = [
+				`keep_keys(attributes, [])`,
+				`set(name, "baton.codex.metadata")`,
+				`set(version, "1")`,
+			]
+		}
+
+		metric_statements {
+			context    = "metric"
+			statements = [
+				`set(description, "")`,
+				`set(unit, "")`,
+			]
+		}
+
+		metric_statements {
+			context    = "datapoint"
+			statements = [
+				`keep_keys(attributes, ["tool_name", "tool", "success", "model", "token_type", "status"])`,
+				`delete_key(attributes, "tool_name") where attributes["tool_name"] != nil and not (IsString(attributes["tool_name"]) and IsMatch(attributes["tool_name"], "^(exec_command|write_stdin|apply_patch|shell|shell_command)$"))`,
+				`delete_key(attributes, "tool") where attributes["tool"] != nil and not (IsString(attributes["tool"]) and IsMatch(attributes["tool"], "^(exec_command|write_stdin|apply_patch|shell|shell_command)$"))`,
+				`delete_key(attributes, "success") where attributes["success"] != nil and not (IsBool(attributes["success"]))`,
+				`delete_key(attributes, "model") where attributes["model"] != nil and not (IsString(attributes["model"]) and IsMatch(attributes["model"], "^(gpt-6[.]1-sol|gpt-6-sol|gpt-6-astra|gpt-6-luna|gpt-5[.]6-sol)$"))`,
+				`delete_key(attributes, "token_type") where attributes["token_type"] != nil and not (IsString(attributes["token_type"]) and IsMatch(attributes["token_type"], "^(input|cached_input|cache_write_input|output|reasoning_output|total)$"))`,
+				`delete_key(attributes, "status") where attributes["status"] != nil and not (IsInt(attributes["status"]) and attributes["status"] >= 100 and attributes["status"] <= 599)`,
+				`set(exemplars, nil)`,
+			]
+		}
+
+		output {
+			metrics = [otelcol.processor.deltatocumulative.codex.input]
+		}
+	}
+
+	otelcol.processor.deltatocumulative "codex" {
+		max_stale   = "24h"
+		max_streams = 1000
+
+		output {
+			metrics = argument.metrics_output.value
+		}
+	}
+}

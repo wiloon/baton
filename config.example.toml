@@ -1,0 +1,249 @@
+# baton's configuration. Copy this file to config.toml next to it and edit that copy: the runner
+# reads config.toml (or --config PATH). Every key is required; `python -m baton --validate` checks
+# the file without starting anything. A leading ~/ is the runner's home; relative paths are
+# from this file's directory.
+
+[paths]
+# Runner-wide roots. Each repository gets OWNER/NAME below clones, wt_root, state/repos, logs and ctx;
+# quota, vendor cooldowns, run counts, telemetry, runner.log and the lock stay global.
+# Where the runner is installed (this checkout). Informational: nothing reads it yet.
+agent_home = "~/baton"
+# Each repository's clone, at clones/OWNER/NAME. Clone it there yourself before the first tick.
+clones = "~/baton/repos"
+# The agents' git worktrees, one per issue or PR, under wt_root/OWNER/NAME.
+wt_root = "~/baton/worktrees"
+# Checkpoints, cooldowns, quota snapshots, run counts and the telemetry ledger.
+state = "~/.local/state/baton"
+# runner.log and one log per agent run.
+logs = "~/.local/state/baton/logs"
+# The context files given to agents (issue, comments, diffs); removed after 14 days.
+ctx = "~/.local/state/baton/ctx"
+# The scripts, prompts and agent settings this checkout ships.
+self_dir = "bin"
+# The Matt skills plugin, if Claude Code has it; its newest version is used. A missing directory
+# is fine: large reviews then run in one pass instead of through its code-review skill.
+matt_skills_root = "~/.claude/plugins/cache/mattpocock/mattpocock-skills"
+
+[scheduling]
+# Merge an agent PR whose review passed, CI is green and "## Manual checks" is none. false: every
+# PR waits for the owner.
+auto_merge = true
+# Per repository: no new issue starts while this many agent PRs are still in the review loop
+# (a PR handed to the owner, ready-for-human, doesn't count).
+max_pending_prs = 1
+# Reviews per PR before it goes to the owner; each review but the last can be followed by a fix.
+max_review_rounds = 2
+# Fix runs after the pre-push checks (verify_hook or ci_command) fail, before giving up unpushed.
+max_verify_fixes = 2
+# How long a vendor rests after a quota limit with no reset time, or after an auth failure.
+cooldown_hours = 5
+# A diff over this many lines is reviewed through the Matt skills' code-review skill, when present.
+review_skill_min_lines = 800
+# Passes one tick may chain (an item that ends hands straight to the next).
+chain_max = 5
+# The most characters of PR comments and reviews given to a reviewer or fixer as context.
+review_context_max_chars = 20000
+# true: the timer's ticks do nothing; runs by hand still work.
+paused = false
+# Cursor triages claude-found issues (its verdicts advance them), and code scans may run.
+cross_review = true
+# Who Cursor is on GitHub: PR author logins and branch names that mark a Cursor PR.
+cursor_login_re = "^(app/cursor|cursor(\\[bot\\])?)$"
+cursor_branch_re = "^cursor/"
+# Spec review rounds before an issue goes to the owner; an owner answer earns one more.
+max_spec_rounds = 6
+# When there is nothing else to do, Claude scans one of a repository's scan_areas for bugs and
+# files what it finds as claude-found + needs-triage issues. Needs cross_review.
+scan = false
+# Hours between two scans.
+scan_interval_hours = 6
+# No new scan while this many claude-found issues still wait for triage.
+scan_max_waiting = 2
+
+[[repos]]
+# A repository the runner works on, one [[repos]] entry each; the runner takes them in turn.
+# Its conventions (tests, CI, commit style) are in its own AGENTS.md. This entry is an example:
+# replace it with your own.
+gh_repo = "acme/app"
+# The GitHub login the runner works for. External issues need this account's ready-for-agent
+# label event; other accounts' labels do not authorize work. Only this owner's comments count
+# as human answers and fix feedback. The configured Cursor accounts can also supply agent context.
+owner = "acme-owner"
+# Issues the runner takes need this milestone ("" for any); claude-found ones need none.
+agent_milestone = ""
+# CI check names an agent may try to fix when they fail on its PR.
+ci_fixable_checks = ["test", "lint"]
+# What the code scan (scheduling.scan) reviews, one area per run: space-separated directories.
+scan_areas = ["web/src", "api"]
+# Plain env files copied into each worktree, laid out as in the repository; "" for none.
+env_files = "~/.config/baton/env-files/acme/app"
+# The secret_env_keys are read from this file for the runs that write code (dev, fix) only.
+secret_env_file = "~/.config/baton/env-files/acme/app/.secrets"
+# The KEY=value names taken from secret_env_file (a missing file gives none).
+secret_env_keys = []
+# Name prefixes the repository's own tests give their /tmp files (myapp for /tmp/myapp-*-test.db).
+# bin/tmp-sweep.sh removes them as it does the runner's baton-* files: a finished issue's
+# PREFIX-N-* at once, and anything untouched for a day.
+tmp_prefixes = []
+# What agents run before they finish; {base} is the branch point (origin/main, or a commit).
+ci_command = "make check BASE={base}"
+# A directory whose same-named *-prompt.md files replace the shipped ones; "" for none.
+prompt_dir = ""
+# Hooks: commands on this host, never in the repository, so an agent's branch can't rewrite the
+# checks that judge it. Relative paths are from this file's directory; "" for none.
+# verify WORKTREE BASE: the checks before every push (none: ci_command in the worktree). It gets
+#   CI_COMMAND and E2E_GATE in its environment.
+verify_hook = ""
+# e2e WORKTREE [args]: how agents run e2e themselves, {{E2E_HOOK}} in prompt_notes.
+e2e_hook = ""
+# gate WORKTREE ARGS: the issue's `## E2E gate` line, after green checks; its last output line is
+# the result posted on the PR. None: issues have no gate.
+gate_hook = ""
+# nightly WORKTREE: once a night on origin/main; exit 0 is green, its last line the summary.
+nightly_hook = ""
+# What a gate line may hold: targets, each matching gate_target, then options matching gate_option.
+# Both are needed with a gate_hook, such as 'e2e/[A-Za-z0-9_-]+\.spec\.ts' and '--repeat-each=([1-9]|10)'.
+gate_target = ""
+gate_option = ""
+
+[repos.areas]
+# Top-level directory -> area, for per-area vendor preferences (`dev_ui = [...]`). Anything else is "other".
+web = "ui"
+api = "api"
+
+[repos.env]
+# Plain variables for the agents' tools; a leading ~/ expands to the runner's home.
+
+[repos.prompt_notes]
+# Text for a template's {{REPO_NOTES}} line, by template name (dev = dev-prompt.md). The repo's
+# conventions belong in its AGENTS.md; these are only what the runner on this host adds.
+
+[models]
+# Roles: dev (implement an issue), fix (answer a review or CI failure), review (review a PR),
+# spec_review (review an issue before work starts), spec (revise the issue after that review),
+# scan (look for bugs in one area). "_followup" models run the later rounds of review,
+# spec_review and spec, when the first round's findings only need checking.
+#
+# Claude Code: --max-budget-usd per run, by role (Claude Code's own estimate at API prices).
+budget_dev = 10
+budget_fix = 5
+budget_review = 4
+budget_spec_review = 3
+budget_spec = 3
+budget_scan = 3
+# Claude Code: minutes before a run is killed.
+max_minutes = 150
+# Claude Code: --model by role.
+model_dev = "sonnet"
+model_fix = "sonnet"
+model_review = "opus"
+model_review_followup = "sonnet"
+model_spec_review = "opus"
+model_spec_review_followup = "sonnet"
+model_spec = "opus"
+model_spec_followup = "sonnet"
+model_scan = "sonnet"
+# Claude Code: the model its sub-agents use (CLAUDE_CODE_SUBAGENT_MODEL), by role; "" for its default.
+subagent_model_review = "sonnet"
+# Cursor: cursor-agent --model, and minutes before a run is killed.
+model_cursor = "auto"
+cursor_max_minutes = 60
+# Codex: the model for any role without its own model_codex_ROLE; "" lets Codex choose.
+codex_model = ""
+# Codex: -m by role.
+model_codex_dev = "gpt-6.1-sol"
+model_codex_fix = "gpt-6.1-terra"
+model_codex_review = "gpt-6.1-sol"
+model_codex_review_followup = "gpt-6.1-terra"
+model_codex_spec_review = "gpt-6.1-sol"
+model_codex_spec_review_followup = "gpt-6.1-terra"
+model_codex_spec = "gpt-6.1-terra"
+# When a vendor's servers are full ("at capacity", "overloaded"), the run moves to the first of
+# these that differs from its model: Claude Code through --fallback-model, Codex by one rerun.
+# If that is full too, the vendor rests for busy_minutes.
+fallback_models_claude = ["sonnet", "opus"]
+fallback_models_codex = ["gpt-6-sol", "gpt-6.1-sol"]
+# Codex: minutes before a run is killed.
+codex_max_minutes = 60
+# Directories Codex's sandbox may write besides the worktree (--add-dir): package and build
+# caches. They must include environment.gocache, gomodcache, gotmpdir and node_compile_cache.
+codex_cache_dirs = ["~/.local/share/pnpm", "~/.local/state/pnpm", "~/.cache/pnpm", "~/.cache/node/corepack", "~/.cache/node-compile-cache", "~/.cache/ms-playwright", "~/.cache/go-build", "~/go/pkg/mod", "~/.cache/go-tmp"]
+# Codex: reasoning effort by role ("", low, medium, high, xhigh, max; "" for the model's default),
+# and the Claude Code sub-agent model for the other roles.
+effort_codex_dev = ""
+subagent_model_dev = ""
+effort_codex_fix = ""
+subagent_model_fix = ""
+effort_codex_review = ""
+effort_codex_spec_review = ""
+subagent_model_spec_review = ""
+effort_codex_spec = ""
+subagent_model_spec = ""
+model_codex_scan = ""
+effort_codex_scan = ""
+subagent_model_scan = ""
+# How long a vendor rests when its fallback model is full too.
+busy_minutes = 30
+
+[quota]
+# Vendors picked by quota headroom (claude, codex), and the ones that run besides them without
+# that balance: [] or ["cursor"]. Preflight checks only these vendors' CLIs.
+vendor_pool = ["claude", "codex"]
+vendor_extra = []
+# The share of a vendor's weekly quota the runner may use (0-1). The rest is left for your own
+# sessions on the same subscription. Within the caps, the vendor furthest behind its weekly pace
+# is picked.
+quota_cap_claude = 0.9
+quota_cap_codex = 0.95
+quota_cap_cursor = 0.95
+# No vendor runs while its 5-hour window is at least this full.
+quota_five_hour_max = 0.9
+# A quota snapshot older than this is refreshed (by a one-turn probe run) before a pick relies on it.
+quota_stale_minutes = 30
+# The Claude model the probe runs on.
+quota_probe_model_claude = "haiku"
+
+[preferences]
+# Vendor order by role, used only to break ties between vendors that may run (cooldowns, quota
+# caps and "the reviewer is not the author" filter first). Roles: dev, reviewer, fixer,
+# spec_reviewer, reviser; ROLE_AREA (dev_ui) for one of the repos.areas. Vendors not listed
+# can still be picked. An empty table keeps the plain quota order.
+dev = ["cursor", "codex", "claude"]
+reviewer = ["claude", "codex"]
+
+[environment]
+# What the agents' tools get. Each key below becomes the variable of the same name in upper case
+# (npm_config_store_dir as is); "" leaves the variable out.
+#
+# Put first on PATH, before the runner's own.
+path_prefix = ["~/.local/share/mise/shims", "~/.local/bin"]
+# Host settings, "" for none: a CA bundle for OpenSSL, curl, git and Go (SSL_CERT_FILE and
+# GIT_SSL_CAINFO), extra CAs for Node (NODE_EXTRA_CA_CERTS) and a Go module proxy (GOPROXY).
+ssl_cert_file = ""
+node_extra_ca_certs = ""
+goproxy = ""
+# false: corepack downloads a package manager without asking (COREPACK_ENABLE_DOWNLOAD_PROMPT=0).
+corepack_enable_download_prompt = false
+# Go and pnpm caches outside /tmp, shared by every worktree (also in codex_cache_dirs).
+gocache = "~/.cache/go-build"
+gomodcache = "~/go/pkg/mod"
+gotmpdir = "~/.cache/go-tmp"
+npm_config_store_dir = "~/.local/share/pnpm/store"
+node_compile_cache = "~/.cache/node-compile-cache"
+# Claude Code: the context size at which it compacts the conversation.
+claude_code_auto_compact_window = 200000
+# Claude Code: false keeps the MCP servers of your claude.ai account out of the agents' runs.
+enable_claudeai_mcp_servers = false
+
+# Optional integrations, none by default. Each key comes from the runner's environment or from
+# env_file, which only its owner may read (chmod 600); no tool inherits them.
+#
+# [linear]                  owner actions ("## Before release") become Linear issues, else a GitHub issue
+# env_file = "~/.config/baton/linear.env"     # LINEAR_API_KEY
+# team_id = ""
+# project_id = ""
+# label_id = ""
+# assignee_id = ""
+#
+# [telegram]                notifications go to this chat as well as runner.log
+# env_file = "~/.config/baton/telegram.env"   # TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID

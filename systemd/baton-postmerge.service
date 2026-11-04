@@ -1,0 +1,11 @@
+[Unit]
+Description=baton post-merge outcomes: reverts and issues that reference merged agent PRs (#227)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Reads each merged PR's GitHub timeline; writes only $STATE/telemetry/postmerge.
+ExecStart=/usr/bin/python3 %h/baton/bin/telemetry.py postmerge
+TimeoutStartSec=20min
+Nice=10

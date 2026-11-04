@@ -1,0 +1,38 @@
+# The tests' repository: one [[repos]] entry using every feature (hooks, an E2E gate, areas, env,
+# prompt notes and a secret key). conftest.FULL puts it in place of the baseline's example entry.
+[[repos]]
+gh_repo = "acme/app"
+owner = "acme-owner"
+agent_milestone = "Beta"
+ci_fixable_checks = ["golangci-lint", "go test", "Typecheck, lint and test", "Lint, test and build"]
+scan_areas = ["api/billing", "api/account api/entitlement", "web/src/lib web/src/services", "extension/src/background extension/src/content"]
+env_files = "~/.config/baton/env-files"
+tmp_prefixes = ["app"]
+secret_env_file = "~/.config/baton/env-files/web/.env.local"
+secret_env_keys = ["APP_SECRET_KEY"]
+ci_command = "task ci:changed BASE={base}"
+prompt_dir = ""
+verify_hook = "hooks/verify.sh"
+e2e_hook = "hooks/e2e.sh"
+gate_hook = "hooks/gate.sh"
+nightly_hook = "hooks/nightly.sh"
+gate_target = 'e2e/(?!staging-)[A-Za-z0-9_-]+(?:[./][A-Za-z0-9_-]+)*\.spec\.ts'
+gate_option = '--repeat-each=([1-9]|[1-4][0-9]|50)'
+
+[repos.areas]
+web = "ui"
+api = "api"
+extension = "chrome"
+
+[repos.env]
+E2E_CHROMIUM_PATH = "/usr/bin/chromium"
+E2E_USER_EMAIL = "e2e+test@example.com"
+APP_DATA_PATH = "~/.local/share/app/data.db"
+
+[repos.prompt_notes]
+dev = """
+The runner also runs the `extension/e2e/*.spec.ts` files you add or edit before pushing, so they must pass. To run e2e yourself, use `{{E2E_HOOK}} {{WORKTREE}} [playwright arguments]`: it installs, builds and supplies the test key, data and Chromium, so don't write your own wrapper. When the issue has an `## E2E gate` section, the runner runs it before pushing and reports the result on the PR, so your own e2e stops at what you need while developing.
+"""
+spec-review = """
+- **E2E gate:** an acceptance item that needs a specific or repeated Playwright run belongs in an `## E2E gate` section, not in a step for the implementer: one line of specs and an optional repeat, like `e2e/a.spec.ts --repeat-each=15` (staging specs excluded, N up to 50). The runner runs it with no retries, and a red gate blocks the push. Raise one `decidable` point when such a run is written elsewhere or the line has any other form.
+"""

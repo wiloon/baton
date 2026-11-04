@@ -1,0 +1,9 @@
+[Unit]
+Description=Remove the agent's stale /tmp files (#248)
+
+[Service]
+Type=oneshot
+# Only this user's agent-named entries in /tmp with nothing written for a day.
+# Every watched repository's tmp_prefixes come from config.toml.
+ExecStart=/usr/bin/uv run --quiet --frozen --no-dev --project %h/baton --directory %h/baton python -m baton.tmp_sweep
+Nice=10

@@ -1,0 +1,13 @@
+[Unit]
+Description=baton tick: one step of the agent pipeline
+Documentation=file://%h/baton/config.toml
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/baton
+ExecStart=/usr/bin/uv run --quiet --frozen --no-dev --project %h/baton --directory %h/baton python -m baton
+# Each vendor invocation has its configured timeout; a tick may chain several runs.
+TimeoutStartSec=infinity
+Nice=10

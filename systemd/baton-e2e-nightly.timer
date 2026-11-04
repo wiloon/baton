@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the watched repository's nightly hook
+
+[Timer]
+OnCalendar=*-*-* 03:30
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

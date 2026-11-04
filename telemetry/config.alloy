@@ -1,0 +1,93 @@
+// The collector's entry point. Raw data never bypasses the reviewed modules beside it.
+// Every deployment value comes from the environment (see telemetry.env.example):
+// the host name stamped on every record, backend URLs, remote write credentials, CA.
+logging { level = "error" }
+livedebugging { enabled = false }
+import.file "codex" { filename = file.path_join(module_path, "codex.alloy") }
+import.file "runner" { filename = file.path_join(module_path, "runner.alloy") }
+import.file "claude" { filename = file.path_join(module_path, "claude.alloy") }
+runner.baton_runner_ingest "agent" {
+  listen_address = "127.0.0.1:4319"
+  host_name = sys.env("BATON_TELEMETRY_HOST")
+  logs_output = [otelcol.exporter.loki.runner.input]
+  traces_output = [otelcol.exporter.otlphttp.tempo.input]
+}
+otelcol.exporter.loki "runner" {
+  forward_to = [loki.process.runner.receiver]
+}
+loki.process "runner" {
+  stage.static_labels { values = { source = "runner", host = sys.env("BATON_TELEMETRY_HOST") } }
+  forward_to = [loki.write.backend.receiver]
+}
+codex.baton_codex_ingest "agent" {
+  listen_address = "127.0.0.1:4318"
+  host_name = sys.env("BATON_TELEMETRY_HOST")
+  logs_output = [otelcol.exporter.loki.codex.input]
+  traces_output = [otelcol.exporter.otlphttp.tempo.input]
+  metrics_output = [otelcol.exporter.prometheus.native.input]
+}
+// Claude Code: native metrics only (run_claude enables no logs or traces exporter).
+claude.baton_claude_ingest "agent" {
+  listen_address = "127.0.0.1:4320"
+  host_name = sys.env("BATON_TELEMETRY_HOST")
+  metrics_output = [otelcol.exporter.prometheus.native.input]
+}
+// Sanitized attributes become JSON entry fields; no run/issue stream labels.
+otelcol.exporter.loki "codex" {
+  forward_to = [loki.process.codex.receiver]
+}
+loki.process "codex" {
+  stage.static_labels { values = { agent = "codex", host = sys.env("BATON_TELEMETRY_HOST") } }
+  forward_to = [loki.write.backend.receiver]
+}
+loki.write "backend" {
+  endpoint {
+    url = sys.env("BATON_LOKI_PUSH_URL")
+    tls_config { ca_file = sys.env("BATON_TELEMETRY_CA_FILE") }
+  }
+}
+otelcol.exporter.otlphttp "tempo" {
+  client {
+    endpoint = sys.env("BATON_TEMPO_OTLP_URL")
+    tls { ca_file = sys.env("BATON_TELEMETRY_CA_FILE") }
+  }
+}
+otelcol.exporter.prometheus "native" {
+  include_scope_labels = false
+  include_target_info = false
+  resource_to_telemetry_conversion = true
+  forward_to = [prometheus.remote_write.backend.receiver]
+}
+prometheus.remote_write "backend" {
+  endpoint {
+    url = sys.env("BATON_PROM_REMOTE_WRITE_URL")
+    basic_auth {
+      username = sys.env("BATON_PROM_REMOTE_WRITE_USER")
+      password = sys.env("BATON_PROM_REMOTE_WRITE_PASSWORD")
+    }
+    tls_config { ca_file = sys.env("BATON_TELEMETRY_CA_FILE") }
+  }
+}
+// Self collection continues during agent idle and timer-off periods.
+prometheus.exporter.self "alloy" {}
+prometheus.scrape "alloy" {
+  targets = prometheus.exporter.self.alloy.targets
+  scrape_interval = "30s"
+  forward_to = [prometheus.relabel.alloy.receiver]
+}
+prometheus.relabel "alloy" {
+  rule {
+    source_labels = ["__name__"]
+    regex = "up|alloy_build_info|process_start_time_seconds|prometheus_remote_storage_.*|otelcol_exporter_.*|otelcol_receiver_.*|otelcol_processor_.*"
+    action = "keep"
+  }
+  rule {
+    target_label = "instance"
+    replacement = sys.env("BATON_TELEMETRY_HOST")
+  }
+  rule {
+    target_label = "job"
+    replacement = "baton-alloy"
+  }
+  forward_to = [prometheus.remote_write.backend.receiver]
+}

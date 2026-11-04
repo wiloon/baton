@@ -1,0 +1,10 @@
+[Unit]
+Description=Check merged agent PRs for reverts and issues every 6 hours
+
+[Timer]
+OnCalendar=00/6:17
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=Run baton every 10 minutes
+
+[Timer]
+OnCalendar=*:0/10
+RandomizedDelaySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

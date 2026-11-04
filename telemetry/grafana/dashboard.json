@@ -1,0 +1,5510 @@
+{
+  "id": null,
+  "uid": "baton",
+  "title": "Baton",
+  "description": "Agent scheduler state, validated run consumption, native Codex telemetry and Tempo traces. Incremental coverage for issue #142; unavailable pipeline/quality/pricing data is explicitly identified. Provider quota snapshots include 5h/weekly balances, runner headroom, resets and independent observation freshness.",
+  "tags": [
+    "baton",
+    "agents",
+    "observability"
+  ],
+  "timezone": "America/Los_Angeles",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "graphTooltip": 1,
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "refresh": "1m",
+  "templating": {
+    "list": [
+      {
+        "name": "prometheus",
+        "label": "Prometheus",
+        "type": "datasource",
+        "query": "prometheus",
+        "hide": 0,
+        "current": {},
+        "refresh": 1,
+        "regex": "",
+        "options": []
+      },
+      {
+        "name": "loki",
+        "label": "Loki",
+        "type": "datasource",
+        "query": "loki",
+        "hide": 0,
+        "current": {},
+        "refresh": 1,
+        "regex": "",
+        "options": []
+      },
+      {
+        "name": "tempo",
+        "label": "Tempo",
+        "type": "datasource",
+        "query": "tempo",
+        "hide": 0,
+        "current": {},
+        "refresh": 1,
+        "regex": "",
+        "options": []
+      },
+      {
+        "name": "host",
+        "label": "Host",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${prometheus}"
+        },
+        "definition": "label_values(baton_state_collect_success, hostname)",
+        "query": {
+          "query": "label_values(baton_state_collect_success, hostname)",
+          "refId": "host"
+        },
+        "refresh": 1,
+        "hide": 0,
+        "current": {},
+        "options": [],
+        "sort": 1,
+        "includeAll": false,
+        "multi": false,
+        "regex": ""
+      },
+      {
+        "name": "node_job",
+        "label": "node_exporter job",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${prometheus}"
+        },
+        "definition": "label_values(node_filesystem_size_bytes{hostname=\"$host\"}, job)",
+        "query": {
+          "query": "label_values(node_filesystem_size_bytes{hostname=\"$host\"}, job)",
+          "refId": "node_job"
+        },
+        "refresh": 1,
+        "hide": 2,
+        "current": {},
+        "options": [],
+        "sort": 1,
+        "includeAll": false,
+        "multi": false,
+        "regex": ""
+      },
+      {
+        "name": "agent",
+        "label": "Agent",
+        "type": "custom",
+        "query": "claude,cursor,codex",
+        "options": [
+          {
+            "text": "claude",
+            "value": "claude",
+            "selected": false
+          },
+          {
+            "text": "cursor",
+            "value": "cursor",
+            "selected": false
+          },
+          {
+            "text": "codex",
+            "value": "codex",
+            "selected": false
+          }
+        ],
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "hide": 0
+      },
+      {
+        "name": "role",
+        "label": "Role",
+        "type": "custom",
+        "query": "spec,review,fix,triage,scan,dev",
+        "options": [
+          {
+            "text": "spec",
+            "value": "spec",
+            "selected": false
+          },
+          {
+            "text": "review",
+            "value": "review",
+            "selected": false
+          },
+          {
+            "text": "fix",
+            "value": "fix",
+            "selected": false
+          },
+          {
+            "text": "triage",
+            "value": "triage",
+            "selected": false
+          },
+          {
+            "text": "scan",
+            "value": "scan",
+            "selected": false
+          },
+          {
+            "text": "dev",
+            "value": "dev",
+            "selected": false
+          }
+        ],
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "hide": 0
+      }
+    ]
+  },
+  "annotations": {
+    "list": []
+  },
+  "links": [
+    {
+      "title": "Detailed logs in Loki",
+      "type": "link",
+      "url": "/explore?schemaVersion=1&panes={%22logs%22%3A{%22datasource%22%3A%22${loki}%22%2C%22queries%22%3A%5B{%22refId%22%3A%22A%22%2C%22datasource%22%3A{%22type%22%3A%22loki%22%2C%22uid%22%3A%22${loki}%22}%2C%22expr%22%3A%22{source%3D%5C%22runner%5C%22%2Chost%3D%5C%22${host}%5C%22}%22%2C%22queryType%22%3A%22range%22}%5D%2C%22range%22%3A{%22from%22%3A%22${__from}%22%2C%22to%22%3A%22${__to}%22}}}",
+      "targetBlank": true
+    }
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "Agent Activity · $host",
+      "description": "",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 4
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**Live telemetry from $host.** State refreshes every minute. Daily counters follow **America/Los_Angeles** and include manual runs. Current executions and Agent activity always show all Agents. Agent/Role filters apply to quota/usage panels and run summaries; task history spans all vendors.\n\nTask episodes and events start after their instrumentation rollout. Earlier runs are not backfilled. Task identity links review, CI, handoff and run consumption. Missing data is **N/A / Unknown**. Pricing, quality-rate cohorts and CI/dispatch live health are still pending.\n\nDashboard updates are managed in Git and applied automatically by Argo CD."
+      }
+    },
+    {
+      "id": 110,
+      "type": "row",
+      "title": "Current executions & Agent activity",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 111,
+      "type": "table",
+      "title": "Current executions",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 5,
+        "w": 24,
+        "h": 7
+      },
+      "description": "Latest observed agent CLI invocations across all Agents; overview ignores Agent/Role filters. Running means a reconciled invocation is alive, including time waiting for tools or network. Idle means no instrumented invocation. Unknown means collection failed, exporter unavailable or observation older than 150 seconds. Uninstrumented manual CLIs are excluded. Updated about once per minute. Task links appear where metadata is available.",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "(clamp_max(max by (agent) (baton_running_by_agent{hostname=\"$host\"}), 1) and on() (max(baton_state_collect_success{hostname=\"$host\"}) == 1 and (time() - max(baton_activity_observed_at_seconds{hostname=\"$host\"})) < 150 and max(up{job=\"$node_job\",hostname=\"$host\"}) == 1)) or on(agent) (label_replace(vector(-1), \"agent\", \"claude\", \"\", \"\") or label_replace(vector(-1), \"agent\", \"cursor\", \"\", \"\") or label_replace(vector(-1), \"agent\", \"codex\", \"\", \"\"))",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "legendFormat": "{{agent}}",
+          "editorMode": "code"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "label_replace(label_join(label_replace(label_join((time() - max by (agent, role, stage, repo, issue, pr, run_id) (baton_current_execution_started_seconds{hostname=\"$host\"})) and on() (max(baton_state_collect_success{hostname=\"$host\"}) == 1 and (time() - max(baton_activity_observed_at_seconds{hostname=\"$host\"})) < 150 and max(up{job=\"$node_job\",hostname=\"$host\"}) == 1), \"repo_issue\", \";\", \"repo\", \"issue\"), \"issue_link\", \"[$2](https://github.com/$1/issues/$2)\", \"repo_issue\", \"(.+);([1-9][0-9]*)\"), \"repo_pr\", \";\", \"repo\", \"pr\"), \"pr_link\", \"[$2](https://github.com/$1/pull/$2)\", \"repo_pr\", \"(.+);([1-9][0-9]*)\")",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "legendFormat": "{{agent}}",
+          "editorMode": "code"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "agent",
+            "mode": "outerTabular"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Time 1": true,
+              "Time 2": true,
+              "run_id": true,
+              "issue": true,
+              "repo_issue": true,
+              "pr": true,
+              "repo_pr": true
+            },
+            "indexByName": {
+              "agent": 0,
+              "Value #A": 1,
+              "role": 2,
+              "stage": 3,
+              "repo": 4,
+              "Value #B": 7,
+              "issue_link": 5,
+              "pr_link": 6
+            },
+            "renameByName": {
+              "agent": "Agent",
+              "Value #A": "State",
+              "role": "Role",
+              "stage": "Stage",
+              "repo": "Repo",
+              "Value #B": "Elapsed",
+              "issue_link": "Issue",
+              "pr_link": "PR"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "width": 150
+          },
+          "noValue": "—"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "State"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "-1": {
+                        "text": "Unknown",
+                        "color": "orange"
+                      },
+                      "0": {
+                        "text": "Idle",
+                        "color": "#52545c"
+                      },
+                      "1": {
+                        "text": "Running",
+                        "color": "green"
+                      }
+                    }
+                  },
+                  {
+                    "type": "special",
+                    "options": {
+                      "match": "nan",
+                      "result": {
+                        "text": "Unknown",
+                        "color": "orange"
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Agent"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "claude": {
+                        "text": "Claude Code"
+                      },
+                      "cursor": {
+                        "text": "Cursor Agent"
+                      },
+                      "codex": {
+                        "text": "Codex"
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Elapsed"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Issue"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "markdown"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "special",
+                    "options": {
+                      "match": "null+nan",
+                      "result": {
+                        "text": "—"
+                      }
+                    }
+                  },
+                  {
+                    "type": "special",
+                    "options": {
+                      "match": "empty",
+                      "result": {
+                        "text": "—"
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "PR"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "markdown"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "special",
+                    "options": {
+                      "match": "null+nan",
+                      "result": {
+                        "text": "—"
+                      }
+                    }
+                  },
+                  {
+                    "type": "special",
+                    "options": {
+                      "match": "empty",
+                      "result": {
+                        "text": "—"
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "sortBy": [
+          {
+            "displayName": "Agent",
+            "desc": false
+          }
+        ]
+      }
+    },
+    {
+      "id": 112,
+      "type": "state-timeline",
+      "title": "Agent activity",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 12,
+        "w": 24,
+        "h": 8
+      },
+      "description": "X: time; Y: Agent. Green Active = an agent invocation overlapped the preceding observed collection interval, including short runs completed between polls. Gray Idle = no invocation overlapped that observed interval. Orange Unknown = failed/stale collection or a gap over 150 seconds. This is interval activity, not exact run boundaries or current process state; see Current executions for what is running now. About one-minute collection resolution; range aggregation preserves active buckets when zooming out, which can widen visible activity blocks. Existing missed instantaneous samples are not backfilled. All Agents remain visible regardless of Agent/Role filters. Before interval rollout, available legacy instantaneous observations are retained and may omit short runs.",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "(clamp_max((max by (agent) (max_over_time(baton_activity_in_interval{hostname=\"$host\"}[$__interval])) or on(agent) max by (agent) (max_over_time(baton_running_by_agent{hostname=\"$host\"}[$__interval]))), 1) and on() (max(baton_state_collect_success{hostname=\"$host\"}) == 1 and (time() - max(baton_activity_observed_at_seconds{hostname=\"$host\"})) < 150 and max(up{job=\"$node_job\",hostname=\"$host\"}) == 1)) or on(agent) (label_replace(vector(-1), \"agent\", \"claude\", \"\", \"\") or label_replace(vector(-1), \"agent\", \"cursor\", \"\", \"\") or label_replace(vector(-1), \"agent\", \"codex\", \"\", \"\"))",
+          "instant": false,
+          "range": true,
+          "format": "time_series",
+          "legendFormat": "{{agent}}",
+          "editorMode": "code"
+        }
+      ],
+      "maxDataPoints": 3000,
+      "interval": "1m",
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "-1": {
+                  "text": "Unknown",
+                  "color": "orange"
+                },
+                "0": {
+                  "text": "Idle",
+                  "color": "#52545c"
+                },
+                "1": {
+                  "text": "Active",
+                  "color": "green"
+                }
+              }
+            },
+            {
+              "type": "special",
+              "options": {
+                "match": "nan",
+                "result": {
+                  "text": "Unknown",
+                  "color": "orange"
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 0,
+            "fillOpacity": 85,
+            "spanNulls": false,
+            "insertNulls": 120000
+          },
+          "noValue": "Unknown"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "claude"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Claude Code"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "cursor"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Cursor Agent"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "codex"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Codex"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "mergeValues": true,
+        "showValue": "never",
+        "alignValue": "center",
+        "rowHeight": 0.7,
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 100,
+      "type": "row",
+      "title": "Quota & Scheduling",
+      "gridPos": {
+        "x": 0,
+        "y": 20,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 101,
+      "type": "table",
+      "title": "Quota balances by provider",
+      "gridPos": {
+        "x": 0,
+        "y": 21,
+        "w": 24,
+        "h": 8
+      },
+      "description": "Account/provider quota, shared across model calls; not per-model budgets. Runner Left (pp) is percentage points of account quota below the configured weekly cap. Quota gate does not predict role/PR selection. Stale balances are last observed values. Reset-pending/unknown balances are N/A. Cursor has no quota source. Observation ages appear beside each balance and are independent for the two provider windows. Credential status shows the latest authentication result; check results age to Stale after 24 hours, while an explicit authentication failure remains visible until a later success.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "max by (agent) (baton_quota_remaining_ratio{hostname=\"$host\",agent=~\"${agent:regex}\",window=\"five_hour\"})",
+          "legendFormat": "{{agent}}",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "max by (agent) (baton_quota_remaining_ratio{hostname=\"$host\",agent=~\"${agent:regex}\",window=\"seven_day\"})",
+          "legendFormat": "{{agent}}",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "100 * max by (agent) (baton_quota_runner_headroom_ratio{hostname=\"$host\",agent=~\"${agent:regex}\",window=\"seven_day\"})",
+          "legendFormat": "{{agent}}",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "clamp_min(max by (agent) (baton_quota_resets_at_seconds{hostname=\"$host\",agent=~\"${agent:regex}\",window=\"five_hour\"}) - time(), 0)",
+          "legendFormat": "{{agent}}",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code"
+        },
+        {
+          "refId": "E",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "clamp_min(max by (agent) (baton_quota_resets_at_seconds{hostname=\"$host\",agent=~\"${agent:regex}\",window=\"seven_day\"}) - time(), 0)",
+          "legendFormat": "{{agent}}",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code"
+        },
+        {
+          "refId": "F",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "max by (agent) (baton_quota_gate{hostname=\"$host\",agent=~\"${agent:regex}\"})",
+          "legendFormat": "{{agent}}",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code"
+        },
+        {
+          "refId": "G",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "max by (agent) (baton_quota_window_state{hostname=\"$host\",agent=~\"${agent:regex}\",window=\"five_hour\"})",
+          "legendFormat": "{{agent}}",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code"
+        },
+        {
+          "refId": "H",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "max by (agent) (baton_quota_window_state{hostname=\"$host\",agent=~\"${agent:regex}\",window=\"seven_day\"})",
+          "legendFormat": "{{agent}}",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code"
+        },
+        {
+          "refId": "I",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "time() - max by (agent) (baton_quota_observed_at_seconds{hostname=\"$host\",agent=~\"${agent:regex}\",window=\"five_hour\"})",
+          "legendFormat": "{{agent}}",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code"
+        },
+        {
+          "refId": "J",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "time() - max by (agent) (baton_quota_observed_at_seconds{hostname=\"$host\",agent=~\"${agent:regex}\",window=\"seven_day\"})",
+          "legendFormat": "{{agent}}",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code"
+        },
+        {
+          "refId": "K",
+          "expr": "max by (agent) (baton_credential_state{hostname=\"$host\",agent=~\"${agent:regex}\"})",
+          "legendFormat": "{{agent}}",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          }
+        },
+        {
+          "refId": "L",
+          "expr": "time() - max by (agent) (baton_credential_observed_at_seconds{hostname=\"$host\",agent=~\"${agent:regex}\"})",
+          "legendFormat": "{{agent}}",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          }
+        }
+      ],
+      "transformations": [
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "agent",
+            "mode": "outerTabular"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "indexByName": {
+              "agent": 0,
+              "Value #A": 3,
+              "Value #I": 4,
+              "Value #B": 5,
+              "Value #J": 6,
+              "Value #C": 7,
+              "Value #D": 8,
+              "Value #E": 9,
+              "Value #F": 10,
+              "Value #G": 11,
+              "Value #H": 12,
+              "Value #K": 1,
+              "Value #L": 2
+            },
+            "renameByName": {
+              "agent": "Provider",
+              "Value #A": "5h Remaining",
+              "Value #B": "Weekly Remaining",
+              "Value #C": "Runner Left (pp)",
+              "Value #D": "5h Reset In",
+              "Value #E": "Weekly Reset In",
+              "Value #F": "Quota Gate",
+              "Value #G": "5h State",
+              "Value #H": "Weekly State",
+              "Value #I": "5h Observed Ago",
+              "Value #J": "Weekly Observed Ago",
+              "Value #K": "Credential Status",
+              "Value #L": "Credential Checked Ago"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "N/A",
+          "decimals": 0,
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false,
+            "width": 140
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "nan",
+                "result": {
+                  "text": "N/A",
+                  "color": "gray"
+                }
+              }
+            }
+          ]
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "5h Remaining"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": 1
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "gauge",
+                  "mode": "basic",
+                  "valueDisplayMode": "text"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 0.2
+                    },
+                    {
+                      "color": "green",
+                      "value": 0.4
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Weekly Remaining"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": 1
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "gauge",
+                  "mode": "basic",
+                  "valueDisplayMode": "text"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 0.2
+                    },
+                    {
+                      "color": "green",
+                      "value": 0.4
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Runner Left (pp)"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "suffix: pp"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "5h Reset In"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Weekly Reset In"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Quota Gate"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": {
+                        "text": "Unknown",
+                        "color": "gray"
+                      },
+                      "1": {
+                        "text": "Within quota",
+                        "color": "green"
+                      },
+                      "2": {
+                        "text": "5h limit",
+                        "color": "red"
+                      },
+                      "3": {
+                        "text": "Weekly limit",
+                        "color": "red"
+                      },
+                      "4": {
+                        "text": "Cooldown",
+                        "color": "orange"
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "5h State"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": {
+                        "text": "Unknown",
+                        "color": "gray"
+                      },
+                      "1": {
+                        "text": "Fresh",
+                        "color": "green"
+                      },
+                      "2": {
+                        "text": "Stale",
+                        "color": "orange"
+                      },
+                      "3": {
+                        "text": "Reset pending",
+                        "color": "orange"
+                      },
+                      "4": {
+                        "text": "Unsupported",
+                        "color": "gray"
+                      },
+                      "5": {
+                        "text": "Invalid",
+                        "color": "red"
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Weekly State"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": {
+                        "text": "Unknown",
+                        "color": "gray"
+                      },
+                      "1": {
+                        "text": "Fresh",
+                        "color": "green"
+                      },
+                      "2": {
+                        "text": "Stale",
+                        "color": "orange"
+                      },
+                      "3": {
+                        "text": "Reset pending",
+                        "color": "orange"
+                      },
+                      "4": {
+                        "text": "Unsupported",
+                        "color": "gray"
+                      },
+                      "5": {
+                        "text": "Invalid",
+                        "color": "red"
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "5h Observed Ago"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              },
+              {
+                "id": "custom.width",
+                "value": 125
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Weekly Observed Ago"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              },
+              {
+                "id": "custom.width",
+                "value": 125
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Provider"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 100
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Credential Status"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": {
+                        "text": "Unknown",
+                        "color": "gray"
+                      },
+                      "1": {
+                        "text": "OK",
+                        "color": "green"
+                      },
+                      "2": {
+                        "text": "Authentication expired",
+                        "color": "red"
+                      },
+                      "3": {
+                        "text": "Probe failed",
+                        "color": "orange"
+                      },
+                      "4": {
+                        "text": "Stale",
+                        "color": "orange"
+                      },
+                      "5": {
+                        "text": "Invalid",
+                        "color": "red"
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "custom.width",
+                "value": 190
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Credential Checked Ago"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              },
+              {
+                "id": "custom.width",
+                "value": 145
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "md",
+        "footer": {
+          "show": false
+        },
+        "sortBy": [
+          {
+            "displayName": "Provider",
+            "desc": false
+          }
+        ]
+      }
+    },
+    {
+      "id": 102,
+      "type": "text",
+      "title": "Quota interpretation",
+      "gridPos": {
+        "x": 0,
+        "y": 29,
+        "w": 24,
+        "h": 4
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**5h / Weekly Remaining** = account quota left in the provider window. Weekly resets follow the provider, not calendar weeks. **Runner Left (pp)** = max(weekly cap − used, 0), in percentage points of account quota. Limits come from the runner's effective configuration.\n\n**Fresh / Stale** refer to each window’s last successful observation; stale balances retain that value. **Reset pending / Unknown / Unsupported** show N/A until data is available. Cursor has no quota source. Probe attempts do not refresh observation times. **Quota Gate** covers quota and cooldown only; role rules, PR contributions and reviewer exclusions also affect dispatch."
+      }
+    },
+    {
+      "id": 103,
+      "type": "timeseries",
+      "title": "5h Remaining History",
+      "description": "Last observed quota remaining. Stale values retain their last observation; reset-pending and unknown values leave gaps. No extrapolation or calendar-week aggregation. History starts at deployment.",
+      "gridPos": {
+        "x": 0,
+        "y": 33,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "max by (agent) (baton_quota_remaining_ratio{hostname=\"$host\",agent=~\"${agent:regex}\",window=\"five_hour\"})",
+          "legendFormat": "{{agent}}",
+          "instant": false,
+          "range": true,
+          "format": "time_series",
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "N/A",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "pointSize": 4
+          },
+          "min": 0,
+          "max": 1,
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 104,
+      "type": "timeseries",
+      "title": "Weekly Remaining History",
+      "description": "Last observed quota remaining. Stale values retain their last observation; reset-pending and unknown values leave gaps. No extrapolation or calendar-week aggregation. History starts at deployment.",
+      "gridPos": {
+        "x": 12,
+        "y": 33,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "max by (agent) (baton_quota_remaining_ratio{hostname=\"$host\",agent=~\"${agent:regex}\",window=\"seven_day\"})",
+          "legendFormat": "{{agent}}",
+          "instant": false,
+          "range": true,
+          "format": "time_series",
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "N/A",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "pointSize": 4
+          },
+          "min": 0,
+          "max": 1,
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 2,
+      "type": "row",
+      "title": "Now · scheduler and collection",
+      "description": "",
+      "gridPos": {
+        "x": 0,
+        "y": 41,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Node exporter",
+      "description": "",
+      "gridPos": {
+        "x": 0,
+        "y": 42,
+        "w": 3,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "max(up{job=\"$node_job\",hostname=\"$host\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "last"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "Unknown",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "Offline",
+                  "color": "red"
+                },
+                "1": {
+                  "text": "Online",
+                  "color": "green"
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Agent timer enabled",
+      "description": "",
+      "gridPos": {
+        "x": 3,
+        "y": 42,
+        "w": 3,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "max(baton_timer_enabled{hostname=\"$host\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "last"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "Unknown",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "Disabled",
+                  "color": "gray"
+                },
+                "1": {
+                  "text": "Enabled",
+                  "color": "green"
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Agent timer active",
+      "description": "",
+      "gridPos": {
+        "x": 6,
+        "y": 42,
+        "w": 3,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "max(baton_timer_active{hostname=\"$host\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "last"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "Unknown",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "Inactive",
+                  "color": "gray"
+                },
+                "1": {
+                  "text": "Active",
+                  "color": "green"
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Agent paused",
+      "description": "",
+      "gridPos": {
+        "x": 9,
+        "y": 42,
+        "w": 3,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "max(baton_paused{hostname=\"$host\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "last"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "Unknown",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "No",
+                  "color": "green"
+                },
+                "1": {
+                  "text": "Paused",
+                  "color": "orange"
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Runner lock",
+      "description": "A held lock can represent CLI work, CI waits, dispatch or a runner started before instrumentation. It does not by itself prove a healthy agent invocation.",
+      "gridPos": {
+        "x": 12,
+        "y": 42,
+        "w": 3,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "max(baton_lock_held{hostname=\"$host\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "last"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "Unknown",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "Free",
+                  "color": "blue"
+                },
+                "1": {
+                  "text": "Held",
+                  "color": "orange"
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Instrumented CLI runs",
+      "description": "Known instrumented CLI invocations only. Zero does not mean the runner is idle; check the lock. Interrupted invocations are reconciled by the independent collector.",
+      "gridPos": {
+        "x": 15,
+        "y": 42,
+        "w": 3,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "max(baton_running{hostname=\"$host\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "last"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "Unknown",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 9,
+      "type": "stat",
+      "title": "State age",
+      "description": "Age since the last successful independent state read. Unknown if it has never succeeded.",
+      "gridPos": {
+        "x": 18,
+        "y": 42,
+        "w": 3,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "time() - max(baton_state_last_success_seconds{hostname=\"$host\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "last"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "Unknown",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 10,
+      "type": "stat",
+      "title": "Alloy self scrape",
+      "description": "Last received independent self-scrape value. Check sample age below; a stale Up sample is not current health.",
+      "gridPos": {
+        "x": 21,
+        "y": 42,
+        "w": 3,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "max(up{job=\"baton-alloy\",instance=\"$host\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "last"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "Unknown",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "Failed",
+                  "color": "red"
+                },
+                "1": {
+                  "text": "Up",
+                  "color": "green"
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 11,
+      "type": "stat",
+      "title": "State read",
+      "description": "",
+      "gridPos": {
+        "x": 0,
+        "y": 46,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "min(baton_state_collect_success{hostname=\"$host\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "last"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "Unknown",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "Failed",
+                  "color": "red"
+                },
+                "1": {
+                  "text": "OK",
+                  "color": "green"
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 12,
+      "type": "stat",
+      "title": "Alloy sample age",
+      "description": "",
+      "gridPos": {
+        "x": 6,
+        "y": 46,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "time() - max(timestamp(up{job=\"baton-alloy\",instance=\"$host\"}))",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "last"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "Unknown",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 13,
+      "type": "stat",
+      "title": "Summary export to Alloy",
+      "description": "Local collector acceptance, not a guarantee of durable backend storage. Stable event IDs support deduplication.",
+      "gridPos": {
+        "x": 12,
+        "y": 46,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "min(baton_summary_export_success{hostname=\"$host\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "last"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "Unknown",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "Retrying",
+                  "color": "orange"
+                },
+                "1": {
+                  "text": "Accepted",
+                  "color": "green"
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 14,
+      "type": "stat",
+      "title": "Last scheduled tick age",
+      "description": "Unknown before the first instrumented scheduled tick. Paused and lock-busy ticks still record their start. No NoTick alert is enabled.",
+      "gridPos": {
+        "x": 18,
+        "y": 46,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "time() - max(baton_last_scheduled_tick_seconds{hostname=\"$host\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "last"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "Unknown",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 41,
+      "type": "stat",
+      "title": "/tmp used",
+      "description": "The host's /tmp is a tmpfs (half the RAM) with a per-user quota; when it fills, runs and deploys fail with \"Disk quota exceeded\" (#248). The agent user writes nearly all of it, so the mount total stands in for that user's quota use. node_exporter filesystem collector; display only, no alert.",
+      "gridPos": {
+        "x": 0,
+        "y": 50,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "100 * (max(node_filesystem_size_bytes{job=\"$node_job\",hostname=\"$host\",mountpoint=\"/tmp\"}) - max(node_filesystem_avail_bytes{job=\"$node_job\",hostname=\"$host\",mountpoint=\"/tmp\"})) / max(node_filesystem_size_bytes{job=\"$node_job\",hostname=\"$host\",mountpoint=\"/tmp\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "last"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "noValue": "Unknown",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 70
+              },
+              {
+                "color": "red",
+                "value": 90
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 42,
+      "type": "timeseries",
+      "title": "/tmp usage",
+      "description": "The host's /tmp is a tmpfs (half the RAM) with a per-user quota; when it fills, runs and deploys fail with \"Disk quota exceeded\" (#248). The agent user writes nearly all of it, so the mount total stands in for that user's quota use. node_exporter filesystem collector; display only, no alert.",
+      "gridPos": {
+        "x": 6,
+        "y": 50,
+        "w": 18,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "max(node_filesystem_size_bytes{job=\"$node_job\",hostname=\"$host\",mountpoint=\"/tmp\"}) - max(node_filesystem_avail_bytes{job=\"$node_job\",hostname=\"$host\",mountpoint=\"/tmp\"})",
+          "legendFormat": "used",
+          "range": true,
+          "editorMode": "code"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "max(node_filesystem_size_bytes{job=\"$node_job\",hostname=\"$host\",mountpoint=\"/tmp\"})",
+          "legendFormat": "size",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "noValue": "N/A",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "pointSize": 4
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "right",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 15,
+      "type": "row",
+      "title": "Daily usage and cooldown",
+      "description": "",
+      "gridPos": {
+        "x": 0,
+        "y": 54,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 16,
+      "type": "stat",
+      "title": "Runs today",
+      "description": "Actual runner daily counters, including manual invocations and CLI launches that fail before producing usage. These are distinct from completed summaries.",
+      "gridPos": {
+        "x": 0,
+        "y": 55,
+        "w": 8,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "max by (agent) (baton_runs_today{hostname=\"$host\",agent=~\"${agent:regex}\"})",
+          "legendFormat": "{{agent}}",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "last"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "Unknown",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 17,
+      "type": "stat",
+      "title": "Configured daily cap",
+      "description": "Read from current runner configuration; manual invocations bypass the scheduled cap. No quota is changed by monitoring.",
+      "gridPos": {
+        "x": 8,
+        "y": 55,
+        "w": 8,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "max by (agent) (baton_daily_cap{hostname=\"$host\",agent=~\"${agent:regex}\"})",
+          "legendFormat": "{{agent}}",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "last"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "Unknown",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 18,
+      "type": "stat",
+      "title": "Cooldown remaining",
+      "description": "Zero means no remaining cooldown. Unknown means a state read failed.",
+      "gridPos": {
+        "x": 16,
+        "y": 55,
+        "w": 8,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "clamp_min(max by (agent) (baton_cooldown_until_seconds{hostname=\"$host\",agent=~\"${agent:regex}\"}) - time(), 0)",
+          "legendFormat": "{{agent}}",
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "last"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "Unknown",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "Runs today by agent",
+      "description": "Local-date counters reset at the host's midnight, including idle periods.",
+      "gridPos": {
+        "x": 0,
+        "y": 59,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "max by (agent) (baton_runs_today{hostname=\"$host\",agent=~\"${agent:regex}\"})",
+          "legendFormat": "{{agent}}",
+          "instant": false,
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "N/A",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "pointSize": 4
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Scheduled cap utilization",
+      "description": "May exceed 100% because manual invocations bypass the cap. A missing/zero cap is unavailable, not unlimited.",
+      "gridPos": {
+        "x": 12,
+        "y": 59,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "100 * max by (agent) (baton_runs_today{hostname=\"$host\",agent=~\"${agent:regex}\"}) / max by (agent) (baton_daily_cap{hostname=\"$host\",agent=~\"${agent:regex}\"})",
+          "legendFormat": "{{agent}}",
+          "instant": false,
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "noValue": "N/A",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "pointSize": 4
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 21,
+      "type": "row",
+      "title": "Validated run summaries",
+      "description": "",
+      "gridPos": {
+        "x": 0,
+        "y": 66,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 22,
+      "type": "text",
+      "title": "Summary coverage",
+      "description": "",
+      "gridPos": {
+        "x": 0,
+        "y": 67,
+        "w": 24,
+        "h": 3
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "Exact run consumption below uses **one stable event ID per invocation** and deduplicates retries. Native counters are not added to these totals. Only `usage_state=complete` contributes to the token totals; partial / unavailable usage remains visible in the table. Missing token categories, actual summary model and price are unavailable. The table is limited to the latest 500 matching records."
+      }
+    },
+    {
+      "id": 23,
+      "type": "stat",
+      "title": "Distinct summaries by usage state",
+      "description": "",
+      "gridPos": {
+        "x": 16,
+        "y": 70,
+        "w": 8,
+        "h": 4
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "${loki}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "${loki}"
+          },
+          "expr": "sum by (agent, usage_state) (max by (event_id, agent, usage_state) (count_over_time({source=\"runner\",host=\"$host\"} |= \"baton.run_summary\" | json event_id=\"attributes.event_id\", agent=\"attributes.agent\", role=\"attributes[\\\"baton.role\\\"]\", usage_state=\"attributes.usage_state\" | agent=~\"${agent:regex}\" | role=~\"${role:regex}\" | __error__=\"\" [$__range]) > bool 0))",
+          "queryType": "instant",
+          "editorMode": "code",
+          "maxLines": 500,
+          "legendFormat": "{{agent}} · {{usage_state}}"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "last"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "N/A",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 24,
+      "type": "stat",
+      "title": "Completed run tokens",
+      "description": "",
+      "gridPos": {
+        "x": 0,
+        "y": 70,
+        "w": 16,
+        "h": 4
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "${loki}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "${loki}"
+          },
+          "expr": "sum by (agent) (max by (event_id, agent) (max_over_time({source=\"runner\",host=\"$host\"} |= \"baton.run_summary\" | json event_id=\"attributes.event_id\", agent=\"attributes.agent\", role=\"attributes[\\\"baton.role\\\"]\", usage_state=\"attributes.usage_state\", value=\"attributes.input_tokens\" | agent=~\"${agent:regex}\" | role=~\"${role:regex}\" | usage_state=\"complete\" | unwrap value | __error__=\"\" [$__range])))",
+          "queryType": "instant",
+          "editorMode": "code",
+          "maxLines": 500,
+          "legendFormat": "{{agent}} · Non-cached input"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "loki",
+            "uid": "${loki}"
+          },
+          "expr": "sum by (agent) (max by (event_id, agent) (max_over_time({source=\"runner\",host=\"$host\"} |= \"baton.run_summary\" | json event_id=\"attributes.event_id\", agent=\"attributes.agent\", role=\"attributes[\\\"baton.role\\\"]\", usage_state=\"attributes.usage_state\", value=\"attributes.cache_read_tokens\" | agent=~\"${agent:regex}\" | role=~\"${role:regex}\" | usage_state=\"complete\" | unwrap value | __error__=\"\" [$__range])))",
+          "queryType": "instant",
+          "editorMode": "code",
+          "maxLines": 500,
+          "legendFormat": "{{agent}} · Cache read"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "loki",
+            "uid": "${loki}"
+          },
+          "expr": "sum by (agent) (max by (event_id, agent) (max_over_time({source=\"runner\",host=\"$host\"} |= \"baton.run_summary\" | json event_id=\"attributes.event_id\", agent=\"attributes.agent\", role=\"attributes[\\\"baton.role\\\"]\", usage_state=\"attributes.usage_state\", value=\"attributes.cache_write_tokens\" | agent=~\"${agent:regex}\" | role=~\"${role:regex}\" | usage_state=\"complete\" | unwrap value | __error__=\"\" [$__range])))",
+          "queryType": "instant",
+          "editorMode": "code",
+          "maxLines": 500,
+          "legendFormat": "{{agent}} · Cache creation"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "loki",
+            "uid": "${loki}"
+          },
+          "expr": "sum by (agent) (max by (event_id, agent) (max_over_time({source=\"runner\",host=\"$host\"} |= \"baton.run_summary\" | json event_id=\"attributes.event_id\", agent=\"attributes.agent\", role=\"attributes[\\\"baton.role\\\"]\", usage_state=\"attributes.usage_state\", value=\"attributes.output_tokens\" | agent=~\"${agent:regex}\" | role=~\"${role:regex}\" | usage_state=\"complete\" | unwrap value | __error__=\"\" [$__range])))",
+          "queryType": "instant",
+          "editorMode": "code",
+          "maxLines": 500,
+          "legendFormat": "{{agent}} · Output"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "last"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "N/A",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 25,
+      "type": "table",
+      "title": "Recent runs · select a trace to explore",
+      "description": "One row per CLI invocation, deduplicated by event ID within the latest 500 records. CLI outcome is not task success. Task ID opens Loki; Trace ID opens Tempo. Configuration fingerprints contain no config contents. Unknown actual model stays unavailable.",
+      "gridPos": {
+        "x": 0,
+        "y": 74,
+        "w": 24,
+        "h": 11
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "${loki}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "${loki}"
+          },
+          "expr": "{source=\"runner\",host=\"$host\"} |= \"baton.run_summary\" | json event_id=\"attributes.event_id\", agent=\"attributes.agent\", role=\"attributes[\\\"baton.role\\\"]\", stage=\"attributes[\\\"baton.stage\\\"]\", issue=\"attributes[\\\"baton.issue\\\"]\", pr=\"attributes[\\\"baton.pr\\\"]\", round=\"attributes[\\\"baton.round\\\"]\", status=\"attributes.status\", usage=\"attributes.usage_state\", duration_ms=\"attributes.duration_ms\", input=\"attributes.input_tokens\", cache_read=\"attributes.cache_read_tokens\", cache_write=\"attributes.cache_write_tokens\", output=\"attributes.output_tokens\", reasoning=\"attributes.reasoning_tokens\", run_id=\"attributes[\\\"baton.run_id\\\"]\", trace_id=\"traceid\", pipeline_id=\"attributes.pipeline_id\", workflow_version=\"attributes.workflow_version\", config_version=\"attributes.config_version\", cli_version=\"attributes.cli_version\" | agent=~\"${agent:regex}\" | role=~\"${role:regex}\" | __error__=\"\" | line_format `{\"event_id\":\"{{.event_id}}\",\"agent\":\"{{.agent}}\",\"role\":\"{{.role}}\",\"stage\":\"{{.stage}}\",\"issue\":\"{{.issue}}\",\"pr\":\"{{.pr}}\",\"round\":\"{{.round}}\",\"status\":\"{{.status}}\",\"usage\":\"{{.usage}}\",\"duration_ms\":\"{{.duration_ms}}\",\"input\":\"{{.input}}\",\"cache_read\":\"{{.cache_read}}\",\"cache_write\":\"{{.cache_write}}\",\"output\":\"{{.output}}\",\"reasoning\":\"{{.reasoning}}\",\"run_id\":\"{{.run_id}}\",\"trace_id\":\"{{.trace_id}}\",\"pipeline_id\":\"{{.pipeline_id}}\",\"workflow_version\":\"{{.workflow_version}}\",\"config_version\":\"{{.config_version}}\",\"cli_version\":\"{{.cli_version}}\"}`",
+          "queryType": "range",
+          "editorMode": "code",
+          "maxLines": 500,
+          "legendFormat": ""
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false
+        },
+        "sortBy": [
+          {
+            "displayName": "Ended",
+            "desc": true
+          }
+        ]
+      },
+      "transformations": [
+        {
+          "id": "extractFields",
+          "options": {
+            "source": "Line",
+            "format": "json",
+            "replace": true,
+            "keepTime": true
+          }
+        },
+        {
+          "id": "groupBy",
+          "options": {
+            "fields": {
+              "Time": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "lastNotNull"
+                ]
+              },
+              "agent": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "lastNotNull"
+                ]
+              },
+              "role": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "lastNotNull"
+                ]
+              },
+              "stage": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "lastNotNull"
+                ]
+              },
+              "issue": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "lastNotNull"
+                ]
+              },
+              "pr": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "lastNotNull"
+                ]
+              },
+              "round": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "lastNotNull"
+                ]
+              },
+              "status": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "lastNotNull"
+                ]
+              },
+              "usage": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "lastNotNull"
+                ]
+              },
+              "duration_ms": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "lastNotNull"
+                ]
+              },
+              "input": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "lastNotNull"
+                ]
+              },
+              "cache_read": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "lastNotNull"
+                ]
+              },
+              "cache_write": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "lastNotNull"
+                ]
+              },
+              "output": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "lastNotNull"
+                ]
+              },
+              "reasoning": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "lastNotNull"
+                ]
+              },
+              "run_id": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "lastNotNull"
+                ]
+              },
+              "trace_id": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "lastNotNull"
+                ]
+              },
+              "event_id": {
+                "operation": "groupby",
+                "aggregations": []
+              },
+              "pipeline_id": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "lastNotNull"
+                ]
+              },
+              "workflow_version": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "lastNotNull"
+                ]
+              },
+              "config_version": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "lastNotNull"
+                ]
+              },
+              "cli_version": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "lastNotNull"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {},
+            "indexByName": {
+              "Time (lastNotNull)": 0,
+              "agent (lastNotNull)": 1,
+              "role (lastNotNull)": 2,
+              "stage (lastNotNull)": 3,
+              "issue (lastNotNull)": 4,
+              "pr (lastNotNull)": 5,
+              "round (lastNotNull)": 6,
+              "status (lastNotNull)": 7,
+              "usage (lastNotNull)": 8,
+              "duration_ms (lastNotNull)": 9,
+              "input (lastNotNull)": 10,
+              "cache_read (lastNotNull)": 11,
+              "cache_write (lastNotNull)": 12,
+              "output (lastNotNull)": 13,
+              "reasoning (lastNotNull)": 14,
+              "run_id (lastNotNull)": 15,
+              "trace_id (lastNotNull)": 16,
+              "event_id": 17,
+              "pipeline_id (lastNotNull)": 18,
+              "workflow_version (lastNotNull)": 19,
+              "config_version (lastNotNull)": 20,
+              "cli_version (lastNotNull)": 21
+            },
+            "renameByName": {
+              "Time (lastNotNull)": "Ended",
+              "agent (lastNotNull)": "Agent",
+              "role (lastNotNull)": "Role",
+              "stage (lastNotNull)": "Stage",
+              "issue (lastNotNull)": "Issue",
+              "pr (lastNotNull)": "PR",
+              "round (lastNotNull)": "Round",
+              "status (lastNotNull)": "Outcome",
+              "usage (lastNotNull)": "Usage",
+              "duration_ms (lastNotNull)": "Duration",
+              "input (lastNotNull)": "Input",
+              "cache_read (lastNotNull)": "Cache read",
+              "cache_write (lastNotNull)": "Cache creation",
+              "output (lastNotNull)": "Output",
+              "reasoning (lastNotNull)": "Reasoning (subset)",
+              "run_id (lastNotNull)": "Run ID",
+              "trace_id (lastNotNull)": "Trace ID",
+              "event_id": "Event ID",
+              "pipeline_id (lastNotNull)": "Task ID",
+              "workflow_version (lastNotNull)": "Workflow version",
+              "config_version (lastNotNull)": "Config version",
+              "cli_version (lastNotNull)": "CLI version"
+            }
+          }
+        },
+        {
+          "id": "convertFieldType",
+          "options": {
+            "conversions": [
+              {
+                "targetField": "Ended",
+                "destinationType": "time"
+              },
+              {
+                "targetField": "Issue",
+                "destinationType": "number"
+              },
+              {
+                "targetField": "PR",
+                "destinationType": "number"
+              },
+              {
+                "targetField": "Round",
+                "destinationType": "number"
+              },
+              {
+                "targetField": "Duration",
+                "destinationType": "number"
+              },
+              {
+                "targetField": "Input",
+                "destinationType": "number"
+              },
+              {
+                "targetField": "Cache read",
+                "destinationType": "number"
+              },
+              {
+                "targetField": "Cache creation",
+                "destinationType": "number"
+              },
+              {
+                "targetField": "Output",
+                "destinationType": "number"
+              },
+              {
+                "targetField": "Reasoning (subset)",
+                "destinationType": "number"
+              }
+            ]
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              {
+                "field": "Ended",
+                "desc": true
+              }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "N/A",
+          "custom": {
+            "filterable": true,
+            "align": "auto"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Trace ID"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open Tempo trace",
+                    "url": "/explore?schemaVersion=1&panes=%7B%22trace%22%3A%7B%22datasource%22%3A%22tempo%22%2C%22queries%22%3A%5B%7B%22refId%22%3A%22A%22%2C%22datasource%22%3A%7B%22type%22%3A%22tempo%22%2C%22uid%22%3A%22tempo%22%7D%2C%22queryType%22%3A%22traceId%22%2C%22query%22%3A%22${__value.raw}%22%7D%5D%2C%22range%22%3A%7B%22from%22%3A%22${__from}%22%2C%22to%22%3A%22${__to}%22%7D%7D%7D",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Duration"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ms"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Event ID"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Task ID"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open task events in Loki",
+                    "url": "/explore?schemaVersion=1&panes={%22logs%22%3A{%22datasource%22%3A%22${loki}%22%2C%22queries%22%3A%5B{%22refId%22%3A%22A%22%2C%22datasource%22%3A{%22type%22%3A%22loki%22%2C%22uid%22%3A%22${loki}%22}%2C%22expr%22%3A%22{source%3D%5C%22runner%5C%22%2Chost%3D%5C%22${host}%5C%22}%20%7C%20json%20task%3D%5C%22attributes.pipeline_id%5C%22%20%7C%20task%3D%5C%22${__value.raw}%5C%22%22%2C%22queryType%22%3A%22range%22}%5D%2C%22range%22%3A{%22from%22%3A%22${__from}%22%2C%22to%22%3A%22${__to}%22}}}",
+                    "targetBlank": true
+                  }
+                ]
+              },
+              {
+                "id": "custom.width",
+                "value": 160
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 26,
+      "type": "row",
+      "title": "Codex native telemetry · historical trends",
+      "description": "",
+      "gridPos": {
+        "x": 0,
+        "y": 85,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 27,
+      "type": "text",
+      "title": "Native metric semantics",
+      "description": "",
+      "gridPos": {
+        "x": 0,
+        "y": 86,
+        "w": 24,
+        "h": 3
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "Codex native token histograms are converted from delta to cumulative. Charts use counter **rates**, handle resets and leave idle / missing intervals as gaps. Input includes cache reads; cache is a subset, so do not add the input and cached lines. Reasoning is a subset of output. These native trends are separate from the exact run summaries above. Claude native telemetry and Cursor token metrics are not yet connected."
+      }
+    },
+    {
+      "id": 28,
+      "type": "timeseries",
+      "title": "Input and cache token rate",
+      "description": "Codex only. Empty intervals mean no valid rate sample, not zero consumption. Native metrics have no role/issue labels, so the role filter does not apply.",
+      "gridPos": {
+        "x": 0,
+        "y": 89,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum by (model, token_type) (rate(codex_turn_token_usage_sum{agent=\"codex\",host_name=\"$host\",agent=~\"${agent:regex}\",token_type=~\"input|cached_input|cache_write_input\"}[$__rate_interval]))",
+          "legendFormat": "{{model}} · {{token_type}}",
+          "instant": false,
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix:tokens/s",
+          "noValue": "N/A",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "pointSize": 4
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 29,
+      "type": "timeseries",
+      "title": "Output and reasoning token rate",
+      "description": "Codex only. Empty intervals mean no valid rate sample, not zero consumption. Native metrics have no role/issue labels, so the role filter does not apply.",
+      "gridPos": {
+        "x": 12,
+        "y": 89,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum by (model, token_type) (rate(codex_turn_token_usage_sum{agent=\"codex\",host_name=\"$host\",agent=~\"${agent:regex}\",token_type=~\"output|reasoning_output\"}[$__rate_interval]))",
+          "legendFormat": "{{model}} · {{token_type}}",
+          "instant": false,
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix:tokens/s",
+          "noValue": "N/A",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "pointSize": 4
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "Tool calls per second",
+      "description": "Native Codex tool counters only. Role filtering is unavailable on bounded native metrics.",
+      "gridPos": {
+        "x": 0,
+        "y": 96,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum by (tool) (rate(codex_tool_call_total{agent=\"codex\",host_name=\"$host\",agent=~\"${agent:regex}\"}[$__rate_interval]))",
+          "legendFormat": "{{tool}}",
+          "instant": false,
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "N/A",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "pointSize": 4
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Mean tool duration",
+      "description": "Native histogram sum/count, excluding idle intervals without observations.",
+      "gridPos": {
+        "x": 12,
+        "y": 96,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum by (tool) (rate(codex_tool_call_duration_ms_sum{agent=\"codex\",host_name=\"$host\",agent=~\"${agent:regex}\"}[$__rate_interval])) / sum by (tool) (rate(codex_tool_call_duration_ms_count{agent=\"codex\",host_name=\"$host\",agent=~\"${agent:regex}\"}[$__rate_interval]))",
+          "legendFormat": "{{tool}}",
+          "instant": false,
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "noValue": "N/A",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "pointSize": 4
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 38,
+      "type": "row",
+      "title": "Claude native telemetry · historical trends",
+      "description": "",
+      "gridPos": {
+        "x": 0,
+        "y": 103,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 39,
+      "type": "timeseries",
+      "title": "Claude token rate by type",
+      "description": "Native claude_code.token.usage from run_claude (metrics only; session/user ids dropped on the host). type: input, output, cacheRead, cacheCreation; query_source: main, subagent, auxiliary.",
+      "gridPos": {
+        "x": 0,
+        "y": 104,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum by (model, type, query_source) (rate(claude_code_token_usage_total{agent=\"claude\",host_name=\"$host\",agent=~\"${agent:regex}\"}[$__rate_interval]))",
+          "legendFormat": "{{model}} · {{type}} · {{query_source}}",
+          "instant": false,
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix:tokens/s",
+          "noValue": "N/A",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "pointSize": 4
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 40,
+      "type": "timeseries",
+      "title": "Claude cost rate (API list price)",
+      "description": "Native claude_code.cost.usage: Claude Code's own USD estimate at API prices. Under a subscription it is a relative measure, not a bill.",
+      "gridPos": {
+        "x": 12,
+        "y": 104,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum by (model) (rate(claude_code_cost_usage_total{agent=\"claude\",host_name=\"$host\",agent=~\"${agent:regex}\"}[$__rate_interval])) * 3600",
+          "legendFormat": "{{model}}",
+          "instant": false,
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "noValue": "N/A",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "pointSize": 4
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 32,
+      "type": "row",
+      "title": "Task outcomes and investigation",
+      "description": "",
+      "gridPos": {
+        "x": 0,
+        "y": 111,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 33,
+      "type": "table",
+      "title": "Task history · select a task to inspect events",
+      "description": "Latest snapshot per task episode within the latest 500 matching records. Active means no terminal event has been observed, not that a CLI is running. Task totals span all vendors and ignore Agent/Role filters. A token category is N/A if any completed invocation lacks complete usage. Duration ends at the last observed event; it does not keep increasing while idle.",
+      "gridPos": {
+        "x": 0,
+        "y": 112,
+        "w": 24,
+        "h": 10
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "${loki}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "${loki}"
+          },
+          "expr": "{source=\"runner\",host=\"$host\"} |= \"baton.task_summary\" | json pipeline_id=\"attributes.pipeline_id\", repo=\"attributes.repo\", issue=\"attributes.issue\", pr=\"attributes.pr\", task_status=\"attributes.task_status\", reason=\"attributes.reason\", duration_ms=\"attributes.duration_ms\", review_rounds=\"attributes.review_rounds\", spec_rounds=\"attributes.spec_rounds\", runs=\"attributes.runs\", incomplete_runs=\"attributes.incomplete_runs\", input_tokens=\"attributes.input_tokens\", cache_read_tokens=\"attributes.cache_read_tokens\", cache_write_tokens=\"attributes.cache_write_tokens\", output_tokens=\"attributes.output_tokens\", workflow_version=\"attributes.workflow_version\", config_version=\"attributes.config_version\", sequence=\"attributes.sequence\", event_id=\"attributes.event_id\" | __error__=\"\" | line_format `{\"pipeline_id\":\"{{.pipeline_id}}\",\"repo\":\"{{.repo}}\",\"issue\":\"{{ if and (ne .issue \"0\") (ne .issue \"\") }}[{{.issue}}](https://github.com/{{.repo}}/issues/{{.issue}}){{ else }}N/A{{ end }}\",\"pr\":\"{{ if and (ne .pr \"0\") (ne .pr \"\") }}[{{.pr}}](https://github.com/{{.repo}}/pull/{{.pr}}){{ else }}N/A{{ end }}\",\"task_status\":\"{{.task_status}}\",\"reason\":\"{{.reason}}\",\"duration_ms\":\"{{.duration_ms}}\",\"review_rounds\":\"{{.review_rounds}}\",\"spec_rounds\":\"{{.spec_rounds}}\",\"runs\":\"{{.runs}}\",\"incomplete_runs\":\"{{.incomplete_runs}}\",\"input_tokens\":\"{{.input_tokens}}\",\"cache_read_tokens\":\"{{.cache_read_tokens}}\",\"cache_write_tokens\":\"{{.cache_write_tokens}}\",\"output_tokens\":\"{{.output_tokens}}\",\"workflow_version\":\"{{.workflow_version}}\",\"config_version\":\"{{.config_version}}\",\"sequence\":\"{{.sequence}}\",\"event_id\":\"{{.event_id}}\"}`",
+          "queryType": "range",
+          "editorMode": "code",
+          "maxLines": 500,
+          "legendFormat": ""
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "sortBy": [
+          {
+            "displayName": "Observed",
+            "desc": true
+          }
+        ],
+        "footer": {
+          "show": false
+        }
+      },
+      "transformations": [
+        {
+          "id": "extractFields",
+          "options": {
+            "source": "Line",
+            "format": "json",
+            "replace": true,
+            "keepTime": true
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              {
+                "field": "Time",
+                "desc": true
+              }
+            ]
+          }
+        },
+        {
+          "id": "groupBy",
+          "options": {
+            "fields": {
+              "Time": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              },
+              "pipeline_id": {
+                "operation": "groupby",
+                "aggregations": []
+              },
+              "repo": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              },
+              "issue": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              },
+              "pr": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              },
+              "task_status": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              },
+              "reason": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              },
+              "duration_ms": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              },
+              "review_rounds": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              },
+              "spec_rounds": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              },
+              "runs": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              },
+              "incomplete_runs": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              },
+              "input_tokens": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              },
+              "cache_read_tokens": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              },
+              "cache_write_tokens": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              },
+              "output_tokens": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              },
+              "workflow_version": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              },
+              "config_version": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              },
+              "sequence": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              },
+              "event_id": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {},
+            "indexByName": {
+              "Time (firstNotNull)": 0,
+              "event_id (firstNotNull)": 1,
+              "pipeline_id": 2,
+              "repo (firstNotNull)": 3,
+              "issue (firstNotNull)": 4,
+              "pr (firstNotNull)": 5,
+              "task_status (firstNotNull)": 6,
+              "reason (firstNotNull)": 7,
+              "duration_ms (firstNotNull)": 8,
+              "review_rounds (firstNotNull)": 9,
+              "spec_rounds (firstNotNull)": 10,
+              "runs (firstNotNull)": 11,
+              "incomplete_runs (firstNotNull)": 12,
+              "input_tokens (firstNotNull)": 13,
+              "cache_read_tokens (firstNotNull)": 14,
+              "cache_write_tokens (firstNotNull)": 15,
+              "output_tokens (firstNotNull)": 16,
+              "workflow_version (firstNotNull)": 17,
+              "config_version (firstNotNull)": 18,
+              "sequence (firstNotNull)": 19
+            },
+            "renameByName": {
+              "Time (firstNotNull)": "Observed",
+              "event_id (firstNotNull)": "Event ID",
+              "pipeline_id": "Task ID",
+              "repo (firstNotNull)": "Repository",
+              "issue (firstNotNull)": "Issue",
+              "pr (firstNotNull)": "PR",
+              "task_status (firstNotNull)": "Task outcome",
+              "reason (firstNotNull)": "Handoff reason",
+              "duration_ms (firstNotNull)": "Duration",
+              "review_rounds (firstNotNull)": "Code review rounds",
+              "spec_rounds (firstNotNull)": "Spec review rounds",
+              "runs (firstNotNull)": "CLI runs",
+              "incomplete_runs (firstNotNull)": "Incomplete usage runs",
+              "input_tokens (firstNotNull)": "Input",
+              "cache_read_tokens (firstNotNull)": "Cache read",
+              "cache_write_tokens (firstNotNull)": "Cache creation",
+              "output_tokens (firstNotNull)": "Output",
+              "workflow_version (firstNotNull)": "Workflow version",
+              "config_version (firstNotNull)": "Config version",
+              "sequence (firstNotNull)": "Sequence"
+            }
+          }
+        },
+        {
+          "id": "convertFieldType",
+          "options": {
+            "conversions": [
+              {
+                "targetField": "Duration",
+                "destinationType": "number"
+              },
+              {
+                "targetField": "Code review rounds",
+                "destinationType": "number"
+              },
+              {
+                "targetField": "Spec review rounds",
+                "destinationType": "number"
+              },
+              {
+                "targetField": "CLI runs",
+                "destinationType": "number"
+              },
+              {
+                "targetField": "Incomplete usage runs",
+                "destinationType": "number"
+              },
+              {
+                "targetField": "Input",
+                "destinationType": "number"
+              },
+              {
+                "targetField": "Cache read",
+                "destinationType": "number"
+              },
+              {
+                "targetField": "Cache creation",
+                "destinationType": "number"
+              },
+              {
+                "targetField": "Output",
+                "destinationType": "number"
+              },
+              {
+                "targetField": "Sequence",
+                "destinationType": "number"
+              }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "N/A",
+          "custom": {
+            "filterable": true,
+            "align": "auto"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Task ID"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open task events in Loki",
+                    "url": "/explore?schemaVersion=1&panes={%22logs%22%3A{%22datasource%22%3A%22${loki}%22%2C%22queries%22%3A%5B{%22refId%22%3A%22A%22%2C%22datasource%22%3A{%22type%22%3A%22loki%22%2C%22uid%22%3A%22${loki}%22}%2C%22expr%22%3A%22{source%3D%5C%22runner%5C%22%2Chost%3D%5C%22${host}%5C%22}%20%7C%20json%20task%3D%5C%22attributes.pipeline_id%5C%22%20%7C%20task%3D%5C%22${__value.raw}%5C%22%22%2C%22queryType%22%3A%22range%22}%5D%2C%22range%22%3A{%22from%22%3A%22${__from}%22%2C%22to%22%3A%22${__to}%22}}}",
+                    "targetBlank": true
+                  }
+                ]
+              },
+              {
+                "id": "custom.width",
+                "value": 160
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Duration"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ms"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Issue"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "markdown"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "PR"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "markdown"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Event ID"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Sequence"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 34,
+      "type": "table",
+      "title": "Task events · reviews, CI and handoffs",
+      "description": "Deduplicated task events from rollout onward; all vendors, independent of Agent/Role filters. CI no_checks, pending, timeout and infrastructure errors are distinct from pass/failure. Planned approval is separate from abnormal handoff. Click Task ID for the full Loki history.",
+      "gridPos": {
+        "x": 0,
+        "y": 122,
+        "w": 24,
+        "h": 10
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "${loki}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "${loki}"
+          },
+          "expr": "{source=\"runner\",host=\"$host\"} |= \"baton.task_event\" | json pipeline_id=\"attributes.pipeline_id\", repo=\"attributes.repo\", issue=\"attributes.issue\", pr=\"attributes.pr\", event_kind=\"attributes.event_kind\", agent=\"attributes.agent\", round=\"attributes.round\", verdict=\"attributes.verdict\", ci_result=\"attributes.ci_result\", reason=\"attributes.reason\", head_sha=\"attributes.head_sha\", run_id=\"attributes.run_id\", event_id=\"attributes.event_id\" | __error__=\"\" | line_format `{\"pipeline_id\":\"{{.pipeline_id}}\",\"repo\":\"{{.repo}}\",\"issue\":\"{{ if and (ne .issue \"0\") (ne .issue \"\") }}[{{.issue}}](https://github.com/{{.repo}}/issues/{{.issue}}){{ else }}N/A{{ end }}\",\"pr\":\"{{ if and (ne .pr \"0\") (ne .pr \"\") }}[{{.pr}}](https://github.com/{{.repo}}/pull/{{.pr}}){{ else }}N/A{{ end }}\",\"event_kind\":\"{{.event_kind}}\",\"agent\":\"{{.agent}}\",\"round\":\"{{.round}}\",\"verdict\":\"{{.verdict}}\",\"ci_result\":\"{{.ci_result}}\",\"reason\":\"{{.reason}}\",\"head_sha\":\"{{.head_sha}}\",\"run_id\":\"{{.run_id}}\",\"event_id\":\"{{.event_id}}\"}`",
+          "queryType": "range",
+          "editorMode": "code",
+          "maxLines": 500,
+          "legendFormat": ""
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "sortBy": [
+          {
+            "displayName": "Observed",
+            "desc": true
+          }
+        ],
+        "footer": {
+          "show": false
+        }
+      },
+      "transformations": [
+        {
+          "id": "extractFields",
+          "options": {
+            "source": "Line",
+            "format": "json",
+            "replace": true,
+            "keepTime": true
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              {
+                "field": "Time",
+                "desc": true
+              }
+            ]
+          }
+        },
+        {
+          "id": "groupBy",
+          "options": {
+            "fields": {
+              "Time": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              },
+              "pipeline_id": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              },
+              "repo": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              },
+              "issue": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              },
+              "pr": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              },
+              "event_kind": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              },
+              "agent": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              },
+              "round": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              },
+              "verdict": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              },
+              "ci_result": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              },
+              "reason": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              },
+              "head_sha": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              },
+              "run_id": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              },
+              "event_id": {
+                "operation": "groupby",
+                "aggregations": []
+              }
+            }
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {},
+            "indexByName": {
+              "Time (firstNotNull)": 0,
+              "event_id": 1,
+              "pipeline_id (firstNotNull)": 2,
+              "repo (firstNotNull)": 3,
+              "issue (firstNotNull)": 4,
+              "pr (firstNotNull)": 5,
+              "reason (firstNotNull)": 6,
+              "event_kind (firstNotNull)": 7,
+              "verdict (firstNotNull)": 8,
+              "ci_result (firstNotNull)": 9,
+              "head_sha (firstNotNull)": 10,
+              "round (firstNotNull)": 11,
+              "agent (firstNotNull)": 12,
+              "run_id (firstNotNull)": 13
+            },
+            "renameByName": {
+              "Time (firstNotNull)": "Observed",
+              "event_id": "Event ID",
+              "pipeline_id (firstNotNull)": "Task ID",
+              "repo (firstNotNull)": "Repository",
+              "issue (firstNotNull)": "Issue",
+              "pr (firstNotNull)": "PR",
+              "reason (firstNotNull)": "Handoff reason",
+              "event_kind (firstNotNull)": "Event",
+              "verdict (firstNotNull)": "Verdict",
+              "ci_result (firstNotNull)": "CI result",
+              "head_sha (firstNotNull)": "Head SHA",
+              "round (firstNotNull)": "Round",
+              "agent (firstNotNull)": "Agent",
+              "run_id (firstNotNull)": "Run ID"
+            }
+          }
+        },
+        {
+          "id": "convertFieldType",
+          "options": {
+            "conversions": [
+              {
+                "targetField": "Round",
+                "destinationType": "number"
+              }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "N/A",
+          "custom": {
+            "filterable": true,
+            "align": "auto"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Task ID"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open task events in Loki",
+                    "url": "/explore?schemaVersion=1&panes={%22logs%22%3A{%22datasource%22%3A%22${loki}%22%2C%22queries%22%3A%5B{%22refId%22%3A%22A%22%2C%22datasource%22%3A{%22type%22%3A%22loki%22%2C%22uid%22%3A%22${loki}%22}%2C%22expr%22%3A%22{source%3D%5C%22runner%5C%22%2Chost%3D%5C%22${host}%5C%22}%20%7C%20json%20task%3D%5C%22attributes.pipeline_id%5C%22%20%7C%20task%3D%5C%22${__value.raw}%5C%22%22%2C%22queryType%22%3A%22range%22}%5D%2C%22range%22%3A{%22from%22%3A%22${__from}%22%2C%22to%22%3A%22${__to}%22}}}",
+                    "targetBlank": true
+                  }
+                ]
+              },
+              {
+                "id": "custom.width",
+                "value": 160
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Duration"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ms"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Issue"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "markdown"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "PR"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "markdown"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Event ID"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Sequence"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 37,
+      "type": "text",
+      "title": "Detailed logs in Loki Explore",
+      "gridPos": {
+        "x": 0,
+        "y": 132,
+        "w": 24,
+        "h": 3
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "[Open runner events and summaries](/explore?schemaVersion=1&panes={%22logs%22%3A{%22datasource%22%3A%22${loki}%22%2C%22queries%22%3A%5B{%22refId%22%3A%22A%22%2C%22datasource%22%3A{%22type%22%3A%22loki%22%2C%22uid%22%3A%22${loki}%22}%2C%22expr%22%3A%22{source%3D%5C%22runner%5C%22%2Chost%3D%5C%22${host}%5C%22}%22%2C%22queryType%22%3A%22range%22}%5D%2C%22range%22%3A{%22from%22%3A%22${__from}%22%2C%22to%22%3A%22${__to}%22}}}) · [Open native Codex events](/explore?schemaVersion=1&panes={%22logs%22%3A{%22datasource%22%3A%22${loki}%22%2C%22queries%22%3A%5B{%22refId%22%3A%22A%22%2C%22datasource%22%3A{%22type%22%3A%22loki%22%2C%22uid%22%3A%22${loki}%22}%2C%22expr%22%3A%22{agent%3D%5C%22codex%5C%22%2Chost%3D%5C%22${host}%5C%22}%22%2C%22queryType%22%3A%22range%22}%5D%2C%22range%22%3A{%22from%22%3A%22${__from}%22%2C%22to%22%3A%22${__to}%22}}})\n\nUse the Task ID links above to inspect one episode. Raw JSON is available in Explore; this dashboard shows summaries and typed event columns."
+      }
+    },
+    {
+      "id": 35,
+      "type": "table",
+      "title": "Recent run traces",
+      "description": "Run traces only; multi-tick pipeline episodes and CI spans are not yet implemented. Open a trace ID to inspect native Codex child spans and use Tempo trace-to-logs correlation.",
+      "gridPos": {
+        "x": 0,
+        "y": 135,
+        "w": 24,
+        "h": 8
+      },
+      "datasource": {
+        "type": "tempo",
+        "uid": "${tempo}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "tempo",
+            "uid": "${tempo}"
+          },
+          "queryType": "traceql",
+          "query": "{ resource.service.name = \"baton-runner\" && span.agent =~ \"${agent:regex}\" && span.baton.role =~ \"${role:regex}\" }",
+          "limit": 30,
+          "tableType": "traces",
+          "metricsQueryType": "range"
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      }
+    },
+    {
+      "id": 36,
+      "type": "text",
+      "title": "Coverage and interpretation",
+      "description": "",
+      "gridPos": {
+        "x": 0,
+        "y": 143,
+        "w": 24,
+        "h": 5
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**Available:** scheduler state, daily launches/caps/cooldowns, run summaries, Codex native telemetry, per-run traces, and task episode/event collection from its rollout.\n\nTask history keeps the latest snapshot per episode within the latest 500 matching log records. Active means no terminal event observed. Each handoff ends an episode; resumed work receives a new Task ID. Review events identify completed verdicts, not CLI exit success. Task Token categories are N/A when usage is incomplete; native counters must not be added to summaries.\n\n**Still pending:** live Claude/Cursor usage verification/native integration, model pricing, CI/dispatch live execution health, quality-rate cohorts and alert rollout. Manual actions outside runner control are not inferred. Task/run event retention follows Loki; per-run traces follow Tempo. Workflow/config hashes identify changes, not their quality or task difficulty. Raw metadata is available through Loki Explore links."
+      }
+    },
+    {
+      "id": 120,
+      "type": "row",
+      "title": "Vendor contribution · last 30 days (collect only)",
+      "description": "",
+      "gridPos": {
+        "x": 0,
+        "y": 148,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 121,
+      "type": "text",
+      "title": "How contribution is counted",
+      "description": "",
+      "gridPos": {
+        "x": 0,
+        "y": 149,
+        "w": 24,
+        "h": 4
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**Collect and display only (#227):** no scheduling, quota or vendor preference reads these numbers.\n\nEpisodes that ended in the last 30 days, from the runner's task ledger; `telemetry-validation/*` repositories are excluded. The **author** is the vendor of the episode's first successful dev run (else its first dev run); `owner` is a PR with no agent dev run; spec-only episodes are not counted. **Author model** is the model the dev run actually used (from its log); runs before 2026-10-27 show `unknown`. Every rate shows its sample size **n** next to it. Tokens are summed over runs with complete usage only; runs with partial or missing usage are counted, never treated as zero. Token counts are not comparable across vendors as cost. Post-merge outcomes come from a separate 6-hourly timer (`baton-postmerge`), final 14 days after merge."
+      }
+    },
+    {
+      "id": 122,
+      "type": "table",
+      "title": "Implementation by author vendor and model",
+      "description": "One row per implementing vendor and the model its dev run used. n = ended episodes. Merged / handoff rates are shares of n. First-round pass uses the first review verdict of each episode (n shown). Review rounds, time and tokens are per merged episode. Tokens exclude cache reads and cover complete runs only; Incomplete runs counts merged-episode runs without complete usage. Post-merge columns use merged PRs whose 14 days after merge have passed (n shown): a merged revert PR, or a `bug`-labelled issue in the same repository that references the PR. Label a regression `bug` and mention the PR for it to count.",
+      "gridPos": {
+        "x": 0,
+        "y": 153,
+        "w": 24,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum by (author, author_model) (baton_contrib_tasks{hostname=\"$host\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum by (author, author_model) (baton_contrib_tasks{hostname=\"$host\",outcome=\"merged\"}) or 0 * sum by (author, author_model) (baton_contrib_tasks{hostname=\"$host\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "(sum by (author, author_model) (baton_contrib_tasks{hostname=\"$host\",outcome=\"abnormal_handoff\"}) or 0 * sum by (author, author_model) (baton_contrib_tasks{hostname=\"$host\"})) / sum by (author, author_model) (baton_contrib_tasks{hostname=\"$host\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "(sum by (author, author_model) (baton_contrib_tasks{hostname=\"$host\",outcome=\"planned_handoff\"}) or 0 * sum by (author, author_model) (baton_contrib_tasks{hostname=\"$host\"})) / sum by (author, author_model) (baton_contrib_tasks{hostname=\"$host\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code"
+        },
+        {
+          "refId": "E",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum by (author, author_model) (baton_contrib_first_review{hostname=\"$host\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code"
+        },
+        {
+          "refId": "F",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "(sum by (author, author_model) (baton_contrib_first_review{hostname=\"$host\",verdict=\"pass\"}) or 0 * sum by (author, author_model) (baton_contrib_first_review{hostname=\"$host\"})) / sum by (author, author_model) (baton_contrib_first_review{hostname=\"$host\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code"
+        },
+        {
+          "refId": "G",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum by (author, author_model) (baton_contrib_review_rounds{hostname=\"$host\"}) / sum by (author, author_model) (baton_contrib_tasks{hostname=\"$host\",outcome=\"merged\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code"
+        },
+        {
+          "refId": "H",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum by (author, author_model) (baton_contrib_duration_seconds{hostname=\"$host\"}) / sum by (author, author_model) (baton_contrib_tasks{hostname=\"$host\",outcome=\"merged\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code"
+        },
+        {
+          "refId": "I",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum by (author, author_model) (baton_contrib_merged_tokens{hostname=\"$host\",type=~\"input|cache_write|output|reasoning\"}) / sum by (author, author_model) (baton_contrib_tasks{hostname=\"$host\",outcome=\"merged\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code"
+        },
+        {
+          "refId": "J",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum by (author, author_model) (baton_contrib_merged_runs{hostname=\"$host\",usage_state=\"incomplete\"}) or 0 * sum by (author, author_model) (baton_contrib_merged_runs{hostname=\"$host\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code"
+        },
+        {
+          "refId": "K",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum by (author, author_model) (baton_contrib_postmerge_checked{hostname=\"$host\",state=\"final\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code"
+        },
+        {
+          "refId": "L",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum by (author, author_model) (baton_contrib_postmerge_reverted{hostname=\"$host\",state=\"final\"}) / sum by (author, author_model) (baton_contrib_postmerge_checked{hostname=\"$host\",state=\"final\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code"
+        },
+        {
+          "refId": "M",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum by (author, author_model) (baton_contrib_postmerge_with_issues{hostname=\"$host\",state=\"final\"}) / sum by (author, author_model) (baton_contrib_postmerge_checked{hostname=\"$host\",state=\"final\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "indexByName": {
+              "author": 0,
+              "author_model": 1,
+              "Value #A": 2,
+              "Value #B": 3,
+              "Value #C": 4,
+              "Value #D": 5,
+              "Value #E": 6,
+              "Value #F": 7,
+              "Value #G": 8,
+              "Value #H": 9,
+              "Value #I": 10,
+              "Value #J": 11,
+              "Value #K": 12,
+              "Value #L": 13,
+              "Value #M": 14
+            },
+            "renameByName": {
+              "author": "Author",
+              "author_model": "Author model",
+              "Value #A": "Episodes (n)",
+              "Value #B": "Merged",
+              "Value #C": "Abnormal handoff rate",
+              "Value #D": "Planned handoff rate",
+              "Value #E": "First reviews (n)",
+              "Value #F": "First-round pass rate",
+              "Value #G": "Review rounds per merge",
+              "Value #H": "Time per merge",
+              "Value #I": "Tokens per merge (no cache reads)",
+              "Value #J": "Incomplete runs",
+              "Value #K": "14-day checks (n)",
+              "Value #L": "Reverted rate",
+              "Value #M": "Bug-issue rate"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "N/A",
+          "decimals": 0,
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Abnormal handoff rate"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Planned handoff rate"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "First-round pass rate"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Review rounds per merge"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "none"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Time per merge"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Tokens per merge (no cache reads)"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Reverted rate"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Bug-issue rate"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "fields": ""
+        },
+        "sortBy": [
+          {
+            "displayName": "Author",
+            "desc": false
+          }
+        ]
+      }
+    },
+    {
+      "id": 123,
+      "type": "table",
+      "title": "Handoffs by author and reason",
+      "description": "Ended episodes handed to the owner, by implementing vendor and runner reason code. auto_merge_off and manual_checks are planned handoffs; the rest are abnormal.",
+      "gridPos": {
+        "x": 0,
+        "y": 161,
+        "w": 24,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum by (author, author_model, reason) (baton_contrib_handoffs{hostname=\"$host\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "indexByName": {
+              "author": 0,
+              "author_model": 1,
+              "reason": 2,
+              "Value #A": 3
+            },
+            "renameByName": {
+              "author": "Author",
+              "author_model": "Author model",
+              "reason": "Reason",
+              "Value #A": "Handoffs (n)"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "N/A",
+          "decimals": 0,
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "fields": ""
+        },
+        "sortBy": [
+          {
+            "displayName": "Author",
+            "desc": false
+          }
+        ]
+      }
+    },
+    {
+      "id": 124,
+      "type": "table",
+      "title": "Reviews by reviewer vendor",
+      "description": "PR review verdicts in ended episodes, by reviewing vendor. Must-fix items are the numbered entries under the review's \"## Must fix\" heading, recorded from 2026-10-27; reviews without a count are excluded from Must-fix per review (its n is shown). Adopted / rejected comes from the fixer's `## Must fix` answers to that round's review (recorded from 2026-10-27); owner rejections are not counted.",
+      "gridPos": {
+        "x": 0,
+        "y": 168,
+        "w": 24,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum by (reviewer) (baton_contrib_reviews{hostname=\"$host\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "(sum by (reviewer) (baton_contrib_reviews{hostname=\"$host\",verdict=\"changes\"}) or 0 * sum by (reviewer) (baton_contrib_reviews{hostname=\"$host\"})) / sum by (reviewer) (baton_contrib_reviews{hostname=\"$host\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum by (reviewer) (baton_contrib_must_fix_reviews{hostname=\"$host\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum by (reviewer) (baton_contrib_must_fix{hostname=\"$host\"}) / sum by (reviewer) (baton_contrib_must_fix_reviews{hostname=\"$host\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code"
+        },
+        {
+          "refId": "E",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum by (reviewer) (baton_contrib_must_fix_answered_rounds{hostname=\"$host\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code"
+        },
+        {
+          "refId": "F",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum by (reviewer) (baton_contrib_must_fix_answers{hostname=\"$host\",answer=\"adopted\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code"
+        },
+        {
+          "refId": "G",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum by (reviewer) (baton_contrib_must_fix_answers{hostname=\"$host\",answer=\"rejected\"}) / sum by (reviewer) (baton_contrib_must_fix_answers{hostname=\"$host\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "indexByName": {
+              "reviewer": 0,
+              "Value #A": 1,
+              "Value #B": 2,
+              "Value #C": 3,
+              "Value #D": 4,
+              "Value #E": 5,
+              "Value #F": 6,
+              "Value #G": 7
+            },
+            "renameByName": {
+              "reviewer": "Reviewer",
+              "Value #A": "Reviews (n)",
+              "Value #B": "Changes requested rate",
+              "Value #C": "Counted reviews (n)",
+              "Value #D": "Must-fix per review",
+              "Value #E": "Answered fix rounds (n)",
+              "Value #F": "Must-fix adopted",
+              "Value #G": "Must-fix rejected rate"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "N/A",
+          "decimals": 0,
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Changes requested rate"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Must-fix per review"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "none"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Must-fix rejected rate"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "fields": ""
+        },
+        "sortBy": [
+          {
+            "displayName": "Reviewer",
+            "desc": false
+          }
+        ]
+      }
+    },
+    {
+      "id": 125,
+      "type": "table",
+      "title": "Runs by vendor, role and model",
+      "description": "Every run that ended in the last 30 days, task or not. Model is what the run's own log reports (Codex: its session rollout; Claude: stream-json init; Cursor reports only Auto, shown as unknown). Token averages are per run with complete usage (n shown). Use with #245 to compare Codex models per role.",
+      "gridPos": {
+        "x": 0,
+        "y": 174,
+        "w": 24,
+        "h": 9
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum by (agent, role, model) (baton_model_runs{hostname=\"$host\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "(sum by (agent, role, model) (baton_model_runs{hostname=\"$host\",status=\"success\"}) or 0 * sum by (agent, role, model) (baton_model_runs{hostname=\"$host\"})) / sum by (agent, role, model) (baton_model_runs{hostname=\"$host\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum by (agent, role, model) (baton_model_complete_runs{hostname=\"$host\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum by (agent, role, model) (baton_model_tokens{hostname=\"$host\",type=\"input\"}) / sum by (agent, role, model) (baton_model_complete_runs{hostname=\"$host\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code"
+        },
+        {
+          "refId": "E",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum by (agent, role, model) (baton_model_tokens{hostname=\"$host\",type=\"cache_read\"}) / sum by (agent, role, model) (baton_model_complete_runs{hostname=\"$host\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code"
+        },
+        {
+          "refId": "F",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "sum by (agent, role, model) (baton_model_tokens{hostname=\"$host\",type=~\"output|reasoning\"}) / sum by (agent, role, model) (baton_model_complete_runs{hostname=\"$host\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "editorMode": "code"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "indexByName": {
+              "agent": 0,
+              "role": 1,
+              "model": 2,
+              "Value #A": 3,
+              "Value #B": 4,
+              "Value #C": 5,
+              "Value #D": 6,
+              "Value #E": 7,
+              "Value #F": 8
+            },
+            "renameByName": {
+              "agent": "Vendor",
+              "role": "Role",
+              "model": "Model",
+              "Value #A": "Runs (n)",
+              "Value #B": "Success rate",
+              "Value #C": "Complete usage (n)",
+              "Value #D": "Input per run",
+              "Value #E": "Cache read per run",
+              "Value #F": "Output per run"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "N/A",
+          "decimals": 0,
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Success rate"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Input per run"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Cache read per run"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Output per run"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "fields": ""
+        },
+        "sortBy": [
+          {
+            "displayName": "Vendor",
+            "desc": false
+          }
+        ]
+      }
+    }
+  ]
+}

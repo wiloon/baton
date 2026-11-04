@@ -1,0 +1,8 @@
+# Tool versions for everything under ~/baton (the clone and every
+# worktree). mise walks up parent directories, so this pins the agent's
+# toolchain without touching the user's global config.
+[tools]
+go = "1.27.0"
+node = "24.21.0"
+task = "latest"
+golangci-lint = "2.14.0"   # the version the watched repositories' CI uses

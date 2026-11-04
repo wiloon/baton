@@ -1,0 +1,12 @@
+[Unit]
+Description=The watched repository's nightly hook on origin/main; Telegram when it is not green
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/baton
+ExecStart=/usr/bin/uv run --quiet --frozen --no-dev --project %h/baton --directory %h/baton python -m baton.nightly
+SuccessExitStatus=75
+TimeoutStartSec=1h
+Nice=10

@@ -1,0 +1,90 @@
+// Managed source for ADR-0004 / issue #142. No debug exporter or raw payload logs.
+// Claude Code OTLP HTTP entry point, metrics only: run_claude never enables Claude's
+// logs or traces exporters, and this receiver forwards no logs or traces.
+declare "baton_claude_ingest" {
+	argument "listen_address" { }
+	// host.name on every record; one value per collector.
+	argument "host_name" { }
+
+	argument "metrics_output" { }
+
+	otelcol.receiver.otlp "claude" {
+		http {
+			endpoint = argument.listen_address.value
+		}
+
+		output {
+			metrics = [otelcol.processor.filter.metrics.input]
+		}
+	}
+
+	// Only documented, bounded native series are exported.
+	otelcol.processor.filter "metrics" {
+		error_mode = "propagate"
+
+		metrics {
+			metric = [`not IsMatch(name, "^claude_code[.](token[.]usage|cost[.]usage|session[.]count|lines_of_code[.]count|commit[.]count|pull_request[.]count|active_time[.]total)$")`]
+		}
+
+		output {
+			metrics = [otelcol.processor.transform.metrics.input]
+		}
+	}
+
+	// Propagate drops a malformed batch; ignore would forward unfiltered fields.
+	otelcol.processor.transform "metrics" {
+		error_mode = "propagate"
+
+		metric_statements {
+			context    = "resource"
+			statements = [
+				`keep_keys(attributes, [])`,
+				`set(attributes["service.name"], "claude-code")`,
+				`set(attributes["host.name"], "` + argument.host_name.value + `")`,
+				`set(attributes["agent"], "claude")`,
+			]
+		}
+
+		metric_statements {
+			context    = "scope"
+			statements = [
+				`keep_keys(attributes, [])`,
+				`set(name, "baton.claude.metadata")`,
+				`set(version, "1")`,
+			]
+		}
+
+		metric_statements {
+			context    = "metric"
+			statements = [
+				`set(description, "")`,
+				`set(unit, "")`,
+			]
+		}
+
+		// Session, user, organization and account ids stay on the host.
+		metric_statements {
+			context    = "datapoint"
+			statements = [
+				`keep_keys(attributes, ["type", "model", "query_source"])`,
+				`delete_key(attributes, "type") where attributes["type"] != nil and not (IsString(attributes["type"]) and IsMatch(attributes["type"], "^(input|output|cacheRead|cacheCreation|added|removed|user|cli)$"))`,
+				`delete_key(attributes, "model") where attributes["model"] != nil and not (IsString(attributes["model"]) and IsMatch(attributes["model"], "^claude-(opus|sonnet|haiku|fable)-[0-9]+(-[0-9]+)*$"))`,
+				`delete_key(attributes, "query_source") where attributes["query_source"] != nil and not (IsString(attributes["query_source"]) and IsMatch(attributes["query_source"], "^(main|subagent|auxiliary)$"))`,
+				`set(exemplars, nil)`,
+			]
+		}
+
+		output {
+			metrics = [otelcol.processor.deltatocumulative.claude.input]
+		}
+	}
+
+	otelcol.processor.deltatocumulative "claude" {
+		max_stale   = "24h"
+		max_streams = 1000
+
+		output {
+			metrics = argument.metrics_output.value
+		}
+	}
+}

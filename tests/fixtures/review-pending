@@ -1,0 +1,10 @@
+pr=4242
+wt=/srv/agent/baton/worktrees/cursor-9
+note=$'cursor just addressed this review feedback from acme-owner. Check it.\n\n<feedback>\nReview (2026-10-27T10:00:00Z):\nplease rename `foo` to "bar" \342\200\224 it\'s $HOME-safe?\n\n---\n\nInline comment on a.go:3:\n\303\274n\303\257c\303\266d\303\251 \346\227\245\346\234\254\350\252\236 \\ back\n</feedback>'
+fixer=cursor
+reviewer=codex
+round=2
+step=fix
+fix_head=6f1a3c0
+fixed_by=claude
+ISSUE=9

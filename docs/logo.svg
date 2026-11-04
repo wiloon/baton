@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-labelledby="t">
+  <title id="t">baton</title>
+  <defs>
+    <linearGradient id="crust" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#E9A95B"/>
+      <stop offset="0.55" stop-color="#C9792F"/>
+      <stop offset="1" stop-color="#9A5420"/>
+    </linearGradient>
+    <linearGradient id="crumb" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFF1D6"/>
+      <stop offset="1" stop-color="#F3D29C"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(6 12) rotate(-35 128 128)">
+    <!-- shadow -->
+    <ellipse cx="132" cy="150" rx="112" ry="10" fill="#000" opacity="0.12"/>
+    <!-- loaf -->
+    <path d="M24 128 C24 104 50 100 128 100 C206 100 232 104 232 128 C232 152 206 156 128 156 C50 156 24 152 24 128 Z"
+          fill="url(#crust)" stroke="#7A3F14" stroke-width="3"/>
+    <!-- top highlight -->
+    <path d="M44 114 C80 106 176 106 212 114" fill="none" stroke="#F6C98A" stroke-width="5" stroke-linecap="round" opacity="0.7"/>
+    <!-- scores (grignes) -->
+    <g fill="url(#crumb)" stroke="#7A3F14" stroke-width="2.5" stroke-linejoin="round">
+      <path d="M52 134 C60 116 74 110 84 112 C78 126 66 134 52 134 Z"/>
+      <path d="M92 134 C100 116 114 110 124 112 C118 126 106 134 92 134 Z"/>
+      <path d="M132 134 C140 116 154 110 164 112 C158 126 146 134 132 134 Z"/>
+      <path d="M172 134 C180 116 194 110 204 112 C198 126 186 134 172 134 Z"/>
+    </g>
+  </g>
+</svg>
