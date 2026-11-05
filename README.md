@@ -138,6 +138,14 @@ loginctl enable-linger "$USER"
 Logs are in `~/.local/state/baton/logs` (`runner.log`, plus one file per agent run). Set
 `paused = true` in `config.toml` to stop the timer's ticks while keeping manual runs.
 
+Inspect an issue with `uv run python -m baton.audit --repo OWNER/NAME 42`, or inspect global
+quota-probe overhead with `uv run python -m baton.audit probes` (when telemetry is enabled).
+Issue totals exclude probes. The audit separates elapsed time, recorded active attempts, model
+execution, local checks, CI waits and deferred waits. Timing coverage is unavailable for older
+history and partial when only some attempts were recorded; missing observations stay unknown.
+Model/check/CI times are components of active time, so do not add them to active time again.
+The last-attempt duration measures the most recent invocation, including a resumed invocation.
+
 ### More commands
 
 ```text
@@ -163,10 +171,21 @@ The units assume the checkout is at `~/baton` and uv at `/usr/bin/uv`; adjust `E
 
 ## Configuration
 
-`config.example.toml` documents every key. Every key is required; the example has a working
-default for each. Edit the `[[repos]]` entry, choose your installed vendors in `[quota]`, and
+`config.example.toml` documents every key. Fields are required except the optional Cursor role
+overrides; the example has a working default for each. Edit the `[[repos]]` entry, choose your installed vendors in `[quota]`, and
 choose whether `[scheduling].auto_merge` should be enabled. The optional
 `[linear]` and `[telegram]` tables are at the end of the file.
+
+Cursor uses `model_cursor` by default. Optional `model_cursor_dev`, `model_cursor_fix`,
+`model_cursor_review`, `model_cursor_spec_review`, `model_cursor_spec` and `model_cursor_scan`
+override individual roles; empty or omitted overrides keep the default. Run records distinguish
+the requested model from the actual model; Cursor Auto's actual model remains unknown when its
+CLI does not report it. Existing host configurations need no migration for these overrides.
+
+Each vendor choice logs its preference order, weekly usage/cap, time to reset, pace score and
+quota/cooldown gate. Lower pace scores mean further behind the weekly spending pace. Cursor is
+an extra vendor outside pool balancing: a configured preference can choose it before comparing
+pool pace. This policy remains subject to quota limits and independent-review eligibility.
 
 ## Telemetry
 

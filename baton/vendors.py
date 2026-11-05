@@ -280,6 +280,26 @@ def _preferred(state, pool, tied, prefer, now):
     return next((v for v in order if v not in pool or best in (None, v)), order[0])
 
 
+def selection_details(state, pool, candidates, chosen, role, *, area="", now=None):
+    """Explain the existing policy using bounded quota metadata, without another probe."""
+    now = int(time.time()) if now is None else now
+    prefer, label = preference(role, area)
+    config = session.resolve().config.quota
+    parts = [f"chosen={chosen} role={role} preference={label or role}:{','.join(prefer) or 'none'}",
+             "extra_policy=preference-before-pool-pace"]
+    for vendor in dict.fromkeys(candidates):
+        snap = quota.load(state, vendor)
+        cap = getattr(config, f'quota_cap_{vendor}')
+        score, blocked = quota.assess(snap, cap, config.quota_five_hour_max, now)
+        week, reset = quota._used(snap, 'seven_day', now)
+        week_text = f'{week:.1%}' if week is not None else 'unknown'
+        reset_text = f'{max(0, reset - now)}s' if reset is not None else 'unknown'
+        pace = f'{score:.4f}' if score is not None and week is not None else 'unknown'
+        parts.append(f"{vendor}[{'pool' if vendor in pool else 'extra'}] week={week_text} cap={cap:.1%} "
+                     f"reset_in={reset_text} pace={pace} gate={vendor_blocked(state, vendor, now) or blocked or 'open'}")
+    return '; '.join(parts)
+
+
 def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool",
          now=None, probe_only=False, review=False, fixed_by="", area="", other_model="", pr_state=None):
     """STATE: the machine's cooldowns and quota; PR_STATE (default STATE): the repository's PR

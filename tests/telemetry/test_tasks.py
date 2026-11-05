@@ -154,6 +154,26 @@ class TaskTests(unittest.TestCase):
 
 @unittest.skipUnless(__import__('shutil').which(__import__('os').environ.get('ALLOY_BIN','alloy')), 'Alloy required')
 class TaskAlloyTests(unittest.TestCase):
+    def test_probe_models_and_attempt_timing_survive_real_collector(self):
+        from test_alloy import AlloyHarness
+        record = dict(run_id='aaaaaaaa-0000-4000-8000-000000000001', trace_id='0'*32, span_id='0'*16,
+                      agent='cursor', role='probe', stage='probe', status='success', usage_state='complete',
+                      started=1., ended=2., issue=0, pr=0, round=0,
+                      requested_model='auto', actual_model='unknown')
+        payload = t.summary_payload(record)
+        row = payload['resourceLogs'][0]['scopeLogs'][0]['logRecords'][0]
+        row['attributes'] += [{'key': 'active_ms', 'value': {'intValue': '1234'}},
+                              {'key': 'timing_state', 'value': {'stringValue': 'partial'}}]
+        with AlloyHarness('runner') as harness:
+            harness.send('logs', payload)
+            deadline = time.monotonic() + 8
+            while not harness.received and time.monotonic() < deadline:
+                time.sleep(.05)
+            self.assertTrue(harness.received)
+            output = json.dumps(harness.received)
+            for expected in ('requested_model', 'actual_model', 'auto', 'unknown', 'probe', 'active_ms', '1234', 'partial'):
+                self.assertIn(expected, output)
+
     def test_verify_event_survives_allowlist(self):
         from test_alloy import AlloyHarness
         with tempfile.TemporaryDirectory() as directory:

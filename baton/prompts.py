@@ -16,6 +16,7 @@ from pathlib import Path
 from . import session
 
 NOTES_LINE = re.compile(r"^[ \t]*\{\{REPO_NOTES\}\}[ \t]*\n?", re.M)
+READING_GUIDANCE = """\nRead narrowly: locate symbols with rg -n or git grep, then read the relevant line ranges and callers. Use rg -l when only filenames are needed. Keep exploratory output to about 100 lines per call; narrow a query that exceeds it and inspect every relevant match. Expand to a whole file or repository-wide search when needed to establish correctness. In follow-up rounds, start with the changed points and diff; reuse facts in the supplied context after checking they still hold.\n"""
 
 
 def name_of(template):
@@ -34,6 +35,7 @@ def render(template, pairs, env=None):
     given = dict(pairs)
     base = given.get("BASE", "origin/main")
     for key, value in (("OWNER", repo.owner), ("GH_REPO", given.get("GH_REPO", repo.gh_repo)),
+                       ("READING_GUIDANCE", READING_GUIDANCE.strip()),
                        ("CI_COMMAND", repo.ci_command.replace("{base}", base)),
                        ("E2E_HOOK", str(repo.e2e_hook or ""))):
         text = text.replace("{{" + key + "}}", value)

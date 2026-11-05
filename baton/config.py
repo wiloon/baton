@@ -2,9 +2,9 @@
 
 Loading and validation only: no environment mutation, subprocesses, directory creation,
 secret reads, or scheduler initialization. The existing launch path migrates separately.
-All fields are required in the effective file: defaults have one source, config.example.toml.
+Fields are required except optional Cursor role overrides, which fall back to model_cursor.
 """
-from dataclasses import dataclass, fields
+from dataclasses import MISSING, dataclass, fields
 from pathlib import Path
 import argparse
 import math
@@ -143,6 +143,13 @@ class Models:
     effort_codex_scan: str
     subagent_model_scan: str
     busy_minutes: int
+    # Optional overrides preserve existing host configurations; empty uses model_cursor.
+    model_cursor_dev: str = ""
+    model_cursor_fix: str = ""
+    model_cursor_review: str = ""
+    model_cursor_spec_review: str = ""
+    model_cursor_spec: str = ""
+    model_cursor_scan: str = ""
 
 
 @dataclass(frozen=True)
@@ -239,13 +246,14 @@ def _section(name, cls, data, directory, home):
     if not isinstance(data, dict):
         raise ConfigError(f"{name}: expected a table")
     hints = get_type_hints(cls)
+    defaults = {f.name: f.default for f in fields(cls) if f.default is not MISSING}
     if unknown := data.keys() - hints.keys():
         raise ConfigError(f"{name}: unknown fields: {', '.join(sorted(unknown))}")
-    if missing := hints.keys() - data.keys():
+    if missing := hints.keys() - data.keys() - defaults.keys():
         raise ConfigError(f"{name}: missing fields: {', '.join(sorted(missing))}")
     result = {}
     for key, typ in hints.items():
-        value, label = data[key], f"{name}.{key}"
+        value, label = data.get(key, defaults.get(key)), f"{name}.{key}"
         if typ in (tuple[str, ...], tuple[Path, ...]):
             if not isinstance(value, list) or any(type(v) is not str for v in value):
                 raise ConfigError(f"{label}: expected an array of strings")

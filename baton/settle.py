@@ -17,7 +17,7 @@ import sys
 import tempfile
 import time
 
-from . import notify, quota
+from . import hooks as telemetry, notify, quota
 from .common import child_env, read
 
 PROBE_PROMPT = "Reply with the word ok."
@@ -125,6 +125,8 @@ def probe(state, logs, vendor, model):
         refresh_cursor(state)
         return
     log = Path(logs, f"{time.strftime('%F-%H%M%S')}-quota-probe-{vendor}.jsonl")
+    hooks = telemetry.from_env()  # Global overhead, never charged to an issue's task totals.
+    probe_run = hooks.begin(vendor, "probe", 2, requested_model=model if vendor == "claude" else "")
     with tempfile.TemporaryDirectory() as directory:
         cmd, env = probe_command(vendor, model, directory)
         with open(log, "w") as out:
@@ -134,6 +136,7 @@ def probe(state, logs, vendor, model):
             except OSError as e:
                 out.write(f"baton: cannot start {cmd[0]}: {e}\n")
                 rc = 127
+    hooks.end(probe_run, "success" if rc == 0 else "failure", str(log))
     record_quota(state, vendor, str(log))
     if re.search(PROBE_AUTH, read(log), re.I):
         result = "auth_expired"

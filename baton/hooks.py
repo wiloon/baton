@@ -16,6 +16,8 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
+import uuid
 
 SHA = re.compile(r"[a-f0-9]{40,64}")
 OTEL_STAGE = {"spec": "spec-reply", "spec_review": "spec-review", "review": "review", "fix": "fix"}
@@ -69,16 +71,28 @@ class Telemetry:
                 pass
 
     # --- hooks ---
-    def begin(self, vendor, role, minutes):
+    def begin(self, vendor, role, minutes, requested_model=""):
         """Open a run record owned by this process; None when disabled or refused."""
         if not self.enabled:
             return None
         out = self._call("begin", vendor, role, os.getpid(), minutes, self.issue, self.pr, self.round,
+                         "--requested-model", requested_model,
                          "--repo", self.repo)
         fields = (out or "").split()
         if len(fields) < 3:
             return None
-        return Run(*fields[:3], issue=self.issue, pr=self.pr, pipeline_id=fields[3] if len(fields) > 3 else "")
+        pipeline = fields[3] if len(fields) > 3 else ""
+        if pipeline:
+            self._remember(pipeline_id=pipeline)
+        return Run(*fields[:3], issue=self.issue, pr=self.pr, pipeline_id=pipeline)
+
+    def start_attempt(self):
+        self._remember(attempt_id=str(uuid.uuid4()), started_ms=int(time.time() * 1000))
+
+    def finish_attempt(self, result):
+        item = self._item()
+        if self.enabled and all(k in item for k in ("pipeline_id", "attempt_id", "started_ms")):
+            self._call("attempt", item['pipeline_id'], item['attempt_id'], item['started_ms'], result)
 
     def end(self, run, status, log):
         if run:
@@ -132,7 +146,7 @@ class Telemetry:
         self.task("fix", f"fix:{round}:{last}", "--agent", fixer, "--round", round,
                   "--adopted", answers[0], "--rejected", answers[1], "--run-id", last)
 
-    def ci(self, pr, rc, before, no_checks=False):
+    def ci(self, pr, rc, before, no_checks=False, duration_ms=None):
         if not self.enabled:
             return
         gh = ("gh", "pr")
@@ -154,6 +168,8 @@ class Telemetry:
         options = ["--ci-result", result]
         if SHA.fullmatch(before):
             options += ["--head-sha", before]
+        if duration_ms is not None:
+            options += ["--duration-ms", duration_ms]
         self.task("ci", f"ci:{pr}:{before or 'unknown'}:{result}", *options)
 
     # --- the CLI child's exporters: set on that child only ---

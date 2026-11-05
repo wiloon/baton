@@ -132,7 +132,7 @@
         "name": "role",
         "label": "Role",
         "type": "custom",
-        "query": "spec,review,fix,triage,scan,dev",
+        "query": "spec,spec_review,review,fix,triage,scan,dev,probe",
         "options": [
           {
             "text": "spec",
@@ -163,6 +163,16 @@
             "text": "dev",
             "value": "dev",
             "selected": false
+          },
+          {
+            "selected": false,
+            "text": "spec_review",
+            "value": "spec_review"
+          },
+          {
+            "selected": false,
+            "text": "probe",
+            "value": "probe"
           }
         ],
         "current": {
@@ -2994,7 +3004,7 @@
       "id": 25,
       "type": "table",
       "title": "Recent runs · select a trace to explore",
-      "description": "One row per CLI invocation, deduplicated by event ID within the latest 500 records. CLI outcome is not task success. Task ID opens Loki; Trace ID opens Tempo. Configuration fingerprints contain no config contents. Unknown actual model stays unavailable.",
+      "description": "One row per CLI invocation, deduplicated by event ID within the latest 500 records. CLI outcome is not task success. Task ID opens Loki; Trace ID opens Tempo. Configuration fingerprints contain no config contents. Unknown actual model stays unavailable. Requested model is configuration; actual model stays unknown when Auto does not disclose it. Quota probes have Role=probe and no task.",
       "gridPos": {
         "x": 0,
         "y": 74,
@@ -3012,7 +3022,7 @@
             "type": "loki",
             "uid": "${loki}"
           },
-          "expr": "{source=\"runner\",host=\"$host\"} |= \"baton.run_summary\" | json event_id=\"attributes.event_id\", agent=\"attributes.agent\", role=\"attributes[\\\"baton.role\\\"]\", stage=\"attributes[\\\"baton.stage\\\"]\", issue=\"attributes[\\\"baton.issue\\\"]\", pr=\"attributes[\\\"baton.pr\\\"]\", round=\"attributes[\\\"baton.round\\\"]\", status=\"attributes.status\", usage=\"attributes.usage_state\", duration_ms=\"attributes.duration_ms\", input=\"attributes.input_tokens\", cache_read=\"attributes.cache_read_tokens\", cache_write=\"attributes.cache_write_tokens\", output=\"attributes.output_tokens\", reasoning=\"attributes.reasoning_tokens\", run_id=\"attributes[\\\"baton.run_id\\\"]\", trace_id=\"traceid\", pipeline_id=\"attributes.pipeline_id\", workflow_version=\"attributes.workflow_version\", config_version=\"attributes.config_version\", cli_version=\"attributes.cli_version\" | agent=~\"${agent:regex}\" | role=~\"${role:regex}\" | __error__=\"\" | line_format `{\"event_id\":\"{{.event_id}}\",\"agent\":\"{{.agent}}\",\"role\":\"{{.role}}\",\"stage\":\"{{.stage}}\",\"issue\":\"{{.issue}}\",\"pr\":\"{{.pr}}\",\"round\":\"{{.round}}\",\"status\":\"{{.status}}\",\"usage\":\"{{.usage}}\",\"duration_ms\":\"{{.duration_ms}}\",\"input\":\"{{.input}}\",\"cache_read\":\"{{.cache_read}}\",\"cache_write\":\"{{.cache_write}}\",\"output\":\"{{.output}}\",\"reasoning\":\"{{.reasoning}}\",\"run_id\":\"{{.run_id}}\",\"trace_id\":\"{{.trace_id}}\",\"pipeline_id\":\"{{.pipeline_id}}\",\"workflow_version\":\"{{.workflow_version}}\",\"config_version\":\"{{.config_version}}\",\"cli_version\":\"{{.cli_version}}\"}`",
+          "expr": "{source=\"runner\",host=\"$host\"} |= \"baton.run_summary\" | json event_id=\"attributes.event_id\", agent=\"attributes.agent\", role=\"attributes[\\\"baton.role\\\"]\", stage=\"attributes[\\\"baton.stage\\\"]\", issue=\"attributes[\\\"baton.issue\\\"]\", pr=\"attributes[\\\"baton.pr\\\"]\", round=\"attributes[\\\"baton.round\\\"]\", status=\"attributes.status\", usage=\"attributes.usage_state\", duration_ms=\"attributes.duration_ms\", input=\"attributes.input_tokens\", cache_read=\"attributes.cache_read_tokens\", cache_write=\"attributes.cache_write_tokens\", output=\"attributes.output_tokens\", reasoning=\"attributes.reasoning_tokens\", run_id=\"attributes[\\\"baton.run_id\\\"]\", trace_id=\"traceid\", pipeline_id=\"attributes.pipeline_id\", workflow_version=\"attributes.workflow_version\", config_version=\"attributes.config_version\", cli_version=\"attributes.cli_version\", requested_model=\"attributes.requested_model\", actual_model=\"attributes.actual_model\" | agent=~\"${agent:regex}\" | role=~\"${role:regex}\" | __error__=\"\" | line_format `{\"event_id\":\"{{.event_id}}\",\"agent\":\"{{.agent}}\",\"role\":\"{{.role}}\",\"stage\":\"{{.stage}}\",\"issue\":\"{{.issue}}\",\"pr\":\"{{.pr}}\",\"round\":\"{{.round}}\",\"status\":\"{{.status}}\",\"usage\":\"{{.usage}}\",\"duration_ms\":\"{{.duration_ms}}\",\"input\":\"{{.input}}\",\"cache_read\":\"{{.cache_read}}\",\"cache_write\":\"{{.cache_write}}\",\"output\":\"{{.output}}\",\"reasoning\":\"{{.reasoning}}\",\"run_id\":\"{{.run_id}}\",\"trace_id\":\"{{.trace_id}}\",\"pipeline_id\":\"{{.pipeline_id}}\",\"workflow_version\":\"{{.workflow_version}}\",\"config_version\":\"{{.config_version}}\",\"cli_version\":\"{{.cli_version}}\",\"requested_model\":\"{{.requested_model}}\",\"actual_model\":\"{{.actual_model}}\"}`",
           "queryType": "range",
           "editorMode": "code",
           "maxLines": 500,
@@ -3175,6 +3185,18 @@
                 "aggregations": [
                   "lastNotNull"
                 ]
+              },
+              "requested_model": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "lastNotNull"
+                ]
+              },
+              "actual_model": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "lastNotNull"
+                ]
               }
             }
           }
@@ -3205,7 +3227,9 @@
               "pipeline_id (lastNotNull)": 18,
               "workflow_version (lastNotNull)": 19,
               "config_version (lastNotNull)": 20,
-              "cli_version (lastNotNull)": 21
+              "cli_version (lastNotNull)": 21,
+              "requested_model (lastNotNull)": 22,
+              "actual_model (lastNotNull)": 23
             },
             "renameByName": {
               "Time (lastNotNull)": "Ended",
@@ -3229,7 +3253,9 @@
               "pipeline_id (lastNotNull)": "Task ID",
               "workflow_version (lastNotNull)": "Workflow version",
               "config_version (lastNotNull)": "Config version",
-              "cli_version (lastNotNull)": "CLI version"
+              "cli_version (lastNotNull)": "CLI version",
+              "requested_model (lastNotNull)": "Requested model",
+              "actual_model (lastNotNull)": "Actual model"
             }
           }
         },
@@ -3815,7 +3841,7 @@
       "id": 33,
       "type": "table",
       "title": "Task history · select a task to inspect events",
-      "description": "Latest snapshot per task episode within the latest 500 matching records. Active means no terminal event has been observed, not that a CLI is running. Task totals span all vendors and ignore Agent/Role filters. A token category is N/A if any completed invocation lacks complete usage. Duration ends at the last observed event; it does not keep increasing while idle.",
+      "description": "Latest snapshot per task episode within the latest 500 matching records. Active means no terminal event has been observed, not that a CLI is running. Task totals span all vendors and ignore Agent/Role filters. A token category is N/A if any completed invocation lacks complete usage. Duration ends at the last observed event; it does not keep increasing while idle. Elapsed includes idle time. Recorded active spans completed attempts; timing coverage is partial for mixed old/new history. Model, local checks and CI wait are measured separately; absent history stays unavailable.",
       "gridPos": {
         "x": 0,
         "y": 112,
@@ -3833,7 +3859,7 @@
             "type": "loki",
             "uid": "${loki}"
           },
-          "expr": "{source=\"runner\",host=\"$host\"} |= \"baton.task_summary\" | json pipeline_id=\"attributes.pipeline_id\", repo=\"attributes.repo\", issue=\"attributes.issue\", pr=\"attributes.pr\", task_status=\"attributes.task_status\", reason=\"attributes.reason\", duration_ms=\"attributes.duration_ms\", review_rounds=\"attributes.review_rounds\", spec_rounds=\"attributes.spec_rounds\", runs=\"attributes.runs\", incomplete_runs=\"attributes.incomplete_runs\", input_tokens=\"attributes.input_tokens\", cache_read_tokens=\"attributes.cache_read_tokens\", cache_write_tokens=\"attributes.cache_write_tokens\", output_tokens=\"attributes.output_tokens\", workflow_version=\"attributes.workflow_version\", config_version=\"attributes.config_version\", sequence=\"attributes.sequence\", event_id=\"attributes.event_id\" | __error__=\"\" | line_format `{\"pipeline_id\":\"{{.pipeline_id}}\",\"repo\":\"{{.repo}}\",\"issue\":\"{{ if and (ne .issue \"0\") (ne .issue \"\") }}[{{.issue}}](https://github.com/{{.repo}}/issues/{{.issue}}){{ else }}N/A{{ end }}\",\"pr\":\"{{ if and (ne .pr \"0\") (ne .pr \"\") }}[{{.pr}}](https://github.com/{{.repo}}/pull/{{.pr}}){{ else }}N/A{{ end }}\",\"task_status\":\"{{.task_status}}\",\"reason\":\"{{.reason}}\",\"duration_ms\":\"{{.duration_ms}}\",\"review_rounds\":\"{{.review_rounds}}\",\"spec_rounds\":\"{{.spec_rounds}}\",\"runs\":\"{{.runs}}\",\"incomplete_runs\":\"{{.incomplete_runs}}\",\"input_tokens\":\"{{.input_tokens}}\",\"cache_read_tokens\":\"{{.cache_read_tokens}}\",\"cache_write_tokens\":\"{{.cache_write_tokens}}\",\"output_tokens\":\"{{.output_tokens}}\",\"workflow_version\":\"{{.workflow_version}}\",\"config_version\":\"{{.config_version}}\",\"sequence\":\"{{.sequence}}\",\"event_id\":\"{{.event_id}}\"}`",
+          "expr": "{source=\"runner\",host=\"$host\"} |= \"baton.task_summary\" | json pipeline_id=\"attributes.pipeline_id\", repo=\"attributes.repo\", issue=\"attributes.issue\", pr=\"attributes.pr\", task_status=\"attributes.task_status\", reason=\"attributes.reason\", duration_ms=\"attributes.duration_ms\", review_rounds=\"attributes.review_rounds\", spec_rounds=\"attributes.spec_rounds\", runs=\"attributes.runs\", incomplete_runs=\"attributes.incomplete_runs\", input_tokens=\"attributes.input_tokens\", cache_read_tokens=\"attributes.cache_read_tokens\", cache_write_tokens=\"attributes.cache_write_tokens\", output_tokens=\"attributes.output_tokens\", workflow_version=\"attributes.workflow_version\", config_version=\"attributes.config_version\", sequence=\"attributes.sequence\", event_id=\"attributes.event_id\", active_ms=\"attributes.active_ms\", last_attempt_ms=\"attributes.last_attempt_ms\", model_ms=\"attributes.model_ms\", verify_ms=\"attributes.verify_ms\", ci_wait_ms=\"attributes.ci_wait_ms\", deferred_wait_ms=\"attributes.deferred_wait_ms\", timing_state=\"attributes.timing_state\" | __error__=\"\" | line_format `{\"pipeline_id\":\"{{.pipeline_id}}\",\"repo\":\"{{.repo}}\",\"issue\":\"{{ if and (ne .issue \"0\") (ne .issue \"\") }}[{{.issue}}](https://github.com/{{.repo}}/issues/{{.issue}}){{ else }}N/A{{ end }}\",\"pr\":\"{{ if and (ne .pr \"0\") (ne .pr \"\") }}[{{.pr}}](https://github.com/{{.repo}}/pull/{{.pr}}){{ else }}N/A{{ end }}\",\"task_status\":\"{{.task_status}}\",\"reason\":\"{{.reason}}\",\"duration_ms\":\"{{.duration_ms}}\",\"review_rounds\":\"{{.review_rounds}}\",\"spec_rounds\":\"{{.spec_rounds}}\",\"runs\":\"{{.runs}}\",\"incomplete_runs\":\"{{.incomplete_runs}}\",\"input_tokens\":\"{{.input_tokens}}\",\"cache_read_tokens\":\"{{.cache_read_tokens}}\",\"cache_write_tokens\":\"{{.cache_write_tokens}}\",\"output_tokens\":\"{{.output_tokens}}\",\"workflow_version\":\"{{.workflow_version}}\",\"config_version\":\"{{.config_version}}\",\"sequence\":\"{{.sequence}}\",\"event_id\":\"{{.event_id}}\",\"active_ms\":\"{{.active_ms}}\",\"last_attempt_ms\":\"{{.last_attempt_ms}}\",\"model_ms\":\"{{.model_ms}}\",\"verify_ms\":\"{{.verify_ms}}\",\"ci_wait_ms\":\"{{.ci_wait_ms}}\",\"deferred_wait_ms\":\"{{.deferred_wait_ms}}\",\"timing_state\":\"{{.timing_state}}\"}`",
           "queryType": "range",
           "editorMode": "code",
           "maxLines": 500,
@@ -3996,6 +4022,48 @@
                 "aggregations": [
                   "firstNotNull"
                 ]
+              },
+              "active_ms": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              },
+              "last_attempt_ms": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              },
+              "model_ms": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              },
+              "verify_ms": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              },
+              "ci_wait_ms": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              },
+              "deferred_wait_ms": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
+              },
+              "timing_state": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
               }
             }
           }
@@ -4024,7 +4092,14 @@
               "output_tokens (firstNotNull)": 16,
               "workflow_version (firstNotNull)": 17,
               "config_version (firstNotNull)": 18,
-              "sequence (firstNotNull)": 19
+              "sequence (firstNotNull)": 19,
+              "active_ms (firstNotNull)": 20,
+              "last_attempt_ms (firstNotNull)": 21,
+              "model_ms (firstNotNull)": 22,
+              "verify_ms (firstNotNull)": 23,
+              "ci_wait_ms (firstNotNull)": 24,
+              "deferred_wait_ms (firstNotNull)": 25,
+              "timing_state (firstNotNull)": 26
             },
             "renameByName": {
               "Time (firstNotNull)": "Observed",
@@ -4035,7 +4110,7 @@
               "pr (firstNotNull)": "PR",
               "task_status (firstNotNull)": "Task outcome",
               "reason (firstNotNull)": "Handoff reason",
-              "duration_ms (firstNotNull)": "Duration",
+              "duration_ms (firstNotNull)": "Elapsed",
               "review_rounds (firstNotNull)": "Code review rounds",
               "spec_rounds (firstNotNull)": "Spec review rounds",
               "runs (firstNotNull)": "CLI runs",
@@ -4046,7 +4121,14 @@
               "output_tokens (firstNotNull)": "Output",
               "workflow_version (firstNotNull)": "Workflow version",
               "config_version (firstNotNull)": "Config version",
-              "sequence (firstNotNull)": "Sequence"
+              "sequence (firstNotNull)": "Sequence",
+              "active_ms (firstNotNull)": "Recorded active",
+              "last_attempt_ms (firstNotNull)": "Last attempt",
+              "model_ms (firstNotNull)": "Model time",
+              "verify_ms (firstNotNull)": "Local checks",
+              "ci_wait_ms (firstNotNull)": "CI wait",
+              "deferred_wait_ms (firstNotNull)": "Deferred wait",
+              "timing_state (firstNotNull)": "Timing coverage"
             }
           }
         },
@@ -4055,7 +4137,7 @@
           "options": {
             "conversions": [
               {
-                "targetField": "Duration",
+                "targetField": "Elapsed",
                 "destinationType": "number"
               },
               {
@@ -4092,6 +4174,30 @@
               },
               {
                 "targetField": "Sequence",
+                "destinationType": "number"
+              },
+              {
+                "targetField": "Recorded active",
+                "destinationType": "number"
+              },
+              {
+                "targetField": "Last attempt",
+                "destinationType": "number"
+              },
+              {
+                "targetField": "Model time",
+                "destinationType": "number"
+              },
+              {
+                "targetField": "Local checks",
+                "destinationType": "number"
+              },
+              {
+                "targetField": "CI wait",
+                "destinationType": "number"
+              },
+              {
+                "targetField": "Deferred wait",
                 "destinationType": "number"
               }
             ]
@@ -4132,7 +4238,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "Duration"
+              "options": "Elapsed"
             },
             "properties": [
               {
@@ -4190,6 +4296,78 @@
               {
                 "id": "custom.hidden",
                 "value": true
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Recorded active"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ms"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Last attempt"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ms"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Model time"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ms"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Local checks"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ms"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "CI wait"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ms"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Deferred wait"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ms"
               }
             ]
           }
