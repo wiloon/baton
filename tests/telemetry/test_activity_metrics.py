@@ -76,6 +76,31 @@ class ActivityTests(unittest.TestCase):
         self.assertNotIn('\n', label)
         self.assertIn('\\"', label)
 
+class RetrospectiveActivityTests(unittest.TestCase):
+    def test_missing_and_leftover_lock_are_idle_without_creating_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            self.assertEqual(t.retrospective_running(state), 0)
+            self.assertFalse((state / 'retrospectives').exists())
+            root = state / 'retrospectives'
+            root.mkdir()
+            (root / 'worker.lock').touch()
+            self.assertEqual(t.retrospective_running(state), 0)
+
+    def test_actual_worker_lock_is_active_then_idle(self):
+        from baton.retrospectives import worker_lock
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            with worker_lock(state / 'retrospectives') as acquired:
+                self.assertTrue(acquired)
+                self.assertEqual(t.retrospective_running(state), 1)
+            self.assertEqual(t.retrospective_running(state), 0)
+
+    def test_read_failure_is_not_idle(self):
+        with patch.object(Path, 'open', side_effect=PermissionError('denied')):
+            with self.assertRaises(PermissionError):
+                t.retrospective_running(Path('/unused'))
+
 class IntervalActivityTests(unittest.TestCase):
     def values(self, records, previous=100, now=160):
         result = {}

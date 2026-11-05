@@ -2,7 +2,7 @@
   "id": null,
   "uid": "baton",
   "title": "Baton",
-  "description": "Agent scheduler state, validated run consumption, native Codex telemetry and Tempo traces. Incremental coverage for issue #142; unavailable pipeline/quality/pricing data is explicitly identified. Provider quota snapshots include 5h/weekly balances, runner headroom, resets and independent observation freshness.",
+  "description": "Agent scheduler state, validated run consumption, native Codex telemetry and Tempo traces. Incremental coverage for issue #142; unavailable pipeline/quality/pricing data is explicitly identified. Provider quota snapshots include 5h/weekly balances, runner headroom, resets and independent observation freshness.\n\n**Live telemetry from $host.** State refreshes every minute. Daily counters follow **America/Los_Angeles** and include manual runs. Current executions and Agent activity always show all Agents. Agent/Role filters apply to quota/usage panels and run summaries; task history spans all vendors.\n\nTask episodes and events start after their instrumentation rollout. Earlier runs are not backfilled. Task identity links review, CI, handoff and run consumption. Missing data is **N/A / Unknown**. Pricing, quality-rate cohorts and CI/dispatch live health are still pending.\n\nDashboard updates are managed in Git and applied automatically by Argo CD.",
   "tags": [
     "baton",
     "agents",
@@ -199,307 +199,16 @@
   ],
   "panels": [
     {
-      "id": 1,
-      "type": "text",
-      "title": "Agent Activity · $host",
-      "description": "",
-      "gridPos": {
-        "x": 0,
-        "y": 0,
-        "w": 24,
-        "h": 4
-      },
-      "options": {
-        "mode": "markdown",
-        "content": "**Live telemetry from $host.** State refreshes every minute. Daily counters follow **America/Los_Angeles** and include manual runs. Current executions and Agent activity always show all Agents. Agent/Role filters apply to quota/usage panels and run summaries; task history spans all vendors.\n\nTask episodes and events start after their instrumentation rollout. Earlier runs are not backfilled. Task identity links review, CI, handoff and run consumption. Missing data is **N/A / Unknown**. Pricing, quality-rate cohorts and CI/dispatch live health are still pending.\n\nDashboard updates are managed in Git and applied automatically by Argo CD."
-      }
-    },
-    {
       "id": 110,
       "type": "row",
-      "title": "Current executions & Agent activity",
+      "title": "Activity & quota",
       "collapsed": false,
       "panels": [],
       "gridPos": {
         "x": 0,
-        "y": 4,
+        "y": 0,
         "w": 24,
         "h": 1
-      }
-    },
-    {
-      "id": 111,
-      "type": "table",
-      "title": "Current executions",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${prometheus}"
-      },
-      "gridPos": {
-        "x": 0,
-        "y": 5,
-        "w": 24,
-        "h": 7
-      },
-      "description": "Latest observed agent CLI invocations across all Agents; overview ignores Agent/Role filters. Running means a reconciled invocation is alive, including time waiting for tools or network. Idle means no instrumented invocation. Unknown means collection failed, exporter unavailable or observation older than 150 seconds. Uninstrumented manual CLIs are excluded. Updated about once per minute. Task links appear where metadata is available.",
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${prometheus}"
-          },
-          "expr": "(clamp_max(max by (agent) (baton_running_by_agent{hostname=\"$host\"}), 1) and on() (max(baton_state_collect_success{hostname=\"$host\"}) == 1 and (time() - max(baton_activity_observed_at_seconds{hostname=\"$host\"})) < 150 and max(up{job=\"$node_job\",hostname=\"$host\"}) == 1)) or on(agent) (label_replace(vector(-1), \"agent\", \"claude\", \"\", \"\") or label_replace(vector(-1), \"agent\", \"cursor\", \"\", \"\") or label_replace(vector(-1), \"agent\", \"codex\", \"\", \"\"))",
-          "instant": true,
-          "range": false,
-          "format": "table",
-          "legendFormat": "{{agent}}",
-          "editorMode": "code"
-        },
-        {
-          "refId": "B",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${prometheus}"
-          },
-          "expr": "label_replace(label_join(label_replace(label_join((time() - max by (agent, role, stage, repo, issue, pr, run_id) (baton_current_execution_started_seconds{hostname=\"$host\"})) and on() (max(baton_state_collect_success{hostname=\"$host\"}) == 1 and (time() - max(baton_activity_observed_at_seconds{hostname=\"$host\"})) < 150 and max(up{job=\"$node_job\",hostname=\"$host\"}) == 1), \"repo_issue\", \";\", \"repo\", \"issue\"), \"issue_link\", \"[$2](https://github.com/$1/issues/$2)\", \"repo_issue\", \"(.+);([1-9][0-9]*)\"), \"repo_pr\", \";\", \"repo\", \"pr\"), \"pr_link\", \"[$2](https://github.com/$1/pull/$2)\", \"repo_pr\", \"(.+);([1-9][0-9]*)\")",
-          "instant": true,
-          "range": false,
-          "format": "table",
-          "legendFormat": "{{agent}}",
-          "editorMode": "code"
-        }
-      ],
-      "transformations": [
-        {
-          "id": "joinByField",
-          "options": {
-            "byField": "agent",
-            "mode": "outerTabular"
-          }
-        },
-        {
-          "id": "organize",
-          "options": {
-            "excludeByName": {
-              "Time": true,
-              "Time 1": true,
-              "Time 2": true,
-              "run_id": true,
-              "issue": true,
-              "repo_issue": true,
-              "pr": true,
-              "repo_pr": true
-            },
-            "indexByName": {
-              "agent": 0,
-              "Value #A": 1,
-              "role": 2,
-              "stage": 3,
-              "repo": 4,
-              "Value #B": 7,
-              "issue_link": 5,
-              "pr_link": 6
-            },
-            "renameByName": {
-              "agent": "Agent",
-              "Value #A": "State",
-              "role": "Role",
-              "stage": "Stage",
-              "repo": "Repo",
-              "Value #B": "Elapsed",
-              "issue_link": "Issue",
-              "pr_link": "PR"
-            }
-          }
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "align": "auto",
-            "cellOptions": {
-              "type": "auto"
-            },
-            "width": 150
-          },
-          "noValue": "—"
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "State"
-            },
-            "properties": [
-              {
-                "id": "mappings",
-                "value": [
-                  {
-                    "type": "value",
-                    "options": {
-                      "-1": {
-                        "text": "Unknown",
-                        "color": "orange"
-                      },
-                      "0": {
-                        "text": "Idle",
-                        "color": "#52545c"
-                      },
-                      "1": {
-                        "text": "Running",
-                        "color": "green"
-                      }
-                    }
-                  },
-                  {
-                    "type": "special",
-                    "options": {
-                      "match": "nan",
-                      "result": {
-                        "text": "Unknown",
-                        "color": "orange"
-                      }
-                    }
-                  }
-                ]
-              },
-              {
-                "id": "custom.cellOptions",
-                "value": {
-                  "type": "color-text"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Agent"
-            },
-            "properties": [
-              {
-                "id": "mappings",
-                "value": [
-                  {
-                    "type": "value",
-                    "options": {
-                      "claude": {
-                        "text": "Claude Code"
-                      },
-                      "cursor": {
-                        "text": "Cursor Agent"
-                      },
-                      "codex": {
-                        "text": "Codex"
-                      }
-                    }
-                  }
-                ]
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Elapsed"
-            },
-            "properties": [
-              {
-                "id": "unit",
-                "value": "s"
-              },
-              {
-                "id": "decimals",
-                "value": 0
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Issue"
-            },
-            "properties": [
-              {
-                "id": "custom.cellOptions",
-                "value": {
-                  "type": "markdown"
-                }
-              },
-              {
-                "id": "mappings",
-                "value": [
-                  {
-                    "type": "special",
-                    "options": {
-                      "match": "null+nan",
-                      "result": {
-                        "text": "—"
-                      }
-                    }
-                  },
-                  {
-                    "type": "special",
-                    "options": {
-                      "match": "empty",
-                      "result": {
-                        "text": "—"
-                      }
-                    }
-                  }
-                ]
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "PR"
-            },
-            "properties": [
-              {
-                "id": "custom.cellOptions",
-                "value": {
-                  "type": "markdown"
-                }
-              },
-              {
-                "id": "mappings",
-                "value": [
-                  {
-                    "type": "special",
-                    "options": {
-                      "match": "null+nan",
-                      "result": {
-                        "text": "—"
-                      }
-                    }
-                  },
-                  {
-                    "type": "special",
-                    "options": {
-                      "match": "empty",
-                      "result": {
-                        "text": "—"
-                      }
-                    }
-                  }
-                ]
-              }
-            ]
-          }
-        ]
-      },
-      "options": {
-        "showHeader": true,
-        "cellHeight": "sm",
-        "sortBy": [
-          {
-            "displayName": "Agent",
-            "desc": false
-          }
-        ]
       }
     },
     {
@@ -512,7 +221,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 12,
+        "y": 1,
         "w": 24,
         "h": 8
       },
@@ -632,17 +341,96 @@
       }
     },
     {
-      "id": 100,
-      "type": "row",
-      "title": "Quota & Scheduling",
+      "id": 113,
+      "type": "state-timeline",
+      "title": "Retrospective activity",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
       "gridPos": {
         "x": 0,
-        "y": 20,
+        "y": 9,
         "w": 24,
-        "h": 1
+        "h": 5
       },
-      "collapsed": false,
-      "panels": []
+      "description": "Independent retrospective worker on this host, including catch-up checks and task analysis. Green = working; gray = idle; orange = unavailable or stale observation. Samples the default STATE/retrospectives/worker.lock about once per minute without taking the workload lock. Very short checks or analyses between samples can be missed. Zooming out preserves sampled work but may widen visible blocks. Custom --work-state invocations are not included.",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "(max(max_over_time(baton_retrospective_running{hostname=\"$host\"}[$__interval])) and on() (max(baton_state_collect_success{hostname=\"$host\"}) == 1 and (time() - max(baton_retrospective_observed_at_seconds{hostname=\"$host\"})) < 150 and max(up{job=\"$node_job\",hostname=\"$host\"}) == 1)) or on() vector(-1)",
+          "instant": false,
+          "range": true,
+          "format": "time_series",
+          "legendFormat": "Retrospective loop",
+          "editorMode": "code"
+        }
+      ],
+      "maxDataPoints": 3000,
+      "interval": "1m",
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "-1": {
+                  "text": "Unknown",
+                  "color": "orange"
+                },
+                "0": {
+                  "text": "Idle",
+                  "color": "#52545c"
+                },
+                "1": {
+                  "text": "Active",
+                  "color": "green"
+                }
+              }
+            },
+            {
+              "type": "special",
+              "options": {
+                "match": "nan",
+                "result": {
+                  "text": "Unknown",
+                  "color": "orange"
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 0,
+            "fillOpacity": 85,
+            "spanNulls": false,
+            "insertNulls": 120000
+          },
+          "noValue": "Unknown"
+        },
+        "overrides": []
+      },
+      "options": {
+        "mergeValues": true,
+        "showValue": "never",
+        "alignValue": "center",
+        "rowHeight": 0.7,
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      }
     },
     {
       "id": 101,
@@ -650,7 +438,7 @@
       "title": "Quota balances by provider",
       "gridPos": {
         "x": 0,
-        "y": 21,
+        "y": 14,
         "w": 24,
         "h": 8
       },
@@ -1291,18 +1079,306 @@
       }
     },
     {
+      "id": 111,
+      "type": "table",
+      "title": "Current executions",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 22,
+        "w": 24,
+        "h": 7
+      },
+      "description": "Latest observed agent CLI invocations across all Agents; overview ignores Agent/Role filters. Running means a reconciled invocation is alive, including time waiting for tools or network. Idle means no instrumented invocation. Unknown means collection failed, exporter unavailable or observation older than 150 seconds. Uninstrumented manual CLIs are excluded. Updated about once per minute. Task links appear where metadata is available.",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "(clamp_max(max by (agent) (baton_running_by_agent{hostname=\"$host\"}), 1) and on() (max(baton_state_collect_success{hostname=\"$host\"}) == 1 and (time() - max(baton_activity_observed_at_seconds{hostname=\"$host\"})) < 150 and max(up{job=\"$node_job\",hostname=\"$host\"}) == 1)) or on(agent) (label_replace(vector(-1), \"agent\", \"claude\", \"\", \"\") or label_replace(vector(-1), \"agent\", \"cursor\", \"\", \"\") or label_replace(vector(-1), \"agent\", \"codex\", \"\", \"\"))",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "legendFormat": "{{agent}}",
+          "editorMode": "code"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "label_replace(label_join(label_replace(label_join((time() - max by (agent, role, stage, repo, issue, pr, run_id) (baton_current_execution_started_seconds{hostname=\"$host\"})) and on() (max(baton_state_collect_success{hostname=\"$host\"}) == 1 and (time() - max(baton_activity_observed_at_seconds{hostname=\"$host\"})) < 150 and max(up{job=\"$node_job\",hostname=\"$host\"}) == 1), \"repo_issue\", \";\", \"repo\", \"issue\"), \"issue_link\", \"[$2](https://github.com/$1/issues/$2)\", \"repo_issue\", \"(.+);([1-9][0-9]*)\"), \"repo_pr\", \";\", \"repo\", \"pr\"), \"pr_link\", \"[$2](https://github.com/$1/pull/$2)\", \"repo_pr\", \"(.+);([1-9][0-9]*)\")",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "legendFormat": "{{agent}}",
+          "editorMode": "code"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "agent",
+            "mode": "outerTabular"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Time 1": true,
+              "Time 2": true,
+              "run_id": true,
+              "issue": true,
+              "repo_issue": true,
+              "pr": true,
+              "repo_pr": true
+            },
+            "indexByName": {
+              "agent": 0,
+              "Value #A": 1,
+              "role": 2,
+              "stage": 3,
+              "repo": 4,
+              "Value #B": 7,
+              "issue_link": 5,
+              "pr_link": 6
+            },
+            "renameByName": {
+              "agent": "Agent",
+              "Value #A": "State",
+              "role": "Role",
+              "stage": "Stage",
+              "repo": "Repo",
+              "Value #B": "Elapsed",
+              "issue_link": "Issue",
+              "pr_link": "PR"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "width": 150
+          },
+          "noValue": "\u2014"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "State"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "-1": {
+                        "text": "Unknown",
+                        "color": "orange"
+                      },
+                      "0": {
+                        "text": "Idle",
+                        "color": "#52545c"
+                      },
+                      "1": {
+                        "text": "Running",
+                        "color": "green"
+                      }
+                    }
+                  },
+                  {
+                    "type": "special",
+                    "options": {
+                      "match": "nan",
+                      "result": {
+                        "text": "Unknown",
+                        "color": "orange"
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Agent"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "claude": {
+                        "text": "Claude Code"
+                      },
+                      "cursor": {
+                        "text": "Cursor Agent"
+                      },
+                      "codex": {
+                        "text": "Codex"
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Elapsed"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Issue"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "markdown"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "special",
+                    "options": {
+                      "match": "null+nan",
+                      "result": {
+                        "text": "\u2014"
+                      }
+                    }
+                  },
+                  {
+                    "type": "special",
+                    "options": {
+                      "match": "empty",
+                      "result": {
+                        "text": "\u2014"
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "PR"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "markdown"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "special",
+                    "options": {
+                      "match": "null+nan",
+                      "result": {
+                        "text": "\u2014"
+                      }
+                    }
+                  },
+                  {
+                    "type": "special",
+                    "options": {
+                      "match": "empty",
+                      "result": {
+                        "text": "\u2014"
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "sortBy": [
+          {
+            "displayName": "Agent",
+            "desc": false
+          }
+        ]
+      }
+    },
+    {
+      "id": 100,
+      "type": "row",
+      "title": "Quota history & scheduling",
+      "gridPos": {
+        "x": 0,
+        "y": 29,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
       "id": 102,
       "type": "text",
       "title": "Quota interpretation",
       "gridPos": {
         "x": 0,
-        "y": 29,
+        "y": 30,
         "w": 24,
         "h": 4
       },
       "options": {
         "mode": "markdown",
-        "content": "**5h / Weekly Remaining** = account quota left in the provider window. Weekly resets follow the provider, not calendar weeks. **Runner Left (pp)** = max(weekly cap − used, 0), in percentage points of account quota. Limits come from the runner's effective configuration.\n\n**Fresh / Stale** refer to each window’s last successful observation; stale balances retain that value. **Reset pending / Unknown / Unsupported** show N/A until data is available. Cursor has no quota source. Probe attempts do not refresh observation times. **Quota Gate** covers quota and cooldown only; role rules, PR contributions and reviewer exclusions also affect dispatch."
+        "content": "**5h / Weekly Remaining** = account quota left in the provider window. Weekly resets follow the provider, not calendar weeks. **Runner Left (pp)** = max(weekly cap \u2212 used, 0), in percentage points of account quota. Limits come from the runner's effective configuration.\n\n**Fresh / Stale** refer to each window\u2019s last successful observation; stale balances retain that value. **Reset pending / Unknown / Unsupported** show N/A until data is available. Cursor has no quota source. Probe attempts do not refresh observation times. **Quota Gate** covers quota and cooldown only; role rules, PR contributions and reviewer exclusions also affect dispatch."
       }
     },
     {
@@ -1312,7 +1388,7 @@
       "description": "Last observed quota remaining. Stale values retain their last observation; reset-pending and unknown values leave gaps. No extrapolation or calendar-week aggregation. History starts at deployment.",
       "gridPos": {
         "x": 0,
-        "y": 33,
+        "y": 34,
         "w": 12,
         "h": 8
       },
@@ -1380,7 +1456,7 @@
       "description": "Last observed quota remaining. Stale values retain their last observation; reset-pending and unknown values leave gaps. No extrapolation or calendar-week aggregation. History starts at deployment.",
       "gridPos": {
         "x": 12,
-        "y": 33,
+        "y": 34,
         "w": 12,
         "h": 8
       },
@@ -1444,11 +1520,11 @@
     {
       "id": 2,
       "type": "row",
-      "title": "Now · scheduler and collection",
+      "title": "Now \u00b7 scheduler and collection",
       "description": "",
       "gridPos": {
         "x": 0,
-        "y": 41,
+        "y": 42,
         "w": 24,
         "h": 1
       },
@@ -1462,7 +1538,7 @@
       "description": "",
       "gridPos": {
         "x": 0,
-        "y": 42,
+        "y": 43,
         "w": 3,
         "h": 4
       },
@@ -1540,7 +1616,7 @@
       "description": "",
       "gridPos": {
         "x": 3,
-        "y": 42,
+        "y": 43,
         "w": 3,
         "h": 4
       },
@@ -1618,7 +1694,7 @@
       "description": "",
       "gridPos": {
         "x": 6,
-        "y": 42,
+        "y": 43,
         "w": 3,
         "h": 4
       },
@@ -1696,7 +1772,7 @@
       "description": "",
       "gridPos": {
         "x": 9,
-        "y": 42,
+        "y": 43,
         "w": 3,
         "h": 4
       },
@@ -1774,7 +1850,7 @@
       "description": "A held lock can represent CLI work, CI waits, dispatch or a runner started before instrumentation. It does not by itself prove a healthy agent invocation.",
       "gridPos": {
         "x": 12,
-        "y": 42,
+        "y": 43,
         "w": 3,
         "h": 4
       },
@@ -1852,7 +1928,7 @@
       "description": "Known instrumented CLI invocations only. Zero does not mean the runner is idle; check the lock. Interrupted invocations are reconciled by the independent collector.",
       "gridPos": {
         "x": 15,
-        "y": 42,
+        "y": 43,
         "w": 3,
         "h": 4
       },
@@ -1915,7 +1991,7 @@
       "description": "Age since the last successful independent state read. Unknown if it has never succeeded.",
       "gridPos": {
         "x": 18,
-        "y": 42,
+        "y": 43,
         "w": 3,
         "h": 4
       },
@@ -1978,7 +2054,7 @@
       "description": "Last received independent self-scrape value. Check sample age below; a stale Up sample is not current health.",
       "gridPos": {
         "x": 21,
-        "y": 42,
+        "y": 43,
         "w": 3,
         "h": 4
       },
@@ -2056,7 +2132,7 @@
       "description": "",
       "gridPos": {
         "x": 0,
-        "y": 46,
+        "y": 47,
         "w": 6,
         "h": 4
       },
@@ -2134,7 +2210,7 @@
       "description": "",
       "gridPos": {
         "x": 6,
-        "y": 46,
+        "y": 47,
         "w": 6,
         "h": 4
       },
@@ -2197,7 +2273,7 @@
       "description": "Local collector acceptance, not a guarantee of durable backend storage. Stable event IDs support deduplication.",
       "gridPos": {
         "x": 12,
-        "y": 46,
+        "y": 47,
         "w": 6,
         "h": 4
       },
@@ -2275,7 +2351,7 @@
       "description": "Unknown before the first instrumented scheduled tick. Paused and lock-busy ticks still record their start. No NoTick alert is enabled.",
       "gridPos": {
         "x": 18,
-        "y": 46,
+        "y": 47,
         "w": 6,
         "h": 4
       },
@@ -2338,7 +2414,7 @@
       "description": "The host's /tmp is a tmpfs (half the RAM) with a per-user quota; when it fills, runs and deploys fail with \"Disk quota exceeded\" (#248). The agent user writes nearly all of it, so the mount total stands in for that user's quota use. node_exporter filesystem collector; display only, no alert.",
       "gridPos": {
         "x": 0,
-        "y": 50,
+        "y": 51,
         "w": 6,
         "h": 4
       },
@@ -2410,7 +2486,7 @@
       "description": "The host's /tmp is a tmpfs (half the RAM) with a per-user quota; when it fills, runs and deploys fail with \"Disk quota exceeded\" (#248). The agent user writes nearly all of it, so the mount total stands in for that user's quota use. node_exporter filesystem collector; display only, no alert.",
       "gridPos": {
         "x": 6,
-        "y": 50,
+        "y": 51,
         "w": 18,
         "h": 4
       },
@@ -2484,7 +2560,7 @@
       "description": "",
       "gridPos": {
         "x": 0,
-        "y": 54,
+        "y": 55,
         "w": 24,
         "h": 1
       },
@@ -2498,7 +2574,7 @@
       "description": "Actual runner daily counters, including manual invocations and CLI launches that fail before producing usage. These are distinct from completed summaries.",
       "gridPos": {
         "x": 0,
-        "y": 55,
+        "y": 56,
         "w": 8,
         "h": 4
       },
@@ -2561,7 +2637,7 @@
       "description": "Read from current runner configuration; manual invocations bypass the scheduled cap. No quota is changed by monitoring.",
       "gridPos": {
         "x": 8,
-        "y": 55,
+        "y": 56,
         "w": 8,
         "h": 4
       },
@@ -2624,7 +2700,7 @@
       "description": "Zero means no remaining cooldown. Unknown means a state read failed.",
       "gridPos": {
         "x": 16,
-        "y": 55,
+        "y": 56,
         "w": 8,
         "h": 4
       },
@@ -2687,7 +2763,7 @@
       "description": "Local-date counters reset at the host's midnight, including idle periods.",
       "gridPos": {
         "x": 0,
-        "y": 59,
+        "y": 60,
         "w": 12,
         "h": 7
       },
@@ -2751,7 +2827,7 @@
       "description": "May exceed 100% because manual invocations bypass the cap. A missing/zero cap is unavailable, not unlimited.",
       "gridPos": {
         "x": 12,
-        "y": 59,
+        "y": 60,
         "w": 12,
         "h": 7
       },
@@ -2815,7 +2891,7 @@
       "description": "",
       "gridPos": {
         "x": 0,
-        "y": 66,
+        "y": 67,
         "w": 24,
         "h": 1
       },
@@ -2829,7 +2905,7 @@
       "description": "",
       "gridPos": {
         "x": 0,
-        "y": 67,
+        "y": 68,
         "w": 24,
         "h": 3
       },
@@ -2845,7 +2921,7 @@
       "description": "",
       "gridPos": {
         "x": 16,
-        "y": 70,
+        "y": 71,
         "w": 8,
         "h": 4
       },
@@ -2864,7 +2940,7 @@
           "queryType": "instant",
           "editorMode": "code",
           "maxLines": 500,
-          "legendFormat": "{{agent}} · {{usage_state}}"
+          "legendFormat": "{{agent}} \u00b7 {{usage_state}}"
         }
       ],
       "options": {
@@ -2908,7 +2984,7 @@
       "description": "",
       "gridPos": {
         "x": 0,
-        "y": 70,
+        "y": 71,
         "w": 16,
         "h": 4
       },
@@ -2927,7 +3003,7 @@
           "queryType": "instant",
           "editorMode": "code",
           "maxLines": 500,
-          "legendFormat": "{{agent}} · Non-cached input"
+          "legendFormat": "{{agent}} \u00b7 Non-cached input"
         },
         {
           "refId": "B",
@@ -2939,7 +3015,7 @@
           "queryType": "instant",
           "editorMode": "code",
           "maxLines": 500,
-          "legendFormat": "{{agent}} · Cache read"
+          "legendFormat": "{{agent}} \u00b7 Cache read"
         },
         {
           "refId": "C",
@@ -2951,7 +3027,7 @@
           "queryType": "instant",
           "editorMode": "code",
           "maxLines": 500,
-          "legendFormat": "{{agent}} · Cache creation"
+          "legendFormat": "{{agent}} \u00b7 Cache creation"
         },
         {
           "refId": "D",
@@ -2963,7 +3039,7 @@
           "queryType": "instant",
           "editorMode": "code",
           "maxLines": 500,
-          "legendFormat": "{{agent}} · Output"
+          "legendFormat": "{{agent}} \u00b7 Output"
         }
       ],
       "options": {
@@ -3003,11 +3079,11 @@
     {
       "id": 25,
       "type": "table",
-      "title": "Recent runs · select a trace to explore",
+      "title": "Recent runs \u00b7 select a trace to explore",
       "description": "One row per CLI invocation, deduplicated by event ID within the latest 500 records. CLI outcome is not task success. Task ID opens Loki; Trace ID opens Tempo. Configuration fingerprints contain no config contents. Unknown actual model stays unavailable. Requested model is configuration; actual model stays unknown when Auto does not disclose it. Quota probes have Role=probe and no task.",
       "gridPos": {
         "x": 0,
-        "y": 74,
+        "y": 75,
         "w": 24,
         "h": 11
       },
@@ -3398,11 +3474,11 @@
     {
       "id": 26,
       "type": "row",
-      "title": "Codex native telemetry · historical trends",
+      "title": "Codex native telemetry \u00b7 historical trends",
       "description": "",
       "gridPos": {
         "x": 0,
-        "y": 85,
+        "y": 86,
         "w": 24,
         "h": 1
       },
@@ -3416,7 +3492,7 @@
       "description": "",
       "gridPos": {
         "x": 0,
-        "y": 86,
+        "y": 87,
         "w": 24,
         "h": 3
       },
@@ -3432,7 +3508,7 @@
       "description": "Codex only. Empty intervals mean no valid rate sample, not zero consumption. Native metrics have no role/issue labels, so the role filter does not apply.",
       "gridPos": {
         "x": 0,
-        "y": 89,
+        "y": 90,
         "w": 12,
         "h": 7
       },
@@ -3448,7 +3524,7 @@
             "uid": "${prometheus}"
           },
           "expr": "sum by (model, token_type) (rate(codex_turn_token_usage_sum{agent=\"codex\",host_name=\"$host\",agent=~\"${agent:regex}\",token_type=~\"input|cached_input|cache_write_input\"}[$__rate_interval]))",
-          "legendFormat": "{{model}} · {{token_type}}",
+          "legendFormat": "{{model}} \u00b7 {{token_type}}",
           "instant": false,
           "range": true,
           "editorMode": "code"
@@ -3496,7 +3572,7 @@
       "description": "Codex only. Empty intervals mean no valid rate sample, not zero consumption. Native metrics have no role/issue labels, so the role filter does not apply.",
       "gridPos": {
         "x": 12,
-        "y": 89,
+        "y": 90,
         "w": 12,
         "h": 7
       },
@@ -3512,7 +3588,7 @@
             "uid": "${prometheus}"
           },
           "expr": "sum by (model, token_type) (rate(codex_turn_token_usage_sum{agent=\"codex\",host_name=\"$host\",agent=~\"${agent:regex}\",token_type=~\"output|reasoning_output\"}[$__rate_interval]))",
-          "legendFormat": "{{model}} · {{token_type}}",
+          "legendFormat": "{{model}} \u00b7 {{token_type}}",
           "instant": false,
           "range": true,
           "editorMode": "code"
@@ -3560,7 +3636,7 @@
       "description": "Native Codex tool counters only. Role filtering is unavailable on bounded native metrics.",
       "gridPos": {
         "x": 0,
-        "y": 96,
+        "y": 97,
         "w": 12,
         "h": 7
       },
@@ -3624,7 +3700,7 @@
       "description": "Native histogram sum/count, excluding idle intervals without observations.",
       "gridPos": {
         "x": 12,
-        "y": 96,
+        "y": 97,
         "w": 12,
         "h": 7
       },
@@ -3684,11 +3760,11 @@
     {
       "id": 38,
       "type": "row",
-      "title": "Claude native telemetry · historical trends",
+      "title": "Claude native telemetry \u00b7 historical trends",
       "description": "",
       "gridPos": {
         "x": 0,
-        "y": 103,
+        "y": 104,
         "w": 24,
         "h": 1
       },
@@ -3702,7 +3778,7 @@
       "description": "Native claude_code.token.usage from run_claude (metrics only; session/user ids dropped on the host). type: input, output, cacheRead, cacheCreation; query_source: main, subagent, auxiliary.",
       "gridPos": {
         "x": 0,
-        "y": 104,
+        "y": 105,
         "w": 12,
         "h": 7
       },
@@ -3718,7 +3794,7 @@
             "uid": "${prometheus}"
           },
           "expr": "sum by (model, type, query_source) (rate(claude_code_token_usage_total{agent=\"claude\",host_name=\"$host\",agent=~\"${agent:regex}\"}[$__rate_interval]))",
-          "legendFormat": "{{model}} · {{type}} · {{query_source}}",
+          "legendFormat": "{{model}} \u00b7 {{type}} \u00b7 {{query_source}}",
           "instant": false,
           "range": true,
           "editorMode": "code"
@@ -3766,7 +3842,7 @@
       "description": "Native claude_code.cost.usage: Claude Code's own USD estimate at API prices. Under a subscription it is a relative measure, not a bill.",
       "gridPos": {
         "x": 12,
-        "y": 104,
+        "y": 105,
         "w": 12,
         "h": 7
       },
@@ -3830,7 +3906,7 @@
       "description": "",
       "gridPos": {
         "x": 0,
-        "y": 111,
+        "y": 112,
         "w": 24,
         "h": 1
       },
@@ -3840,11 +3916,11 @@
     {
       "id": 33,
       "type": "table",
-      "title": "Task history · select a task to inspect events",
+      "title": "Task history \u00b7 select a task to inspect events",
       "description": "Latest snapshot per task episode within the latest 500 matching records. Active means no terminal event has been observed, not that a CLI is running. Task totals span all vendors and ignore Agent/Role filters. A token category is N/A if any completed invocation lacks complete usage. Duration ends at the last observed event; it does not keep increasing while idle. Elapsed includes idle time. Recorded active spans completed attempts; timing coverage is partial for mixed old/new history. Model, local checks and CI wait are measured separately; absent history stays unavailable.",
       "gridPos": {
         "x": 0,
-        "y": 112,
+        "y": 113,
         "w": 24,
         "h": 10
       },
@@ -4377,11 +4453,11 @@
     {
       "id": 34,
       "type": "table",
-      "title": "Task events · reviews, CI and handoffs",
+      "title": "Task events \u00b7 reviews, CI and handoffs",
       "description": "Deduplicated task events from rollout onward; all vendors, independent of Agent/Role filters. CI no_checks, pending, timeout and infrastructure errors are distinct from pass/failure. Planned approval is separate from abnormal handoff. Click Task ID for the full Loki history.",
       "gridPos": {
         "x": 0,
-        "y": 122,
+        "y": 123,
         "w": 24,
         "h": 10
       },
@@ -4681,13 +4757,13 @@
       "title": "Detailed logs in Loki Explore",
       "gridPos": {
         "x": 0,
-        "y": 132,
+        "y": 133,
         "w": 24,
         "h": 3
       },
       "options": {
         "mode": "markdown",
-        "content": "[Open runner events and summaries](/explore?schemaVersion=1&panes={%22logs%22%3A{%22datasource%22%3A%22${loki}%22%2C%22queries%22%3A%5B{%22refId%22%3A%22A%22%2C%22datasource%22%3A{%22type%22%3A%22loki%22%2C%22uid%22%3A%22${loki}%22}%2C%22expr%22%3A%22{source%3D%5C%22runner%5C%22%2Chost%3D%5C%22${host}%5C%22}%22%2C%22queryType%22%3A%22range%22}%5D%2C%22range%22%3A{%22from%22%3A%22${__from}%22%2C%22to%22%3A%22${__to}%22}}}) · [Open native Codex events](/explore?schemaVersion=1&panes={%22logs%22%3A{%22datasource%22%3A%22${loki}%22%2C%22queries%22%3A%5B{%22refId%22%3A%22A%22%2C%22datasource%22%3A{%22type%22%3A%22loki%22%2C%22uid%22%3A%22${loki}%22}%2C%22expr%22%3A%22{agent%3D%5C%22codex%5C%22%2Chost%3D%5C%22${host}%5C%22}%22%2C%22queryType%22%3A%22range%22}%5D%2C%22range%22%3A{%22from%22%3A%22${__from}%22%2C%22to%22%3A%22${__to}%22}}})\n\nUse the Task ID links above to inspect one episode. Raw JSON is available in Explore; this dashboard shows summaries and typed event columns."
+        "content": "[Open runner events and summaries](/explore?schemaVersion=1&panes={%22logs%22%3A{%22datasource%22%3A%22${loki}%22%2C%22queries%22%3A%5B{%22refId%22%3A%22A%22%2C%22datasource%22%3A{%22type%22%3A%22loki%22%2C%22uid%22%3A%22${loki}%22}%2C%22expr%22%3A%22{source%3D%5C%22runner%5C%22%2Chost%3D%5C%22${host}%5C%22}%22%2C%22queryType%22%3A%22range%22}%5D%2C%22range%22%3A{%22from%22%3A%22${__from}%22%2C%22to%22%3A%22${__to}%22}}}) \u00b7 [Open native Codex events](/explore?schemaVersion=1&panes={%22logs%22%3A{%22datasource%22%3A%22${loki}%22%2C%22queries%22%3A%5B{%22refId%22%3A%22A%22%2C%22datasource%22%3A{%22type%22%3A%22loki%22%2C%22uid%22%3A%22${loki}%22}%2C%22expr%22%3A%22{agent%3D%5C%22codex%5C%22%2Chost%3D%5C%22${host}%5C%22}%22%2C%22queryType%22%3A%22range%22}%5D%2C%22range%22%3A{%22from%22%3A%22${__from}%22%2C%22to%22%3A%22${__to}%22}}})\n\nUse the Task ID links above to inspect one episode. Raw JSON is available in Explore; this dashboard shows summaries and typed event columns."
       }
     },
     {
@@ -4697,7 +4773,7 @@
       "description": "Run traces only; multi-tick pipeline episodes and CI spans are not yet implemented. Open a trace ID to inspect native Codex child spans and use Tempo trace-to-logs correlation.",
       "gridPos": {
         "x": 0,
-        "y": 135,
+        "y": 136,
         "w": 24,
         "h": 8
       },
@@ -4731,7 +4807,7 @@
       "description": "",
       "gridPos": {
         "x": 0,
-        "y": 143,
+        "y": 144,
         "w": 24,
         "h": 5
       },
@@ -4743,11 +4819,11 @@
     {
       "id": 120,
       "type": "row",
-      "title": "Vendor contribution · last 30 days (collect only)",
+      "title": "Vendor contribution \u00b7 last 30 days (collect only)",
       "description": "",
       "gridPos": {
         "x": 0,
-        "y": 148,
+        "y": 149,
         "w": 24,
         "h": 1
       },
@@ -4761,7 +4837,7 @@
       "description": "",
       "gridPos": {
         "x": 0,
-        "y": 149,
+        "y": 150,
         "w": 24,
         "h": 4
       },
@@ -4777,7 +4853,7 @@
       "description": "One row per implementing vendor and the model its dev run used. n = ended episodes. Merged / handoff rates are shares of n. First-round pass uses the first review verdict of each episode (n shown). Review rounds, time and tokens are per merged episode. Tokens exclude cache reads and cover complete runs only; Incomplete runs counts merged-episode runs without complete usage. Post-merge columns use merged PRs whose 14 days after merge have passed (n shown): a merged revert PR, or a `bug`-labelled issue in the same repository that references the PR. Label a regression `bug` and mention the PR for it to count.",
       "gridPos": {
         "x": 0,
-        "y": 153,
+        "y": 154,
         "w": 24,
         "h": 8
       },
@@ -5164,7 +5240,7 @@
       "description": "Ended episodes handed to the owner, by implementing vendor and runner reason code. auto_merge_off and manual_checks are planned handoffs; the rest are abnormal.",
       "gridPos": {
         "x": 0,
-        "y": 161,
+        "y": 162,
         "w": 24,
         "h": 7
       },
@@ -5252,7 +5328,7 @@
       "description": "PR review verdicts in ended episodes, by reviewing vendor. Must-fix items are the numbered entries under the review's \"## Must fix\" heading, recorded from 2026-10-27; reviews without a count are excluded from Must-fix per review (its n is shown). Adopted / rejected comes from the fixer's `## Must fix` answers to that round's review (recorded from 2026-10-27); owner rejections are not counted.",
       "gridPos": {
         "x": 0,
-        "y": 168,
+        "y": 169,
         "w": 24,
         "h": 6
       },
@@ -5475,7 +5551,7 @@
       "description": "Every run that ended in the last 30 days, task or not. Model is what the run's own log reports (Codex: its session rollout; Claude: stream-json init; Cursor reports only Auto, shown as unknown). Token averages are per run with complete usage (n shown). Use with #245 to compare Codex models per role.",
       "gridPos": {
         "x": 0,
-        "y": 174,
+        "y": 175,
         "w": 24,
         "h": 9
       },

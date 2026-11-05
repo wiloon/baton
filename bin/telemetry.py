@@ -778,6 +778,25 @@ def count(path):
     return int(value)
 
 
+def retrospective_running(state):
+    """Sample the independent worker without creating state or waiting for it.
+
+    The worker holds this lock across both catch-up checks and task analysis.
+    A persistent lock file alone does not imply activity; flock is authoritative.
+    """
+    try:
+        stream = (Path(state) / 'retrospectives' / 'worker.lock').open('r')
+    except FileNotFoundError:
+        return 0
+    with stream:
+        try:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 1
+        fcntl.flock(stream, fcntl.LOCK_UN)
+    return 0
+
+
 def interval_activity(records, previous, now, emit):
     """Any invocation overlap, including runs completed between observations.
 
@@ -984,6 +1003,9 @@ def collect(ledger, config, output):
     # A never-created timestamp is unknown; collection itself can still succeed.
     # Timer active_since is the baseline for the future no-tick alert.
     emit('last_scheduled_tick_seconds', tick)
+    retrospective = attempt(lambda: retrospective_running(ledger.state), math.nan)
+    emit('retrospective_running', retrospective)
+    emit('retrospective_observed_at_seconds', now if math.isfinite(retrospective) else math.nan)
     records = attempt(ledger.reconcile, None)
     activity_metrics(records, emit, now, ledger.state)
     running = [r for r in (records or []) if r['status'] == 'running']
