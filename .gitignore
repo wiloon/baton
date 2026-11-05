@@ -3,6 +3,7 @@ __pycache__/
 .pytest_cache/
 config.toml
 config.toml.*
+/.codex/
 .env
 .env.*
 !.env.example
