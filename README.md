@@ -194,6 +194,12 @@ plus Claude Code's and Codex's own OTLP metrics, to Prometheus, Loki and Tempo. 
 current runs, quota headroom per vendor and the task history. Only metadata leaves the host.
 Setup: [telemetry/README.md](telemetry/README.md).
 
+## Development roadmap
+
+The [continuous improvement plan](docs/plans/continuous-improvement.md) describes an independent
+loop for evaluating execution quality, model choices and consumption. Its first planned delivery
+is [automatic task retrospectives](docs/specs/task-retrospectives.md); it is not implemented yet.
+
 ## A note on history
 
 baton was extracted from a private infrastructure repository where it ran for months against one
