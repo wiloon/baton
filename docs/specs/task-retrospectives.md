@@ -123,11 +123,17 @@ test an explicit retrospective pause control; the workload runner being busy or 
 by itself pause retrospectives. Analysis invocations must be distinguishable from workload/probe
 invocations, cannot attach to a workload episode and cannot recursively trigger retrospectives.
 
-The first adapter uses explicitly configured Claude Code in tool-free safe mode. A nonblocking
-per-vendor lease is shared with workload dispatch, selection and quota probes: different vendors
-can run concurrently, while same-vendor CLI calls defer or select another vendor. The lease does
-not preempt an in-flight analysis; its deadline bounds the possible delay. See the
-[operating guide](../retrospectives.md) for configuration, account gates and limitations.
+The analyst role uses only Opus (Claude Code), GPT Sol (Codex) and Grok 4.7 (Cursor).
+The shared vendor-policy module supplies review-style quota pacing, preferences, cooldowns and
+capacity checks to both workload reviews and retrospectives; author/contribution constraints
+remain review-specific. Retro candidates additionally require fresh authenticated capacity.
+A nonblocking per-vendor lease is shared with workload dispatch and quota probes. Selection,
+per-vendor rejection reasons and requested/observed models are recorded. Sonnet and Auto are not
+eligible and no implicit weaker-model fallback is configured. A failed vendor is deprioritized
+on the next activation without resetting the shared retry/daily/call budgets. Each adapter uses
+restricted evidence-only execution with the same output validation and telemetry normalization.
+The USD CLI cap exists only for Claude; other adapters record the available time/call/size limits.
+See the [operating guide](../retrospectives.md) for migration and CLI limitations.
 
 ### Invocation and deployment
 

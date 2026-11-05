@@ -255,10 +255,17 @@ enable_claudeai_mcp_servers = false
 # [telegram]                notifications go to this chat as well as runner.log
 # env_file = "~/.config/baton/telegram.env"   # TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
-# Optional. The evidence report needs no model; an empty model disables paid analysis.
-# Set an explicit Claude model ID after checking the host's supported models and login.
+# Optional evidence analysis: share review quota/preference policy, restricted to Opus/Sol/Grok 4.7.
+# Global quota.vendor_pool/vendor_extra still determines which CLI vendors are enabled.
+# preferences.retrospective overrides preferences.reviewer for this role (otherwise reused).
 [retrospectives]
+enabled = false
+# Deprecated opt-in compatibility only. Never used as a requested model, including old Sonnet values.
 model = ""
+model_claude = "opus"
+model_codex = "gpt-6.1-sol"
+model_cursor = "grok-4.7-high"
+effort = "high"
 paused = false
 settle_seconds = 300
 daily_calls = 3

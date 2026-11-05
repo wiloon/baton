@@ -9,7 +9,6 @@ from dataclasses import asdict
 import datetime as dt
 import fcntl
 import json
-import math
 import os
 from pathlib import Path
 import signal
@@ -18,7 +17,7 @@ import tempfile
 import time
 import uuid
 
-from . import capacity, quota, vendors
+from . import analyst_pool, vendor_policy
 from .config import ConfigError, load
 from .retrospective_analyst import ANALYZER_VERSION, analyze, prompt_for
 from .retrospective_evidence import EvidenceError, Ledger, VERSION, digest, encoded, eligible, evidence, markdown
@@ -67,30 +66,6 @@ def worker_lock(root):
             yield True
         finally:
             fcntl.flock(file, fcntl.LOCK_UN)
-
-
-def vendor_gate(config, state, now):
-    vendor = 'claude'
-    if vendor not in (*config.quota.vendor_pool, *config.quota.vendor_extra):
-        return 'vendor_disabled'
-    if vendors.vendor_blocked(state, vendor, int(now)):
-        return 'vendor_cooldown'
-    credential = read(state / 'credential-claude.json', {})
-    if credential.get('result') != 'authenticated' or now - credential.get('observed_at', 0) > 86400:
-        return 'credential_unavailable'
-    snapshot = quota.load(state, vendor)
-    if not snapshot or quota.stale(state, vendor, now, config.quota.quota_stale_minutes):
-        return 'quota_stale'
-    windows = snapshot.get('windows', {})
-    if not {'five_hour', 'seven_day'} <= windows.keys() or any(
-            not isinstance(w, dict) or type(w.get('used')) not in (int, float)
-            or not math.isfinite(w['used']) or not 0 <= w['used'] <= 1
-            or now - w.get('observed_at', 0) > config.quota.quota_stale_minutes * 60
-            or w.get('observed_at', 0) > now + 60 or w.get('resets_at', 0) <= now
-            for w in windows.values()):
-        return 'quota_stale'
-    _, blocked = quota.assess(snapshot, config.quota.quota_cap_claude, config.quota.quota_five_hour_max, now)
-    return 'quota_exhausted' if blocked else ''
 
 
 def publish(output, key, revision, report):
@@ -188,6 +163,8 @@ def run(config, state, root, output, repo='', pipeline='', retry=False):
             source = digest(snapshot)
             policy = asdict(settings)
             policy.pop('paused')
+            policy.pop('model')
+            policy['enabled'] = analyst_pool.enabled(config)
             revision = digest(dict(key=key, source=source, schema=VERSION, analyzer=ANALYZER_VERSION, policy=policy))
             if not same_source(state, key, source):
                 results.append(dict(repo=key[0], pipeline_id=key[1], state='deferred', reason='evidence_changed'))
@@ -196,7 +173,7 @@ def run(config, state, root, output, repo='', pipeline='', retry=False):
             mine = [a for a in attempts if a['revision'] == revision]
             previous = current(output, key, revision)
             if previous and (previous['analysis_state'] == 'success' or
-                             (not settings.model and previous['analysis_state'] == 'not_configured')):
+                             (not analyst_pool.enabled(config) and previous['analysis_state'] == 'not_configured')):
                 results.append(dict(repo=key[0], pipeline_id=key[1], state='unchanged'))
                 continue
             if previous:
@@ -205,7 +182,7 @@ def run(config, state, root, output, repo='', pipeline='', retry=False):
             success = next((a for a in reversed(mine) if a['state'] == 'success'), None)
             if success:
                 report.update(analysis_state='success', assessment=success['assessment'])
-            elif not settings.model:
+            elif not analyst_pool.enabled(config):
                 report['analysis_state'] = 'not_configured'
             else:
                 reset_path = root / 'retries' / (revision + '.json')
@@ -229,8 +206,10 @@ def run(config, state, root, output, repo='', pipeline='', retry=False):
                 report['analysis_reason'] = reason
                 report['analysis_attempts'] = mine
                 if not reason:
-                    with capacity.lease(state, 'claude') as available:
-                        reason = 'vendor_capacity' if not available else vendor_gate(config, state, now)
+                    failed = {a['vendor'] for a in mine if a['state'] != 'success'}
+                    with analyst_pool.reserve(config, state, now, failed) as (analyst, available, selection):
+                        report['selection'] = selection
+                        reason = selection['reason']
                         if reason:
                             report.update(analysis_state='deferred', analysis_reason=reason)
                         else:
@@ -242,7 +221,8 @@ def run(config, state, root, output, repo='', pipeline='', retry=False):
                             attempt_id = str(uuid.uuid4())
                             path = root / 'attempts' / (attempt_id + '.json')
                             attempt = dict(attempt_id=attempt_id, revision=revision, repo=key[0], pipeline_id=key[1],
-                                           kind='retrospective', vendor='claude', requested_model=settings.model,
+                                           kind='retrospective', vendor=analyst.vendor, requested_model=analyst.model,
+                                           effort=analyst.effort, selection=selection,
                                            started=time.time(), deadline=time.time() + settings.timeout_seconds,
                                            day=day, state='started', usage={'usage_state': 'unavailable'},
                                            limits=policy)
@@ -252,9 +232,10 @@ def run(config, state, root, output, repo='', pipeline='', retry=False):
                             calls += 1
                             # Never run in a task checkout, and never register this call as a workload.
                             with tempfile.TemporaryDirectory(prefix='analyst-', dir=root) as directory:
-                                result = analyze(config, prompt, Path(directory), report['facts'], available.fileno())
+                                result = analyze(config, analyst, prompt, Path(directory), report['facts'], available.fileno())
                             attempt.update(result, ended=time.time())
                             atomic(path, attempt)
+                            vendor_policy.observe_failure(state, analyst.vendor, result, time.time())
                             report.update(analysis_state='success' if result['state'] == 'success' else 'failed',
                                           analysis_reason='' if result['state'] == 'success' else result['state'],
                                           assessment=result.get('assessment'))

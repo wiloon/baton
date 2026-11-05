@@ -38,14 +38,19 @@ new revision. An unrelated active task does not prevent a completed episode's re
 ## Configure the analyst
 
 Evidence generation works without vendor access. The optional `[retrospectives]` section is
-backwards compatible; `model = ""` generates evidence-only reports (`not_configured`). The first
-analyst adapter uses **Claude Code**, with an explicitly configured model identifier. It does not
-inherit the workload's chosen model and has no automatic model fallback. Set a model supported by
-the target host's Claude login in `config.toml`; the example intentionally leaves it empty.
+backwards compatible and analysis is off unless `enabled = true` (or the legacy `model` opt-in is
+nonempty). Candidates are restricted to **Claude Opus via Claude Code**, **GPT Sol via Codex** and
+**Grok 4.7 via Cursor**. Sonnet, Auto and other model families are rejected in the role model
+fields. A deprecated `model = "sonnet"` from an old deployment is an opt-in flag only: its value is
+never forwarded to a CLI; the new strong-model fields supply actual requests.
 
 ```toml
 [retrospectives]
-model = "" # Replace with an explicit supported Claude model ID to enable analysis.
+enabled = true
+model_claude = "opus"
+model_codex = "gpt-6.1-sol"
+model_cursor = "grok-4.7-high"
+effort = "high"
 paused = false
 settle_seconds = 300
 daily_calls = 3
@@ -56,18 +61,41 @@ output_chars = 20000
 budget_usd = 1.0
 ```
 
-Analysis uses a fresh scratch directory, safe mode with tools/MCP/skills/hooks/memory disabled, no session persistence
-and no repository environment/secrets or workload telemetry context. Its bounded stdin contains
-only allowlisted ledger metadata, summary measurements and a bounded subset of run records. It
-cannot inspect raw logs or monitoring. Selection explanations currently remain unavailable:
-existing free-form runner log lines are deliberately not forwarded. The invocation flags follow
-the [Claude Code CLI reference](https://code.claude.com/docs/en/cli-reference); verify host CLI
-compatibility during deployment. Claude authentication uses its normal local credential store;
-runner integration and GitHub credentials are not forwarded. GNU `timeout` is required, as for
-the workload runner.
+The machine-wide `quota.vendor_pool` / `quota.vendor_extra` still enables vendors. The new
+`preferences.retrospective` order overrides `preferences.reviewer`; when absent the reviewer
+order is reused. The shared `baton.vendor_policy` module supplies cooldown/capacity checks,
+quota pacing, close-tie preferences and the review policy for extras. Workload review retains its
+own author/contribution constraints; retrospectives assess all eligible candidates without
+contribution weighting. Quota caps and unavailable credentials always take precedence over
+preferences. A lease race reselects another available vendor without waiting for the runner.
+
+A failed vendor is a last resort on the next activation for that report revision. All vendors
+share one invocation per activation, the UTC daily cap and the revision attempt allowance;
+switching vendors does not create extra attempts. If none is available, save the evidence with
+per-vendor selection reasons and defer. Model selection never falls back to Sonnet or Auto.
+
+Analysis uses a fresh scratch directory with a bounded evidence-only prompt. Claude uses safe
+mode with tools/MCP/skills/hooks/memory disabled, and no session persistence. Codex uses ephemeral
+read-only execution, ignores user config/rules, disables command execution, browsing, apps,
+plugins, memories and collaboration, and omits project/skill instructions. Cursor uses ask mode,
+an isolated CLI configuration linking its existing authentication file, and explicit deny rules
+for shell, file reads/writes, web fetch and MCP. No adapter runs in a task checkout, receives
+repository secrets or inherits workload telemetry context. Unexpected tool-call events or a
+reported model outside the approved families invalidate the assessment while preserving known
+usage and deterministic evidence. These CLI controls do not provide host isolation.
+
+The bounded summary includes only allowlisted ledger metadata, measurements and a bounded subset
+of run records. Raw logs or unrestricted monitoring are unavailable. Selection explanations for
+the original workload remain unavailable when they exist only in free-form runner logs; analyst
+selection itself is structured in each report/attempt. The invocation flags follow the
+[Claude CLI reference](https://code.claude.com/docs/en/cli-reference),
+[Codex configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference) and
+[Cursor permissions/configuration](https://prod.cursor.com/docs/cli/reference/permissions).
+Verify deployed CLI versions, authentication and the explicit Grok model ID during host acceptance.
+GNU `timeout` is required, as for workload execution.
 
 Before analysis, the selected vendor must be enabled and have a recent authenticated credential
-observation and fresh quota windows below configured caps, with no active cooldown. Missing or
+observation and fresh quota windows (weekly for Cursor; five-hour and weekly for the pool vendors) below configured caps, with no active cooldown. Missing or
 stale capacity evidence defers analysis; retrospectives do not run quota probes themselves. Check
 the existing telemetry/probe setup if the reports remain deferred. An unavailable executable or
 unsupported CLI flag preserves the evidence and consumes an attempt rather than retrying forever.
@@ -77,8 +105,15 @@ revision. One worker runs at a time. Failed and ambiguous attempts count. Calls 
 600-second deadline, at most 20,000 input characters including instructions, at most 20,000 accepted
 assessment characters, and Claude's configured `--max-budget-usd`. The CLI transport is separately
 bounded. Character and USD limits do not guarantee a fixed token count or subscription charge.
+The USD limit is enforced by Claude's CLI only; Codex/Cursor are bounded by time, serialized
+input/output size and call counts, their CLIs do not enforce `budget_usd`. Each attempt records
+which budget controls were available. `effort` selects high/xhigh reasoning for Claude/Codex;
+Cursor's reasoning level comes from its explicit high/xhigh model ID.
 Requested model, observed actual models, CLI version, limits and known usage are recorded per
-attempt separately from workload totals. Reasoning tokens are not added again to output totals;
+attempt separately from workload totals. An unknown actual model stays unknown rather than being
+inferred from the requested alias; this is particularly relevant to Cursor and ephemeral Codex
+output. A provider-reported Sonnet model is never accepted as an Opus/Grok/Sol result.
+Reasoning tokens are not added again to output totals;
 unknown and partial usage remain explicit. The USD figure is a reported API-equivalent cost,
 not a claim about subscription billing.
 

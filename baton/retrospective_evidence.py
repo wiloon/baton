@@ -200,6 +200,8 @@ def markdown(report):
         lines.append(f"| {field} | {measured(item)} | {item['reported_runs']}/{item['total_runs']} | {item['state']} |")
     lines += ['', 'Partial usage is a lower bound. Reasoning tokens overlap output and must not be added again.',
               'Probe overhead and retrospective usage are separate from workload totals.', '',
+              '## Analyst selection', '', '```json',
+              json.dumps(report.get('selection'), indent=2, sort_keys=True), '```', '',
               '## Analyst assessment', '']
     assessment = report.get('assessment')
     if assessment:
