@@ -259,3 +259,13 @@ def test_ci_result_is_unknown_when_the_head_moved(runner, tmp_path, monkeypatch)
     make_hooks(runner, pr=168).ci(168, 0, "%040d" % 1)
     call = runner.calls()[-1]
     assert call[call.index("--ci-result") + 1] == "unknown"
+
+
+def test_vendor_lease_defers_workload_without_starting_or_counting(runner):
+    from baton import capacity
+    with capacity.lease(runner.state_dir, 'claude') as available:
+        assert available
+        out = runner.run()
+    assert out['rc'] == 75 and out['defer'] == 'vendor capacity reserved'
+    assert not list(runner.state_dir.glob('runs-*'))
+    assert not (runner.root/'fake/calls').exists()

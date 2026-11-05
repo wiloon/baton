@@ -1,6 +1,6 @@
 # Automatic task retrospectives
 
-Status: ready for implementation planning. Stage 1 of the
+Status: implemented with offline tests; target-host acceptance pending. Stage 1 of the
 [continuous improvement plan](../plans/continuous-improvement.md), governed by the
 [independent-loop ADR](../adr/0001-independent-improvement-loop.md).
 
@@ -122,6 +122,12 @@ blocking workload execution. Keep workload priority and separate analysis budget
 test an explicit retrospective pause control; the workload runner being busy or paused does not
 by itself pause retrospectives. Analysis invocations must be distinguishable from workload/probe
 invocations, cannot attach to a workload episode and cannot recursively trigger retrospectives.
+
+The first adapter uses explicitly configured Claude Code in tool-free safe mode. A nonblocking
+per-vendor lease is shared with workload dispatch, selection and quota probes: different vendors
+can run concurrently, while same-vendor CLI calls defer or select another vendor. The lease does
+not preempt an in-flight analysis; its deadline bounds the possible delay. See the
+[operating guide](../retrospectives.md) for configuration, account gates and limitations.
 
 ### Invocation and deployment
 

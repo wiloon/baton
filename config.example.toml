@@ -254,3 +254,16 @@ enable_claudeai_mcp_servers = false
 #
 # [telegram]                notifications go to this chat as well as runner.log
 # env_file = "~/.config/baton/telegram.env"   # TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+
+# Optional. The evidence report needs no model; an empty model disables paid analysis.
+# Set an explicit Claude model ID after checking the host's supported models and login.
+[retrospectives]
+model = ""
+paused = false
+settle_seconds = 300
+daily_calls = 3
+revision_attempts = 2
+timeout_seconds = 600
+input_chars = 20000
+output_chars = 20000
+budget_usd = 1.0

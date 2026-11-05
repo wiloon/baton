@@ -21,7 +21,7 @@ from pathlib import Path
 import sys
 import time
 
-from . import agents, hooks as telemetry, notify, settle, vendors
+from . import agents, capacity, hooks as telemetry, notify, settle, vendors
 from .common import Request
 
 # Claude Code writes its prompt cache with a one-hour lifetime by default, at 2x the input price
@@ -77,6 +77,16 @@ def secret_overrides(env, role):
 @session.scoped
 def dispatch(vendor, role, prompt, tag, cwd, settings="", output="", env=None, hooks=None):
     env = session.resolve(env)
+    if vendor not in agents.ADAPTERS:
+        return _dispatch(vendor, role, prompt, tag, cwd, settings, output, env, hooks)
+    with capacity.lease(env.config.paths.state, vendor) as available:
+        if not available:
+            return {"rc": 75, "status": "deferred", "outcome": "", "reply": None,
+                    "model": "", "defer": "vendor capacity reserved"}
+        return _dispatch(vendor, role, prompt, tag, cwd, settings, output, env, hooks)
+
+
+def _dispatch(vendor, role, prompt, tag, cwd, settings, output, env, hooks):
     # Cooldowns and run counts are the machine's; the run's log is its repository's.
     state, logs = str(env.config.paths.state), str(env.dirs.logs)
     cooldown_hours = int(env.config.scheduling.cooldown_hours or agents.COOLDOWN_HOURS)

@@ -1,0 +1,13 @@
+[Unit]
+Description=baton completed task retrospectives (independent of workload execution)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/baton
+ExecStart=/usr/bin/uv run --quiet --frozen --no-dev --project %h/baton --directory %h/baton python -m baton.retrospectives catch-up
+TimeoutStartSec=12min
+KillMode=control-group
+Nice=15
+UMask=0077

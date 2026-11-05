@@ -1,6 +1,6 @@
 # Continuous improvement of BATON
 
-Status: agreed direction; implementation has not started. First delivery:
+Status: Stage 1 implemented with offline tests; target-host acceptance pending. First delivery:
 [automatic task retrospectives](../specs/task-retrospectives.md).
 
 Tracking: [plan #3](https://github.com/wiloon/baton/issues/3),
@@ -95,7 +95,7 @@ step because local evidence can identify private repositories and contain task c
 ## Progress and follow-up decisions
 
 - [x] Record background, terms, architectural boundary and staged plan.
-- [ ] Implement Stage 1 and its offline acceptance tests.
+- [x] Implement Stage 1 and its offline acceptance tests.
 - [ ] Validate Stage 1 on the target host, including ledger coverage, concurrent workload execution and retrospective pause/capacity behavior.
 - [ ] Compare the first three available eligible episode reports with owner review; include a
   handoff case when available, or use an offline fixture and record that live coverage gap.
