@@ -163,6 +163,8 @@ With several `[[repos]]`, put `--repo OWNER/NAME` before the command.
 | Unit | What it does |
 | --- | --- |
 | `baton.timer` / `.service` | a tick every 10 minutes |
+| `baton-quota.*` | every 5 minutes after completion: refreshes only stale vendor quota observations |
+| `baton-retrospectives.*` | every minute after completion: analyzes eligible task episodes |
 | `baton-tmp-sweep.*` | hourly: removes the agents' stale `/tmp` files |
 | `baton-postmerge.*` | every 6 hours: finds reverts of, and issues about, merged agent PRs (telemetry) |
 | `baton-e2e-nightly.*` | nightly: runs the repository's `nightly_hook` on `origin/main`, notifies when red |
@@ -172,7 +174,7 @@ The units assume the checkout is at `~/baton` and uv at `/usr/bin/uv`; adjust `E
 ## Configuration
 
 `config.example.toml` documents every key. Fields are required except the optional Cursor role
-overrides; the example has a working default for each. Edit the `[[repos]]` entry, choose your installed vendors in `[quota]`, and
+overrides and quota probe retry settings; the example has a working default for each. Edit the `[[repos]]` entry, choose your installed vendors in `[quota]`, and
 choose whether `[scheduling].auto_merge` should be enabled. The optional
 `[linear]` and `[telegram]` tables are at the end of the file.
 

@@ -209,6 +209,9 @@ quota_five_hour_max = 0.9
 quota_stale_minutes = 30
 # The Claude model the probe runs on.
 quota_probe_model_claude = "haiku"
+# Independent quota worker retries incomplete probes with exponential backoff.
+quota_probe_retry_minutes = 5
+quota_probe_max_retry_minutes = 60
 
 [preferences]
 # Vendor order by role, used only to break ties between vendors that may run (cooldowns, quota

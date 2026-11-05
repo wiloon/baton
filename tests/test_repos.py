@@ -250,8 +250,8 @@ def test_removing_an_owners_last_repository_does_not_block_the_remaining_reposit
     assert all(path.read_text() == "keep this repository's files" for path in kept)
 
 
-@pytest.mark.parametrize('directory', ['retrospectives', 'vendor-leases'])
-def test_retrospective_global_state_neither_blocks_startup_nor_gets_migrated(tmp_path, monkeypatch, capsys, directory):
+@pytest.mark.parametrize('directory', ['retrospectives', 'vendor-leases', 'quota-locks', 'quota-probes'])
+def test_global_state_neither_blocks_startup_nor_gets_migrated(tmp_path, monkeypatch, capsys, directory):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     c = load(tmp_path, TEXT)
     payload = c.paths.state / directory / "saved.json"

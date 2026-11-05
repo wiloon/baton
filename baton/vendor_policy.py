@@ -6,7 +6,6 @@ probe-and-retry behavior when observations are missing.
 """
 from dataclasses import dataclass
 import json
-import math
 from pathlib import Path
 
 from . import capacity, quota
@@ -38,26 +37,12 @@ def availability(state, settings, vendor, now, *, strict=False, leased=False):
         return Availability('quota_stale', 'quota observations invalid', True)
     if not strict:
         return Availability(stale=stale)
-    try:
-        credential = json.loads((Path(state) / f'credential-{vendor}.json').read_text())
-        if (credential.get('result') != 'authenticated' or
-                not 0 <= now - credential.get('observed_at', 0) <= 86400):
-            return Availability('credential_unavailable', 'credential unavailable')
-    except (OSError, ValueError, TypeError, AttributeError):
+    if not quota.credential_current(state, vendor, now):
         return Availability('credential_unavailable', 'credential unavailable')
     snap = quota.load(state, vendor) or {}
     if not isinstance(snap, dict):
         return Availability('quota_stale', 'quota observations invalid', True)
-    windows = snap.get('windows') or {}
-    required = {'seven_day'} if vendor == 'cursor' else {'five_hour', 'seven_day'}
-    try:
-        valid = required <= windows.keys() and all(
-            type(w.get('used')) in (int, float) and math.isfinite(w['used']) and 0 <= w['used'] <= 1
-            and 0 <= now - w.get('observed_at', 0) <= settings.quota_stale_minutes * 60
-            and w.get('resets_at', 0) > now for w in windows.values())
-    except (TypeError, AttributeError):
-        valid = False
-    if stale or not valid:
+    if not quota.fresh(state, vendor, now, settings.quota_stale_minutes):
         return Availability('quota_stale', 'quota observations stale or unavailable', True)
     _, blocked = quota.assess(snap, getattr(settings, f'quota_cap_{vendor}'), settings.quota_five_hour_max, now)
     return Availability('quota_exhausted', blocked) if blocked else Availability()
@@ -87,7 +72,7 @@ def observe_failure(state, vendor, result, now):
     Called while holding the vendor lease; analysis never emits workload notifications.
     """
     if result['state'] == 'auth':
-        quota.credential(state, vendor, 'auth_expired', int(now))
+        quota.credential(state, vendor, 'auth_expired', now)
     until = result.get('cooldown_until')
     if result['state'] in ('auth', 'quota', 'busy') and type(until) is int and until > now:
         path = Path(state) / f'{vendor}-cooldown-until'

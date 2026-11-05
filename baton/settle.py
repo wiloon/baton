@@ -45,7 +45,7 @@ def refresh_cursor(state):
     """Cursor's usage comes from its API, not from a run's output; a failure only leaves it
     unknown, which picks treat like before it was visible."""
     try:
-        windows = quota.refresh_cursor(state, int(time.time()))
+        windows = quota.refresh_cursor(state, time.time())
     except Exception as error:
         notify.log(f"quota: refreshing cursor failed: {error}")
         return
@@ -59,14 +59,14 @@ def record_quota(state, vendor, log):
         refresh_cursor(state)
     elif vendor in ("claude", "codex") and log:
         try:
-            quota.record_log(state, vendor, log, int(time.time()))
+            quota.record_log(state, vendor, log, time.time())
         except Exception:
             notify.log(f"quota: recording {vendor} from {log} failed")
 
 
 def record_credential(state, vendor, result):
     try:
-        quota.credential(state, vendor, result, int(time.time()))
+        quota.credential(state, vendor, result, time.time())
     except Exception:
         notify.log(f"credential: recording {vendor}={result} failed")
 
@@ -110,12 +110,14 @@ def probe_command(vendor, model, directory):
         "GH_TOKEN": "invalid", "GITHUB_TOKEN": "invalid", "GIT_SSH_COMMAND": "/bin/false"}
 
 
-def probe(state, logs, vendor, model):
+def probe(state, logs, vendor, model, *, needed=None):
     if vendor not in ("claude", "codex", "cursor"):
         return
     with capacity.lease(state, vendor) as available:
-        if available:
-            return _probe(state, logs, vendor, model)
+        if available and (needed is None or needed()):
+            _probe(state, logs, vendor, model)
+            return True
+    return False
 
 
 def _probe(state, logs, vendor, model):

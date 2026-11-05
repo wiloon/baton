@@ -15,7 +15,7 @@ import subprocess
 import time
 
 from .initialization import child_environment
-from . import agents
+from . import agents, quota
 from .codex_cli import UNUSED
 from .analyst_models import approved_model
 from .common import events
@@ -275,6 +275,14 @@ def analyze(config, analyst, prompt, workspace, facts, lease_fd):
             diagnostics['cooldown_until'] = until
     result = dict(state=status, usage=usage, actual_model=actual, actual_models=models,
                   cli_version=version, rc=rc, budget_enforcement='cli_usd' if analyst.vendor == 'claude' else 'deadline_and_call_caps')
+    # Ephemeral Codex has no persistent rollout to consult. Missing limits stay
+    # missing; the independent quota worker can refresh them later.
+    try:
+        lines = raw.decode(errors='replace').splitlines()
+        result['quota_windows'] = (quota.parse_claude(lines) if analyst.vendor == 'claude' else
+                                   quota.parse_codex(lines, str(workspace)) if analyst.vendor == 'codex' else {})
+    except (ValueError, TypeError, KeyError, OverflowError):
+        result['quota_windows'] = {}
     if diagnostics.get('cooldown_until'):
         result['cooldown_until'] = diagnostics['cooldown_until']
     if status != 'success':
