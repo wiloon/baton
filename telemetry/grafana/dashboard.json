@@ -989,6 +989,10 @@
               {
                 "id": "description",
                 "value": "Latest credential check: OK = authenticated; Expired = explicit authentication failure; Error = the check failed; Stale = last check is over 24h old; Unknown = no observation; Invalid = malformed credential metadata. Data age includes this check timestamp; it is not session lifetime."
+              },
+              {
+                "id": "custom.width",
+                "value": 80
               }
             ]
           }
