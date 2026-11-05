@@ -329,7 +329,9 @@ locations are outside this host-service view.
 - account balance;
 - weekly headroom in percentage points;
 - resets and window states;
-- the age of each observation.
+- Data age: the oldest required authentication/5h/weekly observation; unsupported
+  Cursor 5h is excluded, and missing or invalid required timestamps are Unknown.
+  The underlying timestamps remain separate.
 
 ## Tests
 
