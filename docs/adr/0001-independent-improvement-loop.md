@@ -29,5 +29,15 @@ by its own in-flight task. Evaluation criteria and release permissions have sepa
 the candidate changes they judge.
 
 The initial deployment uses another process on the existing runner host, not a new service stack.
-This is a lifecycle boundary, not a host-isolation guarantee. A shared host requires coordination
-of agent invocations, quota and execution priority.
+This is a lifecycle boundary, not a host-isolation guarantee. A completed episode can be assessed
+while the runner executes the next episode. Analysis uses its own workspace and worker lock,
+without holding the runner's execution lock; shared vendor capacity still requires coordination
+and workload priority.
+
+Reuse the existing durable task index and event outbox for handoff. An opt-in systemd timer wakes
+a separate consumer to reconcile completed episodes and its own processing state. Explicit task
+terminal states determine eligibility; evidence-settling delays do not establish completion.
+This avoids introducing a broker or database for the initial single-host volume and tolerates
+missed wake-ups through reconciliation. A synchronous callback would couple task completion to
+the consumer; a standalone message broker would add operations and dual-write failure handling.
+If lower latency becomes necessary, add an event notification while retaining periodic recovery.
