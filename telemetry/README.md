@@ -314,7 +314,9 @@ the dashboard JSON description rather than a visible text panel.
 a leftover file is idle and read failures are unknown. It does not contend with the
 workload lock or register retrospective calls as workload invocations.
 `baton_retrospective_observed_at_seconds` supplies freshness. The color-only timeline
-uses roughly minute samples, so brief checks or analyses between polls may be missed.
+uses roughly minute samples. `baton_retrospective_activity_in_interval` also reads
+completed attempt timestamps to retain analyses between polls; brief checks may be
+missed. First observations and gaps over 150 seconds have unknown interval coverage.
 Range aggregation preserves sampled work when zooming out. Custom `--work-state`
 locations are outside this host-service view.
 

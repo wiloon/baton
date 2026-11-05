@@ -96,6 +96,24 @@ class RetrospectiveActivityTests(unittest.TestCase):
                 self.assertEqual(t.retrospective_running(state), 1)
             self.assertEqual(t.retrospective_running(state), 0)
 
+    def test_completed_analysis_between_polls_is_visible_without_live_worker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            t.atomic(state / 'telemetry' / 'retrospective-last-observed', '100')
+            t.save(state / 'retrospectives' / 'attempts' / 'one.json',
+                   dict(started=120, ended=130))
+            self.assertEqual(t.retrospective_activity(state, 160), (0, 1))
+            self.assertEqual(t.retrospective_activity(state, 220), (0, 0))
+            self.assertTrue(math.isnan(t.retrospective_activity(state, 400)[1]))
+
+    def test_abandoned_attempt_does_not_fake_a_live_worker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            t.atomic(state / 'telemetry' / 'retrospective-last-observed', '100')
+            t.save(state / 'retrospectives' / 'attempts' / 'one.json',
+                   dict(started=120, state='started'))
+            self.assertEqual(t.retrospective_activity(state, 160), (0, 0))
+
     def test_read_failure_is_not_idle(self):
         with patch.object(Path, 'open', side_effect=PermissionError('denied')):
             with self.assertRaises(PermissionError):

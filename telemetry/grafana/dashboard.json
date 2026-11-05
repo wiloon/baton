@@ -354,7 +354,7 @@
         "w": 24,
         "h": 5
       },
-      "description": "Independent retrospective worker on this host, including catch-up checks and task analysis. Green = working; gray = idle; orange = unavailable or stale observation. Samples the default STATE/retrospectives/worker.lock about once per minute without taking the workload lock. Very short checks or analyses between samples can be missed. Zooming out preserves sampled work but may widen visible blocks. Custom --work-state invocations are not included.",
+      "description": "Independent retrospective worker on this host, including catch-up checks and task analysis. Green = working; gray = idle; orange = unavailable or stale observation. Samples the default STATE/retrospectives/worker.lock about once per minute without taking the workload lock. Completed analysis attempts overlapping each observed interval remain visible even between samples. Very short checks can be missed. Gaps over 150 seconds are not reconstructed. Zooming out preserves sampled work but may widen visible blocks. Custom --work-state invocations are not included.",
       "targets": [
         {
           "refId": "A",
@@ -362,7 +362,7 @@
             "type": "prometheus",
             "uid": "${prometheus}"
           },
-          "expr": "(max(max_over_time(baton_retrospective_running{hostname=\"$host\"}[$__interval])) and on() (max(baton_state_collect_success{hostname=\"$host\"}) == 1 and (time() - max(baton_retrospective_observed_at_seconds{hostname=\"$host\"})) < 150 and max(up{job=\"$node_job\",hostname=\"$host\"}) == 1)) or on() vector(-1)",
+          "expr": "(max(max_over_time(baton_retrospective_activity_in_interval{hostname=\"$host\"}[$__interval])) and on() (max(baton_state_collect_success{hostname=\"$host\"}) == 1 and (time() - max(baton_retrospective_observed_at_seconds{hostname=\"$host\"})) < 150 and max(up{job=\"$node_job\",hostname=\"$host\"}) == 1)) or on() vector(-1)",
           "instant": false,
           "range": true,
           "format": "time_series",

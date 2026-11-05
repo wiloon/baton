@@ -797,6 +797,31 @@ def retrospective_running(state):
     return 0
 
 
+def retrospective_activity(state, now):
+    """Preserve completed analyses between polls; checks remain instantaneous."""
+    running = retrospective_running(state)
+    boundary = Path(state) / 'telemetry' / 'retrospective-last-observed'
+    previous = math.nan
+    with contextlib.suppress(FileNotFoundError, ValueError):
+        previous = float(boundary.read_text())
+    active = math.nan
+    if math.isfinite(previous) and 0 < now - previous <= 150:
+        active = running
+        for path in (Path(state) / 'retrospectives' / 'attempts').glob('*.json'):
+            attempt = read(path)
+            if 'ended' not in attempt:
+                continue  # Live work comes from flock, never an abandoned journal row.
+            start, end = attempt['started'], attempt['ended']
+            if (isinstance(start, bool) or isinstance(end, bool)
+                    or not isinstance(start, (int, float)) or not isinstance(end, (int, float))
+                    or not math.isfinite(start) or not math.isfinite(end) or end < start):
+                raise ValueError('invalid retrospective interval')
+            if start < now and end > previous:
+                active = 1
+    atomic(boundary, str(now))
+    return running, active
+
+
 def interval_activity(records, previous, now, emit):
     """Any invocation overlap, including runs completed between observations.
 
@@ -1003,8 +1028,10 @@ def collect(ledger, config, output):
     # A never-created timestamp is unknown; collection itself can still succeed.
     # Timer active_since is the baseline for the future no-tick alert.
     emit('last_scheduled_tick_seconds', tick)
-    retrospective = attempt(lambda: retrospective_running(ledger.state), math.nan)
+    retrospective, retrospective_interval = attempt(
+        lambda: retrospective_activity(ledger.state, now), (math.nan, math.nan))
     emit('retrospective_running', retrospective)
+    emit('retrospective_activity_in_interval', retrospective_interval)
     emit('retrospective_observed_at_seconds', now if math.isfinite(retrospective) else math.nan)
     records = attempt(ledger.reconcile, None)
     activity_metrics(records, emit, now, ledger.state)
