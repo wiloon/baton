@@ -778,6 +778,50 @@ def count(path):
     return int(value)
 
 
+def retrospective_running(state):
+    """Sample the independent worker without creating state or waiting for it.
+
+    The worker holds this lock across both catch-up checks and task analysis.
+    A persistent lock file alone does not imply activity; flock is authoritative.
+    """
+    try:
+        stream = (Path(state) / 'retrospectives' / 'worker.lock').open('r')
+    except FileNotFoundError:
+        return 0
+    with stream:
+        try:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 1
+        fcntl.flock(stream, fcntl.LOCK_UN)
+    return 0
+
+
+def retrospective_activity(state, now):
+    """Preserve completed analyses between polls; checks remain instantaneous."""
+    running = retrospective_running(state)
+    boundary = Path(state) / 'telemetry' / 'retrospective-last-observed'
+    previous = math.nan
+    with contextlib.suppress(FileNotFoundError, ValueError):
+        previous = float(boundary.read_text())
+    active = math.nan
+    if math.isfinite(previous) and 0 < now - previous <= 150:
+        active = running
+        for path in (Path(state) / 'retrospectives' / 'attempts').glob('*.json'):
+            attempt = read(path)
+            if 'ended' not in attempt:
+                continue  # Live work comes from flock, never an abandoned journal row.
+            start, end = attempt['started'], attempt['ended']
+            if (isinstance(start, bool) or isinstance(end, bool)
+                    or not isinstance(start, (int, float)) or not isinstance(end, (int, float))
+                    or not math.isfinite(start) or not math.isfinite(end) or end < start):
+                raise ValueError('invalid retrospective interval')
+            if start < now and end > previous:
+                active = 1
+    atomic(boundary, str(now))
+    return running, active
+
+
 def interval_activity(records, previous, now, emit):
     """Any invocation overlap, including runs completed between observations.
 
@@ -984,6 +1028,11 @@ def collect(ledger, config, output):
     # A never-created timestamp is unknown; collection itself can still succeed.
     # Timer active_since is the baseline for the future no-tick alert.
     emit('last_scheduled_tick_seconds', tick)
+    retrospective, retrospective_interval = attempt(
+        lambda: retrospective_activity(ledger.state, now), (math.nan, math.nan))
+    emit('retrospective_running', retrospective)
+    emit('retrospective_activity_in_interval', retrospective_interval)
+    emit('retrospective_observed_at_seconds', now if math.isfinite(retrospective) else math.nan)
     records = attempt(ledger.reconcile, None)
     activity_metrics(records, emit, now, ledger.state)
     running = [r for r in (records or []) if r['status'] == 'running']

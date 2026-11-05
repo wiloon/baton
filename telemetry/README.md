@@ -303,8 +303,22 @@ and only for an instrumented run (`Telemetry.child_env` in `baton/hooks.py`):
 `grafana/dashboard.json` takes its host and its Prometheus, Loki and Tempo data
 sources from variables.
 
-**Top panels:** it opens with Current executions and Agent activity, which ignore
-the Agent and Role filters so that a filter can't hide an active agent.
+**Top panels:** Agent activity, Retrospective activity and Quota balances by provider
+precede Current executions. Activity and current executions ignore the Agent and Role
+filters so a filter cannot hide an active agent. Introductory operational notes live in
+the dashboard JSON description rather than a visible text panel.
+
+`baton_retrospective_running` samples the independent worker's default
+`STATE/retrospectives/worker.lock`: 1 while checking completed tasks or analyzing one,
+0 when idle. The collector only opens an existing lock and uses nonblocking flock;
+a leftover file is idle and read failures are unknown. It does not contend with the
+workload lock or register retrospective calls as workload invocations.
+`baton_retrospective_observed_at_seconds` supplies freshness. The color-only timeline
+uses roughly minute samples. `baton_retrospective_activity_in_interval` also reads
+completed attempt timestamps to retain analyses between polls; brief checks may be
+missed. First observations and gaps over 150 seconds have unknown interval coverage.
+Range aggregation preserves sampled work when zooming out. Custom `--work-state`
+locations are outside this host-service view.
 
 **Task tables:**
 - they span every vendor;
