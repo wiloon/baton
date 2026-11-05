@@ -194,11 +194,18 @@ plus Claude Code's and Codex's own OTLP metrics, to Prometheus, Loki and Tempo. 
 current runs, quota headroom per vendor and the task history. Only metadata leaves the host.
 Setup: [telemetry/README.md](telemetry/README.md).
 
+## Task retrospectives
+
+Generate local evidence reports and optional bounded Claude analysis with
+`uv run --frozen python -m baton.retrospectives --config config.toml catch-up`.
+See [configuration, timer installation, parallel work and recovery](docs/retrospectives.md).
+Analysis is disabled until an explicit model is configured; timer installation is opt-in.
+
 ## Development roadmap
 
 The [continuous improvement plan](docs/plans/continuous-improvement.md) describes an independent
-loop for evaluating execution quality, model choices and consumption. Its first planned delivery
-is [automatic task retrospectives](docs/specs/task-retrospectives.md); it is not implemented yet.
+loop for evaluating execution quality, model choices and consumption. Its first delivery
+is [automatic task retrospectives](docs/specs/task-retrospectives.md); target-host validation is pending.
 
 ## A note on history
 

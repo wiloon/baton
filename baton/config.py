@@ -201,6 +201,20 @@ class Environment:
 
 
 @dataclass(frozen=True)
+class Retrospectives:
+    """Opt-in, tool-free Claude analysis; evidence generation needs no vendor access."""
+    model: str = ""
+    paused: bool = False
+    settle_seconds: int = 300
+    daily_calls: int = 3
+    revision_attempts: int = 2
+    timeout_seconds: int = 600
+    input_chars: int = 20000
+    output_chars: int = 20000
+    budget_usd: float = 1.0
+
+
+@dataclass(frozen=True)
 class Config:
     paths: Paths
     scheduling: Scheduling
@@ -212,6 +226,7 @@ class Config:
     source: Path
     linear: Linear | None = None
     telegram: Telegram | None = None
+    retrospectives: Retrospectives = Retrospectives()
 
     def repo(self, gh_repo):
         """The configured repository named owner/name; ConfigError for any other."""
@@ -224,7 +239,7 @@ class Config:
 SECTIONS = {"paths": Paths, "scheduling": Scheduling, "models": Models,
             "quota": Quota, "environment": Environment}
 # Integrations a runner may go without (#328): no section, no integration.
-OPTIONAL = {"linear": Linear, "telegram": Telegram}
+OPTIONAL = {"linear": Linear, "telegram": Telegram, "retrospectives": Retrospectives}
 VENDORS = {"claude", "codex", "cursor"}
 ROLES = {"dev", "reviewer", "fixer", "spec_reviewer", "reviser"}
 OTHER_AREA = "other"
@@ -303,7 +318,7 @@ def load(path: str | Path, *, home: Path | None = None) -> Config:
     required = set(SECTIONS) | {"repos", "preferences"}
     if not required <= data.keys() or data.keys() - required - OPTIONAL.keys():
         raise ConfigError("configuration sections do not match the schema (paths, scheduling, repos, models, quota, "
-                          "environment, preferences; optional: linear, telegram)")
+                          "environment, preferences; optional: linear, telegram, retrospectives)")
     sections = {name: _section(name, cls, data[name], source.parent, home or Path.home())
                 for name, cls in SECTIONS.items()}
     sections.update({name: _section(name, cls, data[name], source.parent, home or Path.home())
@@ -331,6 +346,11 @@ def load(path: str | Path, *, home: Path | None = None) -> Config:
         if not isinstance(order, list) or not order or any(type(v) is not str or v not in VENDORS for v in order) or len(set(order)) != len(order):
             raise ConfigError("preferences: expected a nonempty list of distinct known vendors")
     config = Config(**sections, repos=repos, preferences=tuple((k, tuple(v)) for k, v in sorted(preferences.items())), source=source)
+    retro = config.retrospectives
+    if retro.model and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,63}', retro.model):
+        raise ConfigError('retrospectives.model: expected a model identifier')
+    if retro.timeout_seconds > 600 or retro.input_chars > 20000 or retro.output_chars > 20000:
+        raise ConfigError('retrospectives: deadline/character limits exceed Stage 1 bounds')
     schedule, models, quota = config.scheduling, config.models, config.quota
     for key in ('cursor_login_re', 'cursor_branch_re'):
         try:

@@ -58,6 +58,15 @@ class VendorTests(unittest.TestCase):
         self.assertEqual(rc, 75)
         self.assertIn("quota limits: claude=blocked(week 70% >= cap 70%)", result["reason"])
 
+    def test_occupied_vendor_is_skipped_for_workloads_and_probes(self):
+        from baton import capacity
+        with capacity.lease(self.state, 'claude'):
+            result, rc = self.pick(current='claude')
+            self.assertEqual((result['vendor'], rc), ('codex', 0))
+            self.assertEqual(result['blocked']['claude'], 'vendor capacity reserved')
+            result, _ = vendors.pick(self.state, POOL, 'dev', POOL, now=NOW, probe_only=True)
+            self.assertNotIn('claude', result['probe'])
+
     def test_probe_candidates_skip_cooldown_and_exclusions(self):
         Path(self.state, "claude-cooldown-until").write_text(str(NOW + 3600))
         result, rc = vendors.pick(self.state, POOL, "review", [*POOL, "cursor"],

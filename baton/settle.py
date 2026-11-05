@@ -17,7 +17,7 @@ import sys
 import tempfile
 import time
 
-from . import hooks as telemetry, notify, quota
+from . import capacity, hooks as telemetry, notify, quota
 from .common import child_env, read
 
 PROBE_PROMPT = "Reply with the word ok."
@@ -111,6 +111,14 @@ def probe_command(vendor, model, directory):
 
 
 def probe(state, logs, vendor, model):
+    if vendor not in ("claude", "codex", "cursor"):
+        return
+    with capacity.lease(state, vendor) as available:
+        if available:
+            return _probe(state, logs, vendor, model)
+
+
+def _probe(state, logs, vendor, model):
     """One tiny request whose only use is the quota its output reports; the snapshot is
     stale, and the owner's own sessions share the quota. Not counted against the daily
     caps. No repo context or usable credentials; Claude tools/MCP are disabled and

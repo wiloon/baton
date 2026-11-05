@@ -21,7 +21,7 @@ import subprocess
 import sys
 import time
 
-from . import quota
+from . import capacity, quota
 
 
 def state_path(state, pr, kind):
@@ -337,7 +337,7 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
             continue
         if by == "pool" and vendor not in pool:
             continue
-        why = vendor_blocked(state, vendor, now)
+        why = "vendor capacity reserved" if capacity.busy(state, vendor) else vendor_blocked(state, vendor, now)
         if why:
             blocked[vendor] = why
             continue
@@ -346,7 +346,7 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
             probe.append(vendor)
         ready.append(vendor)
     if fallback and fallback not in ready and fallback not in blocked:
-        why = vendor_blocked(state, fallback, now)
+        why = "vendor capacity reserved" if capacity.busy(state, fallback) else vendor_blocked(state, fallback, now)
         if why:
             blocked[fallback] = why
         else:
