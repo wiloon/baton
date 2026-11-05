@@ -442,7 +442,7 @@
         "w": 24,
         "h": 8
       },
-      "description": "Account/provider quota, shared across model calls; not per-model budgets. Runner Left (pp) is percentage points of account quota below the configured weekly cap. Quota gate does not predict role/PR selection. Stale balances are last observed values. Reset-pending/unknown balances are N/A. Cursor has no quota source. Observation ages appear beside each balance and are independent for the two provider windows. Credential status shows the latest authentication result; check results age to Stale after 24 hours, while an explicit authentication failure remains visible until a later success.",
+      "description": "Account/provider quota, shared across model calls; not per-model budgets. Headroom (pp) is percentage points of account quota below the configured weekly cap. Quota gate does not predict role/PR selection. Stale balances are last observed values. Reset-pending/unknown balances are N/A. Cursor has no 5h quota window. Age is time since the last observation or authentication check. Reset is time until the window resets. Observation ages appear beside each balance and are independent for the two provider windows. Credential status shows the latest authentication result; check results age to Stale after 24 hours, while an explicit authentication failure remains visible until a later success.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prometheus}"
@@ -636,18 +636,18 @@
             },
             "renameByName": {
               "agent": "Provider",
-              "Value #A": "5h Remaining",
-              "Value #B": "Weekly Remaining",
-              "Value #C": "Runner Left (pp)",
-              "Value #D": "5h Reset In",
-              "Value #E": "Weekly Reset In",
-              "Value #F": "Quota Gate",
-              "Value #G": "5h State",
-              "Value #H": "Weekly State",
-              "Value #I": "5h Observed Ago",
-              "Value #J": "Weekly Observed Ago",
-              "Value #K": "Credential Status",
-              "Value #L": "Credential Checked Ago"
+              "Value #A": "5h left",
+              "Value #B": "Week left",
+              "Value #C": "Headroom",
+              "Value #D": "5h reset",
+              "Value #E": "Week reset",
+              "Value #F": "Gate",
+              "Value #G": "5h state",
+              "Value #H": "Week state",
+              "Value #I": "5h age",
+              "Value #J": "Week age",
+              "Value #K": "Auth",
+              "Value #L": "Auth age"
             }
           }
         }
@@ -681,7 +681,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "5h Remaining"
+              "options": "5h left"
             },
             "properties": [
               {
@@ -723,13 +723,17 @@
                     }
                   ]
                 }
+              },
+              {
+                "id": "custom.width",
+                "value": 115
               }
             ]
           },
           {
             "matcher": {
               "id": "byName",
-              "options": "Weekly Remaining"
+              "options": "Week left"
             },
             "properties": [
               {
@@ -771,49 +775,65 @@
                     }
                   ]
                 }
+              },
+              {
+                "id": "custom.width",
+                "value": 115
               }
             ]
           },
           {
             "matcher": {
               "id": "byName",
-              "options": "Runner Left (pp)"
+              "options": "Headroom"
             },
             "properties": [
               {
                 "id": "unit",
                 "value": "suffix: pp"
+              },
+              {
+                "id": "custom.width",
+                "value": 105
               }
             ]
           },
           {
             "matcher": {
               "id": "byName",
-              "options": "5h Reset In"
+              "options": "5h reset"
             },
             "properties": [
               {
                 "id": "unit",
                 "value": "s"
+              },
+              {
+                "id": "custom.width",
+                "value": 100
               }
             ]
           },
           {
             "matcher": {
               "id": "byName",
-              "options": "Weekly Reset In"
+              "options": "Week reset"
             },
             "properties": [
               {
                 "id": "unit",
                 "value": "s"
+              },
+              {
+                "id": "custom.width",
+                "value": 110
               }
             ]
           },
           {
             "matcher": {
               "id": "byName",
-              "options": "Quota Gate"
+              "options": "Gate"
             },
             "properties": [
               {
@@ -851,13 +871,17 @@
                 "value": {
                   "type": "color-text"
                 }
+              },
+              {
+                "id": "custom.width",
+                "value": 115
               }
             ]
           },
           {
             "matcher": {
               "id": "byName",
-              "options": "5h State"
+              "options": "5h state"
             },
             "properties": [
               {
@@ -899,13 +923,17 @@
                 "value": {
                   "type": "color-text"
                 }
+              },
+              {
+                "id": "custom.width",
+                "value": 110
               }
             ]
           },
           {
             "matcher": {
               "id": "byName",
-              "options": "Weekly State"
+              "options": "Week state"
             },
             "properties": [
               {
@@ -947,13 +975,17 @@
                 "value": {
                   "type": "color-text"
                 }
+              },
+              {
+                "id": "custom.width",
+                "value": 110
               }
             ]
           },
           {
             "matcher": {
               "id": "byName",
-              "options": "5h Observed Ago"
+              "options": "5h age"
             },
             "properties": [
               {
@@ -962,14 +994,14 @@
               },
               {
                 "id": "custom.width",
-                "value": 125
+                "value": 90
               }
             ]
           },
           {
             "matcher": {
               "id": "byName",
-              "options": "Weekly Observed Ago"
+              "options": "Week age"
             },
             "properties": [
               {
@@ -978,7 +1010,7 @@
               },
               {
                 "id": "custom.width",
-                "value": 125
+                "value": 95
               }
             ]
           },
@@ -990,14 +1022,14 @@
             "properties": [
               {
                 "id": "custom.width",
-                "value": 100
+                "value": 90
               }
             ]
           },
           {
             "matcher": {
               "id": "byName",
-              "options": "Credential Status"
+              "options": "Auth"
             },
             "properties": [
               {
@@ -1042,14 +1074,14 @@
               },
               {
                 "id": "custom.width",
-                "value": 190
+                "value": 110
               }
             ]
           },
           {
             "matcher": {
               "id": "byName",
-              "options": "Credential Checked Ago"
+              "options": "Auth age"
             },
             "properties": [
               {
@@ -1058,7 +1090,7 @@
               },
               {
                 "id": "custom.width",
-                "value": 145
+                "value": 95
               }
             ]
           }
