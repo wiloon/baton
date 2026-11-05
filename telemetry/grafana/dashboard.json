@@ -1047,11 +1047,11 @@
                         "color": "green"
                       },
                       "2": {
-                        "text": "Authentication expired",
+                        "text": "Expired",
                         "color": "red"
                       },
                       "3": {
-                        "text": "Probe failed",
+                        "text": "Error",
                         "color": "orange"
                       },
                       "4": {
@@ -1074,7 +1074,11 @@
               },
               {
                 "id": "custom.width",
-                "value": 110
+                "value": 80
+              },
+              {
+                "id": "description",
+                "value": "Latest credential check: OK = authenticated; Expired = explicit authentication failure; Error = the check failed; Stale = last check is over 24h old; Unknown = no observation; Invalid = malformed credential metadata. Auth age measures time since this check, not session lifetime."
               }
             ]
           },
