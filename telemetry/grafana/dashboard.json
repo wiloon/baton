@@ -632,7 +632,7 @@
               "type": "auto"
             },
             "inspect": false,
-            "width": 140
+            "minWidth": 80
           },
           "mappings": [
             {
@@ -693,10 +693,6 @@
                     }
                   ]
                 }
-              },
-              {
-                "id": "custom.width",
-                "value": 115
               }
             ]
           },
@@ -745,10 +741,6 @@
                     }
                   ]
                 }
-              },
-              {
-                "id": "custom.width",
-                "value": 115
               }
             ]
           },
@@ -761,10 +753,6 @@
               {
                 "id": "unit",
                 "value": "suffix: pp"
-              },
-              {
-                "id": "custom.width",
-                "value": 105
               }
             ]
           },
@@ -777,10 +765,6 @@
               {
                 "id": "unit",
                 "value": "s"
-              },
-              {
-                "id": "custom.width",
-                "value": 100
               }
             ]
           },
@@ -793,10 +777,6 @@
               {
                 "id": "unit",
                 "value": "s"
-              },
-              {
-                "id": "custom.width",
-                "value": 110
               }
             ]
           },
@@ -841,10 +821,6 @@
                 "value": {
                   "type": "color-text"
                 }
-              },
-              {
-                "id": "custom.width",
-                "value": 115
               }
             ]
           },
@@ -893,10 +869,6 @@
                 "value": {
                   "type": "color-text"
                 }
-              },
-              {
-                "id": "custom.width",
-                "value": 110
               }
             ]
           },
@@ -945,10 +917,6 @@
                 "value": {
                   "type": "color-text"
                 }
-              },
-              {
-                "id": "custom.width",
-                "value": 110
               }
             ]
           },
@@ -963,28 +931,12 @@
                 "value": "s"
               },
               {
-                "id": "custom.width",
-                "value": 100
-              },
-              {
                 "id": "noValue",
                 "value": "Unknown"
               },
               {
                 "id": "description",
                 "value": "Age of the oldest required authentication or quota observation. Unsupported Cursor 5h is excluded. Unknown means a required timestamp is missing, invalid or in the future. Independent source timestamps remain available as metrics."
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Provider"
-            },
-            "properties": [
-              {
-                "id": "custom.width",
-                "value": 90
               }
             ]
           },
@@ -1033,10 +985,6 @@
                 "value": {
                   "type": "color-text"
                 }
-              },
-              {
-                "id": "custom.width",
-                "value": 80
               },
               {
                 "id": "description",
