@@ -442,7 +442,7 @@
         "w": 24,
         "h": 8
       },
-      "description": "Account/provider quota, shared across model calls; not per-model budgets. Headroom (pp) is percentage points of account quota below the configured weekly cap. Quota gate does not predict role/PR selection. Stale balances are last observed values. Reset-pending/unknown balances are N/A. Cursor has no 5h quota window. Age is time since the last observation or authentication check. Reset is time until the window resets. Observation ages appear beside each balance and are independent for the two provider windows. Credential status shows the latest authentication result; check results age to Stale after 24 hours, while an explicit authentication failure remains visible until a later success.",
+      "description": "Account/provider quota, shared across model calls; not per-model budgets. Headroom (pp) is percentage points of account quota below the configured weekly cap. Quota gate does not predict role/PR selection. Stale balances are last observed values. Reset-pending/unknown balances are N/A. Cursor has no 5h quota window. Data age is time since the oldest required authentication, 5h or weekly observation. Unsupported Cursor 5h is excluded; missing or invalid required timestamps are Unknown. Reset is time until the window resets. The underlying authentication and quota timestamps remain independent. Credential status shows the latest authentication result; check results age to Stale after 24 hours, while an explicit authentication failure remains visible until a later success.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prometheus}"
@@ -558,20 +558,7 @@
             "type": "prometheus",
             "uid": "${prometheus}"
           },
-          "expr": "time() - max by (agent) (baton_quota_observed_at_seconds{hostname=\"$host\",agent=~\"${agent:regex}\",window=\"five_hour\"})",
-          "legendFormat": "{{agent}}",
-          "instant": true,
-          "range": false,
-          "format": "table",
-          "editorMode": "code"
-        },
-        {
-          "refId": "J",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${prometheus}"
-          },
-          "expr": "time() - max by (agent) (baton_quota_observed_at_seconds{hostname=\"$host\",agent=~\"${agent:regex}\",window=\"seven_day\"})",
+          "expr": "(time() - min by (agent) (baton_credential_observed_at_seconds{hostname=\"$host\",agent=~\"${agent:regex}\"} or baton_quota_observed_at_seconds{hostname=\"$host\",agent=~\"${agent:regex}\",window=~\"five_hour|seven_day\"})) and on(agent) (max by (agent) ((baton_credential_observed_at_seconds{hostname=\"$host\",agent=~\"${agent:regex}\"} > 0) <= time())) and on(agent) (max by (agent) ((baton_quota_observed_at_seconds{hostname=\"$host\",agent=~\"${agent:regex}\",window=\"seven_day\"} > 0) <= time())) and on(agent) (max by (agent) ((baton_quota_observed_at_seconds{hostname=\"$host\",agent=~\"${agent:regex}\",window=\"five_hour\"} > 0) <= time()) or max by (agent) (baton_quota_window_state{hostname=\"$host\",agent=~\"${agent:regex}\",agent=\"cursor\",window=\"five_hour\"} == 4))",
           "legendFormat": "{{agent}}",
           "instant": true,
           "range": false,
@@ -581,19 +568,6 @@
         {
           "refId": "K",
           "expr": "max by (agent) (baton_credential_state{hostname=\"$host\",agent=~\"${agent:regex}\"})",
-          "legendFormat": "{{agent}}",
-          "instant": true,
-          "range": false,
-          "format": "table",
-          "editorMode": "code",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${prometheus}"
-          }
-        },
-        {
-          "refId": "L",
-          "expr": "time() - max by (agent) (baton_credential_observed_at_seconds{hostname=\"$host\",agent=~\"${agent:regex}\"})",
           "legendFormat": "{{agent}}",
           "instant": true,
           "range": false,
@@ -621,18 +595,16 @@
             },
             "indexByName": {
               "agent": 0,
-              "Value #A": 3,
-              "Value #I": 4,
-              "Value #B": 5,
-              "Value #J": 6,
-              "Value #C": 7,
-              "Value #D": 8,
-              "Value #E": 9,
-              "Value #F": 10,
-              "Value #G": 11,
-              "Value #H": 12,
               "Value #K": 1,
-              "Value #L": 2
+              "Value #I": 2,
+              "Value #A": 3,
+              "Value #B": 4,
+              "Value #C": 5,
+              "Value #D": 6,
+              "Value #E": 7,
+              "Value #F": 8,
+              "Value #G": 9,
+              "Value #H": 10
             },
             "renameByName": {
               "agent": "Provider",
@@ -644,10 +616,8 @@
               "Value #F": "Gate",
               "Value #G": "5h state",
               "Value #H": "Week state",
-              "Value #I": "5h age",
-              "Value #J": "Week age",
-              "Value #K": "Auth",
-              "Value #L": "Auth age"
+              "Value #I": "Data age",
+              "Value #K": "Auth"
             }
           }
         }
@@ -985,7 +955,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "5h age"
+              "options": "Data age"
             },
             "properties": [
               {
@@ -994,23 +964,15 @@
               },
               {
                 "id": "custom.width",
-                "value": 90
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Week age"
-            },
-            "properties": [
-              {
-                "id": "unit",
-                "value": "s"
+                "value": 100
               },
               {
-                "id": "custom.width",
-                "value": 95
+                "id": "noValue",
+                "value": "Unknown"
+              },
+              {
+                "id": "description",
+                "value": "Age of the oldest required authentication or quota observation. Unsupported Cursor 5h is excluded. Unknown means a required timestamp is missing, invalid or in the future. Independent source timestamps remain available as metrics."
               }
             ]
           },
@@ -1078,23 +1040,7 @@
               },
               {
                 "id": "description",
-                "value": "Latest credential check: OK = authenticated; Expired = explicit authentication failure; Error = the check failed; Stale = last check is over 24h old; Unknown = no observation; Invalid = malformed credential metadata. Auth age measures time since this check, not session lifetime."
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Auth age"
-            },
-            "properties": [
-              {
-                "id": "unit",
-                "value": "s"
-              },
-              {
-                "id": "custom.width",
-                "value": 95
+                "value": "Latest credential check: OK = authenticated; Expired = explicit authentication failure; Error = the check failed; Stale = last check is over 24h old; Unknown = no observation; Invalid = malformed credential metadata. Data age includes this check timestamp; it is not session lifetime."
               }
             ]
           }
