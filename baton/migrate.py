@@ -27,8 +27,8 @@ import sys
 from .config import ConfigError, load, repo_dirs
 
 # The machine's, not a repository's: the lock and the tick's turn, vendor cooldowns and run counts,
-# quota and credential snapshots, the telemetry ledger, and old deploy backups.
-GLOBAL_STATE = re.compile(r"lock|last-repo|chain-next|telemetry|deploy-backups|repos|"
+# quota and credential snapshots, telemetry/retrospectives, vendor leases, and old deploy backups.
+GLOBAL_STATE = re.compile(r"lock|last-repo|chain-next|telemetry|retrospectives|vendor-leases|deploy-backups|repos|"
                           r"(?:[a-z]+-)?cooldown-until|(?:[a-z]+-)?runs-\d{4}-\d\d-\d\d|"
                           r"(?:quota|credential)-[a-z]+\.json")
 LABELLED = re.compile(r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d \[[^\]\s]+/[^\]\s]+\] ")
