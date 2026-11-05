@@ -82,6 +82,11 @@ Review context keeps comments from trusted accounts; human fix feedback comes on
 External contributions are welcome through issues and fork PRs; see [CONTRIBUTING.md](CONTRIBUTING.md).
 Fork PRs require maintainer review and are not run by baton's unattended agent pipeline.
 
+## Related projects and scheduling research
+
+See the [orchestration landscape review](docs/research/agent-orchestration-landscape.md) for
+existing alternatives, replacement criteria and the proposed boundary for model-assisted scheduling.
+
 ## Requirements
 
 - Linux with systemd user units (`loginctl enable-linger` so they run without a login session)
