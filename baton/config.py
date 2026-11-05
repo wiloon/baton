@@ -4,7 +4,7 @@ Loading and validation only: no environment mutation, subprocesses, directory cr
 secret reads, or scheduler initialization. The existing launch path migrates separately.
 Fields are required except optional Cursor role overrides, which fall back to model_cursor.
 """
-from dataclasses import MISSING, dataclass, fields
+from dataclasses import MISSING, dataclass, fields, replace
 from pathlib import Path
 import argparse
 import math
@@ -205,7 +205,7 @@ class Environment:
 @dataclass(frozen=True)
 class Retrospectives:
     """Opt-in evidence analysis with a fixed strong-model family per CLI vendor."""
-    # Legacy opt-in only: never used as a requested model, including old Sonnet values.
+    # Legacy opt-in when enabled is absent: never used as a requested model.
     model: str = ""
     enabled: bool = False
     model_claude: str = "opus"
@@ -331,6 +331,9 @@ def load(path: str | Path, *, home: Path | None = None) -> Config:
                 for name, cls in SECTIONS.items()}
     sections.update({name: _section(name, cls, data[name], source.parent, home or Path.home())
                      for name, cls in OPTIONAL.items() if name in data})
+    if 'retrospectives' in data and 'enabled' not in data['retrospectives']:
+        legacy = sections['retrospectives']
+        sections['retrospectives'] = replace(legacy, enabled=bool(legacy.model))
     if not isinstance(data['repos'], list) or not data['repos']:
         raise ConfigError("repos: expected at least one [[repos]] entry")
     repos = tuple(_section("repos", Repo, entry, source.parent, home or Path.home()) for entry in data['repos'])

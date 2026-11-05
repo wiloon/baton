@@ -330,7 +330,7 @@ def test_configuration_validation_and_help(tmp_path):
 def test_public_command_analyst_success_and_bounded_hypothesis(host, capsys):
     pipe = seed(host.state)
     source = host.state.parent/'config.toml'
-    text = (ROOT/'config.example.toml').read_text().replace('model = ""','model = "configured-analyst"')
+    text = (ROOT/'config.example.toml').read_text().replace('enabled = false','enabled = true')
     text = text.replace('path_prefix = ["~/.local/share/mise/shims", "~/.local/bin"]','path_prefix = '+json.dumps([str(host.bin)]))
     source.write_text(text)
     host.plan(reply=json.dumps(dict(summary='Investigate repeated work.', hypotheses=[dict(
@@ -409,7 +409,7 @@ def test_optional_configuration_remains_backward_compatible(tmp_path):
 def test_two_public_workers_serialize_and_do_not_duplicate_calls(host):
     seed(host.state)
     source=host.state.parent/'config.toml'
-    text=(ROOT/'config.example.toml').read_text().replace('\nmodel = ""','\nmodel = "analyst-model"')
+    text=(ROOT/'config.example.toml').read_text().replace('enabled = false','enabled = true')
     text=text.replace('path_prefix = ["~/.local/share/mise/shims", "~/.local/bin"]',
                       'path_prefix = '+json.dumps([str(host.bin)]))
     source.write_text(text)
@@ -534,7 +534,11 @@ def test_failed_provider_switches_on_next_activation_without_resetting_budget(ho
 
 def test_legacy_sonnet_opt_in_never_requests_sonnet(host):
     pipe=seed(host.state)
-    host.config=replace(host.config,retrospectives=replace(host.config.retrospectives,enabled=False,model='sonnet'))
+    source=host.state.parent/'legacy-config.toml'
+    text=(ROOT/'config.example.toml').read_text().replace('enabled = false\n','').replace('\nmodel = ""','\nmodel = "sonnet"')
+    source.write_text(text)
+    loaded=config.load(source)
+    host.config=replace(host.config,retrospectives=loaded.retrospectives)
     assert host.run()[0]['state']=='success'
     assert host.report(pipe)['analysis_attempts'][0]['requested_model']=='opus'
     args=host.calls()[0]['args']
@@ -637,4 +641,12 @@ def test_invalid_quota_observation_defers_analysis_but_keeps_facts(host):
     (host.state/'quota-claude.json').write_text('[1,2,3]')
     assert host.run()[0]['reason']=='quota_stale'
     assert host.report(pipe)['evidence']['task']['pipeline_id']==pipe
+    assert not host.calls()
+
+
+def test_explicit_disable_overrides_legacy_model_opt_in(host):
+    pipe=seed(host.state)
+    host.config=replace(host.config,retrospectives=replace(host.config.retrospectives,enabled=False,model='sonnet'))
+    assert host.run()[0]['state']=='not_configured'
+    assert host.report(pipe)['assessment'] is None
     assert not host.calls()

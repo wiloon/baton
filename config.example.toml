@@ -260,7 +260,7 @@ enable_claudeai_mcp_servers = false
 # preferences.retrospective overrides preferences.reviewer for this role (otherwise reused).
 [retrospectives]
 enabled = false
-# Deprecated opt-in compatibility only. Never used as a requested model, including old Sonnet values.
+# Deprecated opt-in only when enabled is absent. Never used as a requested model.
 model = ""
 model_claude = "opus"
 model_codex = "gpt-6.1-sol"

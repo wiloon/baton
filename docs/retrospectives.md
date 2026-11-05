@@ -38,8 +38,8 @@ new revision. An unrelated active task does not prevent a completed episode's re
 ## Configure the analyst
 
 Evidence generation works without vendor access. The optional `[retrospectives]` section is
-backwards compatible and analysis is off unless `enabled = true` (or the legacy `model` opt-in is
-nonempty). Candidates are restricted to **Claude Opus via Claude Code**, **GPT Sol via Codex** and
+backwards compatible and analysis is off unless `enabled = true`. When an old configuration
+omits `enabled`, a nonempty legacy `model` opts in; explicit `enabled = false` always disables analysis. Candidates are restricted to **Claude Opus via Claude Code**, **GPT Sol via Codex** and
 **Grok 4.7 via Cursor**. Sonnet, Auto and other model families are rejected in the role model
 fields. A deprecated `model = "sonnet"` from an old deployment is an opt-in flag only: its value is
 never forwarded to a CLI; the new strong-model fields supply actual requests.

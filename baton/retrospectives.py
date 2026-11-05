@@ -164,7 +164,6 @@ def run(config, state, root, output, repo='', pipeline='', retry=False):
             policy = asdict(settings)
             policy.pop('paused')
             policy.pop('model')
-            policy['enabled'] = analyst_pool.enabled(config)
             revision = digest(dict(key=key, source=source, schema=VERSION, analyzer=ANALYZER_VERSION, policy=policy))
             if not same_source(state, key, source):
                 results.append(dict(repo=key[0], pipeline_id=key[1], state='deferred', reason='evidence_changed'))
@@ -173,7 +172,7 @@ def run(config, state, root, output, repo='', pipeline='', retry=False):
             mine = [a for a in attempts if a['revision'] == revision]
             previous = current(output, key, revision)
             if previous and (previous['analysis_state'] == 'success' or
-                             (not analyst_pool.enabled(config) and previous['analysis_state'] == 'not_configured')):
+                             (not settings.enabled and previous['analysis_state'] == 'not_configured')):
                 results.append(dict(repo=key[0], pipeline_id=key[1], state='unchanged'))
                 continue
             if previous:
@@ -182,7 +181,7 @@ def run(config, state, root, output, repo='', pipeline='', retry=False):
             success = next((a for a in reversed(mine) if a['state'] == 'success'), None)
             if success:
                 report.update(analysis_state='success', assessment=success['assessment'])
-            elif not analyst_pool.enabled(config):
+            elif not settings.enabled:
                 report['analysis_state'] = 'not_configured'
             else:
                 reset_path = root / 'retries' / (revision + '.json')

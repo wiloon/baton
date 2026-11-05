@@ -12,11 +12,6 @@ class Analyst:
     effort: str
 
 
-def enabled(config):
-    # Old nonempty `model` means opt-in only; its value is never used as a model.
-    return config.retrospectives.enabled or bool(config.retrospectives.model)
-
-
 def candidates(config):
     allowed = {*config.quota.vendor_pool, *config.quota.vendor_extra}
     settings = config.retrospectives
