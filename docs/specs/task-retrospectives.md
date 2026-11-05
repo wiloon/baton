@@ -48,10 +48,17 @@ Manual mode selects an episode; catch-up mode scans eligible episodes. Provide e
 state/output locations and repository filtering so offline fixtures and multiple repositories work
 without production access. Command spelling is finalized in implementation and documented in help.
 
-Require a terminal episode, no live attached invocation and a configurable quiet interval
-(initial default: five minutes since the newest attached evidence). A final attempt callback can
-arrive after the merge event; take a consistent snapshot and recheck its digest before committing
-the report. Repeatedly changing evidence is deferred rather than guessed complete.
+Require an explicit terminal episode and no live invocation attached to that episode. Inactivity,
+a stopped runner or an interrupted invocation never substitutes for a terminal state. A handoff
+ends this automation episode, not necessarily the underlying issue's resolution. If liveness or
+completion cannot be established from available records, defer with an observable reason.
+
+Apply a configurable evidence-settling interval (initial default: five minutes since that episode's
+newest attached evidence). This is neither host-wide nor improvement-loop inactivity, and is not
+proof of completion. Prefer explicit attempt-completion records when available; a final callback
+can arrive after the merge event. Take a consistent snapshot and recheck its digest before
+committing the report. Repeatedly changing evidence is deferred; later evidence revises the report.
+A subsequent active episode does not make a previously completed episode ineligible.
 
 ### Evidence and output contract
 
@@ -103,19 +110,34 @@ not a guarantee of token consumption. Failed and ambiguous calls count toward at
 After exhaustion, retain the evidence report and expose a terminal analysis failure; an explicit
 manual retry can reset the revision's attempt allowance while retaining history and daily limits.
 
-The timer can generate evidence reports while execution is busy but defers analyst invocations
-while the runner is busy or paused. Coordinate the busy check with the runner's existing lock so
-there is no check/start race; an analysis holding that lock is bounded by its deadline. Respect
-enabled-vendor quota/auth/cooldown gates; unavailable capacity produces deferred work, not a task
-failure. Analysis invocations must be distinguishable from workload/probe invocations, cannot
-attach to a workload episode and cannot recursively trigger retrospectives.
+The analyst may assess completed episode A while workload episode B runs. Use a separate
+analysis workspace, state and worker lock; never acquire the runner's global execution lock for
+the duration of analysis. Serialize retrospective workers without blocking workload scheduling.
+Read stable evidence snapshots and keep source ledger records read-only.
+
+Coordinate shared vendor quota/auth/cooldown and supported CLI/session constraints without
+assuming ample host hardware implies independent vendor capacity. Capacity reservations/checks
+must be safe under concurrent starts; unavailable capacity defers analysis rather than failing or
+blocking workload execution. Keep workload priority and separate analysis budgets. Document and
+test an explicit retrospective pause control; the workload runner being busy or paused does not
+by itself pause retrospectives. Analysis invocations must be distinguishable from workload/probe
+invocations, cannot attach to a workload episode and cannot recursively trigger retrospectives.
 
 ### Invocation and deployment
 
-Ship manual invocation, catch-up invocation and opt-in systemd service/timer templates. Use periodic
-ledger scanning instead of an execution-path callback so downtime is recoverable without adding
-failure paths to task execution. Document installation, output discovery, limits, pause behavior
-and retry procedure. No new monitoring backend or credential is required for evidence generation.
+Ship manual invocation, catch-up invocation and opt-in systemd service/timer templates. Reuse the
+existing persistent task index and immutable event outbox as the handoff medium; a separate
+retrospective processing journal tracks pending/deferred/success/failed work and report revisions.
+The timer wakes the consumer to reconcile durable terminal episodes and evidence, not infer
+completion from silence. It must recover missed work after downtime without relying on receipt
+of a transient notification. Reuse existing ledger recovery semantics and test a crash between
+terminal-event persistence and task-index update; a terminal event must not be permanently missed.
+
+Stage 1 needs no new database or message broker and no synchronous analyst callback on the
+execution path. Event-driven wake-up can be added later if latency requires it, retaining periodic
+reconciliation as recovery. Document installation, scan interval and settling delay, output
+discovery, limits, separate pause behavior and retry procedure. No new monitoring backend or
+credential is required for evidence generation.
 
 Post-merge quality observations already available locally may enrich a report, with observation
 time and coverage. Their later arrival produces another evidence revision; it does not imply a
@@ -131,6 +153,10 @@ fixtures provide prior art for ledger semantics.
 - [ ] A merged fixture produces valid versioned JSON and readable Markdown with the same facts.
 - [ ] Planned and abnormal handoffs produce reports; active episodes and standalone interrupted
   runs are skipped with an observable reason.
+- [ ] An inactive-looking but active episode is never assessed; episode A can be assessed while
+  episode B runs, without holding the runner lock or sharing its workspace.
+- [ ] Restart reconciliation and a crash between terminal-event and task-index writes do not
+  permanently lose work; vendor-capacity contention and retrospective pause defer analysis safely.
 - [ ] Identical scans and concurrent workers do not duplicate reports or successful analysis.
 - [ ] Two repositories sharing an issue number, and two episodes of one issue, remain distinct.
 - [ ] A delayed attempt callback cannot silently produce a stale final report; changed evidence
@@ -140,7 +166,7 @@ fixtures provide prior art for ledger semantics.
 - [ ] Fake analyst success produces evidence-linked hypotheses or an explicit no-finding result.
 - [ ] Timeout, malformed output, unavailable vendor and missing analyst configuration preserve
   deterministic reports and expose distinct analysis states.
-- [ ] Crash recovery, per-revision retries, daily limits and busy/paused deferral are exercised;
+- [ ] Crash recovery, per-revision retries, daily limits and retrospective pause/capacity deferral are exercised;
   no unbounded retry or recursive workload report is possible.
 - [ ] Analysis usage is tracked separately from workload totals, including known failed-attempt
   usage and explicit unknown usage for ambiguous attempts.

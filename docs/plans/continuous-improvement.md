@@ -33,7 +33,10 @@ loops. The [glossary](../../GLOSSARY.md) defines episodes, retrospectives and ex
 The execution loop remains responsible for authorized workload tasks. The improvement loop reads
 its evidence, produces a retrospective, groups repeated hypotheses, evaluates candidate changes
 and eventually promotes successful versions. Its own invocations and consumption are accounted
-for separately, with workload execution taking priority.
+for separately, with workload execution taking priority. Retrospectives of completed episodes may
+run concurrently with later workload episodes, using independent workspaces and locks. Existing
+durable task records/events provide handoff; periodic reconciliation recovers missed work without
+a new database or message broker.
 
 Existing foundations include the local telemetry ledger, issue audit, selection explanations,
 workflow/config fingerprints, post-merge outcome observations and systemd timers. Exact task
@@ -93,7 +96,7 @@ step because local evidence can identify private repositories and contain task c
 
 - [x] Record background, terms, architectural boundary and staged plan.
 - [ ] Implement Stage 1 and its offline acceptance tests.
-- [ ] Validate Stage 1 on the target host, including ledger coverage and paused/busy behavior.
+- [ ] Validate Stage 1 on the target host, including ledger coverage, concurrent workload execution and retrospective pause/capacity behavior.
 - [ ] Compare the first three available eligible episode reports with owner review; include a
   handoff case when available, or use an offline fixture and record that live coverage gap.
 - [ ] Use that feedback to define Stage 2 proposal thresholds and issue publication policy.
