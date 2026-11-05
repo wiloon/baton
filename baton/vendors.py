@@ -21,7 +21,7 @@ import subprocess
 import sys
 import time
 
-from . import capacity, quota
+from . import quota, vendor_policy
 
 
 def state_path(state, pr, kind):
@@ -34,13 +34,7 @@ def all_vendors(pool, extra=None):
 
 
 def vendor_blocked(state, vendor, now=None):
-    try:
-        until = state_path_cooldown(state, vendor).read_text().splitlines()[0]
-    except (OSError, IndexError):
-        return ""
-    if until.isdecimal() and (now or int(time.time())) < int(until):
-        return f"cooldown until epoch {until}"
-    return ""
+    return vendor_policy.cooldown(state, vendor, int(time.time()) if now is None else now)
 
 
 def state_path_cooldown(state, vendor):
@@ -258,26 +252,20 @@ def review_allowed(state, pr, vendor, model="", fixed_by=""):
     return vendor == "codex" and bool(codex_review_mode(state, pr, model))
 
 
-def _caps(pool):
-    return {v: getattr(session.resolve().config.quota, f"quota_cap_{v}") for v in pool}
-
-
 def _quota_pick(state, vendors, now, current=None, prefer=()):
-    return quota.pick(vendors, {v: quota.load(state, v) for v in vendors},
-                      _caps(vendors), float(session.resolve().config.quota.quota_five_hour_max),
-                      now, current, prefer)
+    return vendor_policy.choose(state, session.resolve().config.quota, vendors, vendors, now,
+                                current=current, prefer=prefer)
 
 
 def _preferred(state, pool, tied, prefer, now):
     """The first of TIED in PREFER order that may win: Cursor (outside the pool's balance)
     always, a pool vendor when its headroom is within quota.TIE of the best tied pool vendor."""
-    order = quota.preference_order(tied, prefer)
-    pool_tied = [v for v in order if v in pool]
     try:
-        best = _quota_pick(state, pool_tied, now, prefer=prefer)[0] if pool_tied else None
+        chosen, _ = vendor_policy.choose(state, session.resolve().config.quota, pool, tied, now,
+                                         prefer=prefer, extras=True)
+        return chosen or quota.preference_order(tied, prefer)[0]
     except Exception:
-        best = None
-    return next((v for v in order if v not in pool or best in (None, v)), order[0])
+        return quota.preference_order(tied, prefer)[0]
 
 
 def selection_details(state, pool, candidates, chosen, role, *, area="", now=None):
@@ -337,7 +325,8 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
             continue
         if by == "pool" and vendor not in pool:
             continue
-        why = "vendor capacity reserved" if capacity.busy(state, vendor) else vendor_blocked(state, vendor, now)
+        status = vendor_policy.availability(state, session.resolve().config.quota, vendor, now)
+        why = status.detail
         if why:
             blocked[vendor] = why
             continue
@@ -346,7 +335,8 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
             probe.append(vendor)
         ready.append(vendor)
     if fallback and fallback not in ready and fallback not in blocked:
-        why = "vendor capacity reserved" if capacity.busy(state, fallback) else vendor_blocked(state, fallback, now)
+        status = vendor_policy.availability(state, session.resolve().config.quota, fallback, now)
+        why = status.detail
         if why:
             blocked[fallback] = why
         else:

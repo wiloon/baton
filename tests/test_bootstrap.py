@@ -6,7 +6,7 @@ import subprocess
 import sys
 
 import pytest
-from baton import bootstrap, session, vendors, tick
+from baton import bootstrap, quota, session, vendors, tick
 from baton.config import load
 from conftest import full_text
 
@@ -36,9 +36,14 @@ def test_explicit_session_scopes_vendor_helpers(tmp_path):
     config = load(ROOT/'config.example.toml',home=tmp_path)
     config = replace(config,quota=replace(config.quota,quota_cap_claude=.42),preferences=(('dev',('codex',)),))
     explicit = session.create(config,{})
+    config.paths.state.mkdir(parents=True)
+    quota.record(config.paths.state, 'claude', {'seven_day': {'used': .5, 'resets_at': 2000}}, 1000)
     @session.scoped
     def invoke(env=None):
-        assert vendors._caps(['claude']) == {'claude':.42}
+        chosen, rc = vendors.pick(config.paths.state, ['claude', 'codex'], 'dev',
+                                  ['claude', 'codex'], now=1000)
+        assert rc == 0 and chosen['vendor'] == 'codex'
+        assert 'cap 42%' in chosen['reason']
         assert vendors.preference('dev') == (['codex'],'dev')
     invoke(explicit)
 

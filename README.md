@@ -196,10 +196,10 @@ Setup: [telemetry/README.md](telemetry/README.md).
 
 ## Task retrospectives
 
-Generate local evidence reports and optional bounded Claude analysis with
+Generate local evidence reports and optional bounded Opus/Sol/Grok 4.7 analysis with
 `uv run --frozen python -m baton.retrospectives --config config.toml catch-up`.
 See [configuration, timer installation, parallel work and recovery](docs/retrospectives.md).
-Analysis is disabled until an explicit model is configured; timer installation is opt-in.
+Analysis is disabled until explicitly enabled; timer installation is opt-in.
 
 ## Development roadmap
 

@@ -4,7 +4,7 @@ Loading and validation only: no environment mutation, subprocesses, directory cr
 secret reads, or scheduler initialization. The existing launch path migrates separately.
 Fields are required except optional Cursor role overrides, which fall back to model_cursor.
 """
-from dataclasses import MISSING, dataclass, fields
+from dataclasses import MISSING, dataclass, fields, replace
 from pathlib import Path
 import argparse
 import math
@@ -12,6 +12,8 @@ import re
 import sys
 import tomllib
 from typing import get_type_hints
+
+from .analyst_models import approved_model
 
 
 class ConfigError(ValueError):
@@ -202,8 +204,14 @@ class Environment:
 
 @dataclass(frozen=True)
 class Retrospectives:
-    """Opt-in, tool-free Claude analysis; evidence generation needs no vendor access."""
+    """Opt-in evidence analysis with a fixed strong-model family per CLI vendor."""
+    # Legacy opt-in when enabled is absent: never used as a requested model.
     model: str = ""
+    enabled: bool = False
+    model_claude: str = "opus"
+    model_codex: str = "gpt-6.1-sol"
+    model_cursor: str = "grok-4.7-high"
+    effort: str = "high"
     paused: bool = False
     settle_seconds: int = 300
     daily_calls: int = 3
@@ -241,7 +249,7 @@ SECTIONS = {"paths": Paths, "scheduling": Scheduling, "models": Models,
 # Integrations a runner may go without (#328): no section, no integration.
 OPTIONAL = {"linear": Linear, "telegram": Telegram, "retrospectives": Retrospectives}
 VENDORS = {"claude", "codex", "cursor"}
-ROLES = {"dev", "reviewer", "fixer", "spec_reviewer", "reviser"}
+ROLES = {"dev", "reviewer", "fixer", "spec_reviewer", "reviser", "retrospective"}
 OTHER_AREA = "other"
 ENV_NAME = re.compile(r'[A-Z_][A-Z0-9_]*')
 # Variables the runner itself builds for the tools; a repository must not replace them.
@@ -323,6 +331,9 @@ def load(path: str | Path, *, home: Path | None = None) -> Config:
                 for name, cls in SECTIONS.items()}
     sections.update({name: _section(name, cls, data[name], source.parent, home or Path.home())
                      for name, cls in OPTIONAL.items() if name in data})
+    if 'retrospectives' in data and 'enabled' not in data['retrospectives']:
+        legacy = sections['retrospectives']
+        sections['retrospectives'] = replace(legacy, enabled=bool(legacy.model))
     if not isinstance(data['repos'], list) or not data['repos']:
         raise ConfigError("repos: expected at least one [[repos]] entry")
     repos = tuple(_section("repos", Repo, entry, source.parent, home or Path.home()) for entry in data['repos'])
@@ -349,6 +360,11 @@ def load(path: str | Path, *, home: Path | None = None) -> Config:
     retro = config.retrospectives
     if retro.model and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,63}', retro.model):
         raise ConfigError('retrospectives.model: expected a model identifier')
+    for vendor in ('claude', 'codex', 'cursor'):
+        if not approved_model(vendor, getattr(retro, f'model_{vendor}'), requested=True):
+            raise ConfigError(f'retrospectives.model_{vendor}: requires the approved Opus/Sol/Grok 4.7 family')
+    if retro.effort not in ('high', 'xhigh'):
+        raise ConfigError('retrospectives.effort: expected high or xhigh')
     if retro.timeout_seconds > 600 or retro.input_chars > 20000 or retro.output_chars > 20000:
         raise ConfigError('retrospectives: deadline/character limits exceed Stage 1 bounds')
     schedule, models, quota = config.scheduling, config.models, config.quota

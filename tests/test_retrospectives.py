@@ -45,13 +45,16 @@ def seed(state, status='merged', repo='acme/app', issue=1):
 FAKE_CLAUDE = '''#!PYTHON
 import json, os, pathlib, sys, time
 root = pathlib.Path(__file__).parent
+vendor = 'cursor' if pathlib.Path(__file__).name == 'cursor-agent' else pathlib.Path(__file__).name
 if '--version' in sys.argv:
     print('2.1.100 (Claude Code)')
     sys.exit(0)
 prompt = sys.stdin.read()
 with (root/'calls').open('a') as f:
-    f.write(json.dumps(dict(args=sys.argv[1:], prompt=prompt, cwd=os.getcwd(), env=dict(os.environ)))+'\\n')
+    f.write(json.dumps(dict(vendor=vendor, args=sys.argv[1:], prompt=prompt, cwd=os.getcwd(), env=dict(os.environ)))+'\\n')
 plan = json.loads((root/'plan.json').read_text()) if (root/'plan.json').exists() else {}
+if plan.get('stderr'):
+    print(plan['stderr'],file=sys.stderr)
 if plan.get('sleep'):
     time.sleep(plan['sleep'])
 if plan.get('flood'):
@@ -63,9 +66,18 @@ if plan.get('late'):
     row['output_tokens'] = row.get('output_tokens',0)+1
     path.write_text(json.dumps(row))
 reply = plan.get('reply', json.dumps(dict(summary='No actionable finding.', hypotheses=[])))
-print(json.dumps(dict(type='result', subtype='success', result=reply,
-    usage=dict(input_tokens=4, cache_read_input_tokens=20, cache_creation_input_tokens=0, output_tokens=3),
-    modelUsage={'observed-analyst':{}}, total_cost_usd=0.01)))
+if plan.get('tool'):
+    print(json.dumps(dict(type='tool_call',tool='read_file')))
+if vendor == 'codex':
+    print(json.dumps(dict(type='turn_context', payload={'model':plan.get('actual','gpt-6.1-sol')})))
+    print(json.dumps(dict(type='item.completed', item={'type':'agent_message','text':reply})))
+    print(json.dumps(dict(type='turn.completed', usage={'input_tokens':24,'cached_input_tokens':20,'output_tokens':3})))
+else:
+    usage = (dict(input_tokens=4, cache_read_input_tokens=20, cache_creation_input_tokens=0, output_tokens=3)
+             if vendor == 'claude' else dict(inputTokens=4, cacheReadTokens=20, cacheWriteTokens=0, outputTokens=3))
+    print(json.dumps(dict(type='result', subtype='success', result=reply, usage=usage,
+        modelUsage={plan.get('actual','claude-opus-test'): {}} if vendor=='claude' else {},
+        actual_model=plan.get('actual','grok-4.7') if vendor=='cursor' else 'unknown', total_cost_usd=0.01)))
 sys.exit(plan.get('rc',0))
 '''
 
@@ -76,8 +88,9 @@ def host(tmp_path, monkeypatch):
     state.mkdir()
     cli = tmp_path / 'bin'
     cli.mkdir()
-    (cli/'claude').write_text(FAKE_CLAUDE.replace('PYTHON', sys.executable))
-    (cli/'claude').chmod(0o755)
+    for executable in ('claude', 'codex', 'cursor-agent'):
+        (cli/executable).write_text(FAKE_CLAUDE.replace('PYTHON', sys.executable))
+        (cli/executable).chmod(0o755)
     (cli/'timeout').write_text('#!/bin/sh\nshift 2\nexec "$@"\n')
     (cli/'timeout').chmod(0o755)
     monkeypatch.setenv('PATH', str(cli)+os.pathsep+os.environ['PATH'])
@@ -86,7 +99,8 @@ def host(tmp_path, monkeypatch):
     monkeypatch.setenv('OTEL_RESOURCE_ATTRIBUTES', 'PRIVATE_OTEL')
     c = config.load(ROOT/'config.example.toml')
     c = replace(c, paths=replace(c.paths, state=state), environment=replace(c.environment, path_prefix=()),
-                retrospectives=replace(c.retrospectives, model='requested-analyst'))
+                retrospectives=replace(c.retrospectives, enabled=True),
+                quota=replace(c.quota, vendor_pool=('claude',)))
     now = time.time()
     (state/'credential-claude.json').write_text(json.dumps(dict(result='authenticated', observed_at=now)))
     (state/'quota-claude.json').write_text(json.dumps(dict(observed_at=now, windows={
@@ -134,7 +148,7 @@ def test_analyst_runs_once_separate_usage_and_no_raw_content(host):
     assert host.run()[0]['state'] == 'success'
     report = host.report(pipe)
     assert report['analysis_attempts'][0]['usage']['input_tokens'] == 4
-    assert report['analysis_attempts'][0]['actual_model'] == 'observed-analyst'
+    assert report['analysis_attempts'][0]['actual_model'] == 'claude-opus-test'
     assert report['evidence']['usage']['input_tokens']['value'] == 10
     assert report['assessment']['hypotheses'] == []
     call = host.calls()[0]
@@ -316,7 +330,7 @@ def test_configuration_validation_and_help(tmp_path):
 def test_public_command_analyst_success_and_bounded_hypothesis(host, capsys):
     pipe = seed(host.state)
     source = host.state.parent/'config.toml'
-    text = (ROOT/'config.example.toml').read_text().replace('model = ""','model = "configured-analyst"')
+    text = (ROOT/'config.example.toml').read_text().replace('enabled = false','enabled = true')
     text = text.replace('path_prefix = ["~/.local/share/mise/shims", "~/.local/bin"]','path_prefix = '+json.dumps([str(host.bin)]))
     source.write_text(text)
     host.plan(reply=json.dumps(dict(summary='Investigate repeated work.', hypotheses=[dict(
@@ -395,7 +409,7 @@ def test_optional_configuration_remains_backward_compatible(tmp_path):
 def test_two_public_workers_serialize_and_do_not_duplicate_calls(host):
     seed(host.state)
     source=host.state.parent/'config.toml'
-    text=(ROOT/'config.example.toml').read_text().replace('\nmodel = ""','\nmodel = "analyst-model"')
+    text=(ROOT/'config.example.toml').read_text().replace('enabled = false','enabled = true')
     text=text.replace('path_prefix = ["~/.local/share/mise/shims", "~/.local/bin"]',
                       'path_prefix = '+json.dumps([str(host.bin)]))
     source.write_text(text)
@@ -463,3 +477,176 @@ def test_unchanged_capacity_deferral_does_not_grow_report_history(host):
         assert list(host.output.glob('**/report.json'))==before
     assert host.run()[0]['state']=='success'
     assert len(host.calls())==1
+
+
+def enable_vendors(host, vendors=('claude', 'codex', 'cursor')):
+    host.config=replace(host.config, quota=replace(host.config.quota,
+        vendor_pool=tuple(v for v in vendors if v!='cursor'), vendor_extra=('cursor',) if 'cursor' in vendors else ()))
+    now=time.time()
+    for vendor in vendors:
+        (host.state/f'credential-{vendor}.json').write_text(json.dumps(dict(result='authenticated',observed_at=now)))
+        names=('seven_day',) if vendor=='cursor' else ('five_hour','seven_day')
+        (host.state/f'quota-{vendor}.json').write_text(json.dumps(dict(observed_at=now,windows={
+            name:dict(used=0.1,observed_at=now,resets_at=now+10000) for name in names})))
+
+
+def test_claude_quota_exhaustion_selects_sol_and_preserves_shared_accounting(host):
+    pipe=seed(host.state)
+    enable_vendors(host)
+    path=host.state/'quota-claude.json';row=json.loads(path.read_text())
+    row['windows']['seven_day']['used']=0.95;path.write_text(json.dumps(row))
+    assert host.run()[0]['state']=='success'
+    report=host.report(pipe)
+    attempt=report['analysis_attempts'][0]
+    assert attempt['vendor']=='codex' and attempt['requested_model']=='gpt-6.1-sol'
+    assert attempt['effort']=='high' and attempt['usage']['input_tokens']==4
+    assert report['selection']['blocked']['claude']=='quota_exhausted'
+    args=host.calls()[0]['args']
+    assert '--ignore-user-config' in args and '--ephemeral' in args
+    assert 'shell_tool' in args and 'web_search="disabled"' in args
+    assert report['evidence']['usage']['input_tokens']['value']==10
+
+
+def test_unavailable_pool_selects_explicit_grok_not_auto(host):
+    pipe=seed(host.state)
+    enable_vendors(host)
+    with capacity.lease(host.state,'claude'),capacity.lease(host.state,'codex'):
+        assert host.run()[0]['state']=='success'
+    attempt=host.report(pipe)['analysis_attempts'][0]
+    assert attempt['vendor']=='cursor' and attempt['requested_model']=='grok-4.7-high'
+    assert attempt['actual_model']=='grok-4.7'
+    call=host.calls()[0]
+    assert call['args'][call['args'].index('--model')+1]=='grok-4.7-high'
+    assert call['args'][call['args'].index('--mode')+1]=='ask'
+    assert '--force' not in call['args'] and call['env']['CURSOR_CONFIG_DIR'].startswith(str(host.root))
+
+
+def test_failed_provider_switches_on_next_activation_without_resetting_budget(host):
+    pipe=seed(host.state);enable_vendors(host,('claude','codex'))
+    host.plan(reply='invalid')
+    assert host.run()[0]['state']=='failed'
+    assert host.calls()[0]['vendor']=='claude'
+    assert host.run()[0]['state']=='failed'
+    assert host.calls()[1]['vendor']=='codex'
+    assert host.run()[0]['reason']=='revision_attempts_exhausted'
+    assert len(host.calls())==2
+
+
+def test_legacy_sonnet_opt_in_never_requests_sonnet(host):
+    pipe=seed(host.state)
+    source=host.state.parent/'legacy-config.toml'
+    text=(ROOT/'config.example.toml').read_text().replace('enabled = false\n','').replace('\nmodel = ""','\nmodel = "sonnet"')
+    source.write_text(text)
+    loaded=config.load(source)
+    host.config=replace(host.config,retrospectives=loaded.retrospectives)
+    assert host.run()[0]['state']=='success'
+    assert host.report(pipe)['analysis_attempts'][0]['requested_model']=='opus'
+    args=host.calls()[0]['args']
+    assert args[args.index('--model')+1]=='opus'
+
+
+def test_provider_reported_sonnet_is_rejected_even_for_opus_request(host):
+    pipe=seed(host.state);host.plan(actual='claude-sonnet-5-5')
+    assert host.run()[0]['reason']=='unexpected_model'
+    report=host.report(pipe)
+    assert report['assessment'] is None
+    assert report['analysis_attempts'][0]['usage']['input_tokens']==4
+
+
+@pytest.mark.parametrize('key,value', [('model_claude','sonnet'),('model_claude','claude-sonnet-5-5'),
+    ('model_codex','gpt-6.1-terra'),('model_cursor','auto'),('model_cursor','cursor-grok-4.6-high')])
+def test_only_approved_strong_model_families_are_configurable(tmp_path,key,value):
+    source=tmp_path/'config.toml'
+    text=(ROOT/'config.example.toml').read_text()
+    # Existing examples may omit fields; add a field to their retrospective table.
+    import re
+    section=text[text.index('[retrospectives]'):]
+    if re.search(r'^'+key+' = ',section,re.M):
+        text=text[:text.index('[retrospectives]')]+re.sub(r'^'+key+r' = .*$',key+' = '+json.dumps(value),section,flags=re.M)
+    else:
+        text+='\n'+key+' = '+json.dumps(value)+'\n'
+    source.write_text(text)
+    with pytest.raises(config.ConfigError):config.load(source)
+
+
+def test_review_and_retrospective_share_quota_pace_and_preference_policy(host):
+    from baton import session,vendors,analyst_pool
+    enable_vendors(host)
+    path=host.state/'quota-claude.json';row=json.loads(path.read_text())
+    row['windows']['seven_day']['used']=0.6;path.write_text(json.dumps(row))
+    token=session.bind(session.create(host.config))
+    try:
+        chosen,rc=vendors.pick(str(host.state),['claude','codex'],'review',
+            ['claude','codex','cursor'],by='contrib',now=int(time.time()))
+        assert rc==0
+        with analyst_pool.reserve(host.config,host.state,time.time()) as (analyst,lease,selection):
+            assert analyst.vendor==chosen['vendor']=='codex'
+    finally:session._active.reset(token)
+
+
+def test_all_vendors_unavailable_preserve_evidence_without_calls(host):
+    pipe=seed(host.state);enable_vendors(host)
+    with capacity.lease(host.state,'claude'),capacity.lease(host.state,'codex'),capacity.lease(host.state,'cursor'):
+        assert host.run()[0]['reason']=='vendor_capacity'
+    report=host.report(pipe)
+    assert set(report['selection']['blocked'])=={'claude','codex','cursor'}
+    assert report['evidence']['usage']['input_tokens']['value']==10
+    assert not host.calls()
+
+
+def test_explicit_retrospective_preference_matches_review_extra_policy(host):
+    pipe=seed(host.state);enable_vendors(host)
+    host.config=replace(host.config,preferences=(*host.config.preferences,('retrospective',('cursor','codex','claude'))))
+    assert host.run()[0]['state']=='success'
+    assert host.report(pipe)['analysis_attempts'][0]['vendor']=='cursor'
+    assert host.calls()[0]['args'][host.calls()[0]['args'].index('--model')+1]=='grok-4.7-high'
+
+
+def test_daily_budget_is_shared_across_successful_vendors(host):
+    first=seed(host.state);second=seed(host.state);third=seed(host.state);fourth=seed(host.state)
+    enable_vendors(host)
+    assert host.run(pipeline=first)[0]['state']=='success'
+    with capacity.lease(host.state,'claude'):
+        assert host.run(pipeline=second)[0]['state']=='success'
+    with capacity.lease(host.state,'claude'),capacity.lease(host.state,'codex'):
+        assert host.run(pipeline=third)[0]['state']=='success'
+    assert host.run(pipeline=fourth)[0]['reason']=='daily_budget'
+    assert [c['vendor'] for c in host.calls()]==['claude','codex','cursor']
+
+
+def test_tool_call_invalidates_assessment_but_keeps_usage(host):
+    pipe=seed(host.state);enable_vendors(host,('codex',))
+    host.plan(tool=True)
+    assert host.run()[0]['reason']=='unexpected_tool_use'
+    attempt=host.report(pipe)['analysis_attempts'][0]
+    assert attempt['usage']['input_tokens']==4
+    assert host.report(pipe)['assessment'] is None
+
+
+def test_explicit_auth_failure_updates_shared_gate_and_next_call_uses_other_vendor(host):
+    pipe=seed(host.state);enable_vendors(host,('claude','codex'))
+    host.plan(stderr='authentication failed',rc=1)
+    assert host.run()[0]['reason']=='auth'
+    credential=json.loads((host.state/'credential-claude.json').read_text())
+    assert credential['result']=='auth_expired'
+    assert (host.state/'claude-cooldown-until').exists()
+    host.plan()
+    assert host.run()[0]['state']=='success'
+    assert [c['vendor'] for c in host.calls()]==['claude','codex']
+    assert host.report(pipe)['selection']['blocked']['claude']=='vendor_cooldown'
+
+
+def test_invalid_quota_observation_defers_analysis_but_keeps_facts(host):
+    pipe=seed(host.state)
+    (host.state/'quota-claude.json').write_text('[1,2,3]')
+    assert host.run()[0]['reason']=='quota_stale'
+    assert host.report(pipe)['evidence']['task']['pipeline_id']==pipe
+    assert not host.calls()
+
+
+def test_explicit_disable_overrides_legacy_model_opt_in(host):
+    pipe=seed(host.state)
+    host.config=replace(host.config,retrospectives=replace(host.config.retrospectives,enabled=False,model='sonnet'))
+    assert host.run()[0]['state']=='not_configured'
+    assert host.report(pipe)['assessment'] is None
+    assert not host.calls()
