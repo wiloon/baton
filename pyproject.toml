@@ -2,7 +2,8 @@
 # Run from a checkout: this is not a distributable Python package.
 [project]
 name = "baton"
-version = "0.1.0"
+# Required by uv, read by nothing. A release is a git tag (vX.Y.Z); don't bump this.
+version = "0"
 requires-python = ">=3.15"
 dependencies = []
 
