@@ -250,6 +250,20 @@ def test_removing_an_owners_last_repository_does_not_block_the_remaining_reposit
     assert all(path.read_text() == "keep this repository's files" for path in kept)
 
 
+@pytest.mark.parametrize('directory', ['retrospectives', 'vendor-leases'])
+def test_retrospective_global_state_neither_blocks_startup_nor_gets_migrated(tmp_path, monkeypatch, capsys, directory):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    c = load(tmp_path, TEXT)
+    payload = c.paths.state / directory / "saved.json"
+    payload.parent.mkdir(parents=True)
+    payload.write_text('{"keep": true}')
+
+    assert bootstrap.main(["--config", str(c.source), "scan", "list"]) == 0
+    assert "api/billing" in capsys.readouterr().out
+    assert migrate.migrate(c, "acme/app", None, log=lambda _: None) == 0
+    assert payload.read_text() == '{"keep": true}'
+
+
 @pytest.fixture
 def legacy(tmp_path, monkeypatch):
     """A runner's files as the single-repository runner left them, around a real clone and worktree."""
