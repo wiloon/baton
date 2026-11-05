@@ -66,6 +66,8 @@ if plan.get('late'):
     row['output_tokens'] = row.get('output_tokens',0)+1
     path.write_text(json.dumps(row))
 reply = plan.get('reply', json.dumps(dict(summary='No actionable finding.', hypotheses=[])))
+if plan.get('quota_event'):
+    print(json.dumps(plan['quota_event']))
 if plan.get('tool'):
     print(json.dumps(dict(type='tool_call',tool='read_file')))
 if vendor == 'codex':
@@ -650,3 +652,31 @@ def test_explicit_disable_overrides_legacy_model_opt_in(host):
     assert host.run()[0]['state']=='not_configured'
     assert host.report(pipe)['assessment'] is None
     assert not host.calls()
+
+
+@pytest.mark.parametrize('vendor', ['claude', 'codex'])
+def test_retrospective_updates_shared_quota_from_provider_observations(host, vendor):
+    from baton import quota
+    pipe = seed(host.state)
+    enable_vendors(host, (vendor,))
+    now = time.time()
+    windows = {n: dict(utilization=.23, resetsAt=now+10000) for n in ('five_hour','seven_day')}
+    event = (dict(type='rate_limit_event', rate_limit_info=dict(unifiedWindows=windows)) if vendor=='claude' else
+             dict(rate_limits=dict(primary=dict(used_percent=23,window_minutes=300,resets_at=now+10000),
+                                   secondary=dict(used_percent=23,window_minutes=10080,resets_at=now+10000))))
+    host.plan(quota_event=event)
+    assert host.run()[0]['state'] == 'success'
+    stored = quota.load(host.state, vendor)
+    assert stored['windows']['five_hour']['used'] == .23
+    assert stored['windows']['seven_day']['used'] == .23
+    assert stored['observed_at'] >= now
+    assert quota.credential_current(host.state, vendor, time.time())
+    assert 'quota_windows' not in host.report(pipe)['analysis_attempts'][0]
+
+
+def test_retrospective_without_quota_does_not_rejuvenate_old_data(host):
+    from baton import quota
+    seed(host.state)
+    before = quota.load(host.state, 'claude')
+    assert host.run()[0]['state'] == 'success'
+    assert quota.load(host.state, 'claude') == before

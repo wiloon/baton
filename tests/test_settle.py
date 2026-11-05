@@ -17,6 +17,8 @@ PROBE_CLI = f"""#!{sys.executable}
 import os, pathlib, sys
 fake = pathlib.Path(os.environ["FAKE_DIR"])
 (fake / "args.json").write_text(__import__("json").dumps(sys.argv[1:]))
+with (fake / "calls").open('a') as f:
+    f.write('call\\n')
 (fake / "env.json").write_text(__import__("json").dumps(dict(os.environ)))
 sys.stdout.write(os.environ.get("FAKE_OUT", ""))
 sys.exit(int(os.environ.get("FAKE_RC", "0")))
@@ -183,3 +185,54 @@ def test_a_cursor_run_refreshes_its_quota_and_a_failure_is_only_logged(gh, tmp_p
     monkeypatch.setattr(settle.quota, "refresh_cursor", down)
     assert settle.settle(str(state), "cursor", "success", 0, "", "t")[0] == 0
     assert "quota: refreshing cursor failed: api down" in (tmp_path / "logs" / "runner.log").read_text()
+
+
+def test_independent_quota_worker_only_probes_stale_data_and_rechecks_under_lease(gh, tmp_path, probe_cli, monkeypatch):
+    from dataclasses import replace
+    from baton import capacity, quota, quota_worker, session
+    env = session.resolve()
+    c = replace(env.config, quota=replace(env.config.quota, vendor_pool=('codex',), vendor_extra=()))
+    state = c.paths.state
+    now = int(time.time())
+    windows = {name: dict(used=.2, resets_at=now+10000) for name in ('five_hour', 'seven_day')}
+    monkeypatch.setenv('FAKE_OUT', json.dumps({'rate_limits': {
+        'primary': {'used_percent': 20, 'window_minutes': 300, 'resets_at': now+10000},
+        'secondary': {'used_percent': 20, 'window_minutes': 10080, 'resets_at': now+10000}}}))
+    with capacity.lease(state, 'codex'):
+        assert quota_worker.run(c)[0]['state'] == 'deferred'
+    assert not (probe_cli/'calls').exists()
+    assert quota_worker.run(c)[0]['state'] == 'fresh'
+    assert (probe_cli/'calls').read_text().splitlines() == ['call']
+    assert quota_worker.run(c)[0]['state'] == 'fresh'
+    assert (probe_cli/'calls').read_text().splitlines() == ['call']
+    # The observation expires, but a workload completes while this worker is
+    # selecting the vendor. The recheck after acquiring its lease must win.
+    old = quota.load(state, 'codex')
+    old['observed_at'] = now - 3600
+    for window in old['windows'].values():
+        window['observed_at'] = now - 3600
+    quota.atomic_json(state/'quota-codex.json', old)
+    original = settle.probe
+    def racing(*args, **kwargs):
+        quota.record(state, 'codex', windows, time.time())
+        return original(*args, **kwargs)
+    monkeypatch.setattr(settle, 'probe', racing)
+    quota_worker.run(c)
+    assert (probe_cli/'calls').read_text().splitlines() == ['call']
+
+
+def test_independent_quota_worker_backs_off_missing_data_without_faking_freshness(gh, tmp_path, probe_cli):
+    from dataclasses import replace
+    from baton import quota, quota_worker, session
+    c = replace(session.resolve().config, quota=replace(session.resolve().config.quota,
+                vendor_pool=('codex',), vendor_extra=()))
+    assert quota_worker.run(c)[0]['state'] == 'probe_incomplete'
+    assert quota_worker.run(c)[0]['state'] == 'deferred'
+    assert (probe_cli/'calls').read_text().splitlines() == ['call']
+    assert not quota.fresh(c.paths.state, 'codex', time.time(), 30)
+    assert not quota.load(c.paths.state, 'codex').get('observed_at')
+    # A normal call supplies the missing quota and clears the failed-probe backoff.
+    quota.record(c.paths.state, 'codex', {n:dict(used=.2,resets_at=time.time()+10000)
+                 for n in ('five_hour','seven_day')}, time.time())
+    assert quota_worker.run(c)[0]['state'] == 'fresh'
+    assert not (c.paths.state/'quota-probes/codex.json').exists()

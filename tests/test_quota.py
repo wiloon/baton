@@ -102,6 +102,16 @@ class ParseTests(unittest.TestCase):
 
 
 class RecordTests(unittest.TestCase):
+    def test_late_observation_does_not_overwrite_newer_window(self):
+        with tempfile.TemporaryDirectory() as state:
+            quota.record(state, 'codex', {'five_hour': {'used': .4, 'resets_at': NOW + HOUR}}, NOW)
+            quota.record(state, 'codex', {'five_hour': {'used': .1, 'resets_at': NOW + HOUR},
+                                          'seven_day': {'used': .2, 'resets_at': NOW + WEEK}}, NOW - 60)
+            stored = quota.load(state, 'codex')
+            self.assertEqual(stored['windows']['five_hour']['used'], .4)
+            self.assertEqual(stored['windows']['seven_day']['used'], .2)
+            self.assertEqual(stored['observed_at'], NOW)
+
     def test_new_windows_merge_into_the_stored_snapshot(self):
         with tempfile.TemporaryDirectory() as state:
             quota.record(state, "claude", {"five_hour": {"used": 0.3, "resets_at": NOW + HOUR},
@@ -192,3 +202,46 @@ class PickTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_storage_lock_serializes_processes_and_preserves_merged_windows(tmp_path):
+    import subprocess
+    import sys
+    import time
+    state = str(tmp_path)
+    marker = tmp_path/'writer-started'
+    script = '''
+from baton import quota
+from pathlib import Path
+import sys
+Path(sys.argv[2]).touch()
+quota.record(sys.argv[1], 'codex', {'seven_day': {'used': .3, 'resets_at': 9999999999}}, 200)
+'''
+    with quota.locked(state, 'codex'):
+        writer = subprocess.Popen([sys.executable, '-c', script, state, str(marker)])
+        try:
+            deadline = time.monotonic()+5
+            while not marker.exists() and time.monotonic()<deadline:
+                time.sleep(.01)
+            assert marker.exists()
+            try:
+                writer.wait(timeout=.2)
+            except subprocess.TimeoutExpired:
+                pass
+            else:
+                raise AssertionError('writer bypassed the storage lock')
+            # Write the other window while owning the same transaction lock.
+            # The child must load this generation only after it acquires the lock.
+            (tmp_path/'quota-codex.json').write_text(json.dumps({'observed_at':100, 'windows': {
+                'five_hour':dict(used=.2,resets_at=9999999999,observed_at=100)}}))
+        except BaseException:
+            writer.kill(); writer.wait()
+            raise
+    try:
+        assert writer.wait(timeout=5) == 0
+    finally:
+        if writer.poll() is None:
+            writer.kill(); writer.wait()
+    windows = quota.load(state, 'codex')['windows']
+    assert windows['five_hour']['used'] == .2
+    assert windows['seven_day']['used'] == .3

@@ -17,7 +17,7 @@ import tempfile
 import time
 import uuid
 
-from . import analyst_pool, vendor_policy
+from . import analyst_pool, vendor_policy, quota
 from .config import ConfigError, load
 from .retrospective_analyst import ANALYZER_VERSION, analyze, prompt_for
 from .retrospective_evidence import EvidenceError, Ledger, VERSION, digest, encoded, eligible, evidence, markdown
@@ -232,6 +232,18 @@ def run(config, state, root, output, repo='', pipeline='', retry=False):
                             # Never run in a task checkout, and never register this call as a workload.
                             with tempfile.TemporaryDirectory(prefix='analyst-', dir=root) as directory:
                                 result = analyze(config, analyst, prompt, Path(directory), report['facts'], available.fileno())
+                            windows = result.pop('quota_windows', {})
+                            try:
+                                observed = time.time()
+                                if analyst.vendor == 'cursor':
+                                    quota.refresh_cursor(state, observed)
+                                elif windows:
+                                    quota.record(state, analyst.vendor, windows, observed)
+                                if result.get('rc') == 0:
+                                    quota.credential(state, analyst.vendor, 'authenticated', observed)
+                            except (OSError, ValueError, TypeError, KeyError):
+                                # Accounting failure must not discard a completed assessment.
+                                result['quota_update_failed'] = True
                             attempt.update(result, ended=time.time())
                             atomic(path, attempt)
                             vendor_policy.observe_failure(state, analyst.vendor, result, time.time())

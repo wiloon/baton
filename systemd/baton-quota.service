@@ -1,0 +1,13 @@
+[Unit]
+Description=Refresh stale baton quota observations
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/baton
+ExecStart=/usr/bin/uv run --quiet --frozen --no-dev --project %h/baton --directory %h/baton python -m baton.quota_worker
+TimeoutStartSec=8min
+KillMode=control-group
+Nice=15
+UMask=0077

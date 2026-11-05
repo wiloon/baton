@@ -18,10 +18,14 @@ Cursor's output carries none: refresh_cursor asks the dashboard API its IDE uses
 from . import session
 import glob
 import json
+from contextlib import contextmanager
+import fcntl
+import math
 import os
 from pathlib import Path
 import sys
 import time
+import tempfile
 import urllib.request
 
 WINDOW_SECONDS = {"five_hour": 5 * 3600, "seven_day": 7 * 24 * 3600}
@@ -112,6 +116,7 @@ def refresh_cursor(state, now, auth=None, fetch=_fetch_cursor):
     windows = parse_cursor(fetch(token))
     if windows:
         record(state, "cursor", windows, now)
+        credential(state, 'cursor', 'authenticated', now)
     return windows
 
 
@@ -127,21 +132,61 @@ def load(state, vendor):
 
 
 def _save(state, vendor, snap):
-    tmp = _path(state, vendor).with_suffix(".tmp")
-    tmp.write_text(json.dumps(snap))
-    tmp.replace(_path(state, vendor))
+    atomic_json(_path(state, vendor), snap)
+
+
+def atomic_json(path, value):
+    """Readers see a complete generation; writers never share a temporary file."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode='w', dir=path.parent, prefix=path.name + '.', delete=False) as out:
+        temporary = Path(out.name)
+        try:
+            json.dump(value, out)
+            out.close()
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+@contextmanager
+def locked(state, vendor):
+    """Short storage lock, independent of the lease held during model execution."""
+    path = Path(state) / 'quota-locks' / vendor
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open('a') as file:
+        fcntl.flock(file, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(file, fcntl.LOCK_UN)
 
 
 def record(state, vendor, windows, now):
-    snap = load(state, vendor) or {"windows": {}}
-    # Preserve the age of untouched windows, including legacy snapshots whose
-    # observation timestamp existed only at the snapshot level.
-    for window in snap.setdefault("windows", {}).values():
-        window.setdefault("observed_at", 0)
-    snap["windows"].update({name: dict(window, observed_at=now) for name, window in windows.items()})
-    if windows:
-        snap["observed_at"] = now
-    _save(state, vendor, snap)
+    with locked(state, vendor):
+        snap = load(state, vendor) or {"windows": {}}
+        for window in snap.setdefault("windows", {}).values():
+            window.setdefault("observed_at", 0)
+        for name, window in windows.items():
+            if now >= snap['windows'].get(name, {}).get('observed_at', 0):
+                snap['windows'][name] = dict(window, observed_at=now)
+        if windows:
+            snap['observed_at'] = max(now, snap.get('observed_at', 0))
+        _save(state, vendor, snap)
+
+
+def fresh(state, vendor, now, minutes):
+    """A probe attempt or a successful call without quota data is not an observation."""
+    snap = load(state, vendor) or {}
+    required = {'seven_day'} if vendor == 'cursor' else {'five_hour', 'seven_day'}
+    try:
+        windows = snap.get('windows') or {}
+        return required <= windows.keys() and all(
+            type(w.get('used')) in (int, float) and math.isfinite(w['used']) and 0 <= w['used'] <= 1
+            and 0 <= now - w.get('observed_at', 0) <= minutes * 60
+            and w.get('resets_at', 0) > now for w in (windows[n] for n in required))
+    except (TypeError, AttributeError):
+        return False
 
 
 def record_log(state, vendor, log, now):
@@ -157,9 +202,10 @@ def record_log(state, vendor, log, now):
 
 
 def mark_probed(state, vendor, now):
-    snap = load(state, vendor) or {"windows": {}}
-    snap["probed_at"] = now
-    _save(state, vendor, snap)
+    with locked(state, vendor):
+        snap = load(state, vendor) or {"windows": {}}
+        snap["probed_at"] = max(now, snap.get('probed_at', 0))
+        _save(state, vendor, snap)
 
 
 def credential(state, vendor, result, now):
@@ -168,9 +214,21 @@ def credential(state, vendor, result, now):
             "authenticated", "auth_expired", "probe_failed"):
         raise ValueError("invalid credential result")
     path = Path(state, f"credential-{vendor}.json")
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"result": result, "observed_at": now}))
-    tmp.replace(path)
+    with locked(state, vendor):
+        try:
+            previous = json.loads(path.read_text()) if path.exists() else {}
+        except ValueError:
+            previous = {}
+        if now >= previous.get('observed_at', 0):
+            atomic_json(path, {"result": result, "observed_at": now})
+
+
+def credential_current(state, vendor, now):
+    try:
+        row = json.loads((Path(state) / f'credential-{vendor}.json').read_text())
+        return row.get('result') == 'authenticated' and 0 <= now - row.get('observed_at', 0) <= 86400
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
 
 
 def stale(state, vendor, now, minutes):
@@ -231,7 +289,7 @@ def pick(vendors, snapshots, caps, five_hour_max, now, current=None, prefer=()):
 
 def main(argv):
     state = str(session.resolve().config.paths.state)
-    now = int(time.time())
+    now = time.time()
     command, args = argv[0], argv[1:]
     if command == "record":
         record_log(state, *args, now)

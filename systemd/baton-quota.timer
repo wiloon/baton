@@ -1,0 +1,11 @@
+[Unit]
+Description=Check baton quota observation freshness
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=5min
+AccuracySec=10s
+Unit=baton-quota.service
+
+[Install]
+WantedBy=timers.target

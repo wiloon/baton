@@ -96,8 +96,8 @@ GNU `timeout` is required, as for workload execution.
 
 Before analysis, the selected vendor must be enabled and have a recent authenticated credential
 observation and fresh quota windows (weekly for Cursor; five-hour and weekly for the pool vendors) below configured caps, with no active cooldown. Missing or
-stale capacity evidence defers analysis; retrospectives do not run quota probes themselves. Check
-the existing telemetry/probe setup if the reports remain deferred. An unavailable executable or
+stale capacity evidence defers analysis; retrospectives do not run quota probes themselves. Enable
+the independent quota timer described below if the reports remain deferred. An unavailable executable or
 unsupported CLI flag preserves the evidence and consumes an attempt rather than retrying forever.
 
 The default limits are one analysis per activation, three per UTC day and two attempts per report
@@ -164,6 +164,35 @@ review/sanitize them before sharing. Global probe overhead remains separate; ins
 `python -m baton.audit probes`.
 
 ## Enable the timer on the target host
+
+Normal workload calls and retrospective calls publish provider quota observations to the same
+`STATE/quota-VENDOR.json` files. Claude/Codex observations are extracted when present; ephemeral
+Codex responses without limits do not refresh their age. Cursor usage is queried from its API.
+Successful authentication is tracked separately. Each quota update holds a per-vendor storage
+lock across read/merge/write, rejects older observations per window and atomically replaces the
+file using a unique temporary name. Readers see a complete generation without acquiring a lock.
+
+The optional `baton-quota.timer` checks every five minutes after completion, independently of
+both workload scheduling and retrospective analysis. It probes only enabled vendors whose required
+quota windows are missing, reset or older than `[quota].quota_stale_minutes` (default example: 30),
+or whose authenticated credential observation has expired. It acquires the shared vendor lease
+and rechecks before probing, yielding to active model calls and respecting vendor cooldowns.
+Cursor probes query its API without a model call; Claude/Codex probes make a small model request.
+Failed or incomplete probes back off from `quota_probe_retry_minutes` (default 5) up to
+`quota_probe_max_retry_minutes` (default 60). A probe attempt does not refresh quota observations.
+Normal calls that provide fresh data clear the retry backoff at the next check. No work is required
+in the main loop for either timer to operate. Manual workload selection retains its existing
+on-demand probes as a fallback.
+
+Install and activate the quota worker alongside the retrospective timer:
+
+```sh
+cp systemd/baton-quota.service systemd/baton-quota.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now baton-quota.timer
+systemctl --user start baton-quota.service
+journalctl --user -u baton-quota.service
+```
 
 Install the supplied units as user services, adjusting the checkout/uv paths if needed:
 

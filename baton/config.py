@@ -164,6 +164,8 @@ class Quota:
     quota_five_hour_max: float
     quota_stale_minutes: int
     quota_probe_model_claude: str
+    quota_probe_retry_minutes: int = 5
+    quota_probe_max_retry_minutes: int = 60
 
 
 @dataclass(frozen=True)
