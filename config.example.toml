@@ -1,5 +1,5 @@
 # baton's configuration. Copy this file to config.toml next to it and edit that copy: the runner
-# reads config.toml (or --config PATH). Every key is required; `python -m baton --validate` checks
+# reads config.toml (or --config PATH). Only Cursor role overrides are optional; `python -m baton --validate` checks
 # the file without starting anything. A leading ~/ is the runner's home; relative paths are
 # from this file's directory.
 
@@ -147,6 +147,13 @@ model_scan = "sonnet"
 subagent_model_review = "sonnet"
 # Cursor: cursor-agent --model, and minutes before a run is killed.
 model_cursor = "auto"
+# Optional role overrides; empty uses model_cursor. Auto's actual model may be unknown.
+model_cursor_dev = ""
+model_cursor_fix = ""
+model_cursor_review = ""
+model_cursor_spec_review = ""
+model_cursor_spec = ""
+model_cursor_scan = ""
 cursor_max_minutes = 60
 # Codex: the model for any role without its own model_codex_ROLE; "" lets Codex choose.
 codex_model = ""

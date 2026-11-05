@@ -9,8 +9,9 @@ import json
 from pathlib import Path
 import sys
 import time
+from . import timing
 
-COLUMNS = ("start", "stage", "rd", "agent", "model", "status", "verdict", "secs", "fresh", "cache_read", "output", "cost")
+COLUMNS = ("start", "stage", "rd", "agent", "requested", "actual", "status", "verdict", "secs", "fresh", "cache_read", "output", "cost")
 
 
 def _records(root, kind):
@@ -32,7 +33,14 @@ def load(state, issue, repo=None):
     runs = sorted((r for r in _records(state, "runs") if (r.get("issue") == issue and mine(r)) or r.get("pipeline_id") in pipelines),
                   key=lambda r: r.get("started", 0))
     verdicts = {}
-    for event in _records(state, "events"):
+    events = _records(state, "events")
+    attempts = _records(state, "attempts")
+    for task in tasks:
+        pipeline = task['pipeline_id']
+        task['timing'] = timing.summarize(task, [r for r in runs if r.get('pipeline_id') == pipeline],
+            [e for e in events if e.get('task', {}).get('pipeline_id') == pipeline],
+            [a for a in attempts if a.get('pipeline_id') == pipeline])
+    for event in events:
         attrs = event.get("attrs") or {}
         if attrs.get("verdict") and attrs.get("run_id"):
             verdicts[attrs["run_id"]] = attrs["verdict"]
@@ -94,10 +102,17 @@ def report(issue, tasks, runs):
         span = f"{int(task['ended'] - task['started'])}s" if "ended" in task and "started" in task else "unfinished"
         lines.append(f"#{issue} pipeline {str(task.get('pipeline_id'))[:8]}: {task.get('task_status')}, {span}, PR #{task.get('pr') or '-'}, "
                      f"{task.get('spec_rounds', 0)} spec round(s), {task.get('review_rounds', 0)} review round(s)")
+        measured = task.get('timing', {})
+        labels = (("elapsed_ms", "elapsed"), ("active_ms", "active"), ("last_attempt_ms", "last attempt"),
+                  ("model_ms", "model"), ("verify_ms", "local checks"), ("ci_wait_ms", "CI wait"),
+                  ("deferred_wait_ms", "deferred wait"))
+        lines.append("  timing=" + measured.get('timing_state', 'unavailable') + "; " + ", ".join(f"{label}={measured[key] / 1000:.1f}s" if key in measured else f"{label}=-"
+                                        for key, label in labels))
     rows = [COLUMNS]
     for run in runs:
         rows.append((time.strftime("%m-%d %H:%M:%S", time.localtime(run.get("started", 0))), run.get("stage", "?"),
-                     str(run.get("round") or "-"), run.get("agent", "?"), run.get("model", "?"), run.get("status", "?"),
+                     str(run.get("round") or "-"), run.get("agent", "?"), run.get("requested_model", "-"),
+                     run.get("actual_model", run.get("model", "unknown")), run.get("status", "?"),
                      run.get("verdict") or "-", _count(seconds(run)), _count(fresh(run), _partial(run)), _count(run.get("cache_read_tokens"), _partial(run)),
                      _count(run.get("output_tokens"), _partial(run)), _cost(run.get("cost_usd"))))
     lines += ["", *_table(rows), ""]
@@ -110,6 +125,9 @@ def report(issue, tasks, runs):
 
 
 def main_for(state, issue, repo=None):
+    if issue == 'probes':
+        runs = [r for r in _records(state, 'runs') if r.get('role') == 'probe']
+        return 0, "Global quota probes (all repositories; separate from issue totals)\n" + report('probes', [], sorted(runs, key=lambda r: r['started']))
     tasks, runs = load(state, issue, repo)
     if not runs:
         return 1, f"#{issue}: no runs in the ledger"
@@ -122,18 +140,18 @@ def main(argv=None):
     repo = ""
     if args[:1] == ["--repo"] and len(args) > 1:
         repo, args = args[1], args[2:]
-    if len(args) != 1 or not args[0].isdecimal():
-        print("usage: python -m baton.audit [--repo OWNER/NAME] ISSUE", file=sys.stderr)
+    if len(args) != 1 or not (args[0].isdecimal() or args[0] == 'probes'):
+        print("usage: python -m baton.audit [--repo OWNER/NAME] ISSUE|probes", file=sys.stderr)
         return 2
     try:
         config = load_config(Path(__file__).resolve().parents[1] / "config.toml")
-        if not repo and len(config.repos) > 1:
+        if not repo and len(config.repos) > 1 and args[0] != 'probes':
             raise ConfigError("repos: several repositories are configured; pass --repo OWNER/NAME")
         repo = config.repo(repo).gh_repo if repo else config.repos[0].gh_repo
     except ConfigError as error:
         print(f"Invalid configuration: {error}", file=sys.stderr)
         return 2
-    rc, text = main_for(config.paths.state, int(args[0]), repo)
+    rc, text = main_for(config.paths.state, 'probes' if args[0] == 'probes' else int(args[0]), repo)
     print(text, file=sys.stderr if rc else sys.stdout)
     return rc
 

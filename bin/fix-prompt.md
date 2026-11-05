@@ -1,5 +1,7 @@
 You are running unattended: no human is watching and no permission prompt will be answered. You are the author of PR #{{PR}} in {{GH_REPO}} (issue #{{ISSUE}}). Address the review feedback from {{SOURCE}} shown at the end.
 
+{{READING_GUIDANCE}}
+
 The PR branch is checked out in {{WORKTREE}}; stay inside it.
 
 ## Rules

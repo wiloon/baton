@@ -19,6 +19,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 
 from . import after_merge, ci, fix, hooks as telemetry, names, notify, pick, pr as pr_helpers
 from .common import Deferred, git
@@ -58,8 +59,10 @@ class Merger:
             result = session.run_process(["timeout", "15", "gh", "pr", "view", str(self.pr), "-R", self.repo,
                                      "--json", "headRefOid", "--jq", ".headRefOid"], text=True, capture_output=True)
             before = result.stdout.strip() if result.returncode == 0 else ""
+        started = time.monotonic()
         result = ci.green(str(self.pr), minutes)
-        self.hooks.ci(self.pr, result["rc"], before, result["no_checks"])
+        self.hooks.ci(self.pr, result["rc"], before, result["no_checks"],
+                      duration_ms=int((time.monotonic() - started) * 1000))
         return result["green"]
 
     def ci_fix_round(self, wt):

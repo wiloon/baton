@@ -17,9 +17,12 @@ import time
 import urllib.request
 import uuid
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from baton import timing
+
 VENDORS = ('claude', 'cursor', 'codex')
 CREDENTIAL_STALE_SECONDS = 24 * 60 * 60
-ROLES = ('spec', 'spec_review', 'review', 'fix', 'triage', 'scan', 'dev')
+ROLES = ('spec', 'spec_review', 'review', 'fix', 'triage', 'scan', 'dev', 'probe')
 STATUSES = ('success', 'failure', 'timeout', 'auth', 'quota', 'busy', 'interrupted')
 
 
@@ -143,8 +146,10 @@ def run_model(vendor, log, codex_home=None):
                     continue
                 if not isinstance(row, dict):
                     continue
-                if vendor == 'claude' and row.get('type') == 'system' and row.get('subtype') == 'init':
+                if vendor in ('claude', 'cursor') and row.get('type') == 'system' and row.get('subtype') == 'init':
                     model = row.get('model')
+                    if vendor == 'cursor' and str(model).lower() == 'auto':
+                        model = None
                     break
                 if vendor == 'codex' and row.get('type') == 'thread.started' and row.get('thread_id'):
                     model = codex_model(str(row['thread_id']), codex_home)
@@ -266,7 +271,7 @@ def gh_timeline(repo, pr):
 
 
 # Task events are deliberately bounded metadata, never agent prose.
-EVENTS = ('started', 'run_completed', 'review', 'spec_review', 'fix', 'ci', 'verify', 'ci_fix', 'handoff', 'merged')
+EVENTS = ('started', 'run_completed', 'review', 'spec_review', 'fix', 'ci', 'verify', 'ci_fix', 'handoff', 'merged', 'attempt_completed')
 REASONS = ('none', 'auto_merge_off', 'manual_checks', 'review_failed', 'review_limit',
            'fix_failed', 'needs_info', 'no_commit', 'push_failed', 'spec_failed',
            'spec_limit', 'spec_rejected', 'ci_not_green', 'merge_failed', 'implementation_failed',
@@ -300,6 +305,21 @@ class Tasks:
 
     def path(self, pipeline):
         return self.root / 'tasks' / (str(uuid.UUID(pipeline)) + '.json')
+
+    def attempt(self, pipeline, attempt_id, started_ms, result):
+        task = read(self.path(pipeline))
+        now = time.time()
+        if not 0 <= started_ms <= int(now * 1000) or result not in (0, 1, 2, 75, 80):
+            raise ValueError('invalid attempt metadata')
+        path = self.root / 'attempts' / (str(uuid.UUID(attempt_id)) + '.json')
+        with locked(path.with_suffix('.lock')):
+            if not path.exists():
+                save(path, dict(pipeline_id=task['pipeline_id'], started=started_ms / 1000,
+                                ended=now, result=result))
+        # A terminal snapshot may have been exported before cleanup finished. Emit a
+        # new sequence so the completed attempt is eventually visible in that case.
+        with locked(self.root / 'tasks.lock'):
+            self._event(read(self.path(pipeline)), 'attempt_completed', attempt_id, {})
 
     def ensure(self, issue=0, pr=0, *, repo):
         if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo):
@@ -374,7 +394,7 @@ class Tasks:
                                    ('auto_merge_off', 'manual_checks') else 'abnormal_handoff')
         elif kind == 'merged':
             task['task_status'] = 'merged'
-        if task['task_status'] != 'active':
+        if task['task_status'] != 'active' and kind != 'attempt_completed':
             task['ended'] = now
         if attrs.get('pr'):
             task['pr'] = attrs['pr']
@@ -389,7 +409,7 @@ class Tasks:
                         task=task, attrs=attrs))
         save(self.path(task['pipeline_id']), task)
 
-    def payloads(self, record):
+    def payloads(self, record, history=None):
         task, attrs = record['task'], record['attrs']
         fields = {k: task[k] for k in ('pipeline_id', 'repo', 'issue', 'pr', 'task_status', 'reason', 'sequence')}
         fields.update(attrs)
@@ -398,14 +418,22 @@ class Tasks:
         event = metadata_log('baton.task_event', record['timestamp'], fields)
         # Task rows are snapshots. Keep the latest sequence per episode, never sum snapshots.
         snapshot = dict(fields, event_id=record['event_id'] + ':task_summary',
-                        duration_ms=int(max(0, record['timestamp'] - task['started']) * 1000))
-        runs = [read(p) for p in (self.root / 'runs').glob('*.json')]
+                        duration_ms=int(max(0, task.get('ended', record['timestamp']) - task['started']) * 1000))
+        if history is None:
+            history = {kind: [read(p) for p in (self.root / kind).glob('*.json')]
+                       for kind in ('runs', 'events', 'attempts')}
+        runs = history['runs']
         runs = [r for r in runs if r.get('pipeline_id') == task['pipeline_id'] and
                 r.get('ended', float('inf')) <= record['timestamp']]
         snapshot['review_rounds'] = task.get('review_rounds', 0)
         snapshot['spec_rounds'] = task.get('spec_rounds', 0)
         snapshot['runs'] = len(runs)
         snapshot['incomplete_runs'] = sum(r.get('usage_state') != 'complete' for r in runs)
+        events = history['events']
+        events = [e for e in events if e['task']['pipeline_id'] == task['pipeline_id']]
+        attempts = history['attempts']
+        attempts = [a for a in attempts if a['pipeline_id'] == task['pipeline_id']]
+        snapshot.update(timing.summarize(task, runs, events, attempts, record['timestamp']))
         # Only expose a category when every run has a complete value for it.
         for field in ('input_tokens', 'cache_read_tokens', 'cache_write_tokens', 'output_tokens'):
             if runs and all(r.get('usage_state') == 'complete' and field in r for r in runs):
@@ -414,14 +442,22 @@ class Tasks:
 
     def flush(self):
         deadline = time.monotonic() + 12
-        for path in sorted((self.root / 'events').glob('*.json')):
+        paths = sorted((self.root / 'events').glob('*.json'))
+        pending = [p for p in paths if not p.with_suffix('.sent').exists()]
+        if not pending:
+            return
+        # Read the shared history once per batch, not once per event snapshot.
+        history = {kind: [read(p) for p in (self.root / kind).glob('*.json')]
+                   for kind in ('runs', 'attempts')}
+        history['events'] = [read(p) for p in paths]
+        for path in pending:
             if time.monotonic() > deadline:
                 break
             with locked(path.with_suffix('.delivery-lock')):
                 ack = path.with_suffix('.sent')
                 if ack.exists():
                     continue
-                for payload in self.payloads(read(path)):
+                for payload in self.payloads(read(path), history):
                     request = urllib.request.Request('http://127.0.0.1:4319/v1/logs',
                         json.dumps(payload).encode(), {'Content-Type': 'application/json'})
                     with urllib.request.urlopen(request, timeout=2) as response:
@@ -469,7 +505,7 @@ class Ledger:
         # Never accept a filename from CLI or agent output.
         return self.root / 'runs' / (str(uuid.UUID(run_id)) + '.json')
 
-    def begin(self, vendor, role, pid, minutes, issue=0, pr=0, round_=0, *, repo):
+    def begin(self, vendor, role, pid, minutes, issue=0, pr=0, round_=0, *, repo, requested_model=''):
         if vendor not in VENDORS or role not in ROLES or not 1 <= minutes <= 1440:
             raise ValueError('invalid bounded run metadata')
         now = time.time()
@@ -479,6 +515,8 @@ class Ledger:
                       trace_id=uuid.uuid4().hex, span_id=uuid.uuid4().hex[:16],
                       started=now, heartbeat=now, deadline=now + minutes * 60 + 60,
                       owner=identity(pid), issue=max(0, issue), pr=max(0, pr), round=max(0, round_))
+        if requested_model and MODEL_RE.fullmatch(requested_model):
+            record['requested_model'] = requested_model
         task = Tasks(self.state).ensure(issue, pr, repo=repo)
         if task:
             record['pipeline_id'] = task['pipeline_id']
@@ -504,6 +542,7 @@ class Ledger:
             record.update(usage(record['agent'], log, record['status']) if log else
                           {'usage_state': 'unavailable', 'cost_state': 'unavailable'})
             record['model'] = run_model(record['agent'], log) if log else 'unknown'
+            record['actual_model'] = record['model']
 
             save(path, record)
             if record.get('pipeline_id'):
@@ -574,7 +613,7 @@ def summary_payload(record):
              'status': record['status'],
              'usage_state': record['usage_state'], 'cost_state': 'unavailable',
              'duration_ms': int(max(0, record['ended'] - record['started']) * 1000)}
-    for key in ('pipeline_id', 'workflow_version', 'config_version', 'cli_version'):
+    for key in ('pipeline_id', 'workflow_version', 'config_version', 'cli_version', 'requested_model', 'actual_model'):
         if key in record:
             attrs[key] = record[key]
     for key in ('issue', 'pr', 'round'):
@@ -984,6 +1023,12 @@ def main():
     for name in ('pid', 'minutes', 'issue', 'pr', 'round'):
         begin.add_argument(name, type=int)
     begin.add_argument('--repo', required=True)
+    begin.add_argument('--requested-model', default='')
+    attempt = sub.add_parser('attempt')
+    attempt.add_argument('pipeline')
+    attempt.add_argument('attempt_id')
+    attempt.add_argument('started_ms', type=int)
+    attempt.add_argument('result', type=int)
     end = sub.add_parser('end')
     end.add_argument('run_id')
     end.add_argument('status', choices=STATUSES)
@@ -1019,11 +1064,14 @@ def main():
     CONFIG_PATH = args.runner_config
     ledger = Ledger(args.state)
     if args.action == 'begin':
-        record = ledger.begin(args.vendor, args.role, args.pid, args.minutes, args.issue, args.pr, args.round, repo=args.repo)
+        record = ledger.begin(args.vendor, args.role, args.pid, args.minutes, args.issue, args.pr, args.round,
+                              repo=args.repo, requested_model=args.requested_model)
         print(record['run_id'], record['trace_id'], record['span_id'], record.get('pipeline_id', ''))
         subprocess.Popen([sys.executable, __file__, '--state', str(args.state), 'heartbeat', record['run_id']],
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True, close_fds=True)
+    elif args.action == 'attempt':
+        Tasks(args.state).attempt(args.pipeline, args.attempt_id, args.started_ms, args.result)
     elif args.action == 'ci-result':
         try:
             checks = json.load(sys.stdin)

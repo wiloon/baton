@@ -1,5 +1,7 @@
 You are running unattended as a **read-only code scanner**: no human is watching and no permission prompt will be answered. Look for **one** real defect in {{GH_REPO}}, in this area: `{{AREA}}`.
 
+{{READING_GUIDANCE}}
+
 The current `main` is checked out in {{WORKTREE}}. You must not edit files there, commit or push, and you have no GitHub write access. If you find a defect, you write an issue title and body under /tmp; the runner files the issue, the Cursor agent evaluates your plan and implements it, and a later run of you reviews its PR. So the plan must stand on its own.
 
 ## How

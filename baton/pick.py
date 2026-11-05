@@ -28,6 +28,10 @@ def choose(env, role, current, mode, candidates, *, pr="", exclude="", issue="",
     if rc == 75:
         raise Deferred("pool", result["reason"])
     vendor = result["vendor"]
+    try:
+        notify.log("selection: " + vendors.selection_details(state, pool, candidates, vendor, role, area=area))
+    except (OSError, ValueError, KeyError, TypeError):
+        notify.log(f"selection: chosen={vendor} role={role} quota_details=unavailable")
     if result.get("quota_error"):
         notify.log("pool: quota.py failed (rc=2); using pool order")
     if vendor != current and not result.get("silent"):

@@ -35,13 +35,15 @@ def log(env):
 def test_a_pool_pick_probes_stale_quota_and_logs_the_change(env):
     assert pick.choose(env, "v", "pool", "pool", ["claude", "codex"]) == "claude"
     assert sorted(env["probes"]) == ["claude", "codex"]
-    assert log(env) == ["pool: v -> claude (was pool; claude=+0.00 codex=+0.00)"]
+    assert log(env)[-1] == "pool: v -> claude (was pool; claude=+0.00 codex=+0.00)"
+    assert log(env)[0].startswith("selection: chosen=claude role=v")
 
 
 def test_a_cooling_vendor_gives_way_to_the_next(env):
     Path(env["STATE"], "claude-cooldown-until").write_text("1999999999\n")
     assert pick.choose(env, "v", "claude", "pool", ["claude", "codex"]) == "codex"
-    assert log(env) == ["pool: v -> codex (was claude; codex=+0.00)"]
+    assert log(env)[-1] == "pool: v -> codex (was claude; codex=+0.00)"
+    assert "gate=cooldown until epoch 1999999999" in log(env)[0]
 
 
 def test_nobody_able_to_run_defers_the_pool(env):
@@ -54,7 +56,8 @@ def test_nobody_able_to_run_defers_the_pool(env):
 
 def test_a_contribution_pick_names_the_pr_in_its_log(env):
     assert pick.choose(env, "fixer", "agent", "contrib", ["claude", "codex", "cursor"], pr="7") == "claude"
-    assert log(env) == ["contrib: fixer -> claude for PR #7 (was agent; lines: claude=0 codex=0 cursor=0)"]
+    assert log(env)[-1] == "contrib: fixer -> claude for PR #7 (was agent; lines: claude=0 codex=0 cursor=0)"
+    assert "cursor[extra]" in log(env)[0]
 
 
 def test_a_codex_pr_may_be_reviewed_by_codex_on_a_proven_model(env, monkeypatch):

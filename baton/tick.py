@@ -123,8 +123,10 @@ class Tick:
         fd, path = tempfile.mkstemp(prefix="baton-telemetry-item.", dir=self.env.tools.get("TMPDIR", "/tmp") or "/tmp")
         os.close(fd)
         self.env.runtime.telemetry_item = path
+        self.hooks().start_attempt()
 
     def finish_item(self, rc):
+        self.hooks().finish_attempt(rc)
         item = self.env.runtime.telemetry_item
         self.env.runtime.telemetry_item = ""
         if item:
