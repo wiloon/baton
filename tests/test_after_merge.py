@@ -348,3 +348,23 @@ def test_a_bug_already_open_is_not_filed_or_posted(gh):
     gh.set(body=BUG_BODY, comments=[], open_issues=["My Documents omits a saved document"])
     after_merge.file_pr_bugs("5", "7")
     assert gh.created() == [] and not gh.pr["comments"]
+
+
+# --- a bug the PR already names by number (a fix round wrote it) is not filed again ------
+
+NUMBERED_BODY = ("## Follow-ups\n- [bug] #650 — fixed by #656 (merged). A side panel card keeps a "
+                 "stale miss — SidePanel.tsx:900\n- [bug] #651: popover spills past the edge")
+
+
+def test_a_bug_the_pr_names_by_number_is_not_filed_after_the_merge(gh, tmp_path):
+    gh.set(title="t", body=NUMBERED_BODY, comments=comments(
+        REVIEW + "## Follow-ups\n- [bug] #652 Toast shows twice — Claimer.tsx:40"))
+    after_merge.follow_ups("5", "7")
+    assert gh.created() == []
+    assert "PR #5: side bug already filed: #650" in log_lines(tmp_path)
+
+
+def test_a_bug_the_pr_names_by_number_is_not_filed_when_the_pr_opens(gh):
+    gh.set(body=NUMBERED_BODY, comments=[])
+    after_merge.file_pr_bugs("5", "7")
+    assert gh.created() == [] and not gh.pr["comments"]

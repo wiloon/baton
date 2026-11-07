@@ -28,6 +28,8 @@ FIX_MARKER = "<!-- baton-fix "
 ADOPTED = re.compile(r"`?:?\s+adopted\b", re.I)
 FILED_BUGS_MARKER = "<!-- baton-filed-bugs -->"
 LINEAR_ERROR_MAX = 500
+# A fix round writes the filed number at the start of the bug (`#650 — fixed by #656. ...`).
+NAMED_ISSUE = re.compile(r"#[0-9]+\b")
 
 
 def repo():
@@ -147,7 +149,7 @@ def file_pr_bugs(pr, issue):
             continue
         bug = text.split("\n", 1)[0].split(" — ", 1)[0]
         key = md.bug_key(bug)
-        if key in seen:
+        if key in seen or NAMED_ISSUE.match(text):
             log(f"PR #{pr}: side bug already filed: {bug}")
             continue
         seen.add(key)
@@ -190,7 +192,7 @@ def follow_ups(pr, issue):
         if kind == "bug":
             bug = text.split("\n", 1)[0].split(" — ", 1)[0]
             key = md.bug_key(bug)
-            if key in seen:
+            if key in seen or NAMED_ISSUE.match(text):
                 log(f"PR #{pr}: side bug already filed: {bug}")
                 continue
             seen.add(key)
