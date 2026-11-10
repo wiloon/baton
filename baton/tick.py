@@ -355,7 +355,8 @@ class Tick:
     def file_merged_follow_ups(self):
         """A PR handed to the owner (manual checks, CI, review rounds) is merged by them, not by
         merge_or_handoff, so its follow-ups and owner actions would be lost. Every tick files
-        them for such PRs merged in the last 7 days; both run once per PR (state markers)."""
+        them for such PRs merged in the last 7 days, and records the merge in telemetry; each runs
+        once per PR (state markers)."""
         since = time.strftime("%F", time.localtime(self.clock() - 7 * 86400))
         merged = self.gh_json("pr", "list", "-R", self.gh_repo, "--state", "merged", "--search", f"merged:>={since}",
                               "--limit", "50", "--json", "number,headRefName,body,comments") or []
@@ -365,6 +366,9 @@ class Tick:
                 continue
             issue, _ = pr_contract.relation(p)
             n = str(p["number"])
+            recorded = self.state / f"merged-event-pr-{n}"
+            if not recorded.exists() and self.hooks(issue, n).owner_merged():
+                recorded.touch()
             merger = merge.Merger(self.env, self.hooks(issue, n), n, issue)
             if not merger.finish_merged_task():
                 self.log(f"PR #{n}: task recovery will retry")

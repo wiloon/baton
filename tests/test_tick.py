@@ -660,6 +660,20 @@ def test_follow_ups_are_filed_for_pr_the_owner_merged(ctx, monkeypatch):
     assert seen == [("finish", "5", "9"), ("after", "5", "9")] and "PR #5: task recovery will retry" in ctx.log()
 
 
+def test_an_owner_merge_is_recorded_once_per_pr(ctx, monkeypatch):
+    reviewed = {"number": 5, "headRefName": "cursor/issue-9", "body": "Refs #9",
+                "comments": [{"author": {"login": "owner"}, "body": "<!-- baton-review round=1 by=codex -->\nok"}]}
+    ctx.gh.answers["pr list"] = [reviewed]
+    monkeypatch.setattr(merge.Merger, "finish_merged_task", lambda self: True)
+    monkeypatch.setattr(merge.Merger, "after_merge", lambda self: None)
+    recorded, answers = [], [False, True]
+    monkeypatch.setattr(tick.telemetry.Telemetry, "owner_merged",
+                        lambda self: recorded.append((self.issue, self.pr)) or answers.pop(0))
+    for _ in range(3):
+        ctx.make().file_merged_follow_ups()
+    assert recorded == [(9, 5), (9, 5)]
+
+
 # --- the dev run --------------------------------------------------------------------------------------------------------------
 @pytest.fixture
 def devrun(ctx, worktree, monkeypatch):
