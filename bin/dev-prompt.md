@@ -15,6 +15,7 @@ This directory ({{WORKTREE}}) is a git worktree on branch `{{BRANCH}}`. Edit fil
    {{REPO_NOTES}}
 6. You have no GitHub access, by design: no `git push`, `gh`, fetch or tags. Commit locally on this branch (conventional messages, scoped the way AGENTS.md describes). Leave no untracked files: commit them or delete scratch files, or the run fails. Never touch `main`, never run deploy tasks, kubectl or ssh. The runner pushes and opens the PR.
    Shell commands: keep them simple, one command per call, with no `;`, `&&` or variable assignments. A command refused for its form is not a block: retry it as a simpler command, or use the Read and Grep tools.
+   Limits: before you write that something can't be done in this run (no network, no browser, no credential, a missing tool), try it once and quote the command and its exact error in the PR description. Without a quoted attempt, don't make the claim. The limits these rules set (no GitHub access, no deploy tasks, kubectl or ssh) are known; don't try them.
 7. Write the PR description to `{{PR_BODY_FILE}}` (outside the worktree; don't commit it). Plain text: the title on the very first line, no code fence around it:
 
    ```
@@ -37,7 +38,7 @@ This directory ({{WORKTREE}}) is a git worktree on branch `{{BRANCH}}`. Edit fil
    none   (or one item per line: `- [nit] <file:line> what and why` | `- [bug] <one-line title> — <file:line, what is wrong>`)
    ```
 
-`## Manual checks` is `none` or a list of checks: the runner auto-merges only when the section is exactly `none`. List only what a human can open in a browser on this PR's code and look at now. When nothing is rendered yet (an unmounted component, a server-only change), write `none`, and put what you did not see in a browser, and any visual check left for a later PR, under `## What changed`.
+`## Manual checks` is `none` or a list of checks: the runner auto-merges only when the section is exactly `none`. List only what a human can open in a browser on this PR's code and look at now. When nothing is rendered yet (an unmounted component, a server-only change), write `none`, and put what you did not see in a browser, and any visual check left for a later PR, under `## What changed`. A check that needs only a terminal command (no real browser, no owner account, no production access) is not a manual check: run it yourself and report its output, or its exact error, under `## What changed`. This includes a check the issue lists as manual. Only checks that need a real browser or the owner stay manual.
 
 The `Task completion` field is about issue #{{ISSUE}} itself, even when it was split from a larger issue: `partial` when any agreed work of #{{ISSUE}} remains after this PR, `complete` when this PR delivers every remaining acceptance item of #{{ISSUE}}. The reviewer checks this field, and a merge with `complete` closes the issue. For `complete`, use `Closes #{{ISSUE}}`. The runner retains the issue for partial slices and includes merged slices in the next run. Describe partial completion with neutral wording, such as `This PR leaves the parent issue open.` GitHub recognizes closing keywords even in negated sentences.
 

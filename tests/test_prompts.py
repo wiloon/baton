@@ -125,3 +125,22 @@ def test_a_prompt_dir_overrides_a_template_by_name(tmp_path):
     env = other_repo(tmp_path, prompt_dir=str(custom))
     assert prompts.render(BIN / "scan-prompt.md", [], env=env) == "Scan acme/shop for alice."
     assert prompts.render(BIN / "review-prompt.md", [], env=env).startswith("You are running unattended")
+
+
+# --- #28: an agent tries before it claims a limitation, and runs the terminal checks itself ---
+
+TRY_FIRST = "try it once and quote the command and its exact error"
+RUN_IT = "run it yourself and report its output"
+UNPROVEN = "without the quoted command and its exact error is Must fix"
+
+
+@pytest.mark.parametrize("name", ["dev-prompt.md", "fix-prompt.md", "codex-fix-prompt.md", "cursor-fix-prompt.md"])
+def test_authors_try_before_claiming_a_limit_and_run_terminal_checks(name):
+    prompt = text(name)
+    assert TRY_FIRST in prompt
+    assert RUN_IT in prompt
+
+
+@pytest.mark.parametrize("name", ["review-prompt.md", "codex-review-prompt.md", "cursor-review-prompt.md"])
+def test_reviewers_flag_an_unproven_limitation(name):
+    assert UNPROVEN in text(name)
