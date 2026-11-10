@@ -287,6 +287,27 @@ def test_the_owners_pr_review_note_names_the_issue(ctx, worktree):
     assert "and issue #5 give the problem" in args[2] and kw == {"issue": "5"}
 
 
+def test_a_pr_on_a_non_agent_branch_takes_its_issue_from_the_closing_reference(ctx, worktree):
+    branch = "feat/715-article-pick"
+    sh(worktree.repo, "git", "push", "-q", "origin", f"origin/main:refs/heads/{branch}")
+    sh(worktree.repo, "git", "fetch", "-q", "origin")
+    ctx.gh.answers["pr view"] = {**pr_json(branch=branch, body="Picks the article. Closes #715 and #716."),
+                                 "closingIssuesReferences": [{"number": 715}, {"number": 716}]}
+    ctx.make("review", "746").pick_review()
+    (args, kw), = ctx.loops
+    assert "and issue #715 give the problem" in args[2] and kw == {"issue": "715"}
+
+
+def test_a_pr_with_no_linked_issue_is_reviewed_without_one(ctx, worktree):
+    branch = "feat/no-issue"
+    sh(worktree.repo, "git", "push", "-q", "origin", f"origin/main:refs/heads/{branch}")
+    sh(worktree.repo, "git", "fetch", "-q", "origin")
+    ctx.gh.answers["pr view"] = {**pr_json(branch=branch, body="Just a tweak."), "closingIssuesReferences": []}
+    ctx.make("review", "746").pick_review()
+    (args, kw), = ctx.loops
+    assert "issue #" not in args[2] and kw == {"issue": ""}
+
+
 def test_review_is_skipped_when_an_issue_or_pr_is_forced(ctx):
     assert ctx.make("5").pick_review() is None and ctx.make("pr", "5").pick_review() is None
     assert not ctx.gh.calls

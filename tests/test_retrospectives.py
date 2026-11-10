@@ -12,7 +12,7 @@ import uuid
 import pytest
 
 from baton import capacity, config, retrospectives as retro
-from baton.retrospective_evidence import Ledger, digest
+from baton.retrospective_evidence import Ledger, digest, markdown, subject
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -27,9 +27,9 @@ def put(state, kind, name, value):
 def seed(state, status='merged', repo='acme/app', issue=1):
     pipe = str(uuid.uuid4())
     started = time.time() - 1000
-    task = dict(repo=repo, pipeline_id=pipe, issue=issue, pr=2, task_status=status,
+    task = dict(repo=repo, pipeline_id=pipe, pr=2, task_status=status,
                 reason='none', started=started, ended=started+200, updated=started+210, sequence=3,
-                workflow_version='a'*64, config_version='b'*64)
+                workflow_version='a'*64, config_version='b'*64, **({} if issue is None else dict(issue=issue)))
     put(state, 'tasks', pipe, task)
     run_id = str(uuid.uuid4())
     run = dict(run_id=run_id, repo=repo, pipeline_id=pipe, role='dev', stage='implement', agent='claude',
@@ -143,6 +143,17 @@ def test_public_command_evidence_only_and_deduplication(host, capsys):
     assert json.loads(capsys.readouterr().out) == dict(state='summary', counts={'unchanged': 1})
     assert len(list(host.output.glob('**/report.json'))) == 1
     assert not host.calls()
+
+
+@pytest.mark.parametrize('issue', [None, 0])
+def test_an_episode_without_an_issue_is_grouped_by_its_pr(host, issue):
+    pipe = seed(host.state, issue=issue)
+    host.run()
+    report = host.report(pipe)
+    assert subject(report['evidence']['task']) == ('pr', 2)
+    text = markdown(report)
+    assert 'Issue: unknown; PR: #2' in text and '#0' not in text
+    assert subject(dict(issue=715, pr=2)) == ('issue', 715)
 
 
 def test_analyst_runs_once_separate_usage_and_no_raw_content(host):

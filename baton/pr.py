@@ -50,11 +50,15 @@ def edit_body(pr, text, directory, prefix):
 
 
 def details(pr, owner, cursor_login):
-    """Branch, review route, issue and completion of PR (empty when absent)."""
-    data = view(pr, "headRefName,author,isCrossRepository,state,isDraft,body")
+    """Branch, review route, issue and completion of PR (empty when absent). A PR whose
+    branch and body name no issue takes the first one GitHub says it closes."""
+    data = view(pr, "headRefName,author,isCrossRepository,state,isDraft,body,closingIssuesReferences")
     if data is None:
         raise ValueError(f"cannot read PR #{pr}")
     issue, completion = pr_contract.relation(data)
+    if not issue:
+        closing = [str(ref["number"]) for ref in data.get("closingIssuesReferences") or () if ref.get("number")]
+        issue = closing[0] if closing else ""
     return {"branch": data.get("headRefName", ""), "route": pr_contract.route(data, owner, cursor_login),
             "issue": issue, "completion": completion}
 

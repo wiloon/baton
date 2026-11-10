@@ -31,6 +31,28 @@ class TaskTests(unittest.TestCase):
         other_repo = self.store.ensure(123, repo='acme/other')
         self.assertNotEqual(second['pipeline_id'], other_repo['pipeline_id'])
 
+    def test_an_episode_without_an_issue_records_none_and_gains_one_later(self):
+        task = self.store.ensure(0, 746, repo='test/repo')
+        self.assertNotIn('issue', task)
+        self.store.event(task['pipeline_id'], 'handoff', 'failed', reason='fix_failed')
+        record = next(t.read(p) for p in (self.store.root / 'events').glob('*.json') if t.read(p)['event_kind'] == 'handoff')
+        for payload in self.store.payloads(record):
+            keys = {a['key'] for a in payload['resourceLogs'][0]['scopeLogs'][0]['logRecords'][0]['attributes']}
+            self.assertNotIn('issue', keys)
+        later = self.store.ensure(0, 747, repo='test/repo')
+        self.assertEqual(self.store.ensure(715, 747, repo='test/repo')['issue'], 715)
+        self.assertEqual(later['pipeline_id'], self.store.ensure(0, 747, repo='test/repo')['pipeline_id'])
+
+    def test_a_run_without_an_issue_records_none(self):
+        ledger = t.Ledger(self.state)
+        with patch.object(t, 'identity', return_value=OWNER), patch.object(t.subprocess, 'run', side_effect=OSError):
+            run = ledger.begin('codex', 'review', 123, 60, 0, 746, 1, repo='test/repo')
+        self.assertNotIn('issue', run)
+        record = ledger.end(run['run_id'], 'interrupted')
+        keys = {a['key'] for a in t.summary_payload(record)['resourceLogs'][0]['scopeLogs'][0]['logRecords'][0]['attributes']}
+        self.assertNotIn('baton.issue', keys)
+        self.assertIn('baton.pr', keys)
+
     def test_a_merge_after_a_handoff_ends_the_episode_merged_and_keeps_the_handoff(self):
         task = self.store.ensure(123, 456, repo='test/repo')
         pipeline = task['pipeline_id']

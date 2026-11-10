@@ -201,16 +201,25 @@ def evidence(snapshot):
                                 'included_in_episode': False})
 
 
+def subject(task):
+    """What an episode is about: ('issue', N), or ('pr', N) when no issue is known.
+    Older ledgers recorded an unknown issue as 0."""
+    if task.get('issue'):
+        return 'issue', task['issue']
+    return 'pr', task.get('pr', 0)
+
+
 def markdown(report):
     data = report['evidence']
     task = data['task']
+    issue = f"#{task['issue']}" if subject(task)[0] == 'issue' else 'unknown'
     def measured(item):
         if item['value'] is None:
             return 'unknown'
         return ('>=' if item['state'] == 'partial' else '') + str(item['value'])
     lines = [f"# Retrospective: {task['repo']} / {task['pipeline_id']}", '',
              f"Outcome: {task['task_status']} ({task.get('reason', 'unavailable')})",
-             f"Issue: #{task.get('issue', 0)}; PR: #{task.get('pr', 0)}",
+             f"Issue: {issue}; PR: #{task.get('pr', 0)}",
              f"Source digest: {report['source_digest']}", f"Observation cutoff: {report['observed_at']}",
              f"Analysis: {report['analysis_state']} ({report.get('analysis_reason', '')})", '',
              '## Workload usage', '', '| Category | Known total | Reporting runs | Coverage |',
