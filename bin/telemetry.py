@@ -348,10 +348,12 @@ class Tasks:
                 raise ValueError('conflicting active task identities')
             task = next(iter(active.values()), None)
             if task is None:
-                task = dict(pipeline_id=str(uuid.uuid4()), repo=repo, issue=issue, pr=pr,
+                task = dict(pipeline_id=str(uuid.uuid4()), repo=repo, pr=pr,
                             task_status='active', reason='none', started=time.time(), sequence=0,
                             **fingerprints(Path(__file__).parent))
-            task['issue'] = issue or task['issue']
+            # An unknown issue is absent, never 0: consumers group such an episode by its PR.
+            if issue:
+                task['issue'] = issue
             task['pr'] = pr or task['pr']
             save(self.path(task['pipeline_id']), task)
             for key in keys:
@@ -423,7 +425,8 @@ class Tasks:
 
     def payloads(self, record, history=None):
         task, attrs = record['task'], record['attrs']
-        fields = {k: task[k] for k in ('pipeline_id', 'repo', 'issue', 'pr', 'task_status', 'reason', 'sequence')}
+        fields = {k: task[k] for k in ('pipeline_id', 'repo', 'issue', 'pr', 'task_status', 'reason', 'sequence')
+                  if k in task}
         fields.update(attrs)
         fields.update(event_id=record['event_id'] + ':event', event_kind=record['event_kind'])
         fields.update({k: task[k] for k in ('workflow_version', 'config_version') if k in task})
@@ -526,7 +529,9 @@ class Ledger:
         record = dict(run_id=run_id, agent=vendor, role=role, stage=stage, repo=repo, status='running',
                       trace_id=uuid.uuid4().hex, span_id=uuid.uuid4().hex[:16],
                       started=now, heartbeat=now, deadline=now + minutes * 60 + 60,
-                      owner=identity(pid), issue=max(0, issue), pr=max(0, pr), round=max(0, round_))
+                      owner=identity(pid), pr=max(0, pr), round=max(0, round_))
+        if issue > 0:
+            record['issue'] = issue
         if requested_model and MODEL_RE.fullmatch(requested_model):
             record['requested_model'] = requested_model
         task = Tasks(self.state).ensure(issue, pr, repo=repo)
@@ -629,7 +634,7 @@ def summary_payload(record):
         if key in record:
             attrs[key] = record[key]
     for key in ('issue', 'pr', 'round'):
-        if record[key] > 0:
+        if record.get(key, 0) > 0:
             attrs['baton.' + key] = record[key]
     for key in ('input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens', 'reasoning_tokens'):
         if key in record:
