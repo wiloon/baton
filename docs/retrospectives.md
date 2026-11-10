@@ -146,9 +146,12 @@ updated only after both artifacts are written and validated. Revisions and earli
 are retained. The source digest, schema, analyzer version and analysis configuration determine
 revision identity. The source digest ignores the post-merge `checked_at` timestamp, which the
 post-merge timer refreshes on every pass; a change in reverts, issues or `final` is new evidence.
-Unchanged successful reports make no new model call. A successful report published under an older
-revision whose evidence differs only in `checked_at`, with the same analyzer version and analysis
-configuration, is carried forward to the new revision without a call.
+A refresh that changes only `checked_at` keeps the revision and does not write a new generation;
+the report keeps the `checked_at` it was published with. Unchanged successful reports make no new
+model call. A successful report published under any older revision of the episode, not only the
+current one, whose evidence differs only in `checked_at`, with the same analyzer version and
+analysis configuration, is carried forward to the new revision without a call; the latest such
+report wins.
 
 A rejected reply is journaled with a `failure` code (`invalid_json`, the assessment rule that
 failed such as `hypothesis references`, `unparseable_output`, `cli_error`, `reply_too_long`) and,

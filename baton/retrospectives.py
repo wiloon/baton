@@ -20,8 +20,8 @@ import uuid
 from . import analyst_pool, vendor_policy, quota
 from .config import ConfigError, load
 from .retrospective_analyst import ANALYZER_VERSION, analyze, prompt_for
-from .retrospective_evidence import (EvidenceError, Ledger, VERSION, digest, encoded, eligible, evidence, markdown,
-                                     material, source_digest)
+from .retrospective_evidence import (EvidenceError, Ledger, VERSION, VOLATILE_POSTMERGE, digest, encoded, eligible,
+                                     evidence, markdown, material, source_digest)
 
 
 def atomic(path, value):
@@ -110,6 +110,11 @@ def pointed(output, key):
     generation = (episode / pointer['generation']).resolve()
     if not generation.is_relative_to(episode.resolve()):
         raise EvidenceError('invalid report pointer')
+    return generation_report(generation, revision)
+
+
+def generation_report(generation, revision):
+    """A published generation's report, or None when its artifacts are incomplete or invalid."""
     try:
         report = read(generation / 'report.json')
         if (isinstance(report, dict) and report.get('revision') == revision
@@ -150,20 +155,37 @@ def same_source(state, key, source):
 
 
 def carried(output, key, report, policy):
-    """A successful assessment of the same material evidence under an older revision.
+    """The latest successful assessment of the same material evidence under an older revision.
 
     Revisions written before checked_at left the digest differ only in that field; reuse
-    their assessment instead of spending another call on an unchanged episode.
+    their assessment instead of spending another call on an unchanged episode. Every
+    revision is searched, not just the current one: a later checked_at revision that only
+    deferred (daily budget, pause) replaced the successful report as current.
     """
-    old = pointed(output, key)
-    if not old or old.get('analysis_state') != 'success' or old.get('analyzer_version') != ANALYZER_VERSION:
-        return None
-    attempts = old.get('analysis_attempts') or []
-    if not any(a.get('state') == 'success' and a.get('limits') == policy for a in attempts):
-        return None
     def strip(data):
         return dict(data, postmerge=material(data.get('postmerge') or {}))
-    return old if strip(old['evidence']) == strip(report['evidence']) else None
+    wanted = strip(report['evidence'])
+    found = []
+    # Leftover '.generation-*' staging directories are never published; skip them.
+    for path in (output / digest(key)[:16] / key[1]).glob('revisions/*/[!.]*/report.json'):
+        old = generation_report(path.parent, path.parent.parent.name)
+        if (old and old.get('analysis_state') == 'success' and old.get('analyzer_version') == ANALYZER_VERSION
+                and any(a.get('state') == 'success' and a.get('limits') == policy
+                        for a in old.get('analysis_attempts') or [])
+                and strip(old['evidence']) == wanted):
+            found.append(old)
+    return max(found, key=lambda r: r['observed_at'], default=None)
+
+
+def pinned(report, previous):
+    """Keep the published checked_at when the revision, and so the material evidence, is unchanged.
+
+    The post-merge timer refreshes checked_at on every pass; without this, each pass would
+    write another generation of a deferred report that nothing else about has changed.
+    """
+    fresh = material(report['evidence']['postmerge'])
+    fresh.update((k, v) for k, v in previous['evidence']['postmerge'].items() if k in VOLATILE_POSTMERGE)
+    report['evidence']['postmerge'] = fresh
 
 
 def run(config, state, root, output, repo='', pipeline='', retry=False):
@@ -202,6 +224,7 @@ def run(config, state, root, output, repo='', pipeline='', retry=False):
                 continue
             if previous:
                 report['observed_at'] = previous['observed_at']
+                pinned(report, previous)
             # A durable successful attempt also recovers a crash before report publication.
             success = next((a for a in reversed(mine) if a['state'] == 'success'), None)
             old = None if success or previous else carried(output, key, report, policy)
