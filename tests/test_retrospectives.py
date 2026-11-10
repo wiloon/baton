@@ -712,6 +712,39 @@ def test_success_under_checked_at_revision_is_carried_forward(host, monkeypatch)
     assert len(host.calls())==1
 
 
+def test_success_behind_a_later_deferred_revision_is_carried_forward(host, monkeypatch):
+    pipe=seed(host.state)
+    put(host.state,'postmerge',pipe,dict(checked_at=time.time()-6000,reverts=0,issues=0,final=False))
+    monkeypatch.setattr(retro,'source_digest',digest)
+    assert host.run()[0]['state']=='success'
+    # Before the fix, the next checked_at refresh made a new revision that only deferred,
+    # and its report replaced the successful one as current. That code never carried forward.
+    monkeypatch.setattr(retro,'carried',lambda *args: None)
+    put(host.state,'postmerge',pipe,dict(checked_at=time.time()-5000,reverts=0,issues=0,final=False))
+    (host.root/'paused').touch()
+    assert host.run()[0]['reason']=='retrospectives_paused'
+    (host.root/'paused').unlink()
+    monkeypatch.undo()
+    put(host.state,'postmerge',pipe,dict(checked_at=time.time()-400,reverts=0,issues=0,final=False))
+    result=host.run()[0]
+    assert result['state']=='success' and 'report' in result
+    assert host.report(pipe)['assessment']['hypotheses']==[]
+    assert len(host.calls())==1
+
+
+def test_checked_at_refresh_does_not_republish_a_deferred_report(host):
+    pipe=seed(host.state)
+    put(host.state,'postmerge',pipe,dict(checked_at=time.time()-4000,reverts=0,issues=0,final=False))
+    host.root.mkdir(parents=True, exist_ok=True)
+    (host.root/'paused').touch()
+    assert 'report' in host.run()[0]
+    generations=lambda: list(host.output.glob(f'*/{pipe}/revisions/*/*/report.json'))
+    assert len(generations())==1
+    put(host.state,'postmerge',pipe,dict(checked_at=time.time()-400,reverts=0,issues=0,final=False))
+    assert host.run()[0]['state']=='unchanged'
+    assert len(generations())==1
+
+
 def test_old_failure_is_not_carried_forward(host, monkeypatch):
     pipe=seed(host.state)
     put(host.state,'postmerge',pipe,dict(checked_at=time.time()-4000,reverts=0,issues=0,final=False))
