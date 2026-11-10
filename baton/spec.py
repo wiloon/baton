@@ -31,7 +31,7 @@ import subprocess
 import sys
 import time
 
-from . import dispatch, fix, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, review, vendors
+from . import dispatch, e2e_gate, fix, hooks as telemetry, md, merge, notify, pick, pr as pr_helpers, prompts, review, vendors
 from .common import Deferred, changed, git, restore, strip_markers
 
 REPLY_CAP = 60000
@@ -233,8 +233,39 @@ class Spec:
         vendors.record_author(self.state, self.pr, vendor)
 
     def finish(self):
-        for name in ("spec-paused", "spec-base", "spec-body"):
+        for name in ("spec-paused", "spec-base", "spec-body", "spec-owner-body"):
             self.path(name).unlink(missing_ok=True)
+
+    def keep_owner_body(self):
+        """Before the first spec round: spec-owner-body-N keeps the body the owner wrote."""
+        if self.path("spec-owner-body").is_file():
+            return
+        body = self.gh("issue", "view", self.issue, "--json", "body", "-q", ".body")
+        if body.returncode == 0:
+            self.path("spec-owner-body").write_text(body.stdout)
+
+    def accept_problems(self):
+        """What the issue body as revised breaks, one point per line; empty when an accept may
+        stand (#25): the E2E gate must still parse, and the owner's manual checks stay."""
+        body = self.gh("issue", "view", self.issue, "--json", "body", "-q", ".body")
+        if body.returncode != 0:
+            return ["The runner could not read the issue body to check it."]
+        problems = []
+        try:
+            e2e_gate.parse(body.stdout, self.env.repo)
+        except ValueError as exc:
+            problems.append(f"The `## E2E gate` section must be exactly one line, with no prose after it: {exc}")
+        try:
+            owner = self.path("spec-owner-body").read_text()
+        except OSError:
+            owner = ""
+        kept = {line.strip() for line in md.section("Manual checks", body.stdout).splitlines()}
+        lost = [line.strip() for line in md.section("Manual checks", owner).splitlines()
+                if line.strip() and line.strip() not in kept]
+        if lost:
+            problems.append("`## Manual checks` must keep every check the owner wrote, word for word; these are "
+                            "missing (never move them to `## Before release`):\n" + "\n".join(f"   {line}" for line in lost))
+        return problems
 
     # --- the reviewer's round ---
     def review_round(self, round, max_rounds, context):
@@ -264,7 +295,20 @@ class Spec:
         reply = reply_text(out["reply"])
         self.hooks.verdict("spec_review", reviewer, head, round, outcome, out["reply"] or "")
         if outcome.startswith("SPEC: accept"):
-            return self.accept(reviewer, round, mode_note, reply)
+            problems = self.accept_problems()
+            if not problems:
+                return self.accept(reviewer, round, mode_note, reply)
+            points = "\n".join(f"{i}. [decidable] {p}" for i, p in enumerate(problems, 1))
+            if not self.post(f"<!-- baton-spec-review round={round} by={reviewer} -->\n"
+                             f"## Spec review ({reviewer}), round {round}: accept refused by the runner\n\n"
+                             f"{reviewer} accepted, but the issue body breaks the runner's rules:\n\n{points}\n\n"
+                             f"{mode_note}{reply[:REPLY_CAP]}", f"posting the refused accept of {reviewer} failed"):
+                return "stop"
+            if round >= max_rounds:
+                self.handoff(f"{reviewer} accepted, but the issue body breaks the runner's rules after {round} spec rounds.",
+                             "spec_limit")
+                return "stop"
+            return "changes"
         if outcome.startswith("SPEC: changes"):
             if not self.post(f"<!-- baton-spec-review round={round} by={reviewer} -->\n"
                              f"## Spec review ({reviewer}), round {round}\n\n{mode_note}{reply[:REPLY_CAP]}",
@@ -390,6 +434,7 @@ class Spec:
             step, round = "review", round + 1   # a reviser revised; the spec is reviewed again
         else:
             step, round = "review", 1
+            self.keep_owner_body()
         max_rounds = max(int(env.config.scheduling.max_spec_rounds or 6), round + 1)   # an owner answer earns another round
         if git(self.repo_dir, "rev-parse", "-q", "--verify", f"origin/{self.branch}") is not None:
             self.base = f"origin/{self.branch}"
