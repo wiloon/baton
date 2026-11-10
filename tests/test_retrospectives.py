@@ -129,7 +129,7 @@ def test_public_command_evidence_only_and_deduplication(host, capsys):
     pipe = seed(host.state)
     args = ['--config', str(ROOT/'config.example.toml'), '--state', str(host.state), 'catch-up']
     assert retro.main(args) == 0
-    first = json.loads(capsys.readouterr().out)
+    first = json.loads(capsys.readouterr().out.splitlines()[0])
     assert first['state'] == 'not_configured'
     report = host.report(pipe)
     assert report['evidence']['usage']['input_tokens']['value'] == 10
@@ -139,7 +139,8 @@ def test_public_command_evidence_only_and_deduplication(host, capsys):
     assert report['evidence']['versions']['workflow_version'] == ['a'*64, 'c'*64]
     assert report['evidence']['timing']['timing_state'] == 'complete'
     assert retro.main(args) == 0
-    assert json.loads(capsys.readouterr().out)['state'] == 'unchanged'
+    # Steady-state catch-up prints one summary line, not a line per episode.
+    assert json.loads(capsys.readouterr().out) == dict(state='summary', counts={'unchanged': 1})
     assert len(list(host.output.glob('**/report.json'))) == 1
     assert not host.calls()
 
@@ -680,3 +681,85 @@ def test_retrospective_without_quota_does_not_rejuvenate_old_data(host):
     before = quota.load(host.state, 'claude')
     assert host.run()[0]['state'] == 'success'
     assert quota.load(host.state, 'claude') == before
+
+
+def test_postmerge_recheck_alone_does_not_reanalyze(host):
+    pipe=seed(host.state)
+    put(host.state,'postmerge',pipe,dict(checked_at=time.time()-4000,reverts=0,issues=0,final=False))
+    assert host.run()[0]['state']=='success'
+    put(host.state,'postmerge',pipe,dict(checked_at=time.time()-400,reverts=0,issues=0,final=False))
+    assert host.run()[0]['state']=='unchanged'
+    assert len(host.calls())==1
+    # A post-merge finding is new evidence and is assessed again.
+    put(host.state,'postmerge',pipe,dict(checked_at=time.time()-400,reverts=1,issues=0,final=True))
+    assert host.run()[0]['state']=='success'
+    assert len(host.calls())==2
+
+
+def test_success_under_checked_at_revision_is_carried_forward(host, monkeypatch):
+    pipe=seed(host.state)
+    put(host.state,'postmerge',pipe,dict(checked_at=time.time()-4000,reverts=0,issues=0,final=False))
+    # Reports published before the fix hashed checked_at into the revision.
+    monkeypatch.setattr(retro,'source_digest',digest)
+    assert host.run()[0]['state']=='success'
+    put(host.state,'postmerge',pipe,dict(checked_at=time.time()-400,reverts=0,issues=0,final=False))
+    monkeypatch.undo()
+    result=host.run()[0]
+    assert result['state']=='success' and 'report' in result
+    report=host.report(pipe)
+    assert report['assessment']['hypotheses']==[] and report['analysis_attempts'][0]['state']=='success'
+    assert host.run()[0]['state']=='unchanged'
+    assert len(host.calls())==1
+
+
+def test_old_failure_is_not_carried_forward(host, monkeypatch):
+    pipe=seed(host.state)
+    put(host.state,'postmerge',pipe,dict(checked_at=time.time()-4000,reverts=0,issues=0,final=False))
+    monkeypatch.setattr(retro,'source_digest',digest)
+    host.plan(reply='invalid')
+    assert host.run()[0]['state']=='failed'
+    monkeypatch.undo()
+    # The new revision is not marked successful from a failed old one.
+    assert host.run()[0]['state']!='success'
+    assert host.report(pipe)['assessment'] is None
+
+
+def test_fenced_reply_is_accepted(host):
+    pipe=seed(host.state)
+    host.plan(reply='```json\n'+json.dumps(dict(summary='Fenced.', hypotheses=[]))+'\n```\n')
+    assert host.run()[0]['state']=='success'
+    assert host.report(pipe)['assessment']['summary']=='Fenced.'
+
+
+@pytest.mark.parametrize('reply,failure', [('Here is my analysis: {', 'invalid_json'),
+    (json.dumps(dict(summary='x', hypotheses=[dict(evidence_refs=['invented'], confidence='low', proposed_change='a',
+        expected_benefit='b', validation_plan='c')])), 'hypothesis references'),
+    (json.dumps(dict(summary='x')), 'assessment schema')])
+def test_malformed_attempt_records_failure_and_excerpt(host, reply, failure):
+    pipe=seed(host.state)
+    host.plan(reply=reply)
+    assert host.run()[0]['reason']=='malformed'
+    attempt=host.report(pipe)['analysis_attempts'][0]
+    assert attempt['failure']==failure and attempt['reply_excerpt']==reply[:1000]
+
+
+def test_episode_without_any_attempt_record_is_reported_as_missing(host):
+    pipe=seed(host.state)
+    (host.state/'telemetry/attempts'/f'{pipe}.json').unlink()
+    assert host.run()[0]['reason']=='attempt_completion_unknown'
+    path=host.state/'telemetry/tasks'/f'{pipe}.json'
+    task=json.loads(path.read_text())
+    task.update(started=task['started']-2*86400, ended=task['ended']-2*86400, updated=task['updated']-2*86400)
+    path.write_text(json.dumps(task))
+    assert host.run()[0]['reason']=='attempt_records_missing'
+    assert not host.calls()
+
+
+def test_catch_up_prints_changes_and_a_summary(host, capsys):
+    seed(host.state)
+    seed(host.state, 'active')
+    args=['--config',str(ROOT/'config.example.toml'),'--state',str(host.state),'catch-up']
+    assert retro.main(args)==0
+    lines=[json.loads(l) for l in capsys.readouterr().out.splitlines()]
+    assert [l['state'] for l in lines]==['not_configured','summary']
+    assert lines[1]['counts']=={'deferred:active_episode':1}

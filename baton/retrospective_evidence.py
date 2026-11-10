@@ -41,6 +41,23 @@ def digest(value):
     return hashlib.sha256(encoded(value).encode()).hexdigest()
 
 
+# The post-merge timer refreshes checked_at on every pass, even when nothing it
+# observes has changed. Revision identity must ignore it, or each pass looks like
+# new evidence and spends another analysis call on the same episode.
+VOLATILE_POSTMERGE = ('checked_at',)
+# A terminal episode this old with no attempt record at all predates attempt
+# telemetry; waiting longer cannot produce the missing evidence.
+ATTEMPT_RECORD_GRACE = 86400
+
+
+def material(postmerge):
+    return {k: v for k, v in postmerge.items() if k not in VOLATILE_POSTMERGE}
+
+
+def source_digest(snapshot):
+    return digest(dict(snapshot, postmerge=material(snapshot['postmerge'])))
+
+
 def projection(row, fields):
     """Metadata only, with finite measurements and bounded identifier strings."""
     result = {}
@@ -131,6 +148,8 @@ def eligible(snapshot, now, settle_seconds):
         return 'invocation_completion_unknown'
     latest_run = max((r['ended'] for r in runs), default=task['ended'])
     if not any(a.get('ended', 0) >= max(task['ended'], latest_run) and 'started' in a for a in attempts):
+        if not attempts and now - task['ended'] > ATTEMPT_RECORD_GRACE:
+            return 'attempt_records_missing'
         return 'attempt_completion_unknown'
     times = [task.get('updated', task['ended']), task['ended'], latest_run,
              *(a.get('ended', 0) for a in attempts), *(e.get('timestamp', 0) for e in snapshot['events']),

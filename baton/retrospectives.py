@@ -20,7 +20,8 @@ import uuid
 from . import analyst_pool, vendor_policy, quota
 from .config import ConfigError, load
 from .retrospective_analyst import ANALYZER_VERSION, analyze, prompt_for
-from .retrospective_evidence import EvidenceError, Ledger, VERSION, digest, encoded, eligible, evidence, markdown
+from .retrospective_evidence import (EvidenceError, Ledger, VERSION, digest, encoded, eligible, evidence, markdown,
+                                     material, source_digest)
 
 
 def atomic(path, value):
@@ -95,9 +96,16 @@ def publish(output, key, revision, report):
 
 
 def current(output, key, revision):
+    report = pointed(output, key)
+    return report if report and report.get('revision') == revision else None
+
+
+def pointed(output, key):
+    """The report the current marker names, whatever its revision."""
     episode = output / digest(key)[:16] / key[1]
     pointer = read(episode / 'current.json', {})
-    if pointer.get('revision') != revision:
+    revision = pointer.get('revision')
+    if not revision:
         return None
     generation = (episode / pointer['generation']).resolve()
     if not generation.is_relative_to(episode.resolve()):
@@ -136,9 +144,26 @@ def report_for(snapshot, source_digest, revision, now):
                 analysis_state='pending', analysis_reason='', assessment=None, analysis_attempts=[])
 
 
-def same_source(state, key, source_digest):
+def same_source(state, key, source):
     ledger = Ledger(state)
-    return key in ledger.tasks and digest(ledger.snapshot(key)) == source_digest
+    return key in ledger.tasks and source_digest(ledger.snapshot(key)) == source
+
+
+def carried(output, key, report, policy):
+    """A successful assessment of the same material evidence under an older revision.
+
+    Revisions written before checked_at left the digest differ only in that field; reuse
+    their assessment instead of spending another call on an unchanged episode.
+    """
+    old = pointed(output, key)
+    if not old or old.get('analysis_state') != 'success' or old.get('analyzer_version') != ANALYZER_VERSION:
+        return None
+    attempts = old.get('analysis_attempts') or []
+    if not any(a.get('state') == 'success' and a.get('limits') == policy for a in attempts):
+        return None
+    def strip(data):
+        return dict(data, postmerge=material(data.get('postmerge') or {}))
+    return old if strip(old['evidence']) == strip(report['evidence']) else None
 
 
 def run(config, state, root, output, repo='', pipeline='', retry=False):
@@ -160,7 +185,7 @@ def run(config, state, root, output, repo='', pipeline='', retry=False):
             if reason:
                 results.append(dict(repo=key[0], pipeline_id=key[1], state='deferred', reason=reason))
                 continue
-            source = digest(snapshot)
+            source = source_digest(snapshot)
             policy = asdict(settings)
             policy.pop('paused')
             policy.pop('model')
@@ -179,8 +204,12 @@ def run(config, state, root, output, repo='', pipeline='', retry=False):
                 report['observed_at'] = previous['observed_at']
             # A durable successful attempt also recovers a crash before report publication.
             success = next((a for a in reversed(mine) if a['state'] == 'success'), None)
+            old = None if success or previous else carried(output, key, report, policy)
             if success:
                 report.update(analysis_state='success', assessment=success['assessment'])
+            elif old:
+                report.update(analysis_state='success', assessment=old['assessment'], observed_at=old['observed_at'])
+                mine = old['analysis_attempts']
             elif not settings.enabled:
                 report['analysis_state'] = 'not_configured'
             else:
@@ -295,9 +324,29 @@ def main(argv=None):
         # Never expose metadata contents, credentials or vendor diagnostics on stderr.
         print('Retrospective failed: invalid configuration, metadata or local I/O; inspect local state.', file=sys.stderr)
         return 2
+    if args.command == 'catch-up':
+        results = condensed(results)
     for result in results:
         print(json.dumps(result, sort_keys=True))
     return 0
+
+
+def condensed(results):
+    """Catch-up runs every minute: print what changed, and count the steady state.
+
+    Unchanged reports and eligibility deferrals that published nothing repeat on every
+    activation; one summary line keeps them visible without flooding the journal.
+    """
+    shown, counts = [], {}
+    for result in results:
+        if 'report' in result or result.get('state') not in ('unchanged', 'deferred'):
+            shown.append(result)
+        else:
+            label = result['state'] + (':' + result['reason'] if result.get('reason') else '')
+            counts[label] = counts.get(label, 0) + 1
+    if counts:
+        shown.append(dict(state='summary', counts=counts))
+    return shown
 
 
 if __name__ == '__main__':
