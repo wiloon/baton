@@ -382,3 +382,62 @@ def test_a_claude_revision_of_claudes_first_review_uses_the_other_model(loop):
     note = s.mode_note("Revision", "claude", "claude", "", "")
     assert note.startswith("Revision mode: same-vendor-different-model (claude")
     assert s.unverified("claude", "claude", "", "") is False
+
+
+# --- what an accept may not break (#25) ------------------------------------------------------
+
+GATED = "Goal\n\n## E2E gate\ne2e/pick.spec.ts --repeat-each=5\n\n## Manual checks\n- Open the popup in Chrome and pick the article\n"
+
+
+@pytest.fixture
+def gated(loop, monkeypatch):
+    real = spec.e2e_gate.parse
+    repo = SimpleNamespace(gate_hook=Path("/hooks/gate"), gate_target=r"e2e/[a-z]+\.spec\.ts", gate_option=r"--repeat-each=[0-9]+")
+    monkeypatch.setattr(spec.e2e_gate, "parse", lambda body, _repo: real(body, repo))
+    loop.gh.body = GATED
+    return loop
+
+
+def refused(loop):
+    return [c for c in loop.gh.posted("<!-- baton-spec-review round=") if "accept refused" in c]
+
+
+def test_an_accept_with_prose_under_the_e2e_gate_goes_back_to_the_reviser(gated):
+    broken = GATED.replace("--repeat-each=5\n", "--repeat-each=5\n\nThe runner ignores this explanation.\n")
+    gated.script = [CHANGES, reviser(body=broken), ACCEPT, reviser(body=GATED), ACCEPT]
+    assert gated.run() is True
+    note, = refused(gated)
+    assert "## E2E gate" in note and "one line" in note
+    assert [r["role"] for r in gated.runs] == ["spec_review", "spec", "spec_review", "spec", "spec_review"]
+    assert len(gated.gh.posted("<!-- baton-verdict: accept")) == 1 and "ready-for-agent" in gated.gh.labels
+
+
+def test_an_accept_that_moves_the_owners_manual_check_goes_back_to_the_reviser(gated):
+    moved = "Goal\n\n## E2E gate\ne2e/pick.spec.ts --repeat-each=5\n\n## Manual checks\nnone\n\n" \
+            "## Before release\n- Open the popup in Chrome and pick the article\n"
+    gated.script = [CHANGES, reviser(body=moved), ACCEPT, reviser(body=GATED + "\n## Before release\n- Deploy\n"), ACCEPT]
+    assert gated.run() is True
+    note, = refused(gated)
+    assert "- Open the popup in Chrome and pick the article" in note and "## Manual checks" in note
+    assert "ready-for-agent" in gated.gh.labels
+
+
+def test_a_refused_accept_in_the_last_round_goes_to_the_owner(gated):
+    broken = GATED.replace("## Manual checks\n", "## Notes\n")
+    gated.script = [CHANGES, reviser(body=broken), CHANGES, reviser(), ACCEPT]
+    assert gated.run() is False
+    assert refused(gated) and "ready-for-human" in gated.gh.labels
+    assert "ready-for-agent" not in gated.gh.labels and not gated.gh.posted("<!-- baton-verdict")
+
+
+def test_an_owner_body_without_manual_checks_needs_none_kept(gated):
+    gated.gh.body = GATED.replace("- Open the popup in Chrome and pick the article\n", "none\n")
+    gated.script = [CHANGES, reviser(body="Goal\n\n## E2E gate\nnone\n"), ACCEPT]
+    assert gated.run() is True
+    assert not refused(gated) and "ready-for-agent" in gated.gh.labels
+    assert not gated.path("spec-owner-body").exists()   # cleaned up with the rest
+
+
+def test_an_unchanged_owner_body_is_accepted(gated):
+    gated.script = [ACCEPT]
+    assert gated.run() is True and not refused(gated)

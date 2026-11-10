@@ -144,3 +144,10 @@ def test_authors_try_before_claiming_a_limit_and_run_terminal_checks(name):
 @pytest.mark.parametrize("name", ["review-prompt.md", "codex-review-prompt.md", "cursor-review-prompt.md"])
 def test_reviewers_flag_an_unproven_limitation(name):
     assert UNPROVEN in text(name)
+
+
+@pytest.mark.parametrize("name", ["spec-prompt.md", "codex-spec-prompt.md", "spec-review-prompt.md"])
+def test_spec_prompts_keep_the_gate_line_and_the_owners_manual_checks(name):
+    prompt = text(name)
+    assert "`## E2E gate` is exactly one line" in prompt or "`## E2E gate` must be exactly one line" in prompt
+    assert "`## Manual checks`" in prompt and "The runner refuses an accept" in prompt
