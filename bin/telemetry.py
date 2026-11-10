@@ -321,17 +321,26 @@ class Tasks:
         with locked(self.root / 'tasks.lock'):
             self._event(read(self.path(pipeline)), 'attempt_completed', attempt_id, {})
 
+    def index(self, repo, *numbers):
+        if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo):
+            raise ValueError('invalid repository')
+        for number in numbers:
+            if type(number) is not int or not 0 <= number <= 10**12:
+                raise ValueError('invalid task number')
+        return self.root / 'task-index' / hashlib.sha256(repo.encode()).hexdigest()[:16]
+
+    def latest(self, pr, *, repo):
+        """The PR's latest episode, or None; never opens one."""
+        key = self.index(repo, pr) / f'pr-{pr}'
+        return key.read_text().strip() if pr and key.exists() else None
+
     def ensure(self, issue=0, pr=0, *, repo):
         if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo):
             raise ValueError('invalid repository')
         if not issue and not pr:
             return None
-        for number in (issue, pr):
-            if type(number) is not int or not 0 <= number <= 10**12:
-                raise ValueError('invalid task number')
-        namespace = hashlib.sha256(repo.encode()).hexdigest()[:16]
-        keys = [self.root / 'task-index' / namespace / f'{kind}-{number}'
-                for kind, number in (('issue', issue), ('pr', pr)) if number]
+        index = self.index(repo, issue, pr)
+        keys = [index / f'{kind}-{number}' for kind, number in (('issue', issue), ('pr', pr)) if number]
         with locked(self.root / 'tasks.lock'):
             candidates = [read(self.path(k.read_text().strip())) for k in keys if k.exists()]
             active = {t['pipeline_id']: t for t in candidates if t['task_status'] == 'active'}
@@ -366,6 +375,7 @@ class Tasks:
             'adopted': lambda v: type(v) is int and 0 <= v <= 1000,
             'rejected': lambda v: type(v) is int and 0 <= v <= 1000,
             'pr': lambda v: type(v) is int and 0 <= v <= 10**12,
+            'merged_by': lambda v: v == 'owner',
             'duration_ms': lambda v: type(v) is int and 0 <= v <= 86400000,
             'workflow_version': lambda v: bool(re.fullmatch(r'[a-f0-9]{64}', v)),
             'config_version': lambda v: bool(re.fullmatch(r'[a-f0-9]{64}', v)),
@@ -374,8 +384,10 @@ class Tasks:
             raise ValueError('invalid event metadata')
         with locked(self.root / 'tasks.lock'):
             task = read(self.path(pipeline))
-            # A late callback cannot rewrite a terminal episode.
-            if task['task_status'] != 'active':
+            # A late callback cannot rewrite a terminal episode; only the owner's merge
+            # of a handed-off PR still ends it as merged.
+            if task['task_status'] != 'active' and not (
+                    kind == 'merged' and task['task_status'] in ('planned_handoff', 'abnormal_handoff')):
                 return
             self._event(task, kind, key, attrs)
 
@@ -1099,6 +1111,7 @@ def main():
     task.add_argument('--adopted', type=int)
     task.add_argument('--rejected', type=int)
     task.add_argument('--duration-ms', type=int)
+    task.add_argument('--merged-by', choices=('owner',))
     sub.add_parser('must-fix')
     sub.add_parser('fix-answers')
     sub.add_parser('postmerge')
@@ -1140,12 +1153,17 @@ def main():
     elif args.action == 'task':
         store = Tasks(args.state)
         pipeline = args.pipeline
-        if not pipeline:
+        if args.merged_by and not pipeline:
+            # An owner merge belongs to the PR's latest episode, never a new one.
+            pipeline = store.latest(args.pr, repo=args.repo)
+            if not pipeline:
+                return
+        elif not pipeline:
             record = store.ensure(args.issue, args.pr, repo=args.repo)
             if record is None:
                 return
             pipeline = record['pipeline_id']
-        attrs = {k: getattr(args, k) for k in ('verdict', 'reason', 'head_sha', 'run_id', 'agent', 'ci_result', 'round', 'must_fix', 'adopted', 'rejected', 'duration_ms')
+        attrs = {k: getattr(args, k) for k in ('verdict', 'reason', 'head_sha', 'run_id', 'agent', 'ci_result', 'round', 'must_fix', 'adopted', 'rejected', 'duration_ms', 'merged_by')
                  if getattr(args, k) is not None}
         if args.pr:
             attrs['pr'] = args.pr

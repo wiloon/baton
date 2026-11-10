@@ -31,6 +31,48 @@ elif '--json bucket' in args:
 '''
 
 
+class OwnerMergeHookTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        (self.root / 'telemetry-enabled').touch()
+        (self.root / 'telemetry.py').symlink_to(BIN / 'telemetry.py')
+        env = {'SELF_DIR': str(self.root), 'STATE': str(self.root), 'CTX': str(self.root), 'LOGS': str(self.root),
+               'GH_REPO': 'telemetry-validation/app'}
+        patcher = mock.patch.dict(os.environ, env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def hooks(self, item=None):
+        return telemetry.Telemetry(str(self.root), str(self.root), 'telemetry-validation/app', item, issue=123, pr=456)
+
+    def events(self):
+        return [json.loads(p.read_text()) for p in (self.root / 'telemetry/events').glob('*.json')]
+
+    def test_an_owner_merge_of_a_handed_off_pr_is_recorded_once(self):
+        self.hooks().task('handoff', 'needs_info', '--reason', 'needs_info')
+        self.assertTrue(self.hooks().owner_merged())
+        self.assertTrue(self.hooks().owner_merged())
+        merged = [e for e in self.events() if e['event_kind'] == 'merged']
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]['attrs'].get('merged_by'), 'owner')
+        self.assertEqual(merged[0]['task']['task_status'], 'merged')
+        self.assertEqual(sum(e['event_kind'] == 'handoff' for e in self.events()), 1)
+        self.assertEqual(len({e['task']['pipeline_id'] for e in self.events()}), 1)
+
+    def test_a_pr_baton_merged_keeps_only_its_own_event(self):
+        self.hooks().task('merged', 'merged')
+        self.hooks().owner_merged()
+        merged = [e for e in self.events() if e['event_kind'] == 'merged']
+        self.assertEqual(len(merged), 1)
+        self.assertNotIn('merged_by', merged[0]['attrs'])
+
+    def test_an_owner_merge_without_an_episode_opens_none(self):
+        self.assertTrue(self.hooks().owner_merged())
+        self.assertFalse((self.root / 'telemetry/events').exists() and self.events())
+
+
 class TaskHookTests(unittest.TestCase):
     def test_ci_wrapper_pass_failure_timeout_no_checks_and_head_change(self):
         # baton.ci green's answers (its watch logic: tests/test_ci.py); the hook is real.

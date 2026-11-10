@@ -115,6 +115,14 @@ class Telemetry:
         if out:
             self._remember(pipeline_id=out)
 
+    def owner_merged(self):
+        """The owner merged this PR: its latest episode, found by the PR alone, ends merged.
+        False when nothing was recorded and a later tick should try again."""
+        if not (self.enabled and self.pr):
+            return False
+        return self._call("task", "merged", "--repo", self.repo, "--pr", self.pr, "--key", "merged",
+                          "--merged-by", "owner") is not None
+
     def verdict(self, kind, vendor, head, round, outcome, reply, review_file=""):
         verdict = next((v for prefix, v in (("REVIEW: pass", "pass"), ("REVIEW: changes", "changes"),
                                             ("SPEC: accept", "accept"), ("SPEC: changes", "changes"),

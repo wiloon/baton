@@ -21,7 +21,7 @@ RUN_FIELDS = ('run_id', 'pipeline_id', 'repo', 'agent', 'role', 'stage', 'round'
               'ended', 'requested_model', 'actual_model', 'model', 'cli_version', 'workflow_version',
               'config_version', 'usage_state', 'cost_state', 'cost_usd', *TOKENS)
 ATTR_FIELDS = ('verdict', 'reason', 'ci_result', 'head_sha', 'run_id', 'agent', 'round', 'must_fix',
-               'adopted', 'rejected', 'pr', 'duration_ms', 'workflow_version', 'config_version')
+               'adopted', 'rejected', 'pr', 'duration_ms', 'merged_by', 'workflow_version', 'config_version')
 COUNTS = {*TOKENS, 'issue', 'pr', 'sequence', 'spec_rounds', 'review_rounds', 'round',
           'result', 'must_fix', 'adopted', 'rejected', 'duration_ms', 'reverts', 'issues'}
 MEASURES = {'started', 'ended', 'updated', 'timestamp', 'checked_at', 'cost_usd'}

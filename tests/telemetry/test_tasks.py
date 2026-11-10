@@ -23,13 +23,28 @@ class TaskTests(unittest.TestCase):
         same = self.store.ensure(123, 456, repo='test/repo')
         self.assertEqual(first['pipeline_id'], self.store.ensure(0, 456, repo='test/repo')['pipeline_id'])
         self.store.event(same['pipeline_id'], 'handoff', 'manual', reason='manual_checks')
-        self.store.event(same['pipeline_id'], 'merged', 'late')
+        self.store.event(same['pipeline_id'], 'review', 'late', verdict='pass')
         ended = t.read(self.store.path(same['pipeline_id']))
         self.assertEqual(ended['task_status'], 'planned_handoff')
         second = self.store.ensure(123, 456, repo='test/repo')
         self.assertNotEqual(first['pipeline_id'], second['pipeline_id'])
         other_repo = self.store.ensure(123, repo='acme/other')
         self.assertNotEqual(second['pipeline_id'], other_repo['pipeline_id'])
+
+    def test_a_merge_after_a_handoff_ends_the_episode_merged_and_keeps_the_handoff(self):
+        task = self.store.ensure(123, 456, repo='test/repo')
+        pipeline = task['pipeline_id']
+        self.store.event(pipeline, 'handoff', 'needs-info', reason='needs_info')
+        self.store.event(pipeline, 'merged', 'merged', merged_by='owner')
+        merged = t.read(self.store.path(pipeline))
+        self.assertEqual(merged['task_status'], 'merged')
+        self.assertEqual(merged['reason'], 'needs_info')
+        kinds = sorted(t.read(p)['event_kind'] for p in (self.store.root / 'events').glob('*.json'))
+        self.assertEqual(kinds, ['handoff', 'merged', 'started'])
+        self.assertEqual(self.store.latest(456, repo='test/repo'), pipeline)
+        self.assertIsNone(self.store.latest(457, repo='test/repo'))
+        with self.assertRaises(ValueError):
+            self.store.event(pipeline, 'merged', 'merged', merged_by='someone')
 
     def test_deduplication_and_outbox_recovers_state_write_failure(self):
         task = self.store.ensure(123, repo='test/repo')

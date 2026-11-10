@@ -219,6 +219,29 @@ class AlloyIntegrationTest(unittest.TestCase):
             self.assertIn(json.dumps(av('baton.issue', 142)), json.dumps(h.received))
             self.assertIn(json.dumps(av('baton.pr', 168)), json.dumps(h.received))
 
+    def test_runner_keeps_merged_by_owner_only(self):
+        with AlloyHarness('runner') as h:
+            stamp = time.time_ns()
+            def attrs(value):
+                return [av('event_kind', 'merged'), av('task_status', 'merged'), av('merged_by', value)]
+            records = [{'timeUnixNano': str(stamp), 'body': {'stringValue': 'baton.task_event'}, 'attributes': attrs(v)}
+                       for v in ('owner', MARKER)]
+            h.send('logs', {'resourceLogs': [{'resource': resource(), 'scopeLogs': [{'scope': scope(), 'logRecords': records}]}]})
+            spans = [{'traceId': TRACE, 'spanId': span_id, 'name': 'baton.run', 'kind': 1,
+                      'startTimeUnixNano': str(stamp), 'endTimeUnixNano': str(stamp + 1000), 'attributes': attrs(v)}
+                     for span_id, v in (('1234567890abcdef', 'owner'), ('abcdef1234567890', MARKER))]
+            h.send('traces', {'resourceSpans': [{'resource': resource(), 'scopeSpans': [{'scope': scope(), 'spans': spans}]}]})
+            h.wait(lambda: {path for path, _ in h.received} >= {'/v1/logs', '/v1/traces'})
+            serialized = json.dumps(h.received)
+            self.assertNotIn(MARKER, serialized)
+            logs = [r['attributes'] for path, p in h.received if path == '/v1/logs'
+                    for rl in p['resourceLogs'] for sl in rl['scopeLogs'] for r in sl['logRecords']]
+            spans = [s['attributes'] for path, p in h.received if path == '/v1/traces'
+                     for rs in p['resourceSpans'] for ss in rs['scopeSpans'] for s in ss['spans']]
+            for rows in (logs, spans):
+                self.assertEqual(sorted(any(a == av('merged_by', 'owner') for a in row) for row in rows), [False, True])
+                self.assertTrue(all(any(a['key'] == 'event_kind' for a in row) for row in rows))
+
     def test_real_filter_and_delta_accumulation(self):
         with AlloyHarness() as h:
             stamp = time.time_ns()
