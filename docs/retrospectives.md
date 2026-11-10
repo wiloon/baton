@@ -18,7 +18,9 @@ uv run --frozen python -m baton.retrospectives --config config.toml --repo acme/
 independent processing journal (default `STATE/retrospectives`). `--output DIR` selects reports
 (default `WORK_STATE/reports`). Keep these locations separate from source telemetry and use the
 same work-state for every invocation against the same host, including manual runs. Each line on
-stdout is JSON with an outcome, reason and report path when published. Exit 2 means invalid local
+stdout is JSON with an outcome, reason and report path when published. `catch-up` prints a line only
+for episodes that published a report or need attention, plus one `summary` line counting unchanged
+reports and eligibility deferrals by reason; `episode` prints every result. Exit 2 means invalid local
 configuration/metadata or an I/O failure. Deferred analysis and individual model failures remain
 visible in reports and do not fail workload execution.
 
@@ -27,7 +29,9 @@ event persisted before its index update. Source files are never repaired or rewr
 metadata file stops the scan rather than silently hiding potentially live work. Complete
 associated run records and a completed attempt covering terminal execution are required. Older
 telemetry without attempt-completion evidence is deferred as `attempt_completion_unknown`;
-update/fix the producer rather than treating silence as successful completion. A `running` record
+update/fix the producer rather than treating silence as successful completion. An episode that ended
+more than a day ago with no attempt record at all predates attempt telemetry and is deferred as
+`attempt_records_missing`; it will not become eligible by waiting. A `running` record
 is conservatively deferred until the regular telemetry collector reconciles it.
 
 The initial settling delay is five minutes since that episode's latest evidence. It is a buffer
@@ -140,7 +144,16 @@ Find current reports through `REPORTS/<identity-hash>/<pipeline-uuid>/current.js
 `generation` field names a directory containing `report.json` and `report.md`. The marker is
 updated only after both artifacts are written and validated. Revisions and earlier generations
 are retained. The source digest, schema, analyzer version and analysis configuration determine
-revision identity. Unchanged successful reports make no new model call.
+revision identity. The source digest ignores the post-merge `checked_at` timestamp, which the
+post-merge timer refreshes on every pass; a change in reverts, issues or `final` is new evidence.
+Unchanged successful reports make no new model call. A successful report published under an older
+revision whose evidence differs only in `checked_at`, with the same analyzer version and analysis
+configuration, is carried forward to the new revision without a call.
+
+A rejected reply is journaled with a `failure` code (`invalid_json`, the assessment rule that
+failed such as `hypothesis references`, `unparseable_output`, `cli_error`, `reply_too_long`) and,
+for invalid JSON or schema failures, the first 1,000 characters of the reply as `reply_excerpt`.
+A reply wrapped in a Markdown code fence is unwrapped before validation.
 
 `WORK_STATE/attempts/*.json` is the durable analysis journal. An attempt is recorded before
 starting the CLI; a response is validated and saved before publishing the completed report.

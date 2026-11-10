@@ -74,6 +74,18 @@ def assessment(value, refs):
     return value
 
 
+FENCE = re.compile(r'\A\s*```[A-Za-z]*\s*\n(.*?)\n\s*```\s*\Z', re.DOTALL)
+# Enough of a rejected reply to tell a format slip from a schema error. Attempts are
+# local journal files, like reports; never forwarded anywhere.
+EXCERPT_CHARS = 1000
+
+
+def unfenced(reply):
+    """Models often wrap the requested JSON object in a Markdown code fence."""
+    match = FENCE.match(reply)
+    return match.group(1) if match else reply
+
+
 def environment(config):
     # No repo variables, secrets, workload identities, OTEL context or runner integrations.
     allowed = {'PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'TMPDIR', 'SSL_CERT_FILE',
@@ -295,11 +307,18 @@ def analyze(config, analyst, prompt, workspace, facts, lease_fd):
         result['state'] = 'unexpected_model'
     elif rc or not valid:
         result['state'] = 'vendor_failure' if rows else 'malformed'
+        result['failure'] = 'cli_error' if rows else 'unparseable_output'
     elif not isinstance(reply, str) or len(reply) > settings.output_chars:
         result['state'] = 'output_limit' if isinstance(reply, str) else 'malformed'
+        result['failure'] = 'reply_too_long' if isinstance(reply, str) else 'reply_not_text'
     else:
         try:
-            result['assessment'] = assessment(json.loads(reply), {f['id'] for f in facts})
-        except (ValueError, TypeError, AttributeError):
-            result['state'] = 'malformed'
+            result['assessment'] = assessment(json.loads(unfenced(reply)), {f['id'] for f in facts})
+        except json.JSONDecodeError:
+            result.update(state='malformed', failure='invalid_json', reply_excerpt=reply[:EXCERPT_CHARS])
+        except (ValueError, TypeError, AttributeError) as error:
+            # assessment() raises ValueError with the rule that failed, e.g. 'hypothesis references'.
+            failure = str(error) if isinstance(error, ValueError) and str(error).startswith(('assessment', 'hypothesis')) \
+                else 'invalid_assessment'
+            result.update(state='malformed', failure=failure, reply_excerpt=reply[:EXCERPT_CHARS])
     return result
