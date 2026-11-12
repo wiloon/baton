@@ -23,6 +23,29 @@ guard_decision() {   # ROLE TOOL_JSON -> deny, or none when the guard stays sile
 [[ $(guard_decision dev '{"tool_name":"Bash","tool_input":{"command":"gh pr create --fill"}}') == deny ]] || fail guard-dev-pr
 [[ $(guard_decision dev '{"tool_name":"Bash","tool_input":{"command":"git commit -m x"}}') == none ]] || fail guard-dev-commit
 [[ $(guard_decision spec_review '{"tool_name":"Bash","tool_input":{"command":"git commit -m x"}}') == deny ]] || fail guard-spec-review-commit
+git_c_commit=$(jq -nc --arg cmd "git -C $TEST_ROOT commit -m x" '{tool_name:"Bash",tool_input:{command:$cmd}}')
+git_c_add=$(jq -nc --arg cmd "git -C $TEST_ROOT add file" '{tool_name:"Bash",tool_input:{command:$cmd}}')
+git_c_push=$(jq -nc --arg cmd "git -C $TEST_ROOT push" '{tool_name:"Bash",tool_input:{command:$cmd}}')
+[[ $(guard_decision spec "$git_c_commit") == none ]] || fail guard-spec-git-c-commit
+[[ $(guard_decision spec "$git_c_add") == none ]] || fail guard-spec-git-c-add
+[[ $(guard_decision spec "$git_c_push") == deny ]] || fail guard-spec-git-c-push
+[[ $(guard_decision spec_review "$git_c_commit") == deny ]] || fail guard-spec-review-git-c-commit
+# Check the settings patterns as well as the guard: silence from the hook alone
+# does not allow a command in Claude's dontAsk mode.
+settings_match() { # allow|deny COMMAND
+  local rule pattern
+  while IFS= read -r rule; do
+    pattern=${rule#Bash(}; pattern=${pattern%)}
+    [[ $2 == $pattern ]] && return 0
+  done < <(jq -r --arg kind "$1" '.permissions[$kind][] | select(startswith("Bash("))' "$BIN/spec-settings.json")
+  return 1
+}
+for cmd in "git add file" "git commit -m x" "git -C $TEST_ROOT add file" "git -C $TEST_ROOT commit -m x"; do
+  settings_match allow "$cmd" || fail "spec settings do not allow $cmd"
+  ! settings_match deny "$cmd" || fail "spec settings deny $cmd"
+done
+settings_match deny "git -C $TEST_ROOT push" || fail spec-settings-git-c-push
+! settings_match allow "git -C $TEST_ROOT push" || fail spec-settings-allow-git-c-push
 [[ $(guard_decision spec_review "{\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"$TEST_ROOT/x\",\"content\":\"a\"}}") == deny ]] || fail guard-spec-review-write
 [[ $(guard_decision spec_review '{"tool_name":"Bash","tool_input":{"command":"gh issue comment 1 --body x"}}') == deny ]] || fail guard-spec-review-comment
 # Claude runs in dontAsk mode: a compound command (`cd x; F=y; wc $F`) is denied

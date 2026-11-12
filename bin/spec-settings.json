@@ -55,7 +55,9 @@
       "Bash(echo *)",
       "Edit",
       "Bash(git add *)",
-      "Bash(git commit *)"
+      "Bash(git commit *)",
+      "Bash(git -C * add *)",
+      "Bash(git -C * commit *)"
     ],
     "deny": [
       "CronCreate", "CronDelete", "CronList", "ScheduleWakeup", "RemoteTrigger", "PushNotification", "SendMessage", "ListAgents", "DesignSync", "EnterWorktree", "ExitWorktree",
@@ -69,6 +71,7 @@
       "Bash(gh pr edit*)",
       "Bash(gh pr merge*)",
       "Bash(git push*)",
+      "Bash(git -C * push*)",
       "NotebookEdit",
       "Read(~/.config/baton/**)",
       "Read(~/.config/gh/**)",
