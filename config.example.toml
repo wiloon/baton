@@ -92,7 +92,9 @@ prompt_dir = ""
 # Hooks: commands on this host, never in the repository, so an agent's branch can't rewrite the
 # checks that judge it. Relative paths are from this file's directory; "" for none.
 # verify WORKTREE BASE: the checks before every push (none: ci_command in the worktree). It gets
-#   CI_COMMAND and E2E_GATE in its environment.
+#   CI_COMMAND and E2E_GATE in its environment. It and the gate hook also get VERIFY_ARTIFACTS, a
+#   directory beside the attempt's log for test output (traces, screenshots); a failed attempt
+#   keeps what they wrote there, a passing one doesn't.
 verify_hook = ""
 # e2e WORKTREE [args]: how agents run e2e themselves, {{E2E_HOOK}} in prompt_notes.
 e2e_hook = ""

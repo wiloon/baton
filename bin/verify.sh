@@ -6,6 +6,9 @@
 # runner reports. Hooks live on this host, never in the repository, so a branch can't rewrite the
 # checks that judge it. The Python runner supplies these variables and the tool environment: LOGS is
 # the repository's log directory, RUNNER_LOG the shared runner.log and RUNNER_LOG_LABEL its [owner/name].
+# Both hooks get VERIFY_ARTIFACTS, an empty directory beside this attempt's log, for test output
+# worth keeping (Playwright's traces and screenshots): a later run in the same worktree would erase
+# it there. It is removed when the attempt passes or the hooks leave it empty.
 set -u
 [[ $# == 2 && -d "$1" ]] || { echo 'usage: verify.sh WORKTREE BASE' >&2; exit 2; }
 wt=$1 base=$2
@@ -17,6 +20,8 @@ tag=${VERIFY_TAG:-verify}
 [[ "$tag" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo 'invalid VERIFY_TAG' >&2; exit 2; }
 stamp=$(date +%F-%H%M%S)
 file="$logs/$stamp-$tag.log"
+export VERIFY_ARTIFACTS="$logs/$stamp-$tag-artifacts"
+mkdir -p "$VERIFY_ARTIFACTS"
 start=$(date +%s)
 checks() {
   if [[ -n "${VERIFY_HOOK:-}" ]]; then
@@ -53,9 +58,16 @@ if (( rc == 0 && ${#gate[@]} )); then
   fi
 fi
 duration=$(( $(date +%s) - start ))
+if (( rc == 0 )); then
+  rm -rf "$VERIFY_ARTIFACTS"
+else
+  rmdir "$VERIFY_ARTIFACTS" 2>/dev/null || true
+fi
 printf '%s %sverify tag=%s rc=%s duration=%ss log=%s\n' "$(date '+%F %T')" "$label" "$tag" "$rc" "$duration" "$file" >> "$runner_log"
 if (( rc != 0 )); then
-  printf 'Verification failed (exit %s, %ss; full log: %s). Last 200 lines:\n' "$rc" "$duration" "$file" >&2
+  printf 'Verification failed (exit %s, %ss; full log: %s).\n' "$rc" "$duration" "$file" >&2
+  [[ ! -d "$VERIFY_ARTIFACTS" ]] || printf 'Test output kept in %s\n' "$VERIFY_ARTIFACTS" >&2
+  printf 'Last 200 lines:\n' >&2
   tail -n 200 "$file" >&2
 else
   printf 'Verification passed (%ss; log: %s)\n' "$duration" "$file"

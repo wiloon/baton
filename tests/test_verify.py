@@ -10,6 +10,8 @@ import subprocess
 import pytest
 
 BIN = Path(__file__).resolve().parents[1] / "bin"
+# A hook leaves a file in the attempt's artifact directory when WRITE_ARTIFACT names one.
+WRITE = '[ -z "$WRITE_ARTIFACT" ] || echo trace > "$VERIFY_ARTIFACTS/$WRITE_ARTIFACT"\n'
 
 
 def hook(path, body):
@@ -30,15 +32,23 @@ def world(tmp_path):
         def __init__(self):
             self.calls, self.fail = calls, tmp_path / "fail"
             self.verify_hook = hook(hooks / "verify", f'echo "verify $* gate=$E2E_GATE" >> "{calls}"\necho checks-output\n'
+                                                      f'echo "$VERIFY_ARTIFACTS" >> "{calls}-artifacts"\n{WRITE}'
                                                       f'[ ! -e "{self.fail}-verify" ]\n')
             self.gate_hook = hook(hooks / "gate", f'echo "gate $*" >> "{calls}"\necho gate-output\n'
-                                                  f'printf "  \\033[32m15 passed\\033[39m (7.9m)\\r\\n\\n"\n[ ! -e "{self.fail}-gate" ]\n')
+                                                  f'printf "  \\033[32m15 passed\\033[39m (7.9m)\\r\\n\\n"\n'
+                                                  f'echo "$VERIFY_ARTIFACTS" >> "{calls}-artifacts"\n{WRITE}[ ! -e "{self.fail}-gate" ]\n')
 
         def lines(self):
             return self.calls.read_text().splitlines() if self.calls.exists() else []
 
-        def verify(self, gate="", verify_hook=True, gate_hook=True, ci=f'echo "ci $(pwd)" >> "{calls}"'):
+        def artifact_dirs(self):
+            """The VERIFY_ARTIFACTS each hook call saw."""
+            seen = Path(f"{calls}-artifacts")
+            return seen.read_text().splitlines() if seen.exists() else []
+
+        def verify(self, gate="", verify_hook=True, gate_hook=True, ci=f'echo "ci $(pwd)" >> "{calls}"', write=""):
             env = {**os.environ, "LOGS": str(tmp_path / "logs"), "VERIFY_TAG": "t", "E2E_GATE": gate, "CI_COMMAND": ci,
+                   "WRITE_ARTIFACT": write,
                    "VERIFY_HOOK": str(self.verify_hook) if verify_hook else "",
                    "GATE_HOOK": str(self.gate_hook) if gate_hook else ""}
             return subprocess.run([str(bin_dir / "verify.sh"), str(wt), "origin/main"], capture_output=True, text=True, env=env)
@@ -91,3 +101,33 @@ def test_a_gate_with_no_gate_hook_fails_rather_than_passing_unrun(world):
 def test_no_gate_means_no_gate_run(world):
     assert world.verify().returncode == 0
     assert [line for line in world.lines() if line.startswith("gate")] == []
+
+
+def test_hooks_get_one_artifact_directory_per_attempt_named_after_its_log(world):
+    assert world.verify(gate="e2e/a.spec.ts").returncode == 0
+    seen = world.artifact_dirs()
+    assert len(seen) == 2 and seen[0] == seen[1]
+    log = next(Path(world.calls.parent / "logs").glob("*-t.log"))
+    assert seen[0] == str(log.with_name(log.stem + "-artifacts"))
+
+
+def test_a_passing_attempt_leaves_no_artifact_directory(world):
+    assert world.verify(gate="e2e/a.spec.ts", write="trace.zip").returncode == 0
+    assert not Path(world.artifact_dirs()[0]).exists()
+
+
+def test_a_failing_attempt_keeps_what_its_hooks_wrote_and_names_it_in_the_failure(world):
+    Path(f"{world.fail}-gate").touch()
+    done = world.verify(gate="e2e/a.spec.ts", write="trace.zip")
+    kept = Path(world.artifact_dirs()[0])
+    assert done.returncode != 0
+    assert (kept / "trace.zip").read_text() == "trace\n"
+    assert f"Test output kept in {kept}" in done.stderr
+
+
+def test_a_failing_attempt_whose_hooks_wrote_nothing_leaves_no_directory_or_mention(world):
+    Path(f"{world.fail}-verify").touch()
+    done = world.verify()
+    assert done.returncode != 0
+    assert not Path(world.artifact_dirs()[0]).exists()
+    assert "Test output kept" not in done.stderr
