@@ -417,6 +417,24 @@ def test_a_failing_check_gets_a_repair_run_by_the_same_vendor(run):
     assert run.agent_calls[-1][:3] == ("claude", "fix", f"pr-{PR}-verify-fix-1")
 
 
+def test_a_repair_run_gets_the_failure_in_its_prompt_and_writes_its_reply_under_tmp(run):
+    # #38: Claude's shell could not read the ctx dir, and guard.sh denies writes there.
+    run.verify_script("e2e timeout in {{REPLY_FILE}} spec", "pass")
+    run.agent({"commit": True})
+    assert run.verify()["rc"] == 0
+    prompt, output = run.prompts[-1], run.agent_calls[-1][3]
+    assert "<failure>\ne2e timeout in {{REPLY_FILE}} spec\n</failure>" in prompt   # data stays data
+    assert output.startswith("/tmp/baton-") and output.endswith(f"-pr-{PR}-verify-fix.md")
+    assert f"to {output} with the Write tool" in prompt
+
+
+def test_a_long_failure_reaches_the_prompt_as_its_tail():
+    text = "head\n" + "x" * fix.FAILURE_PROMPT_CAP + "\nthe error"
+    excerpt = fix.failure_excerpt(text)
+    assert excerpt.endswith("\nthe error") and "head" not in excerpt and "see the failure file" in excerpt
+    assert fix.failure_excerpt("short") == "short"
+
+
 def gate_body(section="e2e/a.spec.ts --repeat-each=15"):
     return {"419": {"body": f"Goal\n\n## E2E gate\n{section}\n"}}
 

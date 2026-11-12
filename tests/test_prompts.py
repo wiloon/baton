@@ -151,3 +151,14 @@ def test_spec_prompts_keep_the_gate_line_and_the_owners_manual_checks(name):
     prompt = text(name)
     assert "`## E2E gate` is exactly one line" in prompt or "`## E2E gate` must be exactly one line" in prompt
     assert "`## Manual checks`" in prompt and "The runner refuses an accept" in prompt
+
+
+# --- #38: the verify-fix agent keeps to simple commands and retries a refused one ---
+
+def test_the_verify_fix_prompt_gives_the_shell_rules_and_the_retry_on_denial():
+    prompt = text("verify-fix-prompt.md")
+    assert "one simple command per call, with no `;`, `&&`, `||`, pipes or `cd dir && …`" in prompt
+    assert "retry the step as a simpler command or with the Read and Grep tools" in prompt
+    assert "Only a denial that starts with `baton guard:` is final" in prompt
+    assert "{{FAILURE}}" in prompt and "with the Read tool, not the shell" in prompt
+

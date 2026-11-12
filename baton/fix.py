@@ -25,6 +25,15 @@ from . import dispatch, e2e_gate, hooks as telemetry, notify, pr as pr_helpers, 
 from .common import Deferred, child_env, git, strip_markers
 
 REPLY_CAP = 60000
+# The verify output a repair run gets in its prompt: the tail, where the errors are. The whole
+# output stays in the failure file (#38: a Claude agent could not read the ctx dir with the shell).
+FAILURE_PROMPT_CAP = 20000
+
+
+def failure_excerpt(failure):
+    if len(failure) <= FAILURE_PROMPT_CAP:
+        return failure
+    return f"[... first {len(failure) - FAILURE_PROMPT_CAP} characters cut; see the failure file ...]\n" + failure[-FAILURE_PROMPT_CAP:]
 
 
 class Runner:
@@ -95,7 +104,8 @@ class Runner:
             notify.log(f"{kind} #{number}: {failure}")
             return 1, failure, 0
         failure_file = Path(self.ctx, f"{kind}-{number}-verify-failure.txt")
-        reply_file = Path(self.ctx, f"{kind}-{number}-verify-fix.md")
+        # Under /tmp, the one place outside the worktree guard.sh lets a fixer write (#38).
+        reply_file = Path("/tmp", f"baton-{self.repo.replace('/', '-')}-{kind}-{number}-verify-fix.md")
         attempt, failure = 0, ""
 
         def dirty():
@@ -136,7 +146,8 @@ class Runner:
             head = git(wt, "rev-parse", "HEAD")
             reply_file.unlink(missing_ok=True)
             out = self.agent(vendor, "fix", self.render("verify-fix-prompt.md", VENDOR=vendor, WORKTREE=str(wt), BASE=base,
-                                                        FAILURE_FILE=str(failure_file), REPLY_FILE=str(reply_file)),
+                                                        FAILURE_FILE=str(failure_file), REPLY_FILE=str(reply_file),
+                                                        FAILURE=failure_excerpt(failure)),
                              f"{kind}-{number}-verify-fix-{attempt}", wt, str(reply_file))
             if not out["outcome"].startswith("RESULT: fixed") or dirty():
                 notify.log(f"{kind} #{number}: {vendor} verification fix failed or left the tree dirty")
