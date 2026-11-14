@@ -553,3 +553,23 @@ def test_a_verified_repair_makes_the_author_model_unknown(run):
     run.agent({"model": "gpt-6.1-sol"}, {})
     assert run.fix("codex")["rc"] == 0
     assert (run.root / "state" / f"pr-{PR}-author-models").read_text() == "codex unknown\n"
+
+
+# --- screenshot review (#50) ----------------------------------------------------------------
+
+@pytest.mark.parametrize("fixer", ["claude", "codex"])
+def test_with_screenshot_review_the_fixer_reshoots_into_a_cleared_dir(run, monkeypatch, fixer):
+    monkeypatch.setenv("SCREENSHOT_REVIEW", "1")
+    shots = Path(env_ctx(), f"pr-{PR}-shots")
+    shots.mkdir(parents=True, exist_ok=True)
+    (shots / "01-stale-390.png").write_bytes(b"x")
+    run.agent(dict(CHECKED))
+    run.fix(fixer)
+    assert str(shots) in run.prompts[0] and "screenshot" in run.prompts[0].lower()
+    assert not (shots / "01-stale-390.png").exists() and shots.is_dir()
+
+
+def test_without_screenshot_review_the_fix_prompt_names_no_screenshots_dir(run):
+    run.agent(dict(CHECKED))
+    run.fix("claude")
+    assert f"pr-{PR}-shots" not in run.prompts[0]

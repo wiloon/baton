@@ -86,6 +86,8 @@ class Repo:
     # "gate": a PR whose `## Manual checks` is not none waits for the owner. "defer": it merges,
     # and its checks go to one tracking issue for a later trial of the whole app (#48).
     manual_checks: str = "gate"
+    # A second model reviews the manual-check screenshots, and fixers re-shoot them (#50).
+    screenshot_review: bool = False
 
 
 @dataclass(frozen=True)

@@ -143,3 +143,9 @@ def test_manual_checks_gate_the_merge_unless_the_repository_defers_them(tmp_path
     assert load_other(tmp_path, deferred).repos[0].manual_checks == 'defer'
     with pytest.raises(config.ConfigError, match='repos.manual_checks'):
         load_other(tmp_path, OTHER.replace('gate_option = ""', 'gate_option = ""\nmanual_checks = "later"'))
+
+
+def test_screenshot_review_is_off_unless_the_repository_asks_for_it(tmp_path):
+    assert load_other(tmp_path).repos[0].screenshot_review is False
+    on = OTHER.replace('gate_option = ""', 'gate_option = ""\nscreenshot_review = true')
+    assert load_other(tmp_path, on).repos[0].screenshot_review is True

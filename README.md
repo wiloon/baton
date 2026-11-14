@@ -26,6 +26,7 @@ issue labelled ready-for-agent
   fix           answer the review or a failing CI check (up to max_review_rounds)
   merge         auto_merge on, CI green, "## Manual checks" none -> merge; else ready-for-human
                 (manual_checks = "defer": the checks go to a "Manual checks to try" issue instead)
+                (screenshot_review = true: the reviewer also checks the manual-check screenshots)
 ```
 
 **One step per tick.** A tick takes the configured repositories in turn. In each one it does the

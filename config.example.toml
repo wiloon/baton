@@ -114,6 +114,9 @@ signoff = false
 # "defer": it merges once review and CI pass, and its checks are collected in one open
 # "Manual checks to try" issue (ready-for-human) for a later trial of the whole app.
 manual_checks = "gate"
+# true: the pool reviewer also looks at the manual-check screenshots (Must fix for anything a
+# user would see as broken, or for missing screenshots), and every fixer re-shoots them.
+screenshot_review = false
 
 [repos.areas]
 # Top-level directory -> area, for per-area vendor preferences (`dev_ui = [...]`). Anything else is "other".
