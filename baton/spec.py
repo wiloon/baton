@@ -32,7 +32,7 @@ import sys
 import time
 
 from . import dispatch, e2e_gate, fix, hooks as telemetry, md, merge, notify, pick, pr as pr_helpers, prompts, review, vendors
-from .common import Deferred, changed, git, restore, strip_markers
+from .common import Deferred, changed, git, push, restore, strip_markers
 
 REPLY_CAP = 60000
 VERDICT = re.compile(r"<!-- baton-verdict: (accept|revise)( by=(cursor|codex|claude))? -->")
@@ -390,7 +390,7 @@ class Spec:
                 self.record(reviser, model)
             except OSError:
                 return "stop"
-            if session.run_process(["git", "-C", str(wt), "push", "-q", "-u", "origin", self.branch]).returncode != 0:
+            if not push(wt, self.branch, upstream=True, signoff=self.env.repo.signoff):
                 self.handoff(f"Pushing {self.branch} failed.")
                 return "stop"
             self.base = f"origin/{self.branch}"

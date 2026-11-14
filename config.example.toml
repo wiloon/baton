@@ -107,6 +107,9 @@ nightly_hook = ""
 # Both are needed with a gate_hook, such as 'e2e/[A-Za-z0-9_-]+\.spec\.ts' and '--repeat-each=([1-9]|10)'.
 gate_target = ""
 gate_option = ""
+# true when the repository requires a Signed-off-by on every commit (a DCO check): before each
+# push the runner adds one for the author to the agent's unpushed commits that lack it.
+signoff = false
 
 [repos.areas]
 # Top-level directory -> area, for per-area vendor preferences (`dev_ui = [...]`). Anything else is "other".

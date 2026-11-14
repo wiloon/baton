@@ -120,6 +120,13 @@ def test_hooks_are_host_paths_and_none_by_default(tmp_path):
     assert c.repos[0].nightly_hook == tmp_path / 'home/shop-hooks/nightly.sh'
 
 
+def test_signoff_is_off_unless_the_repository_asks_for_it(tmp_path):
+    assert load_other(tmp_path).repos[0].signoff is False
+    assert load_other(tmp_path, OTHER.replace('gate_option = ""', 'gate_option = ""\nsignoff = true')).repos[0].signoff
+    with pytest.raises(config.ConfigError, match='repos.signoff'):
+        load_other(tmp_path, OTHER.replace('gate_option = ""', 'gate_option = ""\nsignoff = "yes"'))
+
+
 def test_a_gate_hook_needs_a_pattern_for_what_an_issue_may_ask_it_to_run(tmp_path):
     gated = OTHER.replace('gate_hook = ""', 'gate_hook = "hooks/gate.sh"')
     with pytest.raises(config.ConfigError, match='gate_target'):
