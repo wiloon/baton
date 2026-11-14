@@ -21,7 +21,7 @@ import subprocess
 import sys
 import time
 
-from . import quota, vendor_policy
+from . import pr as pr_helpers, quota, vendor_policy
 
 
 def state_path(state, pr, kind):
@@ -141,10 +141,8 @@ def seed_authors(state, pr, repo, cursor_branch_re, cursor_login_re):
     writer as it opens the PR, and a guess added on top would exclude an innocent reviewer."""
     if _lines(state_path(state, pr, "authors")):
         return 0
-    result = session.run_process(
-        ["gh", "pr", "view", str(pr), "-R", repo, "--json", "headRefName,author",
-         "--jq", '.headRefName + " " + .author.login'],
-        text=True, capture_output=True, check=False)
+    result = pr_helpers.gh("pr", "view", str(pr), "-R", repo, "--json", "headRefName,author",
+                           "--jq", '.headRefName + " " + .author.login')
     if result.returncode:
         return 1
     parts = result.stdout.split()
@@ -206,7 +204,7 @@ def mentioned_area(text, env=None):
 
 
 def _gh(*args):
-    result = session.run_process(["gh", *args], text=True, capture_output=True, check=False)
+    result = pr_helpers.gh(*args)
     return result.stdout if result.returncode == 0 else None
 
 

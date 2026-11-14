@@ -14,6 +14,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 
 from . import pr_contract
 
@@ -22,8 +23,98 @@ TASK_LINE = re.compile(r"TASK: (partial|complete)")
 ATTRIBUTION = re.compile(r"(🤖 Generated with |co-authored-by:)", re.IGNORECASE)
 
 
-def gh(*args, input=None):
-    return session.run_process(["gh", *args], input=input, text=True, capture_output=True, check=False)
+# A gh failure worth another try: the network or GitHub's edge, not the request (#46).
+TRANSIENT = re.compile(r"TLS handshake timeout|connection reset|connection refused|i/o timeout|unexpected EOF"
+                       r"|timeout awaiting response headers|Client\.Timeout exceeded|error connecting to"
+                       r"|HTTP 50[234]|secondary rate limit", re.IGNORECASE)
+# Pauses before each retry, in seconds: three retries over about 20 s.
+BACKOFF = (2, 5, 15)
+sleep = time.sleep
+STDERR_LINES = 3
+
+
+def call(*args, input=None, limit=None):
+    """One `gh ARGS` run; LIMIT (seconds) runs it under `timeout`."""
+    command = ["gh", *args] if limit is None else ["timeout", str(limit), "gh", *args]
+    return session.run_process(command, input=input, text=True, capture_output=True, check=False)
+
+
+def transient(result):
+    stderr = result.stderr or ""
+    if re.search(r"HTTP 4\d\d", stderr) and not re.search(r"secondary rate limit", stderr, re.IGNORECASE):
+        return False
+    return bool(TRANSIENT.search(stderr))
+
+
+def why(result):
+    """gh's last stderr lines as ` (gh: ...)` for a runner.log line or a handoff; '' when it printed none."""
+    lines = [line.strip() for line in (getattr(result, "stderr", "") or "").splitlines() if line.strip()]
+    return f" (gh: {' | '.join(lines[-STDERR_LINES:])})" if lines else ""
+
+
+def _option(args, name):
+    return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else None
+
+
+def _landed(args, input):
+    """For a write that may have reached GitHub before its answer was lost: the result it
+    would have given, or None when it did not land. Idempotent calls return None: retry them."""
+    repo = _option(args, "-R")
+    scope = ["-R", repo] if repo else []
+    if args[1:2] == ("comment",) and args[0] in ("issue", "pr") and len(args) > 2:
+        text = _option(args, "--body")
+        if text is None and _option(args, "--body-file") is not None:
+            source = _option(args, "--body-file")
+            try:
+                text = input if source == "-" else Path(source).read_text()
+            except OSError:
+                return None
+        if text is None:
+            return None
+        seen = gh(args[0], "view", args[2], *scope, "--json", "comments")
+        try:
+            bodies = [c.get("body", "") for c in json.loads(seen.stdout)["comments"][-20:]]
+        except (ValueError, KeyError, TypeError):
+            return None
+        if text.strip() in (b.strip() for b in bodies):
+            return subprocess.CompletedProcess(["gh", *args], 0, "", "")
+        return None
+    if args[:2] == ("pr", "create") and (head := _option(args, "--head")):
+        found = gh("pr", "list", *scope, "--state", "open", "--head", head, "--json", "url", "--jq", ".[0].url // empty")
+        url = found.stdout.strip() if found.returncode == 0 else ""
+        return subprocess.CompletedProcess(["gh", *args], 0, url + "\n", "") if url else None
+    if args[:2] == ("issue", "create") and (title := _option(args, "--title")):
+        found = gh("issue", "list", *scope, "--state", "open", "--limit", "30", "--json", "title,url")
+        try:
+            url = next((i["url"] for i in json.loads(found.stdout) if i.get("title") == title), "")
+        except (ValueError, KeyError, TypeError):
+            return None
+        return subprocess.CompletedProcess(["gh", *args], 0, url + "\n", "") if url else None
+    if args[:2] == ("pr", "merge") and len(args) > 2:
+        state = gh("pr", "view", args[2], *scope, "--json", "state", "--jq", ".state")
+        if state.returncode == 0 and state.stdout.strip() == "MERGED":
+            return subprocess.CompletedProcess(["gh", *args], 0, "", "")
+    return None
+
+
+def gh(*args, input=None, limit=None):
+    """`gh ARGS`, retried on transient failures (TLS or connection errors, 502/503/504, the
+    secondary rate limit) with BACKOFF; a 4xx or any other failure is returned at once. Before
+    retrying a write that is not idempotent (a comment, `pr create`, `issue create`,
+    `pr merge`), it checks whether the first try landed. The one entry point for every
+    baton `gh` call (#46); the final failure's stderr is in the result (why())."""
+    result = call(*args, input=input, limit=limit)
+    for pause in BACKOFF:
+        if result.returncode == 0 or not transient(result):
+            break
+        sleep(pause)
+        if (done := _landed(args, input)) is not None:
+            return done
+        result = call(*args, input=input, limit=limit)
+    if result.returncode != 0 and transient(result):
+        from . import notify   # notify imports this module
+        notify.log(f"gh {' '.join(args[:2])} failed after {len(BACKOFF) + 1} tries{why(result)}")
+    return result
 
 
 def view(pr, fields):

@@ -56,8 +56,8 @@ class Merger:
         goes to the optional CI metadata hook."""
         before = ""
         if self.hooks.enabled:
-            result = session.run_process(["timeout", "15", "gh", "pr", "view", str(self.pr), "-R", self.repo,
-                                     "--json", "headRefOid", "--jq", ".headRefOid"], text=True, capture_output=True)
+            result = pr_helpers.gh("pr", "view", str(self.pr), "-R", self.repo, "--json", "headRefOid", "--jq", ".headRefOid",
+                                   limit=15)
             before = result.stdout.strip() if result.returncode == 0 else ""
         started = time.monotonic()
         result = ci.green(str(self.pr), minutes)
@@ -172,8 +172,9 @@ class Merger:
             self.handoff("manual_checks", f"PR #{pr} needs a manual check", f"Review and CI passed. {url}")
             notify.send_shots(pr)
             return
-        if pr_helpers.gh("pr", "merge", str(pr), "-R", self.repo, "--merge").returncode != 0:
-            self.handoff("merge_failed", f"PR #{pr} merge failed", url)
+        merged = pr_helpers.gh("pr", "merge", str(pr), "-R", self.repo, "--merge")
+        if merged.returncode != 0:
+            self.handoff("merge_failed", f"PR #{pr} merge failed", f"{url}{pr_helpers.why(merged)}")
             return
         self.hooks.task("merged", "merged")
         notify.notify(f"PR #{pr} merged", url)

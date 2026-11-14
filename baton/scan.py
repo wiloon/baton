@@ -81,7 +81,7 @@ def file_scan(env, draft):
     created = pr_helpers.gh("issue", "create", "-R", env.repo.gh_repo, "--title", title, "--body-file", f"{draft}.body",
                             "--label", "claude-found", "--label", "needs-triage")
     if created.returncode != 0:
-        notify.log(f"scan of {area}: gh issue create failed (draft {draft})")
+        notify.log(f"scan of {area}: gh issue create failed (draft {draft}){pr_helpers.why(created)}")
         notify.notify("Scan: filing the issue failed", f"{draft}.md")
         return False
     url = created.stdout.rstrip("\n")
