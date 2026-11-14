@@ -135,3 +135,11 @@ def test_a_gate_hook_needs_a_pattern_for_what_an_issue_may_ask_it_to_run(tmp_pat
     assert c.repos[0].gate_target == 'tests/[a-z_]+\\.py'
     with pytest.raises(config.ConfigError, match='gate_option'):
         load_other(tmp_path, OTHER.replace('gate_option = ""', 'gate_option = "(["'))
+
+
+def test_manual_checks_gate_the_merge_unless_the_repository_defers_them(tmp_path):
+    assert load_other(tmp_path).repos[0].manual_checks == 'gate'
+    deferred = OTHER.replace('gate_option = ""', 'gate_option = ""\nmanual_checks = "defer"')
+    assert load_other(tmp_path, deferred).repos[0].manual_checks == 'defer'
+    with pytest.raises(config.ConfigError, match='repos.manual_checks'):
+        load_other(tmp_path, OTHER.replace('gate_option = ""', 'gate_option = ""\nmanual_checks = "later"'))

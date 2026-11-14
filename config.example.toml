@@ -110,6 +110,10 @@ gate_option = ""
 # true when the repository requires a Signed-off-by on every commit (a DCO check): before each
 # push the runner adds one for the author to the agent's unpushed commits that lack it.
 signoff = false
+# "gate": a PR whose `## Manual checks` is not none waits for the owner (ready-for-human).
+# "defer": it merges once review and CI pass, and its checks are collected in one open
+# "Manual checks to try" issue (ready-for-human) for a later trial of the whole app.
+manual_checks = "gate"
 
 [repos.areas]
 # Top-level directory -> area, for per-area vendor preferences (`dev_ui = [...]`). Anything else is "other".

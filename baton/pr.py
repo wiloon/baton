@@ -289,11 +289,12 @@ def checks_none(text):
     return sections == 1 and len(answer) == 1 and bool(re.fullmatch(r"none\.?", answer[0].lower()))
 
 
-def gate(pr):
+def gate(pr, defer=False):
     """After green CI: merge, hand off for a manual check, or queue a metadata review
-    when the live description would close the wrong issue (preflight)."""
+    when the live description would close the wrong issue (preflight). DEFER: the
+    repository's manual checks wait for a later trial instead of the merge (#48)."""
     current = body(pr)
-    if current is None or not checks_none(current):
+    if current is None or not (defer or checks_none(current)):
         return {"action": "manual_checks"}
     try:
         preflight(pr)
@@ -342,7 +343,7 @@ def main(argv=None):
         current = body(args.pr)
         return 0 if current is not None and checks_none(current) else 1
     elif args.command == "gate":
-        print(json.dumps(gate(args.pr)))
+        print(json.dumps(gate(args.pr, defer=env.repo.manual_checks == "defer")))
     return 0
 
 
