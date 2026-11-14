@@ -61,8 +61,9 @@ class Runner:
         return 1
 
     def comment(self, pr, body, failed=""):
-        if pr_helpers.gh("pr", "comment", str(pr), "-R", self.repo, "--body", body).returncode != 0 and failed:
-            notify.log(failed)
+        posted = pr_helpers.gh("pr", "comment", str(pr), "-R", self.repo, "--body", body)
+        if posted.returncode != 0 and failed:
+            notify.log(f"{failed}{pr_helpers.why(posted)}")
 
     def render(self, template, **pairs):
         return prompts.render(self.self_dir / template, list(pairs.items()), env=self.env)

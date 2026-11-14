@@ -30,6 +30,7 @@ class FakeGH:
         self.owner, self.calls = owner, []
         self.body, self.comments, self.labels = "Goal\nOld step\n", [], {"needs-triage", "ready-for-human"}
         self.adr_pr, self.fails = "", set()
+        self.flaky = {}   # "issue edit --body-file": [(stderr, landed), ...] failures before it works
 
     def __call__(self, *args, input=None):
         self.calls.append(list(args))
@@ -37,6 +38,10 @@ class FakeGH:
         head = " ".join(args[:2])
         if head in self.fails:
             return subprocess.CompletedProcess(args, 1, "", "boom")
+        key = head + (" --body-file" if "--body-file" in args else "")
+        stderr, landed = self.flaky[key].pop(0) if self.flaky.get(key) else ("", True)
+        if not landed:
+            return subprocess.CompletedProcess(args, 1, "", stderr)
         if head == "issue view" and "comments" in args[args.index("--json") + 1]:
             data = {"title": "T", "body": self.body, "comments": self.comments}
             out = json.dumps(data)
@@ -59,7 +64,7 @@ class FakeGH:
         elif head == "pr create":
             self.adr_pr = "77"
             out = "https://github.com/owner/app/pull/77\n"
-        return subprocess.CompletedProcess(args, rc, out, "")
+        return subprocess.CompletedProcess(args, 1, "", stderr) if stderr else subprocess.CompletedProcess(args, rc, out, "")
 
     def posted(self, marker):
         return [c["body"] for c in self.comments if c["body"].startswith(marker)]
@@ -80,10 +85,11 @@ def loop(worktree, tmp_path, monkeypatch):
     monkeypatch.setenv("LOGS", env["LOGS"])
     monkeypatch.setattr(pick.settle, "probe", lambda *args: None)
     fake = FakeGH("owner")
-    monkeypatch.setattr(spec.pr_helpers, "gh", fake)
+    # Below baton.pr.gh, so the loop runs through its retries (#46).
+    monkeypatch.setattr(spec.pr_helpers, "call", lambda *args, input=None, limit=None: fake(*args, input=input))
+    monkeypatch.setattr(spec.pr_helpers, "sleep", lambda seconds: None)
     state = SimpleNamespace(env=env, gh=fake, repo=worktree.repo, runs=[], script=[], ci=True, merged=[])
     monkeypatch.setattr(merge.Merger, "ci_green", lambda self, minutes: state.ci)
-    monkeypatch.setattr(spec.Spec, "gh", lambda self, *args: fake(*args, "-R", "owner/app"))
 
     def agent(vendor, role, prompt, tag, cwd, settings="", output="", env=None, hooks=None):
         state.runs.append({"vendor": vendor, "role": role, "tag": tag, "prompt": prompt, "settings": settings, "output": output,
@@ -198,6 +204,59 @@ def test_changes_go_to_another_vendor_then_the_spec_is_reviewed_again(loop):
     # The round-2 reviewer is told what the revision changed.
     assert "the issue body diff is" in loop.runs[2]["prompt"]
     assert loop.runs[0]["vendor"] != loop.runs[1]["vendor"]
+
+
+TLS = 'Post "https://api.github.com/graphql": net/http: TLS handshake timeout'
+
+
+def test_a_revision_survives_two_tls_timeouts_on_the_body_edit(loop):
+    """wiloon/tomeshelf#6: one network blip on `gh issue edit` stopped the whole loop (#46)."""
+    loop.gh.comments = []
+    loop.gh.flaky["issue edit --body-file"] = [(TLS, False), (TLS, False)]
+    loop.script = [CHANGES, reviser(body="Goal\nNew step\n"), ACCEPT]
+    assert loop.run() is True
+    assert loop.gh.body == "Goal\nNew step\n"
+    assert sum(1 for c in loop.gh.calls if c[:2] == ["issue", "edit"] and "--body-file" in c) == 3
+    assert loop.gh.posted("<!-- baton-spec-reply round=1 by=") and "ready-for-agent" in loop.gh.labels
+
+
+def test_a_404_is_not_retried_and_its_stderr_reaches_the_handoff(loop, monkeypatch):
+    notes = []
+    monkeypatch.setattr(spec.notify, "notify", lambda title, text="": notes.append(text))
+    loop.gh.comments = []
+    loop.gh.flaky["issue edit --body-file"] = [("HTTP 404: Not Found (https://api.github.com/graphql)", False)]
+    loop.script = [CHANGES, reviser(body="Goal\nNew step\n")]
+    assert loop.run() is False
+    assert sum(1 for c in loop.gh.calls if c[:2] == ["issue", "edit"] and "--body-file" in c) == 1
+    assert any("revised issue body failed" in n and "HTTP 404: Not Found" in n for n in notes)
+
+
+def test_a_comment_that_timed_out_but_landed_is_not_posted_twice(loop):
+    loop.gh.comments = []
+    loop.gh.flaky["issue comment"] = [("read tcp: connection reset by peer", True)]
+    loop.script = [CHANGES, reviser(), ACCEPT]
+    assert loop.run() is True
+    assert len(loop.gh.posted("<!-- baton-spec-review round=1 by=")) == 1
+    assert sum(1 for c in loop.gh.calls if c[:2] == ["issue", "comment"]) == 3   # review, reply, verdict
+
+
+def test_a_gh_failure_that_outlasts_the_retries_is_in_runner_log(loop):
+    loop.gh.comments = []
+    loop.gh.flaky["issue edit --body-file"] = [("HTTP 502: Bad Gateway", False)] * 4
+    loop.script = [CHANGES, reviser(body="Goal\nNew step\n")]
+    assert loop.run() is False
+    log = loop.log()
+    assert "gh issue edit failed after 4 tries (gh: HTTP 502: Bad Gateway)" in log
+
+
+def test_a_handoff_whose_label_swap_fails_says_so(loop, monkeypatch):
+    notes = []
+    monkeypatch.setattr(spec.notify, "notify", lambda title, text="": notes.append(text))
+    loop.gh.fails.add("issue edit")
+    loop.script = [{"rc": 1, "status": "failure", "outcome": "RESULT: failed x", "reply": "", "model": "", "defer": ""}]
+    assert loop.run() is False
+    assert "handoff label swap failed (gh: boom)" in loop.log()
+    assert any("still looks in progress" in n for n in notes)
 
 
 def test_a_reply_claiming_to_be_the_runner_loses_its_marker_lines(loop):

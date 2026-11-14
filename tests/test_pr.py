@@ -200,3 +200,66 @@ def test_cli_prints_json_and_keeps_exit_codes(gh, dirs, monkeypatch, capsys):
     assert pr.main(["checks-none", "335"]) == 1
     assert pr.main(["apply-body", "335", str(ctx / "none.md")]) == 0
     assert json.loads(capsys.readouterr().out) == {"changed": False}
+
+
+# --- pr.gh: transient failures are retried, the rest are not (#46) ---------------------
+
+class Scripted:
+    """pr.call answering from a script of (rc, stdout, stderr); every call is kept."""
+
+    def __init__(self, *answers):
+        self.answers, self.calls = list(answers), []
+
+    def __call__(self, *args, input=None, limit=None):
+        import subprocess
+        self.calls.append(args)
+        rc, out, err = self.answers.pop(0)
+        return subprocess.CompletedProcess(["gh", *args], rc, out, err)
+
+
+@pytest.fixture
+def scripted(monkeypatch):
+    pauses = []
+    monkeypatch.setattr(pr, "sleep", pauses.append)
+    def install(*answers):
+        fake = Scripted(*answers)
+        monkeypatch.setattr(pr, "call", fake)
+        fake.pauses = pauses
+        return fake
+    return install
+
+
+@pytest.mark.parametrize("stderr", ["net/http: TLS handshake timeout", "HTTP 503: Service Unavailable",
+                                    "HTTP 403: You have exceeded a secondary rate limit"])
+def test_a_transient_failure_is_retried_with_backoff(scripted, stderr):
+    fake = scripted((1, "", stderr), (1, "", stderr), (0, "ok\n", ""))
+    assert pr.gh("issue", "view", "6", "-R", "o/r").stdout == "ok\n"
+    assert len(fake.calls) == 3 and fake.pauses == list(pr.BACKOFF[:2])
+
+
+@pytest.mark.parametrize("stderr", ["HTTP 404: Not Found", "HTTP 401: Bad credentials", "HTTP 422: Validation Failed",
+                                    "unknown flag: --nope"])
+def test_a_request_error_is_not_retried(scripted, stderr):
+    fake = scripted((1, "", stderr))
+    assert pr.gh("issue", "edit", "6", "-R", "o/r").returncode == 1
+    assert len(fake.calls) == 1 and fake.pauses == []
+
+
+def test_a_pr_create_that_landed_returns_the_existing_pr(scripted):
+    fake = scripted((1, "", "read: connection reset by peer"), (0, "https://github.com/o/r/pull/9\n", ""))
+    result = pr.gh("pr", "create", "-R", "o/r", "--head", "docs/x", "--base", "main", "--title", "t", "--body", "b")
+    assert result.returncode == 0 and result.stdout.strip().endswith("/pull/9")
+    assert [c[:2] for c in fake.calls] == [("pr", "create"), ("pr", "list")]
+
+
+def test_a_comment_that_did_not_land_is_posted_again(scripted):
+    fake = scripted((1, "", "TLS handshake timeout"), (0, json.dumps({"comments": [{"body": "older"}]}), ""), (0, "", ""))
+    assert pr.gh("pr", "comment", "5", "-R", "o/r", "--body", "<!-- baton-x -->\nhi").returncode == 0
+    assert [c[:2] for c in fake.calls] == [("pr", "comment"), ("pr", "view"), ("pr", "comment")]
+
+
+def test_why_is_the_last_stderr_lines():
+    import subprocess
+    result = subprocess.CompletedProcess([], 1, "", "a\n\nb\nc\nHTTP 502: Bad Gateway\n")
+    assert pr.why(result) == " (gh: b | c | HTTP 502: Bad Gateway)"
+    assert pr.why(subprocess.CompletedProcess([], 1, "", "")) == ""

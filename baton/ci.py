@@ -1,17 +1,16 @@
 """A PR's CI for the bash runner (migration slice 3a, #263): wait for it, and decide
 whether a red head is a code-only failure an agent may repair once (#243).
 
-`gh` and `timeout` are called as the bash helpers called them, so the exit codes bash
-hands to telemetry (124 for a timeout) are unchanged.
+`gh` runs through baton.pr.gh (retried on transient failures, #46) under `timeout`, so the
+exit codes bash hands to telemetry (124 for a timeout) are unchanged.
 """
 
-from . import session
+from . import pr as pr_helpers, session
 import argparse
 import json
 import os
 from pathlib import Path
 import re
-import subprocess
 import sys
 import time
 
@@ -19,15 +18,15 @@ FEEDBACK_MAX = 60000   # render's FEEDBACK is one argv element (Linux limit: 128
 LOG_LINES = 200
 
 
-def run(*cmd):
-    """(exit code, stdout and stderr together)."""
-    result = session.run_process(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
-    return result.returncode, result.stdout
+def gh(*args, limit=None):
+    """(exit code, stdout and stderr together) of baton's retrying gh (#46)."""
+    result = pr_helpers.gh(*args, limit=limit)
+    return result.returncode, (result.stdout or "") + (result.stderr or "")
 
 
 def watch(pr, minutes):
-    return run("timeout", f"{minutes}m", "gh", "pr", "checks", str(pr), "-R", session.resolve().repo.gh_repo,
-               "--watch", "--fail-fast", "-i", "30")
+    return gh("pr", "checks", str(pr), "-R", session.resolve().repo.gh_repo, "--watch", "--fail-fast", "-i", "30",
+              limit=f"{minutes}m")
 
 
 def green(pr, minutes, sleep=time.sleep):
@@ -59,8 +58,7 @@ def classify(pr, state, allowed):
     """The repair feedback for PR's red head, or None when the owner should get it:
     infrastructure and ambiguous failures, or a head already repaired once."""
     repo = session.resolve().repo.gh_repo
-    result = session.run_process(["gh", "pr", "view", str(pr), "-R", repo, "--json", "headRefOid", "--jq", ".headRefOid"],
-                            text=True, capture_output=True, check=False)
+    result = pr_helpers.gh("pr", "view", str(pr), "-R", repo, "--json", "headRefOid", "--jq", ".headRefOid")
     head = result.stdout.strip()
     if result.returncode != 0 or not re.fullmatch(r"[a-f0-9]{40,64}", head):
         return None
@@ -68,10 +66,9 @@ def classify(pr, state, allowed):
         return None
     # green() stops at the first failure (--fail-fast); classify only once every check
     # has finished, or a slow image build still pending would hide behind a fast lint.
-    run("timeout", "45m", "gh", "pr", "checks", str(pr), "-R", repo, "--watch", "-i", "30")
+    gh("pr", "checks", str(pr), "-R", repo, "--watch", "-i", "30", limit="45m")
     # `gh pr checks` may exit 1 while still returning valid JSON: read its JSON, not its exit.
-    result = session.run_process(["gh", "pr", "checks", str(pr), "-R", repo, "--json", "name,bucket,link"],
-                            text=True, capture_output=True, check=False)
+    result = pr_helpers.gh("pr", "checks", str(pr), "-R", repo, "--json", "name,bucket,link")
     try:
         checks = json.loads(result.stdout)
     except ValueError:
@@ -87,8 +84,7 @@ def classify(pr, state, allowed):
             return None
         run_id, job_id = found[1], found[2]
         # --job keeps two failed jobs of one run from each getting both logs.
-        rc, logs = run("gh", "run", "view", run_id, *(["--job", job_id] if job_id else []), "-R", repo,
-                       "--log-failed")
+        rc, logs = gh("run", "view", run_id, *(["--job", job_id] if job_id else []), "-R", repo, "--log-failed")
         logs = logs.rstrip("\n")
         if rc != 0 or not logs:
             return None

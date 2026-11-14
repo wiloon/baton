@@ -192,14 +192,20 @@ class Spec:
     def handoff(self, why, reason="spec_failed"):
         """The owner takes over; the loop resumes once they answer on the issue and remove
         ready-for-human."""
-        self.gh("issue", "edit", self.issue, "--remove-label", "agent-wip", "--add-label", "ready-for-human")
+        swapped = self.gh("issue", "edit", self.issue, "--remove-label", "agent-wip", "--add-label", "ready-for-human")
         self.hooks.task("handoff", reason, "--reason", reason)
+        if swapped.returncode != 0:
+            # Nothing runs the task now, but agent-wip would say otherwise (#46).
+            why += (" Swapping agent-wip for ready-for-human failed too, so the issue still looks in progress: "
+                    f"fix its labels by hand.{pr_helpers.why(swapped)}")
+            notify.log(f"#{self.issue}: handoff label swap failed{pr_helpers.why(swapped)}")
         notify.notify(f"#{self.issue}: spec needs you", f"{why} {self.url}")
 
     def post(self, body, failed):
-        if self.gh("issue", "comment", self.issue, "--body", body).returncode == 0:
+        posted = self.gh("issue", "comment", self.issue, "--body", body)
+        if posted.returncode == 0:
             return True
-        notify.log(f"#{self.issue}: {failed}")
+        notify.log(f"#{self.issue}: {failed}{pr_helpers.why(posted)}")
         return False
 
     def worktree(self):
@@ -333,8 +339,9 @@ class Spec:
             if not merge.Merger(self.env, self.hooks, pr, n).ci_green(30):
                 self.handoff(f"{reviewer} accepted, but CI on the ADR PR #{pr} is not green.")
                 return "stop"
-            if self.gh("pr", "merge", pr, "--merge").returncode != 0:
-                self.handoff(f"{reviewer} accepted, but merging the ADR PR #{pr} failed.")
+            merged = self.gh("pr", "merge", pr, "--merge")
+            if merged.returncode != 0:
+                self.handoff(f"{reviewer} accepted, but merging the ADR PR #{pr} failed.{pr_helpers.why(merged)}")
                 return "stop"
             notify.notify(f"#{n}: ADR PR #{pr} merged", f"https://github.com/{self.repo}/pull/{pr}")
         if not self.post(f"<!-- baton-verdict: accept by={reviewer} -->\n"
@@ -382,8 +389,9 @@ class Spec:
             return "stop"
         if body.is_file() and body.stat().st_size:
             body.write_text(strip_markers(body.read_text()).rstrip("\n") + "\n")
-            if self.gh("issue", "edit", n, "--body-file", str(body)).returncode != 0:
-                self.handoff(f"Applying {reviser} revised issue body failed ({body}).")
+            edited = self.gh("issue", "edit", n, "--body-file", str(body))
+            if edited.returncode != 0:
+                self.handoff(f"Applying {reviser} revised issue body failed ({body}).{pr_helpers.why(edited)}")
                 return "stop"
         if git(wt, "rev-list", f"{self.base}..HEAD"):
             try:
@@ -401,7 +409,7 @@ class Spec:
                                   "once a spec reviewer accepts the spec; the issue stays open for implementation.\n\n"
                                   "## Manual checks\nnone")
                 if created.returncode != 0:
-                    self.handoff(f"Opening the ADR PR for {self.branch} failed.")
+                    self.handoff(f"Opening the ADR PR for {self.branch} failed.{pr_helpers.why(created)}")
                     return "stop"
                 self.pr = created.stdout.strip().rsplit("/", 1)[-1]
         try:

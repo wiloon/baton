@@ -7,7 +7,7 @@ that outlive a call (the task's pipeline id, the last run's id) are kept in the 
 file named by BATON_TELEMETRY_ITEM, created by begin_item and removed by finish_item.
 """
 
-from . import session
+from . import pr as pr_helpers, session
 import argparse
 from dataclasses import dataclass
 import json
@@ -157,14 +157,12 @@ class Telemetry:
     def ci(self, pr, rc, before, no_checks=False, duration_ms=None):
         if not self.enabled:
             return
-        gh = ("gh", "pr")
+        repo = session.resolve().repo.gh_repo
         after, checks = "", ""
         try:
-            after = session.run_process(["timeout", "15", *gh, "view", str(pr), "-R", session.resolve().repo.gh_repo,
-                                    "--json", "headRefOid", "--jq", ".headRefOid"],
-                                   text=True, capture_output=True).stdout.strip()
-            checks = session.run_process(["timeout", "15", *gh, "checks", str(pr), "-R", session.resolve().repo.gh_repo,
-                                     "--json", "bucket"], text=True, capture_output=True).stdout
+            after = pr_helpers.gh("pr", "view", str(pr), "-R", repo, "--json", "headRefOid", "--jq", ".headRefOid",
+                                  limit=15).stdout.strip()
+            checks = pr_helpers.gh("pr", "checks", str(pr), "-R", repo, "--json", "bucket", limit=15).stdout
         except OSError:
             pass
         result = (self._call("ci-result", rc, input=checks) or "unknown").strip() or "unknown"

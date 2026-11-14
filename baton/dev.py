@@ -284,7 +284,8 @@ def run(tick, issue):
     created = pr_helpers.gh("pr", "create", "-R", repo, "--head", branch, "--base", "main", "--title", lines[0], "--body", text)
     if created.returncode != 0:
         # A lost GitHub response may still have created the PR; leave the intent to reconcile.
-        tick.log(f"#{issue}: PR create returned an error; saved intent will be reconciled on the next tick")
+        tick.log(f"#{issue}: PR create returned an error; saved intent will be reconciled on the next tick"
+                 f"{pr_helpers.why(created)}")
         tick.notify(f"#{issue}: PR creation needs reconciliation", f"branch {branch} is pushed. {url}")
         return 1
     pr = created.stdout.strip().rsplit("/", 1)[-1]
