@@ -106,6 +106,19 @@ def test_manual_checks_go_to_the_owner_with_screenshots(run):
     assert "notify PR #335 needs a manual check" in run.events
 
 
+def test_deferred_manual_checks_do_not_stop_the_merge(run):
+    run.gh.set(body=CLEAN.replace("none", "- check the theme"))
+    run.go(MANUAL_CHECKS="defer")
+    assert run.merged() and not run.labelled("ready-for-human") and run.shots == []
+    assert "notify PR #335 merged" in run.events and "after_merge" in run.events
+
+
+def test_deferred_manual_checks_still_need_auto_merge(run):
+    run.gh.set(body=CLEAN.replace("none", "- check the theme"))
+    run.go(MANUAL_CHECKS="defer", AUTO_MERGE="0")
+    assert run.events == ["notify PR #335 review passed"] and not run.merged() and run.shots == []
+
+
 def test_a_failed_merge_goes_to_the_owner(run):
     run.gh.fail("merge")
     run.go()

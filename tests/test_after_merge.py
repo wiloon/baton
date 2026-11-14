@@ -368,3 +368,40 @@ def test_a_bug_the_pr_names_by_number_is_not_filed_when_the_pr_opens(gh):
     gh.set(body=NUMBERED_BODY, comments=[])
     after_merge.file_pr_bugs("5", "7")
     assert gh.created() == [] and not gh.pr["comments"]
+
+
+# --- deferred manual checks (#48) -------------------------------------------------------
+
+DEFERRED = "Closes #6\n\n## Manual checks\n- Open the library at 390 px.\n- Open a book.\n\n## Before release\nnone\n"
+
+
+@pytest.fixture
+def deferred(monkeypatch):
+    monkeypatch.setenv("MANUAL_CHECKS", "defer")
+
+
+def test_deferred_checks_open_the_tracking_issue_when_none_is_open(gh, deferred):
+    gh.set(body=DEFERRED, title="feat: covers")
+    after_merge.deferred_checks(32, "6")
+    [issue] = gh.created()
+    assert issue["title"] == "Manual checks to try" and issue["label"] == "ready-for-human"
+    assert issue["body"].endswith("### PR #32: feat: covers\nhttps://github.com/owner/app/pull/32\n\n"
+                                  "- [ ] Open the library at 390 px.\n- [ ] Open a book.\n")
+
+
+def test_deferred_checks_are_appended_to_the_open_tracking_issue_once_per_pr(gh, deferred):
+    gh.set(body=DEFERRED, title="feat: covers", open_issues=[{"number": 41, "title": "Manual checks to try"}])
+    after_merge.deferred_checks(32, "6")
+    after_merge.deferred_checks(32, "6")
+    comments = [c for c in gh.calls() if c[:3] == ["issue", "comment", "41"]]
+    assert len(comments) == 1 and gh.created() == []
+    assert comments[0][comments[0].index("--body") + 1].startswith("### PR #32: feat: covers\n")
+
+
+def test_no_checks_and_the_gate_setting_add_nothing(gh, monkeypatch):
+    gh.set(body=DEFERRED, title="t")
+    after_merge.deferred_checks(32, "6")   # MANUAL_CHECKS unset: "gate"
+    monkeypatch.setenv("MANUAL_CHECKS", "defer")
+    gh.set(body="Closes #6\n\n## Manual checks\nnone\n")
+    after_merge.deferred_checks(33, "6")
+    assert gh.created() == [] and not [c for c in gh.calls() if c[:2] == ["issue", "comment"]]

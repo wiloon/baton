@@ -322,6 +322,51 @@ def owner_actions(pr, issue):
     done.touch()
 
 
+TRACKER = "Manual checks to try"
+
+
+def deferred_checks(pr, issue):
+    """With manual_checks = "defer" the PR merged without the owner's look, so its
+    `## Manual checks` go to one open tracking issue for a later trial of the whole app:
+    a new issue, or a comment on the open one. Once per PR (#48)."""
+    env = session.resolve()
+    if env.repo.manual_checks != "defer":
+        return
+    done = Path(str(env.dirs.state), f"deferred-checks-pr-{pr}")
+    if done.exists():
+        return
+    body = pr_body(pr)
+    if body is None:
+        log(f"PR #{pr}: reading its manual checks failed; retried after the next merge step")
+        return
+    checks = md.section("Manual checks", body)
+    if not checks:
+        done.touch()
+        return
+    title = stdout("pr", "view", str(pr), "-R", repo(), "--json", "title", "--jq", ".title") or ""
+    items = "".join(re.sub(r"^[-*]\s+(?!\[[ xX]\])", "- [ ] ", line) + "\n" for line in checks.rstrip("\n").split("\n"))
+    section = f"### PR #{pr}: {title}\nhttps://github.com/{repo()}/pull/{pr}\n\n{items}"
+    listed = stdout("issue", "list", "-R", repo(), "--state", "open", "--search", f'"{TRACKER}" in:title',
+                    "--json", "number,title")
+    try:
+        tracker = next((str(i["number"]) for i in json.loads(listed or "[]") if i.get("title") == TRACKER), None)
+    except (ValueError, TypeError, KeyError):
+        tracker = None
+    if listed is None:
+        log(f"PR #{pr}: finding the {TRACKER!r} issue failed; retried after the next merge step")
+        return
+    done.touch()   # before writing: a half-written section is logged, never written twice
+    if tracker:
+        ok = gh("issue", "comment", tracker, "-R", repo(), "--body", section).returncode == 0
+    else:
+        ok = stdout("issue", "create", "-R", repo(), "--label", "ready-for-human", "--title", TRACKER, "--body",
+                    "Manual checks of PRs that merged without the owner's look (`manual_checks = \"defer\"`). "
+                    "Try them in one pass, tick what works, then close this issue; the next such PR opens "
+                    f"a new one.\n\n{section}") is not None
+    if not ok:
+        log(f"PR #{pr}: deferred manual checks lost: {checks}")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("pr")
@@ -329,6 +374,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     follow_ups(args.pr, args.issue)
     owner_actions(args.pr, args.issue)
+    deferred_checks(args.pr, args.issue)
     return 0
 
 

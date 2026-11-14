@@ -140,19 +140,21 @@ class Merger:
         try:
             after_merge.follow_ups(str(self.pr), self.issue)
             after_merge.owner_actions(str(self.pr), self.issue)
+            after_merge.deferred_checks(str(self.pr), self.issue)
         except Exception as exc:
             notify.log(f"PR #{self.pr}: after-merge failed: {exc}")
             notify.log(f"PR #{self.pr}: after-merge filing failed")
 
     # --- the review passed ---
     def merge_or_handoff(self, wt):
-        """Merge when AUTO_MERGE is on, CI is green and "## Manual checks" is none; otherwise
-        label it ready-for-human."""
+        """Merge when AUTO_MERGE is on, CI is green and "## Manual checks" is none, or the
+        repository defers manual checks (#48); otherwise label it ready-for-human."""
         pr, url = self.pr, self.url
         if self.env.config.scheduling.auto_merge is not True:
             self.handoff("auto_merge_off", f"PR #{pr} review passed", f"Auto-merge is off; ready for you. {url}")
             body = pr_helpers.body(pr)
-            if body is None or not pr_helpers.checks_none(body):
+            deferred = self.env.repo.manual_checks == "defer"
+            if not deferred and (body is None or not pr_helpers.checks_none(body)):
                 notify.send_shots(pr)
             return
         if not self.ci_green(45):
@@ -160,7 +162,7 @@ class Merger:
                 self.handoff("ci_not_green", f"PR #{pr}: CI not green", f"Review passed but CI failed or timed out. {url}")
                 return
         try:
-            gate = pr_helpers.gate(pr)
+            gate = pr_helpers.gate(pr, defer=self.env.repo.manual_checks == "defer")
         except Exception:
             gate = {"action": "manual_checks"}
         if gate.get("action") == "queue_review":
