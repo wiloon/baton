@@ -375,9 +375,17 @@ def test_a_bug_the_pr_names_by_number_is_not_filed_when_the_pr_opens(gh):
 DEFERRED = "Closes #6\n\n## Manual checks\n- Open the library at 390 px.\n- Open a book.\n\n## Before release\nnone\n"
 
 
+MERGED = "2026-11-14T10:00:00Z"
+
+
 @pytest.fixture
-def deferred(monkeypatch):
+def deferred(monkeypatch, gh, tmp_path):
     monkeypatch.setenv("MANUAL_CHECKS", "defer")
+    gh.set(mergedAt=MERGED)
+    after_merge.defer_since()
+    since = next(tmp_path.rglob("deferred-checks-since"))
+    since.write_text("2026-11-14T09:00:00+00:00\n")   # defer took effect before these merges
+    return since
 
 
 def test_deferred_checks_open_the_tracking_issue_when_none_is_open(gh, deferred):
@@ -405,3 +413,32 @@ def test_no_checks_and_the_gate_setting_add_nothing(gh, monkeypatch):
     gh.set(body="Closes #6\n\n## Manual checks\nnone\n")
     after_merge.deferred_checks(33, "6")
     assert gh.created() == [] and not [c for c in gh.calls() if c[:2] == ["issue", "comment"]]
+
+
+def test_two_prs_merging_in_one_tick_share_one_tracking_issue(gh, deferred):
+    """The second PR must find the tracker the first just opened, though search does not see it yet (#52)."""
+    gh.set(body=DEFERRED, title="feat: covers")
+    after_merge.deferred_checks(32, "6")
+    gh.set(title="feat: reader")
+    after_merge.deferred_checks(33, "6")
+    [issue] = gh.created()
+    assert "### PR #32: feat: covers\n" in issue["body"]
+    [comment] = [c for c in gh.calls() if c[:3] == ["issue", "comment", "900"]]
+    assert comment[comment.index("--body") + 1].startswith("### PR #33: feat: reader\n")
+
+
+def test_prs_merged_before_defer_took_effect_add_nothing(gh, deferred):
+    deferred.write_text("2026-11-14T11:00:00+00:00\n")   # turned on after PR #20 merged
+    gh.set(body=DEFERRED, title="feat: old")
+    after_merge.deferred_checks(20, "6")
+    gh.set(mergedAt="2026-11-14T12:00:00Z")
+    after_merge.deferred_checks(20, "6")   # once decided, never filed later
+    assert gh.created() == [] and not [c for c in gh.calls() if c[:2] == ["issue", "comment"]]
+
+
+def test_defer_since_is_written_once_and_cleared_when_defer_is_off(gh, monkeypatch, tmp_path):
+    monkeypatch.setenv("MANUAL_CHECKS", "defer")
+    first = after_merge.defer_since()
+    assert first is not None and after_merge.defer_since() == first
+    monkeypatch.setenv("MANUAL_CHECKS", "gate")
+    assert after_merge.defer_since() is None and not list(tmp_path.rglob("deferred-checks-since"))

@@ -8,6 +8,7 @@ The Linear key is read here into a local variable; no agent inherits it.
 
 from . import session
 import argparse
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -325,12 +326,46 @@ def owner_actions(pr, issue):
 TRACKER = "Manual checks to try"
 
 
+def defer_since(env=None):
+    """When this repository's `manual_checks = "defer"` took effect, as the UTC time in
+    `$STATE/deferred-checks-since`, written the first time it is seen on; None while it is off
+    (the file is removed, so turning defer on again starts a new cutoff). PRs merged before it
+    went through the gate, so their checks are not deferred (#52)."""
+    env = session.resolve(env)
+    path = Path(str(env.dirs.state), "deferred-checks-since")
+    if env.repo.manual_checks != "defer":
+        path.unlink(missing_ok=True)
+        return None
+    try:
+        return datetime.fromisoformat(path.read_text().strip())
+    except (OSError, ValueError):
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        path.write_text(now.isoformat() + "\n")
+        return now
+
+
+def open_tracker():
+    """The open tracker issue's number, "" when none is open, None when gh fails. Lists the
+    label rather than searching: the search index lags a just-created issue by seconds, so a
+    second PR in the same tick opened a second tracker (#52)."""
+    listed = stdout("issue", "list", "-R", repo(), "--state", "open", "--label", "ready-for-human",
+                    "--limit", "200", "--json", "number,title")
+    if listed is None:
+        return None
+    try:
+        return next((str(i["number"]) for i in json.loads(listed or "[]") if i.get("title") == TRACKER), "")
+    except (ValueError, TypeError, KeyError):
+        return None
+
+
 def deferred_checks(pr, issue):
     """With manual_checks = "defer" the PR merged without the owner's look, so its
     `## Manual checks` go to one open tracking issue for a later trial of the whole app:
-    a new issue, or a comment on the open one. Once per PR (#48)."""
+    a new issue, or a comment on the open one. Once per PR (#48), and only for PRs merged
+    after defer took effect (#52)."""
     env = session.resolve()
-    if env.repo.manual_checks != "defer":
+    since = defer_since(env)
+    if since is None:
         return
     done = Path(str(env.dirs.state), f"deferred-checks-pr-{pr}")
     if done.exists():
@@ -343,16 +378,21 @@ def deferred_checks(pr, issue):
     if not checks:
         done.touch()
         return
-    title = stdout("pr", "view", str(pr), "-R", repo(), "--json", "title", "--jq", ".title") or ""
+    listed = stdout("pr", "view", str(pr), "-R", repo(), "--json", "title,mergedAt")
+    try:
+        info = json.loads(listed or "")
+        title = info.get("title") or ""
+        merged = datetime.fromisoformat((info.get("mergedAt") or "").replace("Z", "+00:00"))
+    except (ValueError, TypeError, AttributeError):
+        log(f"PR #{pr}: reading its merge time failed; retried after the next merge step")
+        return
+    if merged < since:
+        done.touch()   # merged through the gate, before defer: the owner had their look
+        return
     items = "".join(re.sub(r"^[-*]\s+(?!\[[ xX]\])", "- [ ] ", line) + "\n" for line in checks.rstrip("\n").split("\n"))
     section = f"### PR #{pr}: {title}\nhttps://github.com/{repo()}/pull/{pr}\n\n{items}"
-    listed = stdout("issue", "list", "-R", repo(), "--state", "open", "--search", f'"{TRACKER}" in:title',
-                    "--json", "number,title")
-    try:
-        tracker = next((str(i["number"]) for i in json.loads(listed or "[]") if i.get("title") == TRACKER), None)
-    except (ValueError, TypeError, KeyError):
-        tracker = None
-    if listed is None:
+    tracker = open_tracker()
+    if tracker is None:
         log(f"PR #{pr}: finding the {TRACKER!r} issue failed; retried after the next merge step")
         return
     done.touch()   # before writing: a half-written section is logged, never written twice

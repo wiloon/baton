@@ -83,7 +83,10 @@ elif args[:2] == ["pr", "merge"]:
 elif args[:1] == ["api"]:
     print(json.dumps(pr.get("inline", [])))
 elif args[:2] == ["issue", "list"]:
-    print(json.dumps([t if isinstance(t, dict) else {"title": t} for t in pr.get("open_issues", [])]))
+    # A just-created issue is listed at once but not yet in the search index (#52).
+    issues = [t if isinstance(t, dict) else {"title": t} for t in pr.get("open_issues", [])]
+    print(json.dumps([{k: v for k, v in t.items() if k != "unindexed"} for t in issues
+                      if not ("--search" in args and t.get("unindexed"))]))
 elif args[:2] == ["issue", "view"] and "--jq" in args:
     print(pr.get("issues", {}).get(args[2], {}).get(args[args.index("--jq") + 1].lstrip("."), ""))
 elif args[:2] == ["issue", "view"] and "title" in args[args.index("--json") + 1]:
@@ -93,7 +96,10 @@ elif args[:2] == ["issue", "view"]:
 elif args[:2] == ["issue", "create"]:
     if fails("issue-create"):
         sys.exit(1)
-    print("https://github.com/owner/app/issues/900")
+    number = 900 + sum(1 for c in (root / "calls").read_text().splitlines() if json.loads(c)[:2] == ["issue", "create"]) - 1
+    pr.setdefault("open_issues", []).append({"number": number, "title": args[args.index("--title") + 1], "unindexed": True})
+    (root / "pr.json").write_text(json.dumps(pr))
+    print(f"https://github.com/owner/app/issues/{number}")
 '''
 
 

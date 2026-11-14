@@ -37,7 +37,7 @@ import sys
 import tempfile
 import time
 
-from . import checkpoint, dev, fix, hooks as telemetry, merge, names, notify, pick, pr as pr_helpers, pr_contract, review, scan, spec, tmp_sweep, vendors
+from . import after_merge, checkpoint, dev, fix, hooks as telemetry, merge, names, notify, pick, pr as pr_helpers, pr_contract, review, scan, spec, tmp_sweep, vendors
 from .common import Deferred, git
 
 AGENT_REVIEW_NOTE = ("The PR description{issue} give the problem, its cause and the fix. Check the diagnosis first: does the "
@@ -357,6 +357,7 @@ class Tick:
         merge_or_handoff, so its follow-ups and owner actions would be lost. Every tick files
         them for such PRs merged in the last 7 days, and records the merge in telemetry; each runs
         once per PR (state markers)."""
+        after_merge.defer_since(self.env)   # before this tick merges anything (#52)
         since = time.strftime("%F", time.localtime(self.clock() - 7 * 86400))
         merged = self.gh_json("pr", "list", "-R", self.gh_repo, "--state", "merged", "--search", f"merged:>={since}",
                               "--limit", "50", "--json", "number,headRefName,body,comments") or []
