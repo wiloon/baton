@@ -103,7 +103,7 @@ def run(req):
         if not common or not gitdir:
             return Run(1, "RESULT: failed Codex did not complete", "", summary="no git metadata")
         args += ["--add-dir", common, "--add-dir", gitdir]
-        if req.role == "dev" and req.shots_dir:
+        if req.role in ("dev", "fix") and req.shots_dir:
             args += ["--add-dir", req.shots_dir]
         if req.online:
             for d in req.add_dirs:

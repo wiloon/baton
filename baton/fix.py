@@ -68,10 +68,10 @@ class Runner:
     def render(self, template, **pairs):
         return prompts.render(self.self_dir / template, list(pairs.items()), env=self.env)
 
-    def agent(self, vendor, role, prompt, tag, wt, output=""):
+    def agent(self, vendor, role, prompt, tag, wt, output="", env=None):
         """One agent run; Deferred when the vendor cannot run now."""
         out = dispatch.dispatch(vendor, role, prompt, tag, str(wt), str(self.self_dir / "settings.json"), output,
-                                self.env, self.hooks)
+                                env or self.env, self.hooks)
         if out["rc"] == 75:
             raise Deferred(vendor, out["defer"])
         return out
@@ -224,10 +224,20 @@ class Runner:
         description = Path(self.ctx, f"pr-{pr}-description.md")
         if fixer == "codex":  # It has no GitHub access: the runner reads and writes the description for it.
             description.write_text(pr_helpers.body(pr) or "")
+        shots_note, env = "", None
+        if self.env.repo.screenshot_review:   # the next review looks at fresh screenshots (#50)
+            shots = Path(self.ctx, f"pr-{pr}-shots")
+            session.run_process(["rm", "-rf", str(shots)])
+            shots.mkdir(parents=True)
+            shots_note = (f" Then, when that section is not `none`, re-shoot every item into `{shots}` (the runner "
+                          "cleared it) the way the repository's agent docs describe, named `NN-<slug>-<variant>.png` in "
+                          "list order: the next review looks at them. Delete the screenshot script and leave the "
+                          "worktree clean.")
+            env = self.env.with_runtime(shots_dir=str(shots))
         out = self.agent(fixer, "fix", self.render(template, PR=str(pr), ISSUE=self.env.runtime.issue or "unknown",
                                                    GH_REPO=self.repo, WORKTREE=str(wt), SOURCE=source, FEEDBACK=feedback,
-                                                   PR_DESCRIPTION_FILE=str(description)),
-                         f"pr-{pr}-fix{f'-{self.round}' if self.round else ''}", wt, str(fix_file))
+                                                   PR_DESCRIPTION_FILE=str(description), SHOTS_NOTE=shots_note),
+                         f"pr-{pr}-fix{f'-{self.round}' if self.round else ''}", wt, str(fix_file), env)
         outcome, model = out["outcome"], out["model"] or "unknown"
         # A failed Codex run has no reply worth posting; its commits still reach the owner below.
         if not (fixer == "codex" and outcome.startswith("RESULT: failed")):

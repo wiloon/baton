@@ -483,3 +483,9 @@ def test_cursor_end_line_says_when_a_reconnect_lost_usage(env):
     assert "usage=partial" not in env.run("cursor", "dev").summary
     env.plan(stream='{"type":"connection","subtype":"reconnecting"}\n' + plain)
     assert env.run("cursor", "dev").summary.endswith("usage=partial")
+
+
+def test_codex_fix_can_write_the_screenshots_dir(env):
+    env.plan(stream=CODEX_STREAM, last="RESULT: fixed")
+    env.run("codex", "fix", prompt="fix it", shots_dir="/shots")
+    assert "/shots" in env.args()

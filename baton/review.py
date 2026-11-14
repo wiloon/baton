@@ -300,12 +300,14 @@ class Review:
             outcome, reply = self.cursor_review(round, note, context)
             self.hooks.verdict("review", "cursor", head, round, outcome, reply)
             return outcome
+        shots_step = self.shots_step()
         review_file = Path(f"/tmp/baton-review-{pr}-{round}.md")
         review_file.unlink(missing_ok=True)
         template = "codex-review-prompt.md" if reviewer == "codex" else "review-prompt.md"
         out = self.agent(reviewer, "review", self.render(
             template, PR=str(pr), ISSUE=self.issue or "unknown", GH_REPO=self.repo, WORKTREE=str(wt), ROUND=str(round),
-            MAX_ROUNDS=str(self.max_rounds), ROUND_NOTE=note, SKILL_STEP=skill, CONTEXT_FILE=str(context),
+            MAX_ROUNDS=str(self.max_rounds), ROUND_NOTE=note, SKILL_STEP=skill, SHOTS_STEP=shots_step,
+            CONTEXT_FILE=str(context),
             NIT_RULE=nit_rule(self.repo, self.issue)), f"pr-{pr}-review-{round}",
             str(self.self_dir / "review-settings.json"), str(review_file),
             self.env.with_runtime(review_followup=True) if self.review_followup(round, reviewer) else None)
@@ -327,6 +329,27 @@ class Review:
                 outcome = "RESULT: failed no review artifact"
         self.hooks.verdict("review", reviewer, head, round, outcome, out["reply"] or "", str(review_file))
         return outcome
+
+    def shots_step(self):
+        """With screenshot_review, the reviewer's look at the manual-check screenshots (#50):
+        every valid PNG, or a Must fix when there are none. Empty when there is nothing to see."""
+        if not self.env.repo.screenshot_review:
+            return ""
+        if pr_helpers.checks_none(pr_helpers.body(self.pr) or "## Manual checks\nnone"):
+            return ""
+        shots = notify.shots(self.pr, self.ctx)
+        if not shots:
+            return (" This PR has `## Manual checks` but no screenshots: report one Must fix asking the author to "
+                    "shoot every manual-check item the way the repository's agent docs describe.")
+        listed = "".join(f"\n   - `{path}`" for path in shots)
+        return (" Then look at the screenshots of this PR's manual checks, every one of them (Claude: the Read tool; "
+                f"Codex: view_image):{listed}\n"
+                "   Compare each with the `## Manual checks` items and the issue. Must fix: anything a user would see "
+                "as broken (horizontal overflow or clipped content, overlapping or misaligned elements, text cramped or "
+                "wrapped into unreadable columns, a broken image, a missing or wrong state, copy that contradicts the "
+                "issue, a layout that shifts where it should hold still); name the file. Taste is a Nit. A check no "
+                "screenshot can show stays with the owner: don't fail the PR for it. Add a `## Screenshots` section to "
+                "the review with one line per file: `<file> — ok` or `<file> — <what is wrong>`.")
 
     # --- the checkpoint ---
     def save(self):

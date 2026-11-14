@@ -369,3 +369,46 @@ def test_a_big_diff_runs_the_review_skill_only_when_matt_skills_are_installed(lo
     loop.reviews[:] = ["pass"]
     assert loop.run(fixer="cursor", MATT_SKILLS_DIR=skills) == 0
     assert loop.agents[0]["vendor"] == "claude" and told in loop.agents[0]["prompt"]
+
+
+# --- screenshot review (#50) ----------------------------------------------------------------
+
+CHECKS_BODY = "Refs #297\n\n## Manual checks\n- The library at 390 px and 1280 px.\n"
+
+
+def shoot(loop, *names):
+    shots = Path(loop.env["CTX"], f"pr-{PR}-shots")
+    shots.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        (shots / name).write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 16)
+    return shots
+
+
+def test_screenshot_review_hands_the_reviewer_every_screenshot(loop):
+    loop.gh.set(body=CHECKS_BODY)
+    shots = shoot(loop, "01-library-390.png", "01-library-1280.png")
+    loop.reviews = ["pass"]
+    loop.run(fixer="cursor", SCREENSHOT_REVIEW="1")
+    prompt = loop.agents[0]["prompt"]
+    assert str(shots / "01-library-390.png") in prompt and str(shots / "01-library-1280.png") in prompt
+    assert "## Screenshots" in prompt and "Must fix" in prompt
+
+
+def test_screenshot_review_asks_for_missing_screenshots(loop):
+    loop.gh.set(body=CHECKS_BODY)
+    loop.reviews = ["pass"]
+    loop.run(fixer="cursor", SCREENSHOT_REVIEW="1")
+    assert "no screenshots" in loop.agents[0]["prompt"]
+
+
+@pytest.mark.parametrize("body, overrides", [
+    (CHECKS_BODY, {}),                                                          # the setting is off
+    ("Refs #297\n\n## Manual checks\nnone\n", {"SCREENSHOT_REVIEW": "1"}),  # nothing to look at
+])
+def test_no_screenshot_step_without_the_setting_or_without_checks(loop, body, overrides):
+    loop.gh.set(body=body)
+    shoot(loop, "01-library-390.png")
+    loop.reviews = ["pass"]
+    loop.run(fixer="cursor", **overrides)
+    prompt = loop.agents[0]["prompt"]
+    assert "01-library-390.png" not in prompt and "no screenshots" not in prompt
