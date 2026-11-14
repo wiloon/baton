@@ -112,7 +112,8 @@ gate_option = ""
 signoff = false
 # "gate": a PR whose `## Manual checks` is not none waits for the owner (ready-for-human).
 # "defer": it merges once review and CI pass, and its checks are collected in one open
-# "Manual checks to try" issue (ready-for-human) for a later trial of the whole app.
+# "Manual checks to try" issue (ready-for-human) for a later trial of the whole app. Only PRs
+# merged after defer is first seen on are collected; turning it off and on again restarts that.
 manual_checks = "gate"
 # true: the pool reviewer also looks at the manual-check screenshots (Must fix for anything a
 # user would see as broken, or for missing screenshots), and every fixer re-shoots them.
