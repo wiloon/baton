@@ -146,6 +146,60 @@ def git(cwd, *args):
     return r.stdout.rstrip("\n") if r.returncode == 0 else None
 
 
+def push(wt, ref, *, upstream=False, signoff=False):
+    """Push an agent's work: `git push origin REF` from worktree WT; True when it pushed.
+
+    Every rule about what may leave the host lives here (#44). With SIGNOFF (the repository's
+    DCO), the unpushed commits first get a Signed-off-by for their author where they lack it.
+    """
+    from . import session
+    if signoff and not sign_off(wt):
+        return False
+    cmd = ["git", "-C", str(wt), "push", "-q", *(["-u"] if upstream else []), "origin", ref]
+    return session.run_process(cmd).returncode == 0
+
+
+def sign_off(wt):
+    """Add `Signed-off-by: AUTHOR` to WT's unpushed commits that lack it; True on success.
+
+    Each commit is rebuilt with its own tree, author and message plus the trailer, so nothing
+    can conflict and `head..HEAD` diffs are unchanged. Merge commits keep their message and are
+    rebuilt only when a parent was. The commits are unpushed, so no force push is needed.
+    """
+    pending = git(wt, "rev-list", "--reverse", "--topo-order", "--parents", "HEAD", "--not", "--remotes=origin")
+    if pending is None:
+        return False
+    rewritten = {}
+    for line in pending.splitlines():
+        sha, *parents = line.split()
+        fields = git(wt, "log", "-1", "--format=%T%x00%an%x00%ae%x00%ad", "--date=raw", sha)
+        raw = git(wt, "cat-file", "commit", sha)
+        if fields is None or raw is None:
+            return False
+        tree, name, email, date = fields.split("\0")
+        message = raw.partition("\n\n")[2] + "\n"   # git() strips the final newline
+        trailer = f"Signed-off-by: {name} <{email}>"
+        sign = len(parents) == 1 and trailer not in message.splitlines()
+        if not sign and not any(p in rewritten for p in parents):
+            continue
+        if sign:
+            r = subprocess.run(["git", "-C", str(wt), "interpret-trailers", "--if-exists", "addIfDifferent",
+                                "--trailer", trailer], input=message, capture_output=True, text=True, env=child_env())
+            if r.returncode != 0:
+                return False
+            message = r.stdout
+        args = [a for p in parents for a in ("-p", rewritten.get(p, p))]
+        r = subprocess.run(["git", "-C", str(wt), "commit-tree", tree, *args], input=message, capture_output=True,
+                           text=True, env=child_env(GIT_AUTHOR_NAME=name, GIT_AUTHOR_EMAIL=email, GIT_AUTHOR_DATE=date))
+        if r.returncode != 0:
+            return False
+        rewritten[sha] = r.stdout.strip()
+    head = git(wt, "rev-parse", "HEAD")
+    if head in rewritten:
+        return git(wt, "update-ref", "-m", "baton: sign off", "HEAD", rewritten[head], head) is not None
+    return True
+
+
 def changed(cwd, head):
     """True when a read-only run left the worktree dirty or moved HEAD."""
     return bool(git(cwd, "status", "--porcelain")) or git(cwd, "rev-parse", "HEAD") != head

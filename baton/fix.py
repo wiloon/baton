@@ -22,7 +22,7 @@ import sys
 import time
 
 from . import dispatch, e2e_gate, hooks as telemetry, notify, pr as pr_helpers, pr_contract, prompts, vendors
-from .common import Deferred, child_env, git, strip_markers
+from .common import Deferred, child_env, git, push, strip_markers
 
 REPLY_CAP = 60000
 # The verify output a repair run gets in its prompt: the tail, where the errors are. The whole
@@ -252,7 +252,7 @@ class Runner:
             # what is done" in the fix prompts): push it unverified. Only a fix is gated below.
             if not self.record(pr, fixer, wt, head, model):
                 return 1
-            if session.run_process(["git", "-C", str(wt), "push", "-q", "origin", "HEAD"]).returncode:
+            if not push(wt, "HEAD", signoff=self.env.repo.signoff):
                 outcome = "RESULT: failed pushing fix"
         if not outcome.startswith("RESULT: fixed"):
             if outcome.startswith("RESULT: needs-info"):
@@ -273,7 +273,7 @@ class Runner:
                 return self.handoff(pr, "verify_failed", f"PR #{pr}: local CI verification failed", url)
             if not self.record(pr, fixer, wt, head, model if rounds == 0 else "unknown"):
                 return 1
-            if session.run_process(["git", "-C", str(wt), "push", "-q", "origin", "HEAD"]).returncode:
+            if not push(wt, "HEAD", signoff=self.env.repo.signoff):
                 return self.handoff(pr, "push_failed", f"PR #{pr}: pushing fix failed", url)
             rc = self.refresh_checks(pr, "", url)
             if rc != 0:
@@ -354,7 +354,7 @@ class Runner:
             return 1
         vendors.record_contrib(self.state, pr, "cursor", str(wt), head)
         if moved:
-            if session.run_process(["git", "-C", str(wt), "push", "-q", "origin", branch]).returncode:
+            if not push(wt, branch, signoff=self.env.repo.signoff):
                 return self.handoff(pr, "push_failed", f"Cursor PR #{pr}: push failed", url)
             if self.refresh_checks(pr, "Cursor ", url):
                 return 1

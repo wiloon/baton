@@ -81,6 +81,8 @@ class Repo:
     areas: Pairs
     env: Pairs
     prompt_notes: Pairs
+    # Agent commits get a Signed-off-by for their author before they are pushed (DCO, #44).
+    signoff: bool = False
 
 
 @dataclass(frozen=True)

@@ -14,7 +14,7 @@ import subprocess
 import time
 
 from . import after_merge, dispatch, fix, md, names, pr as pr_helpers, pr_contract, prompts, spec, vendors
-from .common import Deferred, git, strip_markers
+from .common import Deferred, git, push, strip_markers
 
 REPLY_CAP = 60000
 RESUME_NOTE = ("This worktree already holds earlier work on this issue (an earlier run stopped early). "
@@ -264,7 +264,7 @@ def run(tick, issue):
                       f"<!-- baton-note by={dev_vendor} -->\nLocal CI verification failed before push after {rounds} of "
                       f"{env.config.scheduling.max_verify_fixes or 2} fix rounds. Nothing was pushed.\n\n{failure[:REPLY_CAP]}")
         return stop(tick, issue, "verify_failed", f"#{issue}: local CI verification failed", url)
-    if session.run_process(["git", "-C", str(wt), "push", "-q", "-u", "origin", branch]).returncode != 0:
+    if not push(wt, branch, upstream=True, signoff=tick.env.repo.signoff):
         stop(tick, issue, "push_failed", f"#{issue}: pushing {dev_vendor}'s branch failed",
              f"{branch} is committed in {wt}. {url}")
         return 1
