@@ -32,9 +32,12 @@ import sys
 import time
 
 from . import dispatch, e2e_gate, fix, hooks as telemetry, md, merge, notify, pick, pr as pr_helpers, prompts, review, vendors
-from .common import Deferred, changed, git, push, restore, strip_markers
+from .common import Deferred, changed, git, permission_denials, push, restore, strip_markers
 
 REPLY_CAP = 60000
+DENIED_NOTE = ("\n\nA previous attempt at this round ended with `RESULT: failed` after this command was denied: "
+               "`{command}`. Only that command was refused. Finish the round with the other allowed commands "
+               "and the Read, Edit and Write tools; the worktree keeps whatever that attempt left.\n")
 VERDICT = re.compile(r"<!-- baton-verdict: (accept|revise)( by=(cursor|codex|claude))? -->")
 STATE_RE = re.compile(r"<!-- baton-spec-(?P<k>review|reply) round=(?P<r>[0-9]+)(?P<h> human)?")
 KIND_RE = r"<!-- baton-spec-%s round=[0-9]+( human)? by=(?P<v>[a-z]+) -->"
@@ -366,10 +369,19 @@ class Spec:
         reviser = self.pick("reviser", list(env.config.quota.vendor_pool), last_vendor, other_model)
         self.mark_base(round)
         template = self.self_dir / (f"codex-spec-prompt.md" if reviser == "codex" else "spec-prompt.md")
-        out = self.agent(reviser, "spec", self.render(
+        prompt = self.render(
             template, ISSUE=n, GH_REPO=self.repo, WORKTREE=str(wt), BRANCH=self.branch, ROUND=str(round),
-            CONTEXT_FILE=str(context), OUT=out_base), f"issue-{n}-spec-reply-{round}", "spec-settings.json", out_base,
-            followup=self.reviser_followup(round, reviser, last_vendor))
+            CONTEXT_FILE=str(context), OUT=out_base)
+        followup = self.reviser_followup(round, reviser, last_vendor)
+        tag = f"issue-{n}-spec-reply-{round}"
+        out = self.agent(reviser, "spec", prompt, tag, "spec-settings.json", out_base, followup=followup)
+        denied = permission_denials(out.get("log", "")) if out["outcome"].startswith("RESULT: failed") else []
+        if denied:
+            # A denied command is the runner's setup, not a question for the owner: rerun once (#53).
+            notify.log(f"#{n}: spec revision round {round} failed after a denied command ({denied[0]}); rerunning once")
+            out = self.agent(reviser, "spec", prompt + DENIED_NOTE.format(command=denied[0]), f"{tag}-rerun",
+                             "spec-settings.json", out_base, followup=followup)
+            denied = permission_denials(out.get("log", "")) if out["outcome"].startswith("RESULT: failed") else []
         outcome, model = out["outcome"], out["model"] or ""
         if self.unverified(reviser, last_vendor, model, other_model):
             self.handoff("Codex spec reviser model was not verified as different from the reviewer model.")
@@ -385,7 +397,8 @@ class Spec:
         elif outcome.startswith("SPEC: human"):
             human = " human"
         else:
-            self.handoff(f"{reviser} spec run failed: {outcome}")
+            why = f" A command was denied ({denied[0]}): check the spec role's permissions." if denied else ""
+            self.handoff(f"{reviser} spec run failed: {outcome}{why}")
             return "stop"
         if body.is_file() and body.stat().st_size:
             body.write_text(strip_markers(body.read_text()).rstrip("\n") + "\n")

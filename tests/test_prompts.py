@@ -162,3 +162,10 @@ def test_the_verify_fix_prompt_gives_the_shell_rules_and_the_retry_on_denial():
     assert "Only a denial that starts with `baton guard:` is final" in prompt
     assert "{{FAILURE}}" in prompt and "with the Read tool, not the shell" in prompt
 
+
+
+def test_the_spec_author_is_told_a_denied_command_is_no_reason_to_fail():
+    """#53: one denied `wc` and the reviser ended the round with RESULT: failed."""
+    text = (BIN / "spec-prompt.md").read_text()
+    assert "A denied command blocks only that command" in text
+    assert "never a reason for `RESULT: failed`" in text

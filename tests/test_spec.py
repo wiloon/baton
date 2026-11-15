@@ -342,6 +342,42 @@ def test_a_reviser_without_a_reply_fails(loop):
     assert loop.run() is False
 
 
+def denied_failure(tmp_path, name="denied"):
+    """A Claude run that gave up after dontAsk denied one shell command (#53)."""
+    log = tmp_path / f"{name}.jsonl"
+    log.write_text(json.dumps({"type": "result", "subtype": "success", "permission_denials": [
+        {"tool_name": "Bash", "tool_input": {"command": "wc -l /ctx/issue.md"}}]}) + "\n")
+    return {"rc": 1, "status": "failure", "outcome": "RESULT: failed Bash is denied", "reply": "", "model": "",
+            "defer": "", "log": str(log)}
+
+
+def test_a_revision_that_failed_on_a_denied_command_is_rerun_once_and_finishes(loop, tmp_path):
+    loop.script = [CHANGES, denied_failure(tmp_path), reviser(), ACCEPT]
+    assert loop.run() is True
+    rerun = loop.runs[2]
+    assert rerun["tag"] == f"issue-{N}-spec-reply-1-rerun"
+    assert "`wc -l /ctx/issue.md`" in rerun["prompt"] and rerun["prompt"].startswith(loop.runs[1]["prompt"])
+    assert "rerunning once" in loop.log() and "ready-for-human" not in loop.gh.labels
+
+
+def test_a_revision_denied_twice_goes_to_the_owner_naming_the_command(loop, tmp_path, monkeypatch):
+    told = []
+    monkeypatch.setattr(spec.notify, "notify", lambda title, text="": told.append(text))
+    loop.script = [CHANGES, denied_failure(tmp_path, "a"), denied_failure(tmp_path, "b")]
+    assert loop.run() is False
+    assert len(loop.runs) == 3 and "ready-for-human" in loop.gh.labels
+    assert any("A command was denied (wc -l /ctx/issue.md)" in t for t in told)
+
+
+def test_a_revision_failure_without_a_denial_is_not_rerun(loop, tmp_path):
+    log = tmp_path / "plain.jsonl"
+    log.write_text(json.dumps({"type": "result", "permission_denials": []}) + "\n")
+    loop.script = [CHANGES, {"rc": 1, "status": "failure", "outcome": "RESULT: failed no idea", "reply": "",
+                             "model": "", "defer": "", "log": str(log)}]
+    assert loop.run() is False
+    assert len(loop.runs) == 2
+
+
 def test_a_quota_deferral_keeps_the_paused_marker_and_the_worktree(loop):
     loop.script = [{"rc": 75, "status": "quota", "outcome": "", "reply": None, "model": "", "defer": "quota exhausted"}]
     with pytest.raises(Deferred):

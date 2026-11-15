@@ -43,7 +43,8 @@ def configure(vendor, role, env):
     if vendor == "claude":
         return getattr(env.config.models, "model_" + role + followup, ""), int(env.config.models.max_minutes), "", {
             "fallback_models": " ".join(env.config.models.fallback_models_claude), "budget": str(getattr(env.config.models, "budget_" + role)),
-            "repo": str(env.dirs.clone), "subagent_model": getattr(env.config.models, "subagent_model_" + role, "")}
+            "repo": str(env.dirs.clone), "subagent_model": getattr(env.config.models, "subagent_model_" + role, ""),
+            "context_dir": str(env.dirs.ctx)}
     if vendor == "cursor":
         model = getattr(env.config.models, "model_cursor_" + role, "") or env.config.models.model_cursor
         return model, int(env.config.models.cursor_max_minutes), "", {}
@@ -91,8 +92,8 @@ def _dispatch(vendor, role, prompt, tag, cwd, settings, output, env, hooks):
     state, logs = str(env.config.paths.state), str(env.dirs.logs)
     cooldown_hours = int(env.config.scheduling.cooldown_hours or agents.COOLDOWN_HOURS)
 
-    def result(rc, status, outcome, reply=None, model="", defer=""):
-        return {"rc": rc, "status": status, "outcome": outcome, "reply": reply, "model": model, "defer": defer}
+    def result(rc, status, outcome, reply=None, model="", defer="", log=""):
+        return {"rc": rc, "status": status, "outcome": outcome, "reply": reply, "model": model, "defer": defer, "log": log}
 
     if vendor not in agents.ADAPTERS:
         outcome = f"RESULT: failed unknown vendor {vendor}"
@@ -128,7 +129,7 @@ def _dispatch(vendor, role, prompt, tag, cwd, settings, output, env, hooks):
         outcome = f"RESULT: failed baton rc=1 (log {run_log})"
         rc, outcome, defer = settle.settle(state, vendor, "failure", 1, str(run_log), tag, "", outcome)
         hooks.end(run, "failure", str(run_log))
-        return result(rc, "failure", outcome, "", defer=defer)
+        return result(rc, "failure", outcome, "", defer=defer, log=str(run_log))
     if ran.status == "busy":
         ran.cooldown_until = int(time.time()) + env.config.models.busy_minutes * 60
     if ran.killed:
@@ -138,7 +139,7 @@ def _dispatch(vendor, role, prompt, tag, cwd, settings, output, env, hooks):
                                        "" if ran.cooldown_until is None else str(ran.cooldown_until),
                                        ran.outcome, credential=True)
     hooks.end(run, ran.status, str(run_log))
-    return result(rc, ran.status, outcome, ran.reply, ran.model, defer)
+    return result(rc, ran.status, outcome, ran.reply, ran.model, defer, str(run_log))
 
 
 def main(argv=None):

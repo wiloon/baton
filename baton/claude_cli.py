@@ -20,8 +20,12 @@ def run(req):
     if req.subagent_model:
         env["CLAUDE_CODE_SUBAGENT_MODEL"] = req.subagent_model
     fallback = ["--fallback-model", req.fallback] if req.fallback else []
+    # Without it dontAsk denies shell commands on the context files the prompt names, which sit
+    # outside the worktree (`wc -l <ctx>/...md`, #53); Read was never affected. guard.sh still
+    # limits writes to the worktree and /tmp.
+    context = ["--add-dir", req.context_dir] if req.context_dir else []
     rc = run_cli(["claude", "-p", req.prompt,
-                  "--model", req.model, *fallback,
+                  "--model", req.model, *fallback, *context,
                   "--max-budget-usd", req.budget,
                   "--setting-sources", "user",
                   "--settings", req.settings,
