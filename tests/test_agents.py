@@ -146,6 +146,17 @@ def test_claude_success_flags_and_environment(env):
     assert "VIRTUAL_ENV" not in child, "the runner's venv must not reach the agent's tools"
 
 
+def test_claude_can_run_shell_commands_on_the_context_directory(env):
+    """dontAsk denied `wc -l <ctx>/...md` outside the worktree, and the spec reviser gave up (#53)."""
+    env.plan(stream=claude_stream("Done.\nREVIEW: pass"))
+    env.run("claude", "spec", context_dir="/state/ctx/owner/app")
+    args = env.args()
+    assert args[args.index("--add-dir") + 1] == "/state/ctx/owner/app"
+    env.plan(stream=claude_stream("Done.\nREVIEW: pass"))
+    env.run("claude", "spec")
+    assert "--add-dir" not in env.args()
+
+
 def test_claude_end_line_reports_usage_and_cost(env):
     env.plan(stream=claude_stream("Done.\nREVIEW: pass"))
     r = env.run("claude", "review")
