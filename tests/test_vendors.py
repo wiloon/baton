@@ -15,6 +15,7 @@ from baton import vendors
 
 NOW = 1_793_000_000
 POOL = ["claude", "codex"]
+LONG_REST = 2 * 86400   # past same_vendor_wait_max_minutes: same-vendor review may run (ADR 0002)
 
 
 class VendorTests(unittest.TestCase):
@@ -210,7 +211,7 @@ class VendorTests(unittest.TestCase):
                                       pr="9", by="contrib", now=NOW, review=True)
             self.assertEqual((result["vendor"], rc), ("claude", 0))
             for vendor in ("claude", "cursor"):
-                Path(self.state, f"{vendor}-cooldown-until").write_text(str(NOW + 3600))
+                Path(self.state, f"{vendor}-cooldown-until").write_text(str(NOW + LONG_REST))
             result, rc = vendors.pick(self.state, POOL, "review", [*POOL, "cursor"],
                                       pr="9", by="contrib", now=NOW, review=True)
             self.assertEqual((result["vendor"], rc), ("codex", 0))
@@ -224,7 +225,7 @@ class VendorTests(unittest.TestCase):
                                       pr="16", by="contrib", now=NOW, review=True)
             self.assertEqual((result["vendor"], rc), ("claude", 0))   # another vendor first
             for vendor in ("claude", "cursor"):
-                Path(self.state, f"{vendor}-cooldown-until").write_text(str(NOW + 3600))
+                Path(self.state, f"{vendor}-cooldown-until").write_text(str(NOW + LONG_REST))
             result, rc = vendors.pick(self.state, POOL, "review", [*POOL, "cursor"],
                                       pr="16", by="contrib", now=NOW, review=True)
             self.assertEqual((result["vendor"], rc), ("codex", 0))
@@ -274,7 +275,7 @@ class VendorTests(unittest.TestCase):
                                       exclude=["codex"], by="contrib", now=NOW,
                                       other_model="gpt-6.1-sol")
             self.assertEqual((result["vendor"], rc), ("claude", 0))
-            Path(self.state, "claude-cooldown-until").write_text(str(NOW + 3600))
+            Path(self.state, "claude-cooldown-until").write_text(str(NOW + LONG_REST))
             result, rc = vendors.pick(self.state, POOL, "reviser", POOL,
                                       exclude=["codex"], by="contrib", now=NOW,
                                       other_model="gpt-6.1-sol")
@@ -294,7 +295,7 @@ class VendorTests(unittest.TestCase):
 
     def test_spec_reviewer_falls_back_only_with_distinct_model(self):
         for vendor in ("claude", "cursor"):
-            Path(self.state, f"{vendor}-cooldown-until").write_text(str(NOW + 3600))
+            Path(self.state, f"{vendor}-cooldown-until").write_text(str(NOW + LONG_REST))
         with patch.dict(os.environ, {"MODEL_CODEX_SPEC_REVIEW": "gpt-6.1-sol"}):
             result, rc = vendors.pick(self.state, POOL, "spec_reviewer", [*POOL, "cursor"],
                                       exclude=["codex"], by="contrib", now=NOW,
@@ -304,6 +305,111 @@ class VendorTests(unittest.TestCase):
                                       exclude=["codex"], by="contrib", now=NOW,
                                       other_model="gpt-6.1-sol")
             self.assertEqual((result["vendor"], rc), ("", 75))
+
+    # --- ADR 0002: same-vendor review waits out short blocks ---
+    def codex_pr(self, pr):
+        vendors.record_author(self.state, pr, "codex")
+        vendors.record_author_model(self.state, pr, "codex", "gpt-6.1-terra")
+
+    def review(self, pr):
+        with patch.dict(os.environ, {"MODEL_CODEX_REVIEW": "gpt-6.1-sol"}):
+            return vendors.pick(self.state, POOL, "review", [*POOL, "cursor"],
+                                pr=pr, by="contrib", now=NOW, review=True)
+
+    def test_codex_pr_waits_for_claude_5h_instead_of_codex_reviewing_itself(self):
+        self.codex_pr("20")
+        Path(self.state, "cursor-cooldown-until").write_text(str(NOW + LONG_REST))   # cursor out for long
+        self.snap("claude", 0.30, five=0.95)
+        result, rc = self.review("20")
+        self.assertEqual((result["vendor"], rc), ("", 75))
+        self.assertIn("waiting for claude (quota claude=blocked(5h 95% >= 90%))", result["reason"])
+        self.assertIn("instead of same-vendor codex", result["reason"])
+        self.snap("claude", 0.30, five=0.10)   # the 5-hour window reset: cross-vendor review
+        self.assertEqual(self.review("20")[0]["vendor"], "claude")
+        self.snap("claude", 0.70, five=0.95)   # week at cap too: long, codex may review itself
+        result, rc = self.review("20")
+        self.assertEqual((result["vendor"], rc), ("codex", 0))
+        self.assertEqual(result["review_mode"], "same-vendor-different-model")
+
+    def test_one_short_blocked_vendor_is_enough_to_wait(self):
+        self.codex_pr("21")
+        Path(self.state, "cursor-cooldown-until").write_text(str(NOW + LONG_REST))
+        Path(self.state, "claude-cooldown-until").write_text(str(NOW + 2 * 3600))
+        result, rc = self.review("21")
+        self.assertEqual((result["vendor"], rc), ("", 75))
+        self.assertIn(f"waiting for claude (cooldown until epoch {NOW + 2 * 3600})", result["reason"])
+        self.assertNotIn("cursor (", result["reason"])
+
+    def test_cooldown_horizon_follows_same_vendor_wait_max_minutes(self):
+        self.codex_pr("22")
+        Path(self.state, "cursor-cooldown-until").write_text(str(NOW + LONG_REST))
+        Path(self.state, "claude-cooldown-until").write_text(str(NOW + 2 * 3600))
+        with patch.dict(os.environ, {"SAME_VENDOR_WAIT_MAX_MINUTES": "60"}):
+            self.assertEqual(self.review("22")[0]["vendor"], "codex")
+        with patch.dict(os.environ, {"SAME_VENDOR_WAIT_MAX_MINUTES": "180"}):
+            self.assertEqual(self.review("22")[1], 75)
+
+    def test_an_auth_failure_cooldown_is_long_however_short(self):
+        from baton import quota
+        self.codex_pr("25")
+        Path(self.state, "cursor-cooldown-until").write_text(str(NOW + LONG_REST))
+        Path(self.state, "claude-cooldown-until").write_text(str(NOW + 3600))
+        self.assertEqual(self.review("25")[1], 75)
+        quota.credential(self.state, "claude", "auth_expired", NOW)
+        self.assertEqual(self.review("25")[0]["vendor"], "codex")
+        quota.credential(self.state, "claude", "authenticated", NOW + 1)
+        self.assertEqual(self.review("25")[1], 75)
+
+    def test_a_vendor_holding_its_capacity_lease_is_waited_for(self):
+        from baton import capacity
+        self.codex_pr("23")
+        Path(self.state, "cursor-cooldown-until").write_text(str(NOW + LONG_REST))
+        with capacity.lease(self.state, "claude"):
+            result, rc = self.review("23")
+        self.assertEqual(rc, 75)
+        self.assertIn("waiting for claude (vendor capacity reserved)", result["reason"])
+
+    def test_stale_quota_is_waited_for_before_same_vendor_review(self):
+        self.codex_pr("24")
+        Path(self.state, "cursor-cooldown-until").write_text(str(NOW + LONG_REST))
+        old = NOW - 3600   # older than quota_stale_minutes; the week read at cap then
+        Path(self.state, "quota-claude.json").write_text(json.dumps({
+            "observed_at": old,
+            "windows": {"seven_day": {"used": 0.80, "resets_at": NOW + 302400, "observed_at": old},
+                        "five_hour": {"used": 0.0, "resets_at": NOW + 3600, "observed_at": old}}}))
+        result, rc = self.review("24")
+        self.assertEqual(rc, 75)
+        self.assertIn("waiting for claude", result["reason"])
+        self.snap("claude", 0.80)   # refreshed: the week really is at cap
+        self.assertEqual(self.review("24")[0]["vendor"], "codex")
+
+    def test_spec_revision_waits_for_codex_5h_instead_of_claude_revising_claude(self):
+        revise = lambda: vendors.pick(self.state, POOL, "reviser", POOL, exclude=["claude"], by="contrib", now=NOW)
+        self.snap("codex", 0.50, five=0.95)
+        result, rc = revise()
+        self.assertEqual((result["vendor"], rc), ("", 75))
+        self.assertIn("waiting for codex (quota codex=blocked(5h 95% >= 90%)) instead of same-vendor claude",
+                      result["reason"])
+        self.snap("codex", 0.96, five=0.95)   # codex's week at cap: claude revises on another model
+        self.assertEqual(revise()[0]["vendor"], "claude")
+
+    def test_spec_revision_by_codex_waits_for_claude_5h(self):
+        with patch.dict(os.environ, {"MODEL_CODEX_SPEC": "gpt-6.1-terra"}):
+            revise = lambda: vendors.pick(self.state, POOL, "reviser", POOL, exclude=["codex"],
+                                          by="contrib", now=NOW, other_model="gpt-6.1-sol")
+            self.snap("claude", 0.30, five=0.95)
+            self.assertEqual(revise()[1], 75)
+            self.snap("claude", 0.70, five=0.95)
+            self.assertEqual(revise()[0]["vendor"], "codex")
+
+    def test_quota_horizon_is_long_when_the_week_is_out_even_with_a_full_5h_window(self):
+        from baton import quota
+        snap = lambda week, five: {"windows": {"seven_day": {"used": week, "resets_at": NOW + 9},
+                                              "five_hour": {"used": five, "resets_at": NOW + 9}}}
+        self.assertEqual(quota.horizon(snap(0.95, 0.95), 0.9, 0.9, NOW), "long")
+        self.assertEqual(quota.horizon(snap(0.50, 0.95), 0.9, 0.9, NOW), "short")
+        self.assertEqual(quota.horizon(snap(0.50, 0.50), 0.9, 0.9, NOW), "")
+        self.assertEqual(quota.horizon(None, 0.9, 0.9, NOW), "")
 
     def test_contribution_state_and_legacy_seed(self):
         repo = Path(self.temp.name, "repo")

@@ -173,6 +173,8 @@ class Quota:
     quota_probe_model_claude: str
     quota_probe_retry_minutes: int = 5
     quota_probe_max_retry_minutes: int = 60
+    # Same-vendor review waits for a vendor whose cooldown ends within this (ADR 0002).
+    same_vendor_wait_max_minutes: int = 360
 
 
 @dataclass(frozen=True)
