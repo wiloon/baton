@@ -231,6 +231,14 @@ def credential_current(state, vendor, now):
         return False
 
 
+def credential_expired(state, vendor):
+    """The latest credential check found VENDOR logged out (a failed auth, not a failed probe)."""
+    try:
+        return json.loads((Path(state) / f'credential-{vendor}.json').read_text()).get('result') == 'auth_expired'
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+
+
 def stale(state, vendor, now, minutes):
     snap = load(state, vendor) or {}
     seen = max(snap.get("observed_at") or 0, snap.get("probed_at") or 0)
@@ -260,6 +268,18 @@ def assess(snap, cap, five_hour_max, now):
     if five is not None:
         score += max(0.0, five - 0.7)
     return score, None
+
+
+def horizon(snap, cap, five_hour_max, now):
+    """How long the vendor's quota stops it (ADR 0002): "long" while its week is at the cap,
+    "short" while only its 5-hour window is full, "" when quota does not stop it."""
+    five, _ = _used(snap, "five_hour", now)
+    week, _ = _used(snap, "seven_day", now)
+    if week is not None and week >= cap:
+        return "long"
+    if five is not None and five >= five_hour_max:
+        return "short"
+    return ""
 
 
 def preference_order(vendors, prefer=()):

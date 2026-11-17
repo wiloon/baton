@@ -11,41 +11,66 @@ from pathlib import Path
 from . import capacity, quota
 
 
+SHORT, LONG = 'short', 'long'
+
+
 @dataclass(frozen=True)
 class Availability:
     reason: str = ''
     detail: str = ''
     stale: bool = False
+    # How long a blocked vendor stays blocked (ADR 0002): SHORT is back within hours, so
+    # same-vendor review waits for it; LONG lets same-vendor review run.
+    horizon: str = ''
 
 
-def cooldown(state, vendor, now):
+def cooldown_until(state, vendor, now):
+    """The epoch VENDOR's cooldown ends at, or None when it is not resting."""
     try:
         value = (Path(state) / f'{vendor}-cooldown-until').read_text().splitlines()[0]
     except (OSError, IndexError):
-        return ''
-    return f'cooldown until epoch {value}' if value.isdecimal() and now < int(value) else ''
+        return None
+    return int(value) if value.isdecimal() and now < int(value) else None
+
+
+def cooldown(state, vendor, now):
+    until = cooldown_until(state, vendor, now)
+    return f'cooldown until epoch {until}' if until is not None else ''
+
+
+def cooldown_horizon(state, settings, vendor, until, now):
+    """A cooldown file holds only its end, so its horizon is how far away that end is, except
+    after an auth failure: the vendor stays out until someone logs it in again."""
+    if quota.credential_expired(state, vendor):
+        return LONG
+    return SHORT if until - now <= settings.same_vendor_wait_max_minutes * 60 else LONG
 
 
 def availability(state, settings, vendor, now, *, strict=False, leased=False):
     if not leased and capacity.busy(state, vendor):
-        return Availability('vendor_capacity', 'vendor capacity reserved')
-    if why := cooldown(state, vendor, now):
-        return Availability('vendor_cooldown', why)
+        return Availability('vendor_capacity', 'vendor capacity reserved', horizon=SHORT)
+    if (until := cooldown_until(state, vendor, now)) is not None:
+        return Availability('vendor_cooldown', cooldown(state, vendor, now),
+                            horizon=cooldown_horizon(state, settings, vendor, until, now))
     try:
         stale = quota.stale(state, vendor, now, settings.quota_stale_minutes)
     except (ValueError, TypeError, AttributeError):
-        return Availability('quota_stale', 'quota observations invalid', True)
+        return Availability('quota_stale', 'quota observations invalid', True, SHORT)
     if not strict:
         return Availability(stale=stale)
     if not quota.credential_current(state, vendor, now):
-        return Availability('credential_unavailable', 'credential unavailable')
+        return Availability('credential_unavailable', 'credential unavailable', horizon=LONG)
     snap = quota.load(state, vendor) or {}
     if not isinstance(snap, dict):
-        return Availability('quota_stale', 'quota observations invalid', True)
+        return Availability('quota_stale', 'quota observations invalid', True, SHORT)
     if not quota.fresh(state, vendor, now, settings.quota_stale_minutes):
-        return Availability('quota_stale', 'quota observations stale or unavailable', True)
-    _, blocked = quota.assess(snap, getattr(settings, f'quota_cap_{vendor}'), settings.quota_five_hour_max, now)
-    return Availability('quota_exhausted', blocked) if blocked else Availability()
+        return Availability('quota_stale', 'quota observations stale or unavailable', True, SHORT)
+    cap = getattr(settings, f'quota_cap_{vendor}')
+    _, blocked = quota.assess(snap, cap, settings.quota_five_hour_max, now)
+    if not blocked:
+        return Availability()
+    return Availability('quota_exhausted', blocked,
+                        horizon=quota.horizon(snap, cap, settings.quota_five_hour_max, now))
 
 
 def choose(state, settings, pool, candidates, now, *, prefer=(), current='', extras=False):

@@ -44,7 +44,10 @@ what it finds as an issue.
 
 **Picking a vendor.** For each run, baton drops the vendors that are resting after a limit or an
 auth failure, that are over their quota caps, or, for a review, that wrote any of the PR (when
-every vendor did, the same vendor reviews on a different model). From the rest it takes the one
+every vendor did, the same vendor reviews on a different model). That same-vendor fallback waits
+while another vendor is only briefly blocked, such as a full 5-hour window, and runs only when
+the others are out for the week, logged out, or resting past `same_vendor_wait_max_minutes`
+([ADR 0002](docs/adr/0002-same-vendor-review-waits-for-short-blocks.md)). From the rest it takes the one
 furthest behind its weekly pace. `[preferences]` only breaks ties. Quota readings come
 from the vendors' CLIs, refreshed by a one-turn probe run when older than `quota_stale_minutes`.
 

@@ -225,6 +225,10 @@ quota_probe_model_claude = "haiku"
 # Independent quota worker retries incomplete probes with exponential backoff.
 quota_probe_retry_minutes = 5
 quota_probe_max_retry_minutes = 60
+# Same-vendor review (Codex reviewing Codex, Claude revising Claude's spec) runs only when every
+# other vendor is blocked for the long term: weekly cap, expired credential, or a cooldown ending
+# later than this. A vendor back sooner (5-hour window, short cooldown) is waited for (ADR 0002).
+same_vendor_wait_max_minutes = 360
 
 [preferences]
 # Vendor order by role, used only to break ties between vendors that may run (cooldowns, quota
