@@ -386,6 +386,8 @@ class Spec:
         if denied:
             # A denied command is the runner's setup, not a question for the owner: rerun once (#53).
             notify.log(f"#{n}: spec revision round {round} failed after a denied command ({denied[0]}); rerunning once")
+            for suffix in (".body", ".comment"):
+                Path(f"{out_base}{suffix}").unlink(missing_ok=True)
             out = self.agent(reviser, "spec", prompt + DENIED_NOTE.format(command=denied[0]), f"{tag}-rerun",
                              "spec-settings.json", out_base, followup=followup)
             denied = permission_denials(out.get("log", "")) if out["outcome"].startswith("RESULT: failed") else []

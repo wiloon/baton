@@ -494,6 +494,40 @@ def live_spec(loop, monkeypatch, source):
     return s, path
 
 
+def test_same_vendor_denial_retry_publishes_only_the_verified_attempt(loop, monkeypatch):
+    from baton import claude_cli
+
+    s, context = live_spec(loop, monkeypatch, session.resolve(loop.env).config.source.read_text())
+    for vendor in ("codex", "cursor"):
+        Path(s.env.config.paths.state, f"{vendor}-cooldown-until").write_text(str(int(time.time()) + 86400))
+    attempts = iter([
+        ("claude-opus-4-8", "SPEC: changes", 0),
+        ("claude-opus-4-8", "RESULT: failed Bash is denied", 1),
+        ("claude-sonnet-4-6", "SPEC: revised", 0),
+    ])
+
+    def cli(args, log, minutes, child, **kwargs):
+        model, outcome, rc = next(attempts)
+        result = {"type": "result", "result": outcome}
+        if rc:
+            Path(f"/tmp/baton-spec-{N}-1.body").write_text("Goal\nUnverified revision\n")
+            result["permission_denials"] = [{"tool_name": "Bash", "tool_input": {"command": "wc -l /ctx/issue.md"}}]
+        if outcome == "SPEC: revised":
+            Path(f"/tmp/baton-spec-{N}-1.comment").write_text("Verified reply")
+        message = {"type": "assistant", "parent_tool_use_id": None, "message": {"model": model}}
+        log.write_text("\n".join(map(json.dumps, [message, result])))
+        return rc
+
+    monkeypatch.setattr(claude_cli, "run_cli", cli)
+    assert s.review_round(1, 6, context) == "changes"
+    original_body = loop.gh.body
+    assert s.revise_round(1, context) == "revised"
+    reply, = loop.gh.posted("<!-- baton-spec-reply")
+    assert reply.endswith("Verified reply")
+    assert loop.gh.body == original_body
+    assert spec.last_model(s.env, N, "reply", 1, "claude") == "claude-sonnet-4-6"
+
+
 @pytest.mark.parametrize("round,scenario", [
     (1, "distinct"), (2, "distinct"), (1, "shared"), (1, "inherited"),
     (1, "fallback"), (1, "unknown"), (1, "ambiguous"), (1, "short block"), (1, "unknown review"),
