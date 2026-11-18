@@ -385,9 +385,10 @@ def test_a_forced_pr_must_be_an_agent_branch(ctx, capsys, monkeypatch):
 
 
 # --- the issue pick ----------------------------------------------------------------------------------------
-def issue(n, login="owner", labels=(), milestone="Beta"):
+def issue(n, login="owner", labels=(), milestone="Beta", blocked_by=()):
     return {"number": n, "author": {"login": login}, "labels": [{"name": x} for x in labels],
-            "milestone": {"title": milestone} if milestone else None}
+            "milestone": {"title": milestone} if milestone else None,
+            "blockedBy": {"nodes": [{"number": b, "state": s} for b, s in blocked_by], "totalCount": len(blocked_by)}}
 
 
 def issues(ctx, ready=(), found=(), open_prs=(), pending=0):
@@ -514,6 +515,30 @@ def test_an_issue_no_vendor_can_run_is_skipped_for_the_next(ctx, monkeypatch):
     monkeypatch.setattr(tick.Tick, "pick_vendor", pick_vendor)
     assert ctx.make().next_issue() == "13"
     assert "DEFERRED: pool no vendor can run now" in ctx.log()
+
+
+def test_an_issue_blocked_by_an_open_issue_is_not_a_candidate(ctx):
+    issues(ctx, ready=[issue(12, blocked_by=[(10, "OPEN"), (11, "CLOSED")]), issue(13, blocked_by=[(11, "CLOSED")]),
+                       issue(14)])
+    assert ctx.make().candidates() == [13, 14]
+    assert "#12: skipped; blocked by #10" in ctx.log()
+
+
+def test_blockers_github_did_not_list_count_as_open(ctx):
+    item = issue(12, blocked_by=[(11, "CLOSED")])
+    item["blockedBy"]["totalCount"] = 2
+    issues(ctx, ready=[item])
+    assert ctx.make().candidates() == []
+    assert "#12: skipped; blocked by #?" in ctx.log()
+
+
+def test_a_forced_blocked_issue_warns_and_runs(ctx, capsys):
+    ctx.gh.answers["issue view"] = {"labels": [{"name": "ready-for-agent"}], "author": {"login": "owner"},
+                                    "blockedBy": {"nodes": [{"number": 62, "state": "OPEN"}], "totalCount": 1}}
+    label_history(ctx, 7, [label_event(1, "owner")])
+    ctx.gh.answers["pr list"] = ""
+    assert ctx.make("7").forced_issue() == "7"
+    assert "#7: still blocked by #62; running it as asked" in capsys.readouterr().err
 
 
 def test_a_spec_in_review_needs_a_pool_vendor(ctx, monkeypatch):
