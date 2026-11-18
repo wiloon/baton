@@ -1,8 +1,41 @@
 """Claude Code (`claude -p`). Read-only and GitHub access come from the settings file
 and guard.sh (a PreToolUse hook that reads BATON_AGENT_*), not from this adapter."""
-from .common import Run, child_env, last_result, outcome_line, read, run_cli
+import re
+
+from .common import Run, child_env, events, last_result, outcome_line, read, run_cli
 
 KINDS = ("RESULT", "REVIEW", "VERDICT", "SCAN", "SPEC")
+MODEL = re.compile(
+    r"(?P<prefix>claude-)?(?P<family>opus|sonnet|haiku)(?P<version>(?:-[0-9]+)*?)(?:-(?P<snapshot>[0-9]{8}))?"
+)
+
+
+def distinct_models(first, second):
+    """Compare concrete IDs, conservatively treating shorthand as the whole family."""
+    a, b = MODEL.fullmatch(first), MODEL.fullmatch(second)
+    if not (a and b):
+        return False
+    if a["family"] != b["family"]:
+        return True
+    if not (a["prefix"] and b["prefix"] and a["version"] and b["version"]):
+        return False
+    # An unpinned version can resolve to its dated snapshot.
+    return a["version"] != b["version"] or bool(
+        a["snapshot"] and b["snapshot"] and a["snapshot"] != b["snapshot"])
+
+
+def main_model(text):
+    # Init describes the selection before fallback. Result usage can include subagents.
+    models = set()
+    for _, event in events(text):
+        if (isinstance(event, dict) and event.get("type") == "assistant"
+                and "parent_tool_use_id" in event and event["parent_tool_use_id"] is None):
+            message = event.get("message")
+            model = message.get("model") if isinstance(message, dict) else None
+            if not isinstance(model, str) or not MODEL.fullmatch(model):
+                return ""
+            models.add(model)
+    return models.pop() if len(models) == 1 else ""
 
 
 def usage(result):
@@ -44,4 +77,4 @@ def run(req):
         outcome = f"RESULT: failed budget ${req.budget} exceeded (log {req.log})"
     used = usage(result)
     return Run(rc, outcome or f"RESULT: failed rc={rc} (log {req.log})", final, used,
-               f"{outcome or 'no result line'} {used}")
+               f"{outcome or 'no result line'} {used}", model=main_model(text))

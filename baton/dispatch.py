@@ -8,7 +8,7 @@ exits the item's subshell):
     status   how it ended; "deferred" when the vendor cannot run now; "" for an unknown vendor
     outcome  the RESULT:/REVIEW:/SPEC:/... line
     reply    the agent's final message (untrusted: callers strip markers)
-    model    Codex's actual model
+    model    the actual Claude or Codex model when reported
     defer    why the item must yield, or ""
 Exit code: 0 ok, 1 failed, 75 deferred.
 """
@@ -137,7 +137,8 @@ def _dispatch(vendor, role, prompt, tag, cwd, settings, output, env, hooks):
         ran.cooldown_until = int(time.time()) + env.config.models.busy_minutes * 60
     if ran.killed:
         notify.log(f"killed {tag} after {minutes} min")
-    notify.log(f"end {tag} rc={ran.rc} {ran.summary}")
+    identity = f"claude_model={ran.model or 'unknown'} " if vendor == "claude" else ""
+    notify.log(f"end {tag} rc={ran.rc} {identity}{ran.summary}")
     rc, outcome, defer = settle.settle(state, vendor, ran.status, ran.rc, str(run_log), tag,
                                        "" if ran.cooldown_until is None else str(ran.cooldown_until),
                                        ran.outcome, credential=True)

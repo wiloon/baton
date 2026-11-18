@@ -31,7 +31,7 @@ import subprocess
 import sys
 import time
 
-from . import dispatch, e2e_gate, fix, hooks as telemetry, md, merge, notify, pick, pr as pr_helpers, prompts, review, vendors
+from . import claude_cli, dispatch, e2e_gate, fix, hooks as telemetry, md, merge, notify, pick, pr as pr_helpers, prompts, review, vendors
 from .common import Deferred, changed, git, permission_denials, push, restore, strip_markers
 
 REPLY_CAP = 60000
@@ -93,8 +93,8 @@ def last_by(env, issue, kind):
 
 
 @session.scoped
-def last_model(env, issue, kind, round):
-    """The actual Codex model in the successful run of that round, from runner.log."""
+def last_model(env, issue, kind, round, vendor=""):
+    """The actual model in the latest successful run of that round, from runner.log."""
     env = session.resolve(env)
     tag = f"issue-{issue}-spec-{round}" if kind != "reply" else f"issue-{issue}-spec-reply-{round}"
     log, found, repo = Path(str(env.config.paths.logs), "runner.log"), "", notify.label(env)
@@ -102,10 +102,15 @@ def last_model(env, issue, kind, round):
         return ""
     for line in log.read_text(errors="replace").splitlines():
         fields = line.split()
-        if len(fields) >= 6 and fields[2:6] == [repo, "end", tag, "rc=0"]:
-            for field in fields[6:]:
-                if field.startswith("model="):
-                    found = field[len("model="):]
+        if (len(fields) >= 6 and fields[2:4] == [repo, "end"]
+                and fields[4] in (tag, f"{tag}-rerun") and fields[5] == "rc=0"):
+            first = fields[6] if len(fields) > 6 else ""
+            if first.startswith("claude_model="):
+                found = "" if vendor == "codex" else first.split("=", 1)[1]
+            else:
+                # Codex end lines put the reported model after the outcome and usage.
+                found = "" if vendor == "claude" else next(
+                    (field.split("=", 1)[1] for field in fields[6:] if field.startswith("model=")), "")
     return found
 
 
@@ -145,7 +150,7 @@ class Spec:
         return round == 1 and reviser == "claude" and last_vendor == "claude"
 
     def agent(self, vendor, role, prompt, tag, settings, output="", followup=False):
-        env = self.env.with_runtime(spec_followup=True) if followup else self.env
+        env = self.env.with_runtime(spec_followup=followup)
         out = dispatch.dispatch(vendor, role, prompt, tag, str(self.wt), str(self.self_dir / settings), output, env,
                                 self.hooks)
         if out["rc"] == 75:
@@ -155,9 +160,9 @@ class Spec:
     def gh(self, *args):
         return pr_helpers.gh(*args, "-R", self.repo)
 
-    def pick(self, role, candidates, last_vendor, other_model):
+    def pick(self, role, candidates, last_vendor, other_model, *, spec_followup=False):
         return pick.choose(self.env, role, "agent" if role == "spec_reviewer" else "pool", "contrib", candidates,
-                           exclude=last_vendor, issue=self.issue, other_model=other_model)
+                           exclude=last_vendor, issue=self.issue, other_model=other_model, spec_followup=spec_followup)
 
     # --- a revision starts from what the last one changed ---
     def mark_base(self, round):
@@ -224,7 +229,7 @@ class Spec:
     def unverified(vendor, last_vendor, model, other_model):
         """A Codex run after a Codex run must be a different, known model."""
         return vendor == "codex" and last_vendor == "codex" and (
-            not other_model or not model or model == other_model or model == "unknown")
+            other_model in ("", "unknown") or model in ("", "unknown") or model == other_model)
 
     @staticmethod
     def mode_note(label, vendor, last_vendor, model, other_model):
@@ -286,7 +291,7 @@ class Spec:
                         "see `git diff origin/main...HEAD`.")
         head = git(wt, "rev-parse", "HEAD") or ""
         last_vendor = last_by(env, n, "reply")
-        other_model = last_model(env, n, "reply", round - 1)
+        other_model = last_model(env, n, "reply", round - 1, last_vendor)
         reviewer = self.pick("spec_reviewer", pick.all_vendors(env), last_vendor, other_model)
         out = self.agent(reviewer, "spec_review", self.render(
             self.self_dir / "spec-review-prompt.md", VENDOR=reviewer, ISSUE=n, GH_REPO=self.repo, WORKTREE=str(wt),
@@ -365,14 +370,16 @@ class Spec:
         for stale in Path("/tmp").glob(f"baton-spec-{n}-{round}.*"):
             stale.unlink()
         last_vendor = last_by(env, n, "review")
-        other_model = last_model(env, n, "review", round)
-        reviser = self.pick("reviser", list(env.config.quota.vendor_pool), last_vendor, other_model)
+        other_model = last_model(env, n, "review", round, last_vendor)
+        claude_followup = self.reviser_followup(round, "claude", last_vendor)
+        reviser = self.pick("reviser", list(env.config.quota.vendor_pool), last_vendor, other_model,
+                            spec_followup=claude_followup)
         self.mark_base(round)
         template = self.self_dir / (f"codex-spec-prompt.md" if reviser == "codex" else "spec-prompt.md")
         prompt = self.render(
             template, ISSUE=n, GH_REPO=self.repo, WORKTREE=str(wt), BRANCH=self.branch, ROUND=str(round),
             CONTEXT_FILE=str(context), OUT=out_base)
-        followup = self.reviser_followup(round, reviser, last_vendor)
+        followup = reviser == "claude" and claude_followup
         tag = f"issue-{n}-spec-reply-{round}"
         out = self.agent(reviser, "spec", prompt, tag, "spec-settings.json", out_base, followup=followup)
         denied = permission_denials(out.get("log", "")) if out["outcome"].startswith("RESULT: failed") else []
@@ -383,8 +390,9 @@ class Spec:
                              "spec-settings.json", out_base, followup=followup)
             denied = permission_denials(out.get("log", "")) if out["outcome"].startswith("RESULT: failed") else []
         outcome, model = out["outcome"], out["model"] or ""
-        if self.unverified(reviser, last_vendor, model, other_model):
-            self.handoff("Codex spec reviser model was not verified as different from the reviewer model.")
+        if (self.unverified(reviser, last_vendor, model, other_model)
+                or (reviser == last_vendor == "claude" and not claude_cli.distinct_models(model, other_model))):
+            self.handoff(f"{reviser.capitalize()} spec reviser model was not verified as different from the reviewer model.")
             return "stop"
         mode_note = self.mode_note("Revision", reviser, last_vendor, model, other_model)
         comment, body = Path(f"{out_base}.comment"), Path(f"{out_base}.body")

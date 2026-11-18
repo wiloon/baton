@@ -283,7 +283,8 @@ class VendorTests(unittest.TestCase):
             self.assertEqual(result["review_mode"], "same-vendor-different-model")
 
     def test_a_claude_reviewed_spec_is_revised_by_claude_only_when_codex_cannot_run(self):
-        revise = lambda: vendors.pick(self.state, POOL, "reviser", POOL, exclude=["claude"], by="contrib", now=NOW)
+        revise = lambda: vendors.pick(self.state, POOL, "reviser", POOL, exclude=["claude"], by="contrib", now=NOW,
+                                      other_model="claude-sonnet-4-6")
         self.snap("codex", 0.5)
         self.assertEqual(revise()[0]["vendor"], "codex")
         self.snap("codex", 0.96)
@@ -384,7 +385,8 @@ class VendorTests(unittest.TestCase):
         self.assertEqual(self.review("24")[0]["vendor"], "codex")
 
     def test_spec_revision_waits_for_codex_5h_instead_of_claude_revising_claude(self):
-        revise = lambda: vendors.pick(self.state, POOL, "reviser", POOL, exclude=["claude"], by="contrib", now=NOW)
+        revise = lambda: vendors.pick(self.state, POOL, "reviser", POOL, exclude=["claude"], by="contrib", now=NOW,
+                                      other_model="claude-sonnet-4-6")
         self.snap("codex", 0.50, five=0.95)
         result, rc = revise()
         self.assertEqual((result["vendor"], rc), ("", 75))
