@@ -27,6 +27,9 @@ def sh(cwd, *cmd):
 
 @pytest.fixture
 def run(gh, tmp_path, monkeypatch):
+    # A parent verification can export these. This fixture uses the configured repository.
+    for name in ("VERIFY_HOOK", "GATE_HOOK", "CI_COMMAND"):
+        monkeypatch.delenv(name, raising=False)
     origin, wt, selfdir = tmp_path / "origin.git", tmp_path / "wt", tmp_path / "self"
     sh(tmp_path, "git", "init", "-q", "--bare", str(origin))
     sh(tmp_path, "git", "clone", "-q", str(origin), str(wt))

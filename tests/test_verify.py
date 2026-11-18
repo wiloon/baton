@@ -48,7 +48,7 @@ def world(tmp_path):
 
         def verify(self, gate="", verify_hook=True, gate_hook=True, ci=f'echo "ci $(pwd)" >> "{calls}"', write=""):
             env = {**os.environ, "LOGS": str(tmp_path / "logs"), "VERIFY_TAG": "t", "E2E_GATE": gate, "CI_COMMAND": ci,
-                   "WRITE_ARTIFACT": write,
+                   "RUNNER_LOG": "", "WRITE_ARTIFACT": write,
                    "VERIFY_HOOK": str(self.verify_hook) if verify_hook else "",
                    "GATE_HOOK": str(self.gate_hook) if gate_hook else ""}
             return subprocess.run([str(bin_dir / "verify.sh"), str(wt), "origin/main"], capture_output=True, text=True, env=env)
