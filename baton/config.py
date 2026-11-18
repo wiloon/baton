@@ -220,7 +220,7 @@ class Retrospectives:
     model: str = ""
     enabled: bool = False
     model_claude: str = "opus"
-    model_codex: str = "gpt-6.1-sol"
+    model_codex: str = "gpt-6.2-sol"
     model_cursor: str = "grok-4.7-high"
     effort: str = "high"
     paused: bool = False

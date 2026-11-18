@@ -26,7 +26,7 @@ def test_loading_is_typed_immutable_and_does_not_initialize(tmp_path, monkeypatc
     before = dict(os.environ)
     c = config.load(ROOT / 'config.example.toml', home=home)
     assert c.scheduling.auto_merge is True
-    assert c.models.model_codex_dev == 'gpt-6.1-sol'
+    assert c.models.model_codex_dev == 'gpt-6.2-sol'
     assert c.paths.clones == home / 'baton/repos'
     assert config.repo_dirs(c.paths, c.repos[0]).clone == home / 'baton/repos/acme/app'
     assert c.repos[0].gh_repo == 'acme/app' and c.repos[0].owner == 'acme-owner'   # the baseline's example

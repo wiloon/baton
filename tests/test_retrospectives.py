@@ -512,7 +512,7 @@ def test_claude_quota_exhaustion_selects_sol_and_preserves_shared_accounting(hos
     assert host.run()[0]['state']=='success'
     report=host.report(pipe)
     attempt=report['analysis_attempts'][0]
-    assert attempt['vendor']=='codex' and attempt['requested_model']=='gpt-6.1-sol'
+    assert attempt['vendor']=='codex' and attempt['requested_model']=='gpt-6.2-sol'
     assert attempt['effort']=='high' and attempt['usage']['input_tokens']==4
     assert report['selection']['blocked']['claude']=='quota_exhausted'
     args=host.calls()[0]['args']
@@ -568,7 +568,8 @@ def test_provider_reported_sonnet_is_rejected_even_for_opus_request(host):
 
 
 @pytest.mark.parametrize('key,value', [('model_claude','sonnet'),('model_claude','claude-sonnet-5-5'),
-    ('model_codex','gpt-6.1-terra'),('model_cursor','auto'),('model_cursor','cursor-grok-4.6-high')])
+    ('model_codex','gpt-6.1-terra'),('model_codex','gpt-6.2-astra'),('model_cursor','auto'),
+    ('model_cursor','cursor-grok-4.6-high')])
 def test_only_approved_strong_model_families_are_configurable(tmp_path,key,value):
     source=tmp_path/'config.toml'
     text=(ROOT/'config.example.toml').read_text()
@@ -581,6 +582,12 @@ def test_only_approved_strong_model_families_are_configurable(tmp_path,key,value
         text+='\n'+key+' = '+json.dumps(value)+'\n'
     source.write_text(text)
     with pytest.raises(config.ConfigError):config.load(source)
+
+
+@pytest.mark.parametrize('model', ['gpt-6-sol', 'gpt-6.1-sol', 'gpt-6.2-sol'])
+def test_codex_sol_generations_are_approved(model):
+    from baton.analyst_models import approved_model
+    assert approved_model('codex', model, requested=True)
 
 
 def test_review_and_retrospective_share_quota_pace_and_preference_policy(host):

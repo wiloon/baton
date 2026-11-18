@@ -3,7 +3,7 @@ import re
 
 FAMILIES = {
     'claude': r'(?:opus|claude-opus-[A-Za-z0-9._:-]+)',
-    'codex': r'gpt-6(?:\.1)?-sol',
+    'codex': r'gpt-6(?:\.[12])?-sol',
     'cursor': r'grok-4\.7(?:-(?:high|xhigh)(?:-fast)?)?',
 }
 

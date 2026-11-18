@@ -171,18 +171,18 @@ cursor_max_minutes = 60
 # Codex: the model for any role without its own model_codex_ROLE; "" lets Codex choose.
 codex_model = ""
 # Codex: -m by role.
-model_codex_dev = "gpt-6.1-sol"
-model_codex_fix = "gpt-6.1-terra"
-model_codex_review = "gpt-6.1-sol"
-model_codex_review_followup = "gpt-6.1-terra"
-model_codex_spec_review = "gpt-6.1-sol"
-model_codex_spec_review_followup = "gpt-6.1-terra"
-model_codex_spec = "gpt-6.1-terra"
+model_codex_dev = "gpt-6.2-sol"
+model_codex_fix = "gpt-6.2-sol"
+model_codex_review = "gpt-6.2-astra"
+model_codex_review_followup = "gpt-6.2-sol"
+model_codex_spec_review = "gpt-6.2-astra"
+model_codex_spec_review_followup = "gpt-6.2-sol"
+model_codex_spec = "gpt-6.2-sol"
 # When a vendor's servers are full ("at capacity", "overloaded"), the run moves to the first of
 # these that differs from its model: Claude Code through --fallback-model, Codex by one rerun.
 # If that is full too, the vendor rests for busy_minutes.
 fallback_models_claude = ["sonnet", "opus"]
-fallback_models_codex = ["gpt-6-sol", "gpt-6.1-sol"]
+fallback_models_codex = ["gpt-6.1-sol", "gpt-6.2-astra"]
 # Codex: minutes before a run is killed.
 codex_max_minutes = 60
 # Directories Codex's sandbox may write besides the worktree (--add-dir): package and build
@@ -283,7 +283,7 @@ enabled = false
 # Deprecated opt-in only when enabled is absent. Never used as a requested model.
 model = ""
 model_claude = "opus"
-model_codex = "gpt-6.1-sol"
+model_codex = "gpt-6.2-sol"
 model_cursor = "grok-4.7-high"
 effort = "high"
 paused = false
