@@ -190,7 +190,7 @@ fallback_models_codex = ["gpt-6.1-sol", "gpt-6.2-astra"]
 codex_max_minutes = 60
 # Directories Codex's sandbox may write besides the worktree (--add-dir): package and build
 # caches. They must include environment.gocache, gomodcache, gotmpdir and node_compile_cache.
-codex_cache_dirs = ["~/.local/share/pnpm", "~/.local/state/pnpm", "~/.cache/pnpm", "~/.cache/node/corepack", "~/.cache/node-compile-cache", "~/.cache/ms-playwright", "~/.cache/go-build", "~/go/pkg/mod", "~/.cache/go-tmp"]
+codex_cache_dirs = ["~/.local/share/pnpm", "~/.local/state/pnpm", "~/.cache/pnpm", "~/.cache/node/corepack", "~/.cache/node-compile-cache", "~/.cache/ms-playwright", "~/.cache/go-build", "~/go/pkg/mod", "~/.cache/go-tmp", "~/.cache/uv"]
 # Codex: reasoning effort by role ("", low, medium, high, xhigh, max; "" for the model's default),
 # and the Claude Code sub-agent model for the other roles.
 effort_codex_dev = ""
