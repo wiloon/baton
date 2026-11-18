@@ -389,6 +389,30 @@ def test_a_quota_deferral_keeps_the_paused_marker_and_the_worktree(loop):
     assert Path(loop.env["WT_ROOT"], f"spec-{N}").is_dir()
 
 
+def test_a_tick_that_no_vendor_can_run_sends_no_notice(loop, monkeypatch):
+    """A pool deferral repeats every tick until the quota resets: announcing each one flooded Telegram."""
+    notes = []
+    monkeypatch.setattr(spec.notify, "notify", lambda title, text="": notes.append(title))
+    loop.gh.comments.append({"author": {"login": "owner"}, "body": "<!-- baton-spec-review round=3 by=codex -->\nx"})
+
+    def blocked(*args, **kwargs):
+        raise Deferred("pool", "no vendor can run now; claude: quota claude=blocked(week 98% >= cap 90%)")
+    monkeypatch.setattr(spec.pick, "choose", blocked)
+    for _ in range(3):
+        with pytest.raises(Deferred):
+            loop.run()
+    assert notes == [] and loop.runs == []
+
+
+def test_a_spec_run_announces_itself_once(loop, monkeypatch):
+    notes = []
+    monkeypatch.setattr(spec.notify, "notify", lambda title, text="": notes.append(title))
+    loop.gh.comments = []
+    loop.script = [CHANGES, reviser(), ACCEPT]
+    assert loop.run() is True
+    assert [t for t in notes if "spec review (round" in t] == [f"#{N}: spec review (round 1, review)"]
+
+
 def test_a_paused_revision_resumes_with_its_commits(loop):
     loop.script = [CHANGES, {"rc": 75, "status": "quota", "outcome": "", "reply": None, "model": "", "defer": "quota exhausted"}]
     with pytest.raises(Deferred):
