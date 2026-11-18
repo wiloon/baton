@@ -24,7 +24,8 @@ issue labelled ready-for-agent
   dev           implement in a fresh worktree, run the checks, push, open a PR
   review        a vendor that wrote none of the PR reviews it
   fix           answer the review or a failing CI check (up to max_review_rounds)
-  merge         auto_merge on, CI green, "## Manual checks" none -> merge; else ready-for-human
+  merge         [scheduling].auto_merge and the repository's [[repos]] auto_merge both true,
+                CI green, "## Manual checks" none -> merge; else ready-for-human
                 (manual_checks = "defer": the checks go to a "Manual checks to try" issue instead)
                 (screenshot_review = true: the reviewer also checks the manual-check screenshots)
 ```
@@ -121,7 +122,9 @@ cp config.example.toml config.toml
 #    (gh_repo, owner, ci_command, ...).
 #    Set [quota].vendor_pool to the CLIs you installed, e.g. ["codex"] or ["claude"].
 #    Cursor is optional: vendor_extra = ["cursor"] enables it.
+#    Both [scheduling] and the [[repos]] entry must allow auto-merge.
 #    For a first run, set [scheduling].auto_merge = false to inspect the PR yourself.
+#    Set auto_merge = false in a [[repos]] entry to merge that repository's PRs yourself.
 #    Then clone that repository where baton expects it:
 git clone https://github.com/OWNER/NAME ~/baton/repos/OWNER/NAME
 
@@ -184,7 +187,9 @@ The units assume the checkout is at `~/baton` and uv at `/usr/bin/uv`; adjust `E
 ## Configuration
 
 `config.example.toml` documents every key. Fields are required except the optional Cursor role
-overrides and quota probe retry settings; the example has a working default for each. Edit the `[[repos]]` entry, choose your installed vendors in `[quota]`, and
+overrides, quota probe retry settings, and `[[repos]]` `auto_merge`; the example has a working
+default for each. The repository's `auto_merge` defaults to `true`. Set it to `false` to keep
+that repository's PRs for manual merging. Edit the `[[repos]]` entry, choose your installed vendors in `[quota]`, and
 choose whether `[scheduling].auto_merge` should be enabled. The optional
 `[linear]` and `[telegram]` tables are at the end of the file.
 

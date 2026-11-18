@@ -718,10 +718,10 @@ def test_success_under_checked_at_revision_is_carried_forward(host, monkeypatch)
     pipe=seed(host.state)
     put(host.state,'postmerge',pipe,dict(checked_at=time.time()-4000,reverts=0,issues=0,final=False))
     # Reports published before the fix hashed checked_at into the revision.
-    monkeypatch.setattr(retro,'source_digest',digest)
-    assert host.run()[0]['state']=='success'
+    with monkeypatch.context() as legacy:
+        legacy.setattr(retro,'source_digest',digest)
+        assert host.run()[0]['state']=='success'
     put(host.state,'postmerge',pipe,dict(checked_at=time.time()-400,reverts=0,issues=0,final=False))
-    monkeypatch.undo()
     result=host.run()[0]
     assert result['state']=='success' and 'report' in result
     report=host.report(pipe)
@@ -733,16 +733,16 @@ def test_success_under_checked_at_revision_is_carried_forward(host, monkeypatch)
 def test_success_behind_a_later_deferred_revision_is_carried_forward(host, monkeypatch):
     pipe=seed(host.state)
     put(host.state,'postmerge',pipe,dict(checked_at=time.time()-6000,reverts=0,issues=0,final=False))
-    monkeypatch.setattr(retro,'source_digest',digest)
-    assert host.run()[0]['state']=='success'
-    # Before the fix, the next checked_at refresh made a new revision that only deferred,
-    # and its report replaced the successful one as current. That code never carried forward.
-    monkeypatch.setattr(retro,'carried',lambda *args: None)
-    put(host.state,'postmerge',pipe,dict(checked_at=time.time()-5000,reverts=0,issues=0,final=False))
-    (host.root/'paused').touch()
-    assert host.run()[0]['reason']=='retrospectives_paused'
-    (host.root/'paused').unlink()
-    monkeypatch.undo()
+    with monkeypatch.context() as legacy:
+        legacy.setattr(retro,'source_digest',digest)
+        assert host.run()[0]['state']=='success'
+        # Before the fix, the next checked_at refresh made a new revision that only deferred,
+        # and its report replaced the successful one as current. That code never carried forward.
+        legacy.setattr(retro,'carried',lambda *args: None)
+        put(host.state,'postmerge',pipe,dict(checked_at=time.time()-5000,reverts=0,issues=0,final=False))
+        (host.root/'paused').touch()
+        assert host.run()[0]['reason']=='retrospectives_paused'
+        (host.root/'paused').unlink()
     put(host.state,'postmerge',pipe,dict(checked_at=time.time()-400,reverts=0,issues=0,final=False))
     result=host.run()[0]
     assert result['state']=='success' and 'report' in result
@@ -766,12 +766,12 @@ def test_checked_at_refresh_does_not_republish_a_deferred_report(host):
 def test_old_failure_is_not_carried_forward(host, monkeypatch):
     pipe=seed(host.state)
     put(host.state,'postmerge',pipe,dict(checked_at=time.time()-4000,reverts=0,issues=0,final=False))
-    monkeypatch.setattr(retro,'source_digest',digest)
     host.plan(reply='invalid')
+    with monkeypatch.context() as legacy:
+        legacy.setattr(retro,'source_digest',digest)
+        assert host.run()[0]['state']=='failed'
     assert host.run()[0]['state']=='failed'
-    monkeypatch.undo()
-    # The new revision is not marked successful from a failed old one.
-    assert host.run()[0]['state']!='success'
+    assert len(host.calls())==2
     assert host.report(pipe)['assessment'] is None
 
 
