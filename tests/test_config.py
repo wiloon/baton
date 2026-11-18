@@ -38,6 +38,15 @@ def test_loading_is_typed_immutable_and_does_not_initialize(tmp_path, monkeypatc
     assert isinstance(c.models.fallback_models_codex, tuple)
 
 
+def test_repository_auto_merge_defaults_on_and_turns_off_per_repository(tmp_path):
+    head, repo = TEXT.split('\n[[repos]]\n', 1)
+    omitted = write(tmp_path, head + '\n[[repos]]\n' + repo.replace('\nauto_merge = true\n', '\n', 1))
+    assert config.load(omitted, home=tmp_path).repos[0].auto_merge is True
+    off = write(tmp_path, head + '\n[[repos]]\n' + repo.replace('\nauto_merge = true\n', '\nauto_merge = false\n', 1))
+    c = config.load(off, home=tmp_path)
+    assert c.scheduling.auto_merge is True and c.repos[0].auto_merge is False
+
+
 @pytest.mark.parametrize('old,new', [
     ('auto_merge = true', 'auto_merge = 1'),
     ('chain_max = 5', 'chain_max = true'),

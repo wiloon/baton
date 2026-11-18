@@ -147,11 +147,13 @@ class Merger:
 
     # --- the review passed ---
     def merge_or_handoff(self, wt):
-        """Merge when AUTO_MERGE is on, CI is green and "## Manual checks" is none, or the
-        repository defers manual checks (#48); otherwise label it ready-for-human."""
+        """Merge when auto-merge is on for the runner and for this repository, CI is green and
+        "## Manual checks" is none, or the repository defers manual checks (#48); otherwise label
+        it ready-for-human."""
         pr, url = self.pr, self.url
-        if self.env.config.scheduling.auto_merge is not True:
-            self.handoff("auto_merge_off", f"PR #{pr} review passed", f"Auto-merge is off; ready for you. {url}")
+        if self.env.config.scheduling.auto_merge is not True or self.env.repo.auto_merge is not True:
+            where = "" if self.env.config.scheduling.auto_merge is not True else f" for {self.repo}"
+            self.handoff("auto_merge_off", f"PR #{pr} review passed", f"Auto-merge is off{where}; ready for you. {url}")
             body = pr_helpers.body(pr)
             deferred = self.env.repo.manual_checks == "defer"
             if not deferred and (body is None or not pr_helpers.checks_none(body)):
