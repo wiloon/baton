@@ -74,6 +74,10 @@ Quota probes and retrospective analysts use their dedicated alias settings and h
 follow-up phase. The same-vendor Claude spec paths keep the baseline's alternating
 assignments: the first review uses the base review route, later Claude reviews use the
 follow-up review route, and Claude revisions after Claude reviews use the opposite assignment.
+The picker resolves the Claude revision route for that round before admitting the fallback.
+If an inherited entry or another route resolves to the preceding review's model, or the
+comparison cannot establish two known, distinct models, Claude is ineligible for that revision.
+The config remains valid and normal cross-vendor selection applies.
 
 ## Considered options
 
@@ -101,9 +105,18 @@ follow-up review route, and Claude revisions after Claude reviews use the opposi
   two known, different Codex models. Same-vendor fallbacks retain ADR 0002's wait for
   short cross-vendor quota blocks. Post-run eligibility and review mode use the actual
   model reported by the run, which may differ after a capacity fallback.
+- Carry the actual Claude main-session model from CLI output through dispatch and the runner's
+  round record so revision selection can use the preceding review's reported model. Compare
+  model identities, accounting for Claude CLI shorthand and concrete IDs for the same model.
+  Missing or ambiguous main-session evidence counts as unknown. Before publishing a Claude
+  revision after a Claude review, verify that both reported main-session models are known and
+  different. If verification fails, use the existing unverified-spec handoff and publish no
+  revision or `same-vendor-different-model` note.
 
 ## Revision record
 
 - Issue #62, round 1: defined per-vendor inheritance, explicit CLI defaults and caller
   phase selection, preserved existing review eligibility, and covered probe and
   retrospective alias defaults to keep the shipped assignments intact.
+- Issue #62, round 2: require distinct Claude models at selection and after dispatch so
+  inherited routes and CLI fallbacks cannot turn a spec revision into same-model review.
