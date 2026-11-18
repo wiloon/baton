@@ -119,6 +119,13 @@ def test_deferred_manual_checks_still_need_auto_merge(run):
     assert run.events == ["notify PR #335 review passed"] and not run.merged() and run.shots == []
 
 
+def test_a_repository_can_turn_auto_merge_off_for_itself(run):
+    run.go(REPO_AUTO_MERGE="0")
+    assert run.events == ["notify PR #335 review passed"] and not run.merged() and run.labelled("ready-for-human")
+    run.go(REPO_AUTO_MERGE="1")
+    assert run.merged()
+
+
 def test_a_failed_merge_goes_to_the_owner(run):
     run.gh.fail("merge")
     run.go()

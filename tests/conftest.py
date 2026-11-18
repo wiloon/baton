@@ -237,6 +237,9 @@ def typed_legacy_test_inputs(request, monkeypatch):
             sections[name] = replace(section, **changes)
         pref = tuple((k[7:].lower(), tuple(v.split())) for k,v in env.items() if k.startswith('PREFER_'))
         repo = replace(sections.pop('repo'), scan_areas=tuple(env.get('SCAN_AREAS_TEXT','').splitlines()))
+        # AUTO_MERGE names both switches; REPO_AUTO_MERGE sets only the repository's.
+        if 'REPO_AUTO_MERGE' in env:
+            repo = replace(repo, auto_merge=env['REPO_AUTO_MERGE'] == '1')
         # Legacy helpers used 95% when no per-vendor cap was configured.
         sections['quota'] = replace(sections['quota'], quota_cap_claude=float(env.get('QUOTA_CAP_CLAUDE','.95')))
         # Legacy vectors have Linear and Telegram configured, their files under HOME unless named.

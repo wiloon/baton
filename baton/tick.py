@@ -71,6 +71,18 @@ def parse_args(argv):
     return first, "", "", "", ""
 
 
+def open_blockers(item):
+    """The open issues that block ITEM, from GitHub's issue dependencies (`blockedBy`, #70).
+    A "Blocked by #N" line in a body is not a dependency. When GitHub lists fewer blockers than
+    it counts, the unlisted ones are unknown and count as open ("?")."""
+    blocked = item.get("blockedBy") or {}
+    nodes = blocked.get("nodes") or []
+    found = [n.get("number") for n in nodes if (n.get("state") or "").upper() != "CLOSED"]
+    if (blocked.get("totalCount") or 0) > len(nodes):
+        found.append("?")
+    return found
+
+
 class Tick:
     @session.scoped
     def __init__(self, env=None, argv=(), run_sh="", clock=time.time):
@@ -543,7 +555,7 @@ class Tick:
         return self.after_item(self.item(lambda: dev.run(self, issue)))
 
     def forced_issue(self):
-        labels = self.gh_json("issue", "view", self.force_issue, "-R", self.gh_repo, "--json", "labels,author") or {"labels": []}
+        labels = self.gh_json("issue", "view", self.force_issue, "-R", self.gh_repo, "--json", "labels,author,blockedBy") or {"labels": []}
         label_names = [label["name"] for label in labels["labels"]]
         if "ready-for-agent" not in label_names and not ("claude-found" in label_names and "needs-triage" in label_names):
             print(f"#{self.force_issue} needs the ready-for-agent label", file=sys.stderr)
@@ -558,6 +570,11 @@ class Tick:
             if login != self.owner and not re.fullmatch(self.cursor_login, login):
                 print(f"#{self.force_issue}: external issues need the owner's ready-for-agent label", file=sys.stderr)
                 raise Stop(2)
+        if blockers := open_blockers(labels):
+            # A manual run is the owner's explicit request: say so, and run anyway (#70).
+            warning = f"#{self.force_issue}: still blocked by {' '.join(f'#{n}' for n in blockers)}; running it as asked"
+            print(warning, file=sys.stderr)
+            self.log(warning)
         for branch in names.branches(self.force_issue):
             open_prs = self.gh("pr", "list", "-R", self.gh_repo, "--state", "open", "--head", branch,
                                "--json", "number", "--jq", ".[].number")
@@ -626,7 +643,7 @@ class Tick:
         for labels in (("ready-for-agent",), ("claude-found", "needs-triage")):
             args = [x for label in labels for x in ("--label", label)]
             for i in self.gh_json("issue", "list", "-R", self.gh_repo, "--state", "open", *args, "--limit", "50",
-                                  "--json", "number,author,labels,milestone") or []:
+                                  "--json", "number,author,labels,milestone,blockedBy") or []:
                 label_names = [label["name"] for label in i["labels"]]
                 login = (i.get("author") or {}).get("login") or ""
                 trusted = login == self.owner or bool(re.fullmatch(self.cursor_login, login))
@@ -635,6 +652,9 @@ class Tick:
                 if milestone and not ((i.get("milestone") or {}).get("title") == milestone or "claude-found" in label_names):
                     continue
                 if any(x in label_names for x in ("ready-for-human", "needs-info", "agent-wip")):
+                    continue
+                if blockers := open_blockers(i):
+                    self.log(f"#{i['number']}: skipped; blocked by {' '.join(f'#{n}' for n in blockers)}")
                     continue
                 if (labels == ("ready-for-agent",) or "ready-for-agent" in label_names) and not self.owner_ready(i["number"]):
                     self.log(f"#{i['number']}: skipped; cannot verify ready-for-agent was applied by {self.owner}")

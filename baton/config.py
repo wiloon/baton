@@ -88,6 +88,8 @@ class Repo:
     manual_checks: str = "gate"
     # A second model reviews the manual-check screenshots, and fixers re-shoot them (#50).
     screenshot_review: bool = False
+    # false: every PR of this repository waits for the owner, whatever scheduling.auto_merge says.
+    auto_merge: bool = True
 
 
 @dataclass(frozen=True)

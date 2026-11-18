@@ -26,7 +26,7 @@ matt_skills_root = "~/.claude/plugins/cache/mattpocock/mattpocock-skills"
 
 [scheduling]
 # Merge an agent PR whose review passed, CI is green and "## Manual checks" is none. false: every
-# PR waits for the owner.
+# PR waits for the owner. A repository can also turn it off for itself ([[repos]] auto_merge).
 auto_merge = true
 # Per repository: no new issue starts while this many agent PRs are still in the review loop
 # (a PR handed to the owner, ready-for-human, doesn't count).
@@ -118,6 +118,9 @@ manual_checks = "gate"
 # true: the pool reviewer also looks at the manual-check screenshots (Must fix for anything a
 # user would see as broken, or for missing screenshots), and every fixer re-shoots them.
 screenshot_review = false
+# false: every PR of this repository waits for the owner (ready-for-human), even when
+# [scheduling].auto_merge is true. Use it for a repository whose changes you merge yourself.
+auto_merge = true
 
 [repos.areas]
 # Top-level directory -> area, for per-area vendor preferences (`dev_ui = [...]`). Anything else is "other".
