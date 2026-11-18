@@ -250,7 +250,8 @@ class Review:
         out = self.agent("cursor", "review", self.render(
             "cursor-review-prompt.md", PR=str(pr), GH_REPO=self.repo, WORKTREE=str(wt), ROUND=str(round),
             MAX_ROUNDS=str(self.max_rounds), ROUND_NOTE=note, CONTEXT_FILE=str(context),
-            NIT_RULE=nit_rule(self.repo, self.issue)), f"pr-{pr}-cursor-review-{round}")
+            NIT_RULE=nit_rule(self.repo, self.issue)), f"pr-{pr}-cursor-review-{round}",
+            env=self.env.with_runtime(review_followup=self.review_followup(round, "cursor")))
         outcome, reply = out["outcome"], out["reply"] or ""
         if changed(wt, head):
             restore(wt, head)
@@ -274,7 +275,8 @@ class Review:
         if (reviewer != "cursor" or reviewer not in self.vendors()
                 or vendors.vendor_blocked(str(self.env.config.paths.state), "cursor")):
             reviewer = self.review_vendor(reviewer)
-        expected = (self.env.config.models.model_codex_review or "") if reviewer == "codex" else ""
+        followup = self.review_followup(round, reviewer)
+        expected = self.env.config.models.route("review", reviewer, followup=followup).model
         if not self.review_allowed(reviewer, expected):
             return "RESULT: failed reviewer model may be a PR author"
         numstat = git(wt, "diff", "--numstat", "origin/main...HEAD") or ""
@@ -310,7 +312,7 @@ class Review:
             CONTEXT_FILE=str(context),
             NIT_RULE=nit_rule(self.repo, self.issue)), f"pr-{pr}-review-{round}",
             str(self.self_dir / "review-settings.json"), str(review_file),
-            self.env.with_runtime(review_followup=True) if self.review_followup(round, reviewer) else None)
+            self.env.with_runtime(review_followup=followup))
         outcome, model = out["outcome"], out["model"] or ""
         if not self.review_allowed(reviewer, model):
             return "RESULT: failed actual reviewer model may be a PR author"
@@ -424,7 +426,7 @@ class Review:
                                 issue=self.issue)
             self.values["fixer"] = fixer
             self.save()
-            runner = fix.Runner(self.env, self.hooks, pr, str(round))
+            runner = fix.Runner(self.env.with_runtime(fix_followup=round > 1), self.hooks, pr, str(round))
             rc = fix.fix_pr(runner, pr, wt, fixer, f"the reviewer agent (round {round})", feedback, fix_head)
             if rc == 75:
                 return 75

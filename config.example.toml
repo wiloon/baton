@@ -149,64 +149,74 @@ budget_spec = 3
 budget_scan = 3
 # Claude Code: minutes before a run is killed.
 max_minutes = 150
-# Claude Code: --model by role.
-model_dev = "sonnet"
-model_fix = "sonnet"
-model_review = "opus"
-model_review_followup = "sonnet"
-model_spec_review = "opus"
-model_spec_review_followup = "sonnet"
-model_spec = "opus"
-model_spec_followup = "sonnet"
-model_scan = "sonnet"
-# Claude Code: the model its sub-agents use (CLAUDE_CODE_SUBAGENT_MODEL), by role; "" for its default.
-subagent_model_review = "sonnet"
-# Cursor: cursor-agent --model, and minutes before a run is killed.
-model_cursor = "auto"
-# Optional role overrides; empty uses model_cursor. Auto's actual model may be unknown.
-model_cursor_dev = ""
-model_cursor_fix = ""
-model_cursor_review = ""
-model_cursor_spec_review = ""
-model_cursor_spec = ""
-model_cursor_scan = ""
+# Cursor: minutes before a run is killed.
 cursor_max_minutes = 60
-# Codex: the model for any role without its own model_codex_ROLE; "" lets Codex choose.
-codex_model = ""
-# Codex: -m by role.
-model_codex_dev = "gpt-6.2-sol"
-model_codex_fix = "gpt-6.2-sol"
-model_codex_review = "gpt-6.2-astra"
-model_codex_review_followup = "gpt-6.2-sol"
-model_codex_spec_review = "gpt-6.2-astra"
-model_codex_spec_review_followup = "gpt-6.2-sol"
-model_codex_spec = "gpt-6.2-sol"
 # When a vendor's servers are full ("at capacity", "overloaded"), the run moves to the first of
 # these that differs from its model: Claude Code through --fallback-model, Codex by one rerun.
 # If that is full too, the vendor rests for busy_minutes.
-fallback_models_claude = ["sonnet", "opus"]
-fallback_models_codex = ["gpt-6.1-sol", "gpt-6.2-astra"]
+fallback_models_claude = ["claude_fast", "claude_strong"]
+fallback_models_codex = ["codex_prev", "codex_strong"]
 # Codex: minutes before a run is killed.
 codex_max_minutes = 60
 # Directories Codex's sandbox may write besides the worktree (--add-dir): package and build
 # caches. They must include environment.gocache, gomodcache, gotmpdir and node_compile_cache.
 codex_cache_dirs = ["~/.local/share/pnpm", "~/.local/state/pnpm", "~/.cache/pnpm", "~/.cache/node/corepack", "~/.cache/node-compile-cache", "~/.cache/ms-playwright", "~/.cache/go-build", "~/go/pkg/mod", "~/.cache/go-tmp", "~/.cache/uv"]
-# Codex: reasoning effort by role ("", low, medium, high, xhigh, max; "" for the model's default),
-# and the Claude Code sub-agent model for the other roles.
-effort_codex_dev = ""
-subagent_model_dev = ""
-effort_codex_fix = ""
-subagent_model_fix = ""
-effort_codex_review = ""
-effort_codex_spec_review = ""
-subagent_model_spec_review = ""
-effort_codex_spec = ""
-subagent_model_spec = ""
-model_codex_scan = ""
-effort_codex_scan = ""
-subagent_model_scan = ""
 # How long a vendor rests when its fallback model is full too.
 busy_minutes = 30
+
+[models.aliases]
+claude_strong = "opus"
+claude_fast = "sonnet"
+claude_probe = "haiku"
+codex_fast = "gpt-6.2-sol"
+codex_strong = "gpt-6.2-astra"
+codex_prev = "gpt-6.1-sol"
+cursor_auto = "auto"
+cursor_analyst = "grok-4.7-high"
+
+# A follow-up entry replaces its vendor's base entry. Omitted vendors inherit the base.
+# Optional effort goes to Codex or Claude. Only Claude accepts subagent_model.
+
+[models.routes.dev]
+claude = { model = "claude_fast" }
+codex = { model = "codex_fast" }
+cursor = { model = "cursor_auto" }
+
+[models.routes.fix]
+claude = { model = "claude_fast" }
+codex = { model = "codex_fast" }
+cursor = { model = "cursor_auto" }
+
+[models.routes.review]
+claude = { model = "claude_strong", subagent_model = "claude_fast" }
+codex = { model = "codex_strong" }
+cursor = { model = "cursor_auto" }
+
+[models.routes.spec_review]
+claude = { model = "claude_strong" }
+codex = { model = "codex_strong" }
+cursor = { model = "cursor_auto" }
+
+[models.routes.spec]
+claude = { model = "claude_strong" }
+codex = { model = "codex_fast" }
+cursor = { model = "cursor_auto" }
+
+[models.routes.scan]
+claude = { model = "claude_fast" }
+codex = { model = "" }
+cursor = { model = "cursor_auto" }
+
+[models.routes.review_followup]
+claude = { model = "claude_fast", subagent_model = "claude_fast" }
+codex = { model = "codex_fast" }
+
+[models.routes.spec_review_followup]
+claude = { model = "claude_fast" }
+codex = { model = "codex_fast" }
+
+[models.routes.spec_followup]
+claude = { model = "claude_fast" }
 
 [quota]
 # Vendors picked by quota headroom (claude, codex), and the ones that run besides them without
@@ -224,7 +234,7 @@ quota_five_hour_max = 0.9
 # A quota snapshot older than this is refreshed (by a one-turn probe run) before a pick relies on it.
 quota_stale_minutes = 30
 # The Claude model the probe runs on.
-quota_probe_model_claude = "haiku"
+quota_probe_model_claude = "claude_probe"
 # Independent quota worker retries incomplete probes with exponential backoff.
 quota_probe_retry_minutes = 5
 quota_probe_max_retry_minutes = 60
@@ -285,9 +295,9 @@ enable_claudeai_mcp_servers = false
 enabled = false
 # Deprecated opt-in only when enabled is absent. Never used as a requested model.
 model = ""
-model_claude = "opus"
-model_codex = "gpt-6.2-sol"
-model_cursor = "grok-4.7-high"
+model_claude = "claude_strong"
+model_codex = "codex_fast"
+model_cursor = "cursor_analyst"
 effort = "high"
 paused = false
 settle_seconds = 300

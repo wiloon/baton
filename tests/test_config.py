@@ -1,6 +1,7 @@
 """Configuration contract: side effects and invalid input."""
 from dataclasses import FrozenInstanceError
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -26,7 +27,7 @@ def test_loading_is_typed_immutable_and_does_not_initialize(tmp_path, monkeypatc
     before = dict(os.environ)
     c = config.load(ROOT / 'config.example.toml', home=home)
     assert c.scheduling.auto_merge is True
-    assert c.models.model_codex_dev == 'gpt-6.2-sol'
+    assert c.models.route("dev", "codex").model == 'gpt-6.2-sol'
     assert c.paths.clones == home / 'baton/repos'
     assert config.repo_dirs(c.paths, c.repos[0]).clone == home / 'baton/repos/acme/app'
     assert c.repos[0].gh_repo == 'acme/app' and c.repos[0].owner == 'acme-owner'   # the baseline's example
@@ -57,7 +58,7 @@ def test_repository_auto_merge_defaults_on_and_turns_off_per_repository(tmp_path
     ('quota_cap_claude = 0.9', 'quota_cap_claude = true'),
     ('vendor_pool = ["claude", "codex"]', 'vendor_pool = ["cursor"]'),
     ('vendor_pool = ["claude", "codex"]', 'vendor_pool = ["codex", "codex"]'),
-    ('effort_codex_dev = ""', 'effort_codex_dev = "secret-value"'),
+    ('codex = { model = "codex_fast" }', 'codex = { model = "codex_fast", effort = "secret-value" }'),
     ('reviewer = ["claude", "codex"]', 'reviewer = ["unknown"]'),
     ('reviewer = ["claude", "codex"]', 'reviewer = []'),
     ('chain_max = 5', 'chain_mxa = 5'),
@@ -125,3 +126,43 @@ def test_fractional_budget_and_integer_quota_are_supported(tmp_path):
 def test_invalid_preference_suffix_and_empty_paths(tmp_path, old, new):
     with pytest.raises(config.ConfigError):
         config.load(write(tmp_path, TEXT.replace(old, new)))
+
+
+@pytest.mark.parametrize('old,new,field', [
+    ('codex = { model = "codex_fast" }', 'codex = { model = "missing" }', 'models.routes.dev.codex.model'),
+    ('codex = { model = "codex_fast" }\n', '', 'models.routes.dev.codex'),
+    ('codex = { model = "codex_fast" }', 'codex = {}', 'models.routes.dev.codex.model'),
+    ('codex = { model = "codex_fast" }', 'codex = { model = "codex_fast", typo = "" }', 'models.routes.dev.codex'),
+    ('cursor = { model = "cursor_auto" }', 'cursor = { model = "cursor_auto", effort = "" }', 'models.routes.dev.cursor'),
+    ('fallback_models_codex = [', 'fallback_models_codex = ["missing", ', 'models.fallback_models_codex'),
+    ('quota_probe_model_claude = "claude_probe"', 'quota_probe_model_claude = "missing"', 'quota.quota_probe_model_claude'),
+    ('model_codex = "codex_fast"', 'model_codex = "missing"', 'retrospectives.model_codex'),
+    ('[models]', '[models]\ncodex_model = ""', r'models.aliases.*models.routes'),
+])
+def test_model_route_config_rejects_invalid_references_and_entries(tmp_path, old, new, field):
+    assert old in TEXT
+    with pytest.raises(config.ConfigError, match=field):
+        config.load(write(tmp_path, TEXT.replace(old, new, 1)))
+
+
+def test_retrospective_aliases_default_and_preserve_legacy_opt_in(tmp_path):
+    base = TEXT.split('[retrospectives]')[0].replace('codex_fast = "gpt-6.2-sol"', 'codex_fast = "gpt-6.1-sol"')
+    for suffix, enabled in [('', False), ('[retrospectives]\nmodel = "legacy"\n', True),
+                            ('[retrospectives]\nmodel = "legacy"\nenabled = false\n', False),
+                            ('[retrospectives]\nmodel_codex = "codex_fast"\n', False)]:
+        retro = config.load(write(tmp_path, base + suffix)).retrospectives
+        assert (retro.model_claude, retro.model_codex, retro.model_cursor) == (
+            'opus', 'gpt-6.1-sol', 'grok-4.7-high')
+        assert retro.enabled is enabled
+
+
+def test_alloy_model_filters_match_shipped_codex_config():
+    cfg = config.load(ROOT / 'config.example.toml')
+    identifiers = {route.model for _, vendor, route in cfg.models.routes if vendor == 'codex' and route.model}
+    identifiers.update(cfg.models.fallback_models_codex)
+    identifiers.add(cfg.retrospectives.model_codex)
+    filters = re.findall(r'IsMatch\(attributes\["model"\], "\^\(([^"]+)\)\$"\)',
+                         (ROOT / 'telemetry/codex.alloy').read_text())
+    assert filters
+    for pattern in filters:
+        assert set(pattern.replace('[.]', '.').split('|')) == identifiers

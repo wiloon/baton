@@ -219,7 +219,7 @@ class VendorTests(unittest.TestCase):
 
     def test_review_falls_back_to_the_same_codex_model_in_a_fresh_session(self):
         vendors.record_author(self.state, "16", "codex")
-        vendors.record_author_model(self.state, "16", "codex", "gpt-6.1-sol")
+        vendors.record_author_model(self.state, "16", "codex", "gpt-6.2-astra")
         with patch.dict(os.environ, {"MODEL_CODEX_REVIEW": "gpt-6.1-sol"}):
             result, rc = vendors.pick(self.state, POOL, "review", [*POOL, "cursor"],
                                       pr="16", by="contrib", now=NOW, review=True)
@@ -303,7 +303,7 @@ class VendorTests(unittest.TestCase):
             self.assertEqual((result["vendor"], rc), ("codex", 0))
             result, rc = vendors.pick(self.state, POOL, "spec_reviewer", [*POOL, "cursor"],
                                       exclude=["codex"], by="contrib", now=NOW,
-                                      other_model="gpt-6.1-sol")
+                                      other_model="gpt-6.2-astra")
             self.assertEqual((result["vendor"], rc), ("", 75))
 
     # --- ADR 0002: same-vendor review waits out short blocks ---

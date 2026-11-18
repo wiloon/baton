@@ -1,30 +1,15 @@
 """Quota overhead, model identity and elapsed/active time keep distinct meanings."""
-from dataclasses import replace
 import importlib.util
 import json
 from pathlib import Path
 from unittest.mock import patch
 
-from baton import audit, config, dispatch, session, timing, vendors
+from baton import audit, config, session, timing, vendors
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('pipeline_telemetry', ROOT / 'bin/telemetry.py')
 telemetry = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(telemetry)
-
-
-def test_old_config_and_cursor_role_override(tmp_path):
-    original = (ROOT / 'config.example.toml').read_text()
-    legacy = '\n'.join(l for l in original.splitlines() if not l.startswith('model_cursor_'))
-    path = tmp_path / 'config.toml'
-    path.write_text(legacy)
-    cfg = config.load(path)
-    assert cfg.models.model_cursor_dev == ''
-    env = session.create(cfg)
-    assert dispatch.configure('cursor', 'review', env)[0] == 'auto'
-    env.config = replace(cfg, models=replace(cfg.models, model_cursor_review='chosen-review-model'))
-    assert dispatch.configure('cursor', 'review', env)[0] == 'chosen-review-model'
-    assert dispatch.configure('cursor', 'dev', env)[0] == 'auto'
 
 
 def test_resuming_separates_execution_from_deferred_wait_and_overlaps():

@@ -149,7 +149,8 @@ class Runner:
             out = self.agent(vendor, "fix", self.render("verify-fix-prompt.md", VENDOR=vendor, WORKTREE=str(wt), BASE=base,
                                                         FAILURE_FILE=str(failure_file), REPLY_FILE=str(reply_file),
                                                         FAILURE=failure_excerpt(failure)),
-                             f"{kind}-{number}-verify-fix-{attempt}", wt, str(reply_file))
+                             f"{kind}-{number}-verify-fix-{attempt}", wt, str(reply_file),
+                             self.env.with_runtime(fix_followup=False))
             if not out["outcome"].startswith("RESULT: fixed") or dirty():
                 notify.log(f"{kind} #{number}: {vendor} verification fix failed or left the tree dirty")
                 return 1, failure, attempt

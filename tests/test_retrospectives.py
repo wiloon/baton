@@ -573,15 +573,13 @@ def test_provider_reported_sonnet_is_rejected_even_for_opus_request(host):
 def test_only_approved_strong_model_families_are_configurable(tmp_path,key,value):
     source=tmp_path/'config.toml'
     text=(ROOT/'config.example.toml').read_text()
-    # Existing examples may omit fields; add a field to their retrospective table.
     import re
-    section=text[text.index('[retrospectives]'):]
-    if re.search(r'^'+key+' = ',section,re.M):
-        text=text[:text.index('[retrospectives]')]+re.sub(r'^'+key+r' = .*$',key+' = '+json.dumps(value),section,flags=re.M)
-    else:
-        text+='\n'+key+' = '+json.dumps(value)+'\n'
-    source.write_text(text)
-    with pytest.raises(config.ConfigError):config.load(source)
+    index = text.index('[retrospectives]')
+    head = text[:index].replace('[models.aliases]', '[models.aliases]\ninvalid_family = ' + json.dumps(value))
+    section = re.sub(r'^'+key+r' = .*$', key+' = "invalid_family"', text[index:], flags=re.M)
+    source.write_text(head + section)
+    with pytest.raises(config.ConfigError, match='requires the approved'):
+        config.load(source)
 
 
 @pytest.mark.parametrize('model', ['gpt-6-sol', 'gpt-6.1-sol', 'gpt-6.2-sol'])
@@ -814,3 +812,15 @@ def test_catch_up_prints_changes_and_a_summary(host, capsys):
     lines=[json.loads(l) for l in capsys.readouterr().out.splitlines()]
     assert [l['state'] for l in lines]==['not_configured','summary']
     assert lines[1]['counts']=={'deferred:active_episode':1}
+
+
+def test_analyst_requests_the_resolved_alias_identifier(host):
+    seed(host.state)
+    source = host.state.parent / 'analyst-config.toml'
+    text = (ROOT / 'config.example.toml').read_text()
+    source.write_text(text.replace('enabled = false', 'enabled = true').replace(
+        'claude_strong = "opus"', 'claude_strong = "claude-opus-5-5"'))
+    host.config = replace(host.config, retrospectives=config.load(source).retrospectives)
+    assert host.run()[0]['state'] == 'success'
+    args = host.calls()[0]['args']
+    assert args[args.index('--model') + 1] == 'claude-opus-5-5'

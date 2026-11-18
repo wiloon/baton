@@ -447,10 +447,10 @@ def test_followup_models_apply_from_round_two():
     from baton import dispatch as dispatching
     env = session.create(load(Path(__file__).resolve().parents[1] / "config.example.toml"))
     pick_model = lambda vendor, **rt: dispatching.configure(vendor, "spec_review", env.with_runtime(**rt))[0]
-    assert pick_model("claude") == env.config.models.model_spec_review
-    assert pick_model("claude", spec_followup=True) == env.config.models.model_spec_review_followup
-    assert pick_model("codex", spec_followup=True) == env.config.models.model_codex_spec_review_followup
-    assert dispatching.configure("claude", "review", env.with_runtime(spec_followup=True))[0] == env.config.models.model_review
+    assert pick_model("claude") == "opus"
+    assert pick_model("claude", spec_followup=True) == "sonnet"
+    assert pick_model("codex", spec_followup=True) == "gpt-6.2-sol"
+    assert dispatching.configure("claude", "review", env.with_runtime(spec_followup=True))[0] == "opus"
 
 
 def test_a_followup_review_is_cheaper_unless_codex_must_differ_from_its_own_reviser(loop):
@@ -464,11 +464,9 @@ def test_a_followup_review_is_cheaper_unless_codex_must_differ_from_its_own_revi
 def test_a_claude_revision_of_claudes_first_review_uses_the_other_model(loop):
     from baton import dispatch as dispatching
     env = session.create(load(Path(__file__).resolve().parents[1] / "config.example.toml"))
-    models = env.config.models
-    assert models.model_spec_review != models.model_spec_followup
-    assert dispatching.configure("claude", "spec", env)[0] == models.model_spec
-    assert dispatching.configure("claude", "spec", env.with_runtime(spec_followup=True))[0] == models.model_spec_followup
-    assert dispatching.configure("codex", "spec", env.with_runtime(spec_followup=True))[0] == models.model_codex_spec
+    assert dispatching.configure("claude", "spec", env)[0] == "opus"
+    assert dispatching.configure("claude", "spec", env.with_runtime(spec_followup=True))[0] == "sonnet"
+    assert dispatching.configure("codex", "spec", env.with_runtime(spec_followup=True))[0] == "gpt-6.2-sol"
     s = spec.Spec(loop.env, spec.telemetry.from_env(loop.env, issue=N), N)
     assert s.reviser_followup(1, "claude", "claude") is True
     assert s.reviser_followup(2, "claude", "claude") is False   # that reviewer already ran the followup model

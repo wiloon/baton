@@ -51,9 +51,9 @@ never forwarded to a CLI; the new strong-model fields supply actual requests.
 ```toml
 [retrospectives]
 enabled = true
-model_claude = "opus"
-model_codex = "gpt-6.2-sol"
-model_cursor = "grok-4.7-high"
+model_claude = "claude_strong"
+model_codex = "codex_fast"
+model_cursor = "cursor_analyst"
 effort = "high"
 paused = false
 settle_seconds = 300
@@ -64,6 +64,10 @@ input_chars = 20000
 output_chars = 20000
 budget_usd = 1.0
 ```
+
+The three model fields reference `[models.aliases]`. The example uses the built-in aliases,
+which default to `opus`, `gpt-6.2-sol`, and `grok-4.7-high` respectively. Omitting any model
+field uses its built-in alias. Family validation applies even when analysis is disabled.
 
 The machine-wide `quota.vendor_pool` / `quota.vendor_extra` still enables vendors. The new
 `preferences.retrospective` order overrides `preferences.reviewer`; when absent the reviewer

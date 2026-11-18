@@ -35,22 +35,25 @@ FIVE_MINUTE_CACHE_ROLES = ("spec_review", "spec", "review", "fix")
 def configure(vendor, role, env):
     """(model, minutes, suffix, Request options) from the runner's configuration."""
     env = session.resolve(env)
-    upper = role.upper()
     runtime = env.runtime
-    followup = "_followup" if ((role == "spec_review" and runtime.spec_followup)
-                               or (role == "spec" and vendor == "claude" and runtime.spec_followup)
-                               or (role == "review" and runtime.review_followup)) else ""
+    models = env.config.models
+    followup = (
+        (role in ("spec_review", "spec") and runtime.spec_followup)
+        or (role == "review" and runtime.review_followup)
+        or (role == "fix" and runtime.fix_followup)
+    )
+    route = models.route(role, vendor, followup=followup)
     if vendor == "claude":
-        return getattr(env.config.models, "model_" + role + followup, ""), int(env.config.models.max_minutes), "", {
-            "fallback_models": " ".join(env.config.models.fallback_models_claude), "budget": str(getattr(env.config.models, "budget_" + role)),
-            "repo": str(env.dirs.clone), "subagent_model": getattr(env.config.models, "subagent_model_" + role, ""),
-            "context_dir": str(env.dirs.ctx)}
+        return route.model, models.max_minutes, "", {
+            "fallback_models": " ".join(models.fallback_models_claude),
+            "budget": str(getattr(models, "budget_" + role)),
+            "repo": str(env.dirs.clone), "subagent_model": route.subagent_model,
+            "context_dir": str(env.dirs.ctx), "effort": route.effort}
     if vendor == "cursor":
-        model = getattr(env.config.models, "model_cursor_" + role, "") or env.config.models.model_cursor
-        return model, int(env.config.models.cursor_max_minutes), "", {}
-    return getattr(env.config.models, "model_codex_" + role + followup, "") or env.config.models.codex_model, int(env.config.models.codex_max_minutes or 60), "-codex", {
-        "effort": getattr(env.config.models, "effort_codex_" + role, ""), "fallback_models": " ".join(env.config.models.fallback_models_codex),
-        "add_dirs": list(map(str, env.caches)), "shots_dir": env.runtime.shots_dir,
+        return route.model, models.cursor_max_minutes, "", {}
+    return route.model, models.codex_max_minutes, "-codex", {
+        "effort": route.effort, "fallback_models": " ".join(models.fallback_models_codex),
+        "add_dirs": list(map(str, env.caches)), "shots_dir": runtime.shots_dir,
         "skills_dir": env.skills}
 
 

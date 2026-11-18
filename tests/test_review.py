@@ -9,6 +9,8 @@ import pytest
 
 from baton import checkpoint, merge, pick, review, session, vendors
 from baton.config import load
+from baton.dispatch import dispatch as dispatch_run
+from baton.fix import fix_pr as fix_pr_run
 from baton.common import Deferred
 from conftest import sh
 
@@ -347,9 +349,9 @@ def test_a_codex_review_of_codex_code_keeps_its_usual_model(loop):
     assert rv.review_followup(1, "codex") is False
     env = session.create(load(Path(__file__).resolve().parents[1] / "config.example.toml"))
     config = env.with_runtime(review_followup=True)
-    assert dispatching.configure("codex", "review", config)[0] == env.config.models.model_codex_review_followup
-    assert dispatching.configure("claude", "review", config)[0] == env.config.models.model_review_followup
-    assert dispatching.configure("claude", "spec_review", config)[0] == env.config.models.model_spec_review
+    assert dispatching.configure("codex", "review", config)[0] == "gpt-6.2-sol"
+    assert dispatching.configure("claude", "review", config)[0] == "sonnet"
+    assert dispatching.configure("claude", "spec_review", config)[0] == "opus"
 
 
 def test_codex_is_told_not_to_read_the_review_skill(loop):
@@ -412,3 +414,95 @@ def test_no_screenshot_step_without_the_setting_or_without_checks(loop, body, ov
     loop.run(fixer="cursor", **overrides)
     prompt = loop.agents[0]["prompt"]
     assert "01-library-390.png" not in prompt and "no screenshots" not in prompt
+
+
+@pytest.mark.parametrize("vendor,models", [
+    ("codex", ("gpt-6.2-astra", "gpt-6.2-sol")),
+    ("claude", ("opus", "opus")),
+    ("cursor", ("auto", "cursor-round-two")),
+])
+def test_review_round_routes_reach_cli(loop, monkeypatch, vendor, models):
+    from baton import claude_cli, codex_cli, cursor_cli, dispatch
+    from dataclasses import replace
+
+    if vendor != "claude":
+        loop.gh.set(headRefName="owner/issue-1", author={"login": "owner"})
+    env = session.resolve(loop.env)
+    source = env.config.source
+    config = source.read_text().replace(
+        'claude_strong = "opus"', 'claude_strong = "opus"\ncursor_later = "cursor-round-two"')
+    config = config.replace(
+        'claude = { model = "claude_strong", subagent_model = "claude_fast" }',
+        'claude = { model = "claude_strong", subagent_model = "claude_fast", effort = "high" }', 1)
+    config = config.replace(
+        'claude = { model = "claude_fast", subagent_model = "claude_fast" }\ncodex = { model = "codex_fast" }',
+        'codex = { model = "codex_fast", effort = "low" }'
+        + ('\ncursor = { model = "cursor_later" }' if vendor == "cursor" else ""))
+    path = Path(loop.env["CTX"], "routes.toml")
+    path.write_text(config)
+    cfg = load(path)
+    env.config = replace(cfg, paths=replace(env.config.paths, self_dir=BIN))
+    calls = []
+
+    def cli(args, log, minutes, child, **kwargs):
+        calls.append((args, child))
+        log.write_text("")
+        if vendor == "codex":
+            Path(args[args.index("--output-last-message") + 1]).write_text("REVIEW: pass")
+        return 0
+
+    # Exercise the caller, dispatch and adapter argument construction with a fake CLI boundary.
+    module = {"claude": claude_cli, "codex": codex_cli, "cursor": cursor_cli}[vendor]
+    monkeypatch.setattr(module, "run_cli", cli)
+    monkeypatch.setattr(dispatch.agents, "preflight", lambda *_: "")
+    monkeypatch.setattr(dispatch.vendors, "vendor_blocked", lambda *_: "")
+    monkeypatch.setattr(review.dispatch, "dispatch", dispatch_run)
+    rv = review.Review(env, review.telemetry.from_env(env, issue="297", pr=PR), PR, loop.wt, "297", "")
+    monkeypatch.setattr(rv, "review_vendor", lambda *_: vendor)
+    monkeypatch.setattr(rv, "vendors", lambda: [vendor])
+    for round in (1, 2):
+        rv.run_review(round, "", vendor)
+    flag = "-m" if vendor == "codex" else "--model"
+    assert [args[args.index(flag) + 1] for args, _ in calls] == list(models)
+    if vendor == "codex":
+        assert not any(arg.startswith("model_reasoning_effort=") for arg in calls[0][0])
+        assert 'model_reasoning_effort="low"' in calls[1][0]
+    if vendor == "claude":
+        for args, child in calls:
+            assert args[args.index("--effort") + 1] == "high"
+            assert child["CLAUDE_CODE_SUBAGENT_MODEL"] == "sonnet"
+
+
+@pytest.mark.parametrize("vendor", ["claude", "cursor"])
+@pytest.mark.parametrize("round", [1, 2])
+def test_review_feedback_fixer_routes_reach_cli(loop, monkeypatch, vendor, round):
+    from dataclasses import replace
+    from baton import claude_cli, cursor_cli, dispatch
+
+    env = session.resolve(loop.env)
+    source = Path(loop.env["CTX"], "fix-routes.toml")
+    source.write_text(env.config.source.read_text().replace("[models.routes.review]", """
+[models.routes.fix_followup]
+claude = { model = "claude_strong" }
+cursor = { model = "cursor_analyst" }
+
+[models.routes.review]"""))
+    env.config = replace(load(source), paths=env.config.paths)
+    Path(loop.env["STATE"], f"review-pending-{PR}").write_text(
+        f"pr={PR}\nwt={loop.wt}\nnote=n\nfixer={vendor}\nreviewer=codex\nround={round}\nstep=fix\nISSUE=297\n")
+    calls = []
+
+    def cli(args, log, minutes, child, **kwargs):
+        calls.append(args[args.index("--model") + 1])
+        log.write_text("")
+        return 1
+
+    monkeypatch.setattr(claude_cli if vendor == "claude" else cursor_cli, "run_cli", cli)
+    monkeypatch.setattr(dispatch.agents, "preflight", lambda *_: "")
+    monkeypatch.setattr(dispatch.vendors, "vendor_blocked", lambda *_: "")
+    monkeypatch.setattr(review.dispatch, "dispatch", dispatch_run)
+    monkeypatch.setattr(review.fix, "fix_pr", fix_pr_run)
+    monkeypatch.setattr(review.fix.Runner, "fetch_main", lambda *_: None)
+    hooks = review.telemetry.from_env(env, issue="297", pr=PR)
+    review.Review(env, hooks, PR, loop.wt, "297", "").loop("")
+    assert calls == [{"claude": ("sonnet", "opus"), "cursor": ("auto", "grok-4.7-high")}[vendor][round - 1]]
