@@ -10,6 +10,15 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# When baton works on itself, this suite runs inside a baton run (the verify hook, an agent's own
+# check) and inherits what that run hands its children: the real runner log, the hooks and CI
+# command, and the telemetry context. Tests must never see those (#73, #74).
+INHERITED = ('RUNNER_LOG', 'RUNNER_LOG_LABEL', 'LOGS', 'VERIFY_TAG', 'VERIFY_ARTIFACTS', 'VERIFY_HOOK', 'GATE_HOOK',
+             'CI_COMMAND', 'E2E_GATE', 'TRACEPARENT', 'TRACESTATE')
+INHERITED_PREFIXES = ('OTEL_', 'BATON_', 'CLAUDE_CODE_')
+for _key in [k for k in os.environ if k in INHERITED or k.startswith(INHERITED_PREFIXES)]:
+    del os.environ[_key]
+
 
 def full_text(baseline=None):
     """The baseline config.example.toml with tests/fixtures/repo.toml as its one repository, so a test sees
