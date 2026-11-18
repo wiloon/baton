@@ -52,7 +52,7 @@ never forwarded to a CLI; the new strong-model fields supply actual requests.
 [retrospectives]
 enabled = true
 model_claude = "opus"
-model_codex = "gpt-6.1-sol"
+model_codex = "gpt-6.2-sol"
 model_cursor = "grok-4.7-high"
 effort = "high"
 paused = false
