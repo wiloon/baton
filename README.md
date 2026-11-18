@@ -186,18 +186,19 @@ The units assume the checkout is at `~/baton` and uv at `/usr/bin/uv`; adjust `E
 
 ## Configuration
 
-`config.example.toml` documents every key. Fields are required except the optional Cursor role
-overrides, quota probe retry settings, and `[[repos]]` `auto_merge`; the example has a working
-default for each. The repository's `auto_merge` defaults to `true`. Set it to `false` to keep
+`config.example.toml` documents every key. Base model routes are required. Follow-up routes,
+quota probe retry settings, and `[[repos]]` `auto_merge` are optional. The repository's `auto_merge` defaults to `true`. Set it to `false` to keep
 that repository's PRs for manual merging. Edit the `[[repos]]` entry, choose your installed vendors in `[quota]`, and
 choose whether `[scheduling].auto_merge` should be enabled. The optional
 `[linear]` and `[telegram]` tables are at the end of the file.
 
-Cursor uses `model_cursor` by default. Optional `model_cursor_dev`, `model_cursor_fix`,
-`model_cursor_review`, `model_cursor_spec_review`, `model_cursor_spec` and `model_cursor_scan`
-override individual roles; empty or omitted overrides keep the default. Run records distinguish
-the requested model from the actual model; Cursor Auto's actual model remains unknown when its
-CLI does not report it. Existing host configurations need no migration for these overrides.
+Define model identifiers in `[models.aliases]` and reference those aliases in
+`[models.routes.<role>]` for each vendor. An optional `<role>_followup` entry replaces the
+vendor's whole base entry. If the vendor is omitted, its base entry carries over. Codex
+accepts `model = ""` for its CLI default. Cursor's shipped routes use the alias for `auto`.
+Fallback lists, the Claude quota probe and retrospective model settings also use aliases.
+Migrate legacy flat model keys before validating a host config. Run records distinguish
+the requested model from the actual model when the CLI reports it.
 
 Each vendor choice logs its preference order, weekly usage/cap, time to reset, pace score and
 quota/cooldown gate. Lower pace scores mean further behind the weekly spending pace. Cursor is

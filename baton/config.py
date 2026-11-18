@@ -108,8 +108,24 @@ def repo_dirs(paths, repo):
                     logs=paths.logs / slug, ctx=paths.ctx / slug)
 
 
+ROUTE_ROLES = ("dev", "fix", "review", "spec_review", "spec", "scan")
+BUILTIN_ALIASES = {
+    "claude_strong": "opus",
+    "codex_fast": "gpt-6.2-sol",
+    "cursor_analyst": "grok-4.7-high",
+}
+ANALYST_ALIASES = {"claude": "claude_strong", "codex": "codex_fast", "cursor": "cursor_analyst"}
+
+
 @dataclass(frozen=True)
-class Models:
+class ModelRoute:
+    model: str
+    effort: str = ""
+    subagent_model: str = ""
+
+
+@dataclass(frozen=True)
+class ModelSettings:
     budget_dev: float
     budget_fix: float
     budget_review: float
@@ -117,50 +133,24 @@ class Models:
     budget_spec: float
     budget_scan: float
     max_minutes: int
-    model_dev: str
-    model_fix: str
-    model_review: str
-    model_review_followup: str
-    model_spec_review: str
-    model_spec_review_followup: str
-    model_spec: str
-    model_spec_followup: str
-    model_scan: str
-    subagent_model_review: str
-    model_cursor: str
     cursor_max_minutes: int
-    codex_model: str
-    model_codex_dev: str
-    model_codex_fix: str
-    model_codex_review: str
-    model_codex_review_followup: str
-    model_codex_spec_review: str
-    model_codex_spec_review_followup: str
-    model_codex_spec: str
     fallback_models_claude: tuple[str, ...]
     fallback_models_codex: tuple[str, ...]
     codex_max_minutes: int
     codex_cache_dirs: tuple[Path, ...]
-    effort_codex_dev: str
-    subagent_model_dev: str
-    effort_codex_fix: str
-    subagent_model_fix: str
-    effort_codex_review: str
-    effort_codex_spec_review: str
-    subagent_model_spec_review: str
-    effort_codex_spec: str
-    subagent_model_spec: str
-    model_codex_scan: str
-    effort_codex_scan: str
-    subagent_model_scan: str
     busy_minutes: int
-    # Optional overrides preserve existing host configurations; empty uses model_cursor.
-    model_cursor_dev: str = ""
-    model_cursor_fix: str = ""
-    model_cursor_review: str = ""
-    model_cursor_spec_review: str = ""
-    model_cursor_spec: str = ""
-    model_cursor_scan: str = ""
+
+
+@dataclass(frozen=True)
+class Models(ModelSettings):
+    routes: tuple[tuple[str, str, ModelRoute], ...]
+
+    def route(self, role, vendor, *, followup=False):
+        if followup:
+            for name, provider, route in self.routes:
+                if (name, provider) == (f"{role}_followup", vendor):
+                    return route
+        return next(route for name, provider, route in self.routes if (name, provider) == (role, vendor))
 
 
 @dataclass(frozen=True)
@@ -221,9 +211,9 @@ class Retrospectives:
     # Legacy opt-in when enabled is absent: never used as a requested model.
     model: str = ""
     enabled: bool = False
-    model_claude: str = "opus"
-    model_codex: str = "gpt-6.2-sol"
-    model_cursor: str = "grok-4.7-high"
+    model_claude: str = BUILTIN_ALIASES[ANALYST_ALIASES["claude"]]
+    model_codex: str = BUILTIN_ALIASES[ANALYST_ALIASES["codex"]]
+    model_cursor: str = BUILTIN_ALIASES[ANALYST_ALIASES["cursor"]]
     effort: str = "high"
     paused: bool = False
     settle_seconds: int = 300
@@ -257,7 +247,7 @@ class Config:
         raise ConfigError('repos: no such repository configured')
 
 
-SECTIONS = {"paths": Paths, "scheduling": Scheduling, "models": Models,
+SECTIONS = {"paths": Paths, "scheduling": Scheduling, "models": ModelSettings,
             "quota": Quota, "environment": Environment}
 # Integrations a runner may go without (#328): no section, no integration.
 OPTIONAL = {"linear": Linear, "telegram": Telegram, "retrospectives": Retrospectives}
@@ -324,6 +314,49 @@ def _section(name, cls, data, directory, home):
     return cls(**result)
 
 
+def _model_alias(value, aliases, field):
+    if not isinstance(value, str) or value not in aliases:
+        raise ConfigError(f"{field}: expected a known model alias")
+    return aliases[value]
+
+
+def _model_routes(raw, aliases):
+    names = set(ROUTE_ROLES) | {f"{role}_followup" for role in ROUTE_ROLES}
+    if not isinstance(raw, dict) or raw.keys() - names:
+        raise ConfigError("models.routes: expected tables for known roles")
+    routes = []
+    for name in sorted(names):
+        required = name in ROUTE_ROLES
+        table = raw.get(name, {})
+        if not isinstance(table, dict) or table.keys() - set(VENDORS):
+            raise ConfigError(f"models.routes.{name}: expected entries for known vendors")
+        for vendor in sorted(VENDORS):
+            field = f"models.routes.{name}.{vendor}"
+            if vendor not in table:
+                if required:
+                    raise ConfigError(f"{field}: missing base route")
+                continue
+            entry = table[vendor]
+            allowed = {"model"}
+            if vendor != "cursor":
+                allowed.add("effort")
+            if vendor == "claude":
+                allowed.add("subagent_model")
+            if not isinstance(entry, dict) or entry.keys() - allowed:
+                raise ConfigError(f"{field}: unsupported route fields")
+            model = entry.get("model")
+            if model != "" or vendor != "codex":
+                model = _model_alias(model, aliases, f"{field}.model")
+            effort = entry.get("effort", "")
+            if effort not in ("", "low", "medium", "high", "xhigh", "max"):
+                raise ConfigError(f"{field}.effort: unsupported effort")
+            subagent = entry.get("subagent_model", "")
+            if subagent != "":
+                subagent = _model_alias(subagent, aliases, f"{field}.subagent_model")
+            routes.append((name, vendor, ModelRoute(model, effort, subagent)))
+    return tuple(routes)
+
+
 def load(path: str | Path, *, home: Path | None = None) -> Config:
     """Read one effective file. Relative paths use its directory, not the process cwd."""
     source = Path(path).absolute()
@@ -340,6 +373,19 @@ def load(path: str | Path, *, home: Path | None = None) -> Config:
     if not required <= data.keys() or data.keys() - required - OPTIONAL.keys():
         raise ConfigError("configuration sections do not match the schema (paths, scheduling, repos, models, quota, "
                           "environment, preferences; optional: linear, telegram, retrospectives)")
+    models = data["models"]
+    if not isinstance(models, dict):
+        raise ConfigError("models: expected a table")
+    if any(key == "codex_model" or key.startswith(("model_", "effort_codex_", "subagent_model_"))
+           for key in models):
+        raise ConfigError("models: legacy fields must migrate to [models.aliases] and [models.routes]")
+    catalog = models.pop("aliases", {})
+    if not isinstance(catalog, dict) or any(
+            not key.strip() or not isinstance(value, str) or not value or any(c.isspace() for c in value)
+            for key, value in catalog.items()):
+        raise ConfigError("models.aliases: expected a table of model identifiers")
+    aliases = BUILTIN_ALIASES | catalog
+    routes = _model_routes(models.pop("routes", None), aliases)
     sections = {name: _section(name, cls, data[name], source.parent, home or Path.home())
                 for name, cls in SECTIONS.items()}
     sections.update({name: _section(name, cls, data[name], source.parent, home or Path.home())
@@ -347,6 +393,21 @@ def load(path: str | Path, *, home: Path | None = None) -> Config:
     if 'retrospectives' in data and 'enabled' not in data['retrospectives']:
         legacy = sections['retrospectives']
         sections['retrospectives'] = replace(legacy, enabled=bool(legacy.model))
+    settings = sections["models"]
+    fallback = {
+        key: tuple(_model_alias(alias, aliases, f"models.{key}") for alias in getattr(settings, key))
+        for key in ("fallback_models_claude", "fallback_models_codex")
+    }
+    sections["models"] = Models(**(vars(settings) | fallback), routes=routes)
+    quota = sections["quota"]
+    sections["quota"] = replace(quota, quota_probe_model_claude=_model_alias(
+        quota.quota_probe_model_claude, aliases, "quota.quota_probe_model_claude"))
+    raw_retro = data.get("retrospectives", {})
+    sections["retrospectives"] = replace(sections.get("retrospectives", Retrospectives()), **{
+        f"model_{vendor}": _model_alias(raw_retro.get(f"model_{vendor}", alias), aliases,
+                                       f"retrospectives.model_{vendor}")
+        for vendor, alias in ANALYST_ALIASES.items()
+    })
     if not isinstance(data['repos'], list) or not data['repos']:
         raise ConfigError("repos: expected at least one [[repos]] entry")
     repos = tuple(_section("repos", Repo, entry, source.parent, home or Path.home()) for entry in data['repos'])
@@ -380,7 +441,7 @@ def load(path: str | Path, *, home: Path | None = None) -> Config:
         raise ConfigError('retrospectives.effort: expected high or xhigh')
     if retro.timeout_seconds > 600 or retro.input_chars > 20000 or retro.output_chars > 20000:
         raise ConfigError('retrospectives: deadline/character limits exceed Stage 1 bounds')
-    schedule, models, quota = config.scheduling, config.models, config.quota
+    schedule, quota = config.scheduling, config.quota
     for key in ('cursor_login_re', 'cursor_branch_re'):
         try:
             re.compile(getattr(schedule, key))
@@ -390,10 +451,6 @@ def load(path: str | Path, *, home: Path | None = None) -> Config:
         raise ConfigError('quota.vendor_pool: expected distinct claude/codex vendors')
     if any(v != 'cursor' for v in quota.vendor_extra) or len(set(quota.vendor_extra)) != len(quota.vendor_extra):
         raise ConfigError('quota.vendor_extra: expected [] or ["cursor"]')
-    for field in fields(models):
-        value = getattr(models, field.name)
-        if field.name.startswith('effort_codex_') and value not in ('', 'low', 'medium', 'high', 'xhigh', 'max'):
-            raise ConfigError(f'models.{field.name}: unsupported effort')
     for cache in (config.environment.gocache, config.environment.gomodcache, config.environment.gotmpdir, config.environment.node_compile_cache):
         if cache not in config.models.codex_cache_dirs:
             raise ConfigError("models.codex_cache_dirs: must include the configured Go and Node caches")

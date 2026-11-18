@@ -322,15 +322,15 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
     if review:
         excluded.update(review_excluded(pr_state, pr, fixed_by))
         if "codex" in excluded and "codex" in candidates:
-            review_mode = codex_review_mode(pr_state, pr, session.resolve().config.models.model_codex_review)
+            review_mode = codex_review_mode(pr_state, pr, session.resolve().config.models.route("review", "codex").model)
             same_vendor_review = bool(review_mode)
         if all(v in excluded for v in all_vendors(pool)) and not same_vendor_review:
             chosen = current if current in all_vendors(pool) else pool[0]
             return {"vendor": chosen, "reason": "", "probe": [], "blocked": {},
                     "silent": True}, 0
     if role in ("reviser", "spec_reviewer") and "codex" in excluded and "codex" in candidates:
-        model_key = "MODEL_CODEX_SPEC" if role == "reviser" else "MODEL_CODEX_SPEC_REVIEW"
-        model = getattr(session.resolve().config.models, model_key.lower())
+        route_role = "spec" if role == "reviser" else "spec_review"
+        model = session.resolve().config.models.route(route_role, "codex").model
         same_vendor_review = bool(other_model and other_model != "unknown" and model
                                   and model != other_model)
     # The vendor that may run again as the last resort, on a different model. The reviser's only other

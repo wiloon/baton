@@ -26,6 +26,7 @@ class Runtime:
     manual: bool = False
     spec_followup: bool = False
     review_followup: bool = False
+    fix_followup: bool = False
 
 
 def skills_directory(root: Path) -> Path | None:
