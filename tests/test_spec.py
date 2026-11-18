@@ -3,6 +3,7 @@ memory and stubs for the agent runs. Ported from tests/spec-round.sh (the round 
 the spec_loop of run.sh."""
 import json
 import os
+from contextvars import ContextVar
 from pathlib import Path
 import subprocess
 import time
@@ -13,6 +14,8 @@ import pytest
 from baton import merge, pick, session, spec
 from baton.config import load
 from baton.common import Deferred
+from baton.dispatch import dispatch
+from baton.session import resolve as resolve_session
 from conftest import sh
 
 BIN = Path(__file__).resolve().parents[1] / "bin"
@@ -474,7 +477,201 @@ def test_a_claude_revision_of_claudes_first_review_uses_the_other_model(loop):
     assert s.reviser_followup(1, "codex", "claude") is False
     note = s.mode_note("Revision", "claude", "claude", "", "")
     assert note.startswith("Revision mode: same-vendor-different-model (claude")
-    assert s.unverified("claude", "claude", "", "") is False
+
+
+def live_spec(loop, monkeypatch, source):
+    from dataclasses import replace
+
+    env = session.resolve(loop.env)
+    path = Path(loop.env["CTX"], "routes.toml")
+    path.write_text(source)
+    env.config = replace(env.config, models=load(path).models)
+    monkeypatch.setattr(session, "resolve", resolve_session)
+    monkeypatch.setattr(session, "_active", ContextVar("test_session", default=env))
+    monkeypatch.setattr(spec.dispatch, "dispatch", dispatch)
+    s = spec.Spec(env, spec.telemetry.from_env(env, issue=N), N)
+    assert s.worktree()
+    return s, path
+
+
+def test_same_vendor_denial_retry_publishes_only_the_verified_attempt(loop, monkeypatch):
+    from baton import claude_cli
+
+    s, context = live_spec(loop, monkeypatch, session.resolve(loop.env).config.source.read_text())
+    for vendor in ("codex", "cursor"):
+        Path(s.env.config.paths.state, f"{vendor}-cooldown-until").write_text(str(int(time.time()) + 86400))
+    attempts = iter([
+        ("claude-opus-4-8", "SPEC: changes", 0),
+        ("claude-opus-4-8", "RESULT: failed Bash is denied", 1),
+        ("claude-sonnet-4-6", "SPEC: revised", 0),
+    ])
+
+    def cli(args, log, minutes, child, **kwargs):
+        model, outcome, rc = next(attempts)
+        result = {"type": "result", "result": outcome}
+        if rc:
+            Path(f"/tmp/baton-spec-{N}-1.body").write_text("Goal\nUnverified revision\n")
+            result["permission_denials"] = [{"tool_name": "Bash", "tool_input": {"command": "wc -l /ctx/issue.md"}}]
+        if outcome == "SPEC: revised":
+            Path(f"/tmp/baton-spec-{N}-1.comment").write_text("Verified reply")
+        message = {"type": "assistant", "parent_tool_use_id": None, "message": {"model": model}}
+        log.write_text("\n".join(map(json.dumps, [message, result])))
+        return rc
+
+    monkeypatch.setattr(claude_cli, "run_cli", cli)
+    assert s.review_round(1, 6, context) == "changes"
+    original_body = loop.gh.body
+    assert s.revise_round(1, context) == "revised"
+    reply, = loop.gh.posted("<!-- baton-spec-reply")
+    assert reply.endswith("Verified reply")
+    assert loop.gh.body == original_body
+    assert spec.last_model(s.env, N, "reply", 1, "claude") == "claude-sonnet-4-6"
+
+
+@pytest.mark.parametrize("round,scenario", [
+    (1, "distinct"), (2, "distinct"), (1, "shared"), (1, "inherited"),
+    (1, "fallback"), (1, "unknown"), (1, "ambiguous"), (1, "short block"), (1, "unknown review"),
+    (1, "weekly quota"), (1, "five-hour quota"), (1, "fallback snapshot"),
+])
+def test_claude_spec_revision_verifies_main_session_models(loop, monkeypatch, round, scenario):
+    from baton import claude_cli
+
+    source = session.resolve(loop.env).config.source.read_text()
+    if scenario == "shared":
+        source = source.replace('[models.routes.spec_followup]\nclaude = { model = "claude_fast" }',
+                                '[models.routes.spec_followup]\nclaude = { model = "claude_strong" }')
+    if scenario == "inherited":
+        source = source.replace('[models.routes.spec_followup]\nclaude = { model = "claude_fast" }',
+                                '[models.routes.spec_followup]')
+    s, path = live_spec(loop, monkeypatch, source)
+    env = s.env
+    for vendor in ("codex", "cursor"):
+        Path(env.config.paths.state, f"{vendor}-cooldown-until").write_text(str(int(time.time()) + 86400))
+    calls = []
+    opus, sonnet = "claude-opus-4-8", "claude-sonnet-4-6"
+    review_model = sonnet if round == 2 else opus
+    revision_model = opus if round == 2 else sonnet
+
+    def cli(args, log, minutes, child, **kwargs):
+        calls.append(args[args.index("--model") + 1])
+        assert args[args.index("--fallback-model") + 1] == {"opus": "sonnet", "sonnet": "opus"}[calls[-1]]
+        review = len(calls) == 1
+        model = review_model if review or scenario == "fallback" else revision_model
+        if not review and scenario == "fallback snapshot":
+            model = review_model + "-20261101"
+        message = {"type": "assistant", "parent_tool_use_id": None, "message": {"model": model}}
+        events = [{"type": "system", "subtype": "init", "model": review_model if review else revision_model},
+                  {**message, "parent_tool_use_id": "tool", "message": {"model": "claude-haiku-4-5"}}]
+        if scenario != ("unknown review" if review else "unknown"):
+            events.append(message)
+        if not review and scenario == "ambiguous":
+            events.append({**message, "message": {"model": review_model}})
+        if not review:
+            Path(f"/tmp/baton-spec-{N}-{round}.body").write_text("Goal\nRevised step\n")
+            Path(f"/tmp/baton-spec-{N}-{round}.comment").write_text("done")
+        events.append({"type": "result", "result": "SPEC: changes" if review else "SPEC: revised",
+                       "modelUsage": {model: {}, "claude-haiku-4-5": {}}})
+        log.write_text("\n".join(map(json.dumps, events)))
+        return 0
+
+    monkeypatch.setattr(claude_cli, "run_cli", cli)
+    assert s.review_round(round, 6, path) == "changes"
+    assert spec.last_model(env, N, "review", round) == ("unknown" if scenario == "unknown review" else review_model)
+    if scenario == "short block":
+        Path(env.config.paths.state, "codex-cooldown-until").write_text(str(int(time.time()) + 60))
+    if scenario in ("weekly quota", "five-hour quota"):
+        Path(env.config.paths.state, "codex-cooldown-until").unlink()
+        now = int(time.time())
+        Path(env.config.paths.state, "quota-codex.json").write_text(json.dumps({
+            "observed_at": now,
+            "windows": {"seven_day": {"used": 0.99 if scenario == "weekly quota" else 0.1, "resets_at": now + 302400},
+                        "five_hour": {"used": 0.99, "resets_at": now + 3600}}}))
+    publish = scenario in ("distinct", "weekly quota")
+    if scenario in ("shared", "inherited", "short block", "unknown review", "five-hour quota"):
+        reason = "waiting for codex" if scenario in ("short block", "five-hour quota") else "no vendor can run now"
+        with pytest.raises(Deferred, match=reason):
+            s.revise_round(round, path)
+        assert calls == ["opus"]
+    else:
+        assert s.revise_round(round, path) == ("revised" if publish else "stop")
+        assert calls == (["sonnet", "opus"] if round == 2 else ["opus", "sonnet"])
+    replies = loop.gh.posted("<!-- baton-spec-reply")
+    if publish:
+        assert "same-vendor-different-model" in replies[0]
+        assert loop.gh.body == "Goal\nRevised step\n"
+    else:
+        assert not replies
+        assert loop.gh.body == "Goal\nOld step\n"
+        assert loop.gh.ran("issue", "edit", N, "--remove-label", "agent-wip") == (
+            scenario in ("fallback", "fallback snapshot", "unknown", "ambiguous"))
+        for artifact in Path("/tmp").glob(f"baton-spec-{N}-{round}.*"):
+            artifact.unlink()
+
+
+@pytest.mark.parametrize("role,base", [("review", "gpt-6.2-astra"), ("revision", "gpt-6.2-sol")])
+@pytest.mark.parametrize("scenario", ["different", "prior unknown", "prior identical", "reported unknown",
+                                      "fallback identical", "short block"])
+def test_codex_spec_fallback_verifies_actual_model_at_cli(loop, monkeypatch, tmp_path, role, base, scenario):
+    from baton import codex_cli
+
+    source = session.resolve(loop.env).config.source.read_text().replace(
+        '[models.routes.spec_followup]', '[models.routes.spec_followup]\ncodex = { model = "codex_strong" }')
+    s, path = live_spec(loop, monkeypatch, source)
+    revision = role == "revision"
+    s.env = s.env.with_runtime(spec_followup=True)
+    prior_kind, prior_round = ("review", 2) if revision else ("reply", 1)
+    loop.gh.comments.append({"author": {"login": "owner"},
+                             "body": f"<!-- baton-spec-{prior_kind} round={prior_round} by=codex -->\nx"})
+    fallback = "gpt-6.1-sol"
+    other = {"prior unknown": "unknown", "prior identical": base, "fallback identical": fallback}.get(
+        scenario, "gpt-6.1-test")
+    tag = f"issue-{N}-spec-2" if revision else f"issue-{N}-spec-reply-1"
+    Path(loop.env["LOGS"], "runner.log").write_text(
+        f"2026-10-27 10:00:00 [owner/app] end {tag} rc=0 model={other}\n")
+    for vendor in ("claude", "cursor"):
+        delay = 60 if vendor == "claude" and scenario == "short block" else 86400
+        Path(s.env.config.paths.state, f"{vendor}-cooldown-until").write_text(str(int(time.time()) + delay))
+    monkeypatch.setattr(codex_cli, "preflight", lambda *_: "")
+    day = tmp_path / "sessions"
+    day.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    calls = []
+
+    def cli(args, log, minutes, child):
+        model = args[args.index("-m") + 1]
+        calls.append(model)
+        if scenario == "fallback identical" and len(calls) == 1:
+            log.write_text('{"type":"error","message":"at capacity"}\n')
+            return 1
+        log.write_text('{"type":"thread.started","thread_id":"test"}\n')
+        if scenario != "reported unknown":
+            (day / "rollout-test-test.jsonl").write_text(json.dumps(
+                {"type": "turn_context", "payload": {"model": model}}))
+        if revision:
+            work = next(s.wt.glob(".baton-codex-*"))
+            (work / f"baton-spec-{N}-2.comment").write_text("done")
+        Path(args[args.index("--output-last-message") + 1]).write_text(
+            "SPEC: revised" if revision else "SPEC: changes")
+        return 0
+
+    monkeypatch.setattr(codex_cli, "run_cli", cli)
+    run = (lambda: s.revise_round(2, path)) if revision else (lambda: s.review_round(2, 6, path))
+    if scenario in ("prior unknown", "prior identical", "short block"):
+        with pytest.raises(Deferred):
+            run()
+        assert not calls
+    else:
+        assert run() == (("revised" if revision else "changes") if scenario == "different" else "stop")
+        assert calls == ([base, fallback] if scenario == "fallback identical" else [base])
+    posted = loop.gh.posted("<!-- baton-spec-reply" if revision else "<!-- baton-spec-review")
+    if scenario == "different":
+        assert f"same-vendor-different-model (codex/{base} after codex/{other})" in posted[0]
+    else:
+        assert not posted
+        assert loop.gh.ran("issue", "edit", N, "--remove-label", "agent-wip") == (
+            scenario in ("reported unknown", "fallback identical"))
+        for artifact in Path("/tmp").glob(f"baton-spec-{N}-2.*"):
+            artifact.unlink()
 
 
 # --- what an accept may not break (#25) ------------------------------------------------------

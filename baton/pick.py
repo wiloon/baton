@@ -11,13 +11,14 @@ from .common import Deferred
 
 
 @session.scoped
-def choose(env, role, current, mode, candidates, *, pr="", exclude="", issue="", other_model="", fixed_by=""):
+def choose(env, role, current, mode, candidates, *, pr="", exclude="", issue="", other_model="", fixed_by="",
+           spec_followup=False):
     """The vendor for ROLE. MODE: pool, contrib, or review (contrib among vendors that may
     review PR). Deferred("pool", why) when none can run."""
     env = session.resolve(env)
     state, pool = str(env.config.paths.state), list(env.config.quota.vendor_pool)
     by, review = ("contrib", True) if mode == "review" else (mode, False)
-    kwargs = dict(by=by, review=review, fixed_by=fixed_by, other_model=other_model)
+    kwargs = dict(by=by, review=review, fixed_by=fixed_by, other_model=other_model, spec_followup=spec_followup)
     kwargs["pr_state"] = str(env.dirs.state)   # the repository's PR records; cooldowns and quota are global
     asked, _ = vendors.pick(state, pool, role, candidates, current, pr, exclude.split(), probe_only=True, **kwargs)
     for vendor in asked["probe"]:

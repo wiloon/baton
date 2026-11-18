@@ -21,7 +21,7 @@ import subprocess
 import sys
 import time
 
-from . import pr as pr_helpers, quota, vendor_policy
+from . import claude_cli, pr as pr_helpers, quota, vendor_policy
 
 
 def state_path(state, pr, kind):
@@ -309,7 +309,8 @@ def selection_details(state, pool, candidates, chosen, role, *, area="", now=Non
 
 
 def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool",
-         now=None, probe_only=False, review=False, fixed_by="", area="", other_model="", pr_state=None):
+         now=None, probe_only=False, review=False, fixed_by="", area="", other_model="", pr_state=None,
+         spec_followup=False):
     """STATE: the machine's cooldowns and quota; PR_STATE (default STATE): the repository's PR
     records (authors, contributions)."""
     now = int(time.time()) if now is None else now
@@ -333,11 +334,11 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
         model = session.resolve().config.models.route(route_role, "codex").model
         same_vendor_review = bool(other_model and other_model != "unknown" and model
                                   and model != other_model)
-    # The vendor that may run again as the last resort, on a different model. The reviser's only other
-    # pool vendor may be at its quota; Spec.reviser_followup keeps the models apart for Claude.
     fallback = "codex" if same_vendor_review else ""
     if role == "reviser" and "claude" in excluded and "claude" in candidates:
-        fallback = "claude"
+        model = session.resolve().config.models.route("spec", "claude", followup=spec_followup).model
+        if claude_cli.distinct_models(model, other_model):
+            fallback = "claude"
     ordered = ([current, *candidates] if by == "pool" else candidates)
     ready, blocked, probe = [], {}, []
     horizons = {}   # blocked vendor -> vendor_policy.SHORT or LONG

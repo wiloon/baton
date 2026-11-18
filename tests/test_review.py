@@ -142,6 +142,81 @@ def test_a_same_model_review_says_so_and_the_pr_still_merges(loop, monkeypatch):
     assert loop.merged == [PR] and not loop.labelled("ready-for-human")
 
 
+@pytest.mark.parametrize("scenario", ["short block", "identical", "capacity"])
+def test_codex_pr_self_review_uses_base_and_reports_actual_model(loop, monkeypatch, tmp_path, scenario):
+    from baton import codex_cli
+
+    base, fallback = "gpt-6.2-astra", "gpt-6.1-sol"
+    loop.gh.set(headRefName="owner/issue-297", author={"login": "owner"})
+    vendors.record_author(loop.env["STATE"], PR, "codex")
+    vendors.record_author_model(loop.env["STATE"], PR, "codex", base)
+    for vendor in ("claude", "cursor"):
+        delay = 60 if vendor == "claude" and scenario == "short block" else 86400
+        Path(loop.env["STATE"], f"{vendor}-cooldown-until").write_text(str(int(time.time()) + delay))
+    day = tmp_path / "sessions"
+    day.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    calls = []
+
+    def cli(args, log, minutes, child):
+        calls.append(args[args.index("-m") + 1])
+        if scenario == "capacity" and len(calls) == 1:
+            log.write_text('{"type":"error","message":"at capacity"}\n')
+            return 1
+        log.write_text('{"type":"thread.started","thread_id":"test"}\n')
+        (day / "rollout-test-test.jsonl").write_text(json.dumps(
+            {"type": "turn_context", "payload": {"model": calls[-1]}}))
+        Path(args[args.index("--output-last-message") + 1]).write_text("review text\nREVIEW: pass")
+        return 0
+
+    monkeypatch.setattr(codex_cli, "preflight", lambda *_: "")
+    monkeypatch.setattr(codex_cli, "run_cli", cli)
+    monkeypatch.setattr(review.dispatch, "dispatch", dispatch_run)
+    env = session.resolve(loop.env)
+    rv = review.Review(env, review.telemetry.from_env(env, issue="297", pr=PR), PR, loop.wt, "297", "")
+    if scenario == "short block":
+        with pytest.raises(Deferred, match="waiting for claude"):
+            rv.run_review(2, "")
+        assert not calls and not loop.comments()
+    else:
+        assert rv.run_review(2, "") == "REVIEW: pass"
+        if scenario == "capacity":
+            assert calls == [base, fallback]
+            assert f"same-vendor-different-model (codex/{fallback})" in loop.comments()[0]
+        else:
+            assert calls == [base]
+            assert f"same-model-fresh-context (codex/{base})" in loop.comments()[0]
+
+
+def test_reloading_one_alias_changes_review_and_fix_cli_models(loop, monkeypatch):
+    from dataclasses import replace
+    from baton import claude_cli
+
+    env = session.resolve(loop.env)
+    source = Path(loop.env["CTX"], "shared-route.toml")
+    baseline = env.config.source.read_text().replace(
+        'claude = { model = "claude_strong", subagent_model = "claude_fast" }',
+        'claude = { model = "claude_fast", subagent_model = "claude_fast" }')
+    calls = []
+
+    def cli(args, log, minutes, child, **kwargs):
+        calls.append(args[args.index("--model") + 1])
+        log.write_text("")
+        return 1
+
+    monkeypatch.setattr(claude_cli, "run_cli", cli)
+    monkeypatch.setattr(review.dispatch, "dispatch", dispatch_run)
+    monkeypatch.setattr(review.fix.Runner, "fetch_main", lambda *_: None)
+    for model in ("sonnet", "claude-sonnet-4-6"):
+        source.write_text(baseline.replace('claude_fast = "sonnet"', f'claude_fast = "{model}"'))
+        env.config = replace(env.config, models=load(source).models)
+        hooks = review.telemetry.from_env(env, issue="297", pr=PR)
+        rv = review.Review(env, hooks, PR, loop.wt, "297", "")
+        rv.run_review(1, "", "claude")
+        fix_pr_run(review.fix.Runner(env, hooks, PR, "1"), PR, loop.wt, "claude", "reviewer", "fix it")
+    assert calls == ["sonnet", "sonnet", "claude-sonnet-4-6", "claude-sonnet-4-6"]
+
+
 def test_a_reviewer_that_wrote_the_pr_is_refused_and_the_owner_gets_it(loop):
     for vendor in ("claude", "codex", "cursor"):
         vendors.record_author(loop.env["STATE"], PR, vendor)

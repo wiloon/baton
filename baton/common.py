@@ -68,6 +68,7 @@ class Run:
     reply: str
     usage: str = ""
     summary: str = ""       # the runner.log end line after "rc=N"
+    model: str = ""
 
 
 def strip_markers(text):

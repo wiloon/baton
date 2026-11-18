@@ -181,7 +181,7 @@ def run(req, cooldown_hours=COOLDOWN_HOURS):
         status, until = classify(req.vendor, r.rc, read(req.log), r.outcome, cooldown_hours)
     actual = re.search(r"\bmodel=([^\s]+)", r.summary) if req.vendor == "codex" else None
     return RunResult(status, r.outcome, r.reply, r.usage, str(req.log), r.rc, r.rc in (124, 137), until,
-                     r.summary, actual.group(1) if actual else "")
+                     r.summary, actual.group(1) if actual else r.model)
 
 
 def main(argv=None):

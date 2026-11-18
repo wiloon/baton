@@ -175,6 +175,47 @@ def test_claude_exports_metrics_only_to_the_loopback_collector(runner):
     assert "CLAUDE_CODE_ENABLE_TELEMETRY" not in os.environ
 
 
+@pytest.mark.parametrize("caller", ["worker", "picker", "standalone"])
+def test_claude_quota_probe_alias_matches_cli_and_telemetry(runner, monkeypatch, caller):
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from baton import pick, quota_worker, session, settle
+    from baton.config import load
+
+    env = session.resolve(runner.env)
+    path = runner.root / "routes.toml"
+    path.write_text(env.config.source.read_text().replace('claude_probe = "haiku"',
+                                                         'claude_probe = "claude-haiku-4-5"'))
+    quota = replace(load(path).quota, vendor_pool=("claude",), vendor_extra=())
+    env.config = replace(env.config, quota=quota)
+    resolve = session.resolve
+    monkeypatch.setattr(session, "resolve", lambda value=None: resolve(env if value is None else value))
+    runner.plan(stream=claude_stream("ok"))
+    requests = []
+
+    def begin(vendor, role, minutes, *, requested_model):
+        requests.append((vendor, role, requested_model))
+
+    monkeypatch.setattr(settle.telemetry, "from_env", lambda: SimpleNamespace(begin=begin, end=lambda *args: None))
+    if caller == "worker":
+        quota_worker.run(env.config)
+    elif caller == "picker":
+        assert pick.choose(env, "dev", "", "pool", ["claude"]) == "claude"
+    else:
+        settle.main(["probe", "claude"])
+    args = json.loads((runner.root / "fake" / "args.json").read_text())
+    assert args[args.index("--model") + 1] == "claude-haiku-4-5"
+    assert requests == [("claude", "probe", "claude-haiku-4-5")]
+
+
+def test_shipped_codex_scan_leaves_model_to_cli(runner, monkeypatch):
+    monkeypatch.setattr(dispatch.agents, "preflight", lambda *_: "")
+    runner.plan(stream=CODEX_STREAM, last="SCAN: clean\n")
+    runner.run("codex", "scan")
+    args = json.loads((runner.root / "fake" / "args.json").read_text())
+    assert "-m" not in args
+
+
 @pytest.mark.parametrize("role", ["spec_review", "spec", "review", "fix"])
 def test_short_read_mostly_claude_runs_write_five_minute_cache(runner, role):
     runner.plan(stream=claude_stream("fine\nREVIEW: pass"))
