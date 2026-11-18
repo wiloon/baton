@@ -1,6 +1,7 @@
 """baton.review: the review loop around a real git worktree, the fake `gh` of conftest and
 stubs for the agent runs and the fix run (its own tests: tests/test_fix.py). Ported from the
 review-loop parts of tests/roles.sh and tests/cooldown.sh."""
+import json
 import os
 from pathlib import Path
 import time
@@ -473,9 +474,14 @@ def test_review_round_routes_reach_cli(loop, monkeypatch, vendor, models):
             assert child["CLAUDE_CODE_SUBAGENT_MODEL"] == "sonnet"
 
 
-@pytest.mark.parametrize("vendor", ["claude", "cursor"])
-@pytest.mark.parametrize("round", [1, 2])
-def test_review_feedback_fixer_routes_reach_cli(loop, monkeypatch, vendor, round):
+@pytest.mark.parametrize("vendor,round,repair,expected_models", [
+    ("claude", 1, False, ["sonnet"]),
+    ("claude", 2, False, ["opus"]),
+    ("cursor", 1, False, ["auto"]),
+    ("cursor", 2, False, ["grok-4.7-high"]),
+    pytest.param("claude", 2, True, ["opus", "sonnet"], id="round-two-with-verification-repair"),
+])
+def test_review_feedback_fixer_routes_reach_cli(loop, monkeypatch, tmp_path, vendor, round, repair, expected_models):
     from dataclasses import replace
     from baton import claude_cli, cursor_cli, dispatch
 
@@ -487,22 +493,48 @@ claude = { model = "claude_strong" }
 cursor = { model = "cursor_analyst" }
 
 [models.routes.review]"""))
-    env.config = replace(load(source), paths=env.config.paths)
+    paths = env.config.paths
+    if repair:
+        self_dir = tmp_path / "bin"
+        self_dir.mkdir()
+        for template in ("fix-prompt.md", "verify-fix-prompt.md", "codex-review-prompt.md"):
+            (self_dir / template).symlink_to(BIN / template)
+        verify = self_dir / "verify.sh"
+        verify.write_text('#!/bin/sh\ntest -f "$1/repair.txt" || { echo "lint broke"; exit 1; }\n')
+        verify.chmod(0o755)
+        paths = replace(paths, self_dir=self_dir)
+    env.config = replace(load(source), paths=paths)
     Path(loop.env["STATE"], f"review-pending-{PR}").write_text(
         f"pr={PR}\nwt={loop.wt}\nnote=n\nfixer={vendor}\nreviewer=codex\nround={round}\nstep=fix\nISSUE=297\n")
     calls = []
 
     def cli(args, log, minutes, child, **kwargs):
         calls.append(args[args.index("--model") + 1])
+        if repair:
+            filename = "feedback.txt" if len(calls) == 1 else "repair.txt"
+            (loop.wt / filename).write_text("fixed\n")
+            sh(loop.wt, "git", "add", filename)
+            sh(loop.wt, "git", "commit", "-qm", filename)
+            log.write_text(json.dumps({"type": "result", "result": "RESULT: fixed"}) + "\n")
+            return 0
         log.write_text("")
         return 1
 
     monkeypatch.setattr(claude_cli if vendor == "claude" else cursor_cli, "run_cli", cli)
     monkeypatch.setattr(dispatch.agents, "preflight", lambda *_: "")
     monkeypatch.setattr(dispatch.vendors, "vendor_blocked", lambda *_: "")
-    monkeypatch.setattr(review.dispatch, "dispatch", dispatch_run)
+    review_stub = review.dispatch.dispatch
+    loop.reviews[:] = ["pass"]
+
+    def dispatch_agent(vendor, role, *args, **kwargs):
+        run = review_stub if role == "review" else dispatch_run
+        return run(vendor, role, *args, **kwargs)
+
+    monkeypatch.setattr(review.dispatch, "dispatch", dispatch_agent)
     monkeypatch.setattr(review.fix, "fix_pr", fix_pr_run)
     monkeypatch.setattr(review.fix.Runner, "fetch_main", lambda *_: None)
     hooks = review.telemetry.from_env(env, issue="297", pr=PR)
     review.Review(env, hooks, PR, loop.wt, "297", "").loop("")
-    assert calls == [{"claude": ("sonnet", "opus"), "cursor": ("auto", "grok-4.7-high")}[vendor][round - 1]]
+    assert calls == expected_models
+    if repair:
+        assert loop.merged == [PR]
