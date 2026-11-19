@@ -148,14 +148,17 @@ def agent_review(repo, owner, pr, round):
 
 
 def must_fix_first(text):
-    """A comment with its `## Must fix` section right after the marker line, so a cut keeps it."""
+    """Return the marker and Must fix section, other sections, and bare findings."""
     head, _, rest = text.partition("\n")
     kept, section, on = [], [], False
     for line in rest.split("\n"):
         if line.startswith("## "):
             on = line.startswith("## Must fix")
         (section if on else kept).append(line)
-    return "\n".join([head, *section, *kept])
+    findings = "\n".join(section[1:]).strip()
+    if findings.lower() in ("none", "none."):
+        findings = ""
+    return "\n".join([head, *section]), "".join(f"\n{line}" for line in kept), findings
 
 
 def combined_feedback(code, screenshot, limit):
@@ -165,17 +168,30 @@ def combined_feedback(code, screenshot, limit):
     joined = f"{code}\n\n{screenshot}"
     if len(joined) <= limit:
         return joined
-    room = max(0, limit - 2)
+    code_parts, shot_parts = must_fix_first(code), must_fix_first(screenshot)
+    code_findings, shot_findings = code_parts[2], shot_parts[2]
+    if limit <= 2:
+        return (code_findings or shot_findings or code)[:limit]
+    room = limit - 2
     first = min(len(code), room // 2)
     second = min(len(screenshot), room - first)
     first = min(len(code), room - second)
+    if len(code_findings) + len(shot_findings) <= room:
+        first = max(len(code_findings), min(first, room - len(shot_findings)))
+        second = room - first
 
-    def fit(text, size):
+    def fit(text, parts, size):
         if len(text) <= size:
             return text
-        text, note = must_fix_first(text), "\n[cut]"
-        return text[:max(0, size - len(note))] + note if size > len(note) else text[:size]
-    return f"{fit(code, first)}\n\n{fit(screenshot, second)}"
+        priority, rest, findings = parts
+        if findings and len(priority) > size:
+            return findings[:size]
+        note = "\n[cut]"
+        if len(priority) + len(note) <= size:
+            return (priority + rest)[:size - len(note)] + note
+        return (priority + rest)[:size]
+
+    return f"{fit(code, code_parts, first)}\n\n{fit(screenshot, shot_parts, second)}"
 
 
 def manual_checks(body):
@@ -311,18 +327,17 @@ class Review:
                                 f"<!-- baton-review round={round} by=cursor -->\n{posted[:REPLY_CAP]}")
         return (outcome if comment.returncode == 0 else "RESULT: failed posting Cursor's review"), reply
 
-    def run_review(self, round, note, reviewer="pool"):
-        """One reviewer run; returns OUTCOME. REVIEWER is cursor, a pool vendor, or pool (the
-        pick decides). The code-review skill (two sub-agents) only pays off on a big diff.
+    def run_review(self, round, note, reviewer=None):
+        """One reviewer run; returns OUTCOME. Use the loop's selected reviewer when supplied.
+        The code-review skill (two sub-agents) only pays off on a big diff.
         Deferred when the reviewer cannot run now."""
         pr, wt = self.pr, self.wt
         self.hooks.round = round
         head = git(wt, "rev-parse", "HEAD") or ""
         if not self.seed():
             return "RESULT: failed recording PR authors"
-        if (reviewer != "cursor" or reviewer not in self.vendors()
-                or vendors.vendor_blocked(str(self.env.config.paths.state), "cursor")):
-            reviewer = self.review_vendor(reviewer)
+        if reviewer is None:
+            reviewer = self.review_vendor("pool")
         followup = self.review_followup(round, reviewer)
         expected = self.env.config.models.route("review", reviewer, followup=followup).model
         if not self.review_allowed(reviewer, expected):
@@ -380,20 +395,14 @@ class Review:
         return outcome
 
     # --- the screenshot review (#67): its own run after a successful code review ---
-    def screenshot_applies(self, reviewer):
-        """Screenshot review follows the code review when the repository enables it and the PR has
-        manual checks. Cursor's reviews and owner-authored PRs (recorded when the PR was seeded)
-        never get one."""
-        if reviewer == "cursor" or not self.env.repo.screenshot_review:
-            return False
-        if "owner" in vendors.review_excluded(self.state, self.pr):
-            return False
-        return not pr_helpers.checks_none(pr_helpers.body(self.pr) or "## Manual checks\nnone")
+    def screenshot_enabled(self, reviewer):
+        """Whether to check the PR body for screenshot review after this code review."""
+        return (self.env.repo.screenshot_review and reviewer != "cursor"
+                and "owner" not in vendors.review_excluded(self.state, self.pr))
 
     def screenshot_vendor(self):
         """Claude or Codex, by the code review's exclusions; Cursor never looks at screenshots."""
-        candidates = [v for v in self.vendors() if v in ("claude", "codex")]
-        return pick.choose(self.env, "screenshot_reviewer", "", "review", candidates, pr=str(self.pr),
+        return pick.choose(self.env, "screenshot_reviewer", "", "review", self.vendors(), pr=str(self.pr),
                            issue=self.issue, fixed_by=self.fixed_by)
 
     def shots_step(self, shots):
@@ -407,7 +416,7 @@ class Review:
                 f"Codex: view_image):{listed}\n"
                 "   Compare each with the manual checks above and the issue.")
 
-    def run_screenshot_review(self, round, note=""):
+    def run_screenshot_review(self, round, checks):
         """One screenshot reviewer run and its comment; returns OUTCOME. Deferred when the reviewer
         cannot run now. It never hands the PR over: the loop does, once, on a failed outcome."""
         pr, wt = self.pr, self.wt
@@ -420,13 +429,14 @@ class Review:
         limit = int(self.env.config.scheduling.review_context_max_chars or 20000)
         context = Path(self.ctx, f"pr-{pr}-screenshot-review-{round}-{time.strftime('%Y%m%d-%H%M%S')}.md")
         context.write_text(issue_context(self.env, self.issue) if re.fullmatch(r"\d+", str(self.issue or "")) else "")
-        checks = manual_checks(pr_helpers.body(pr) or "")
         review_file = Path(f"/tmp/baton-screenshot-review-{pr}-{round}.md")
         review_file.unlink(missing_ok=True)
+        delivery = ("Include the full review in your final message, above the verdict line." if vendor == "codex"
+                    else f"Write the comment to `{review_file}` with the Write tool.")
         out = self.agent(vendor, "screenshot_review", self.render(
             "screenshot-review-prompt.md", PR=str(pr), ISSUE=self.issue or "unknown", GH_REPO=self.repo,
             WORKTREE=str(wt), ROUND=str(round), MAX_ROUNDS=str(self.max_rounds), CONTEXT_FILE=str(context),
-            MANUAL_CHECKS=cut(checks, limit), SHOTS_STEP=self.shots_step(notify.shots(pr, self.ctx))),
+            MANUAL_CHECKS=cut(checks, limit), SHOTS_STEP=self.shots_step(notify.shots(pr, self.ctx)), DELIVERY=delivery),
             f"pr-{pr}-screenshot-review-{round}", str(self.self_dir / "review-settings.json"), str(review_file), self.env)
         outcome, model = out["outcome"], out["model"] or ""
         if not vendors.screenshot_allowed(self.state, pr, vendor, model, self.fixed_by):
@@ -465,12 +475,14 @@ class Review:
         pr, wt = self.pr, self.wt
         round, step, fix_head = 1, "review", ""
         code_verdict = screenshot = ""   # the round's code verdict, and "1" when it had a screenshot review
+        checks = ""
         saved = checkpoint.read(self.checkpoint)
         if saved:
             note, fixer, reviewer = saved.get("note", ""), saved.get("fixer", ""), saved.get("reviewer", "")
             round = int(saved["round"]) if saved.get("round", "").isdecimal() else 1
             step, fix_head = saved.get("step") or "review", saved.get("fix_head", "")
             code_verdict, screenshot = saved.get("code_verdict", ""), saved.get("screenshot", "")
+            checks = saved.get("screenshot_checks", "")
             self.fixed_by, self.issue = saved.get("fixed_by", ""), saved.get("ISSUE", "")
         if self.seed():
             self.seed_contrib()
@@ -488,7 +500,7 @@ class Review:
                             "Don't read the full PR diff, AGENTS.md or the principles again unless a fix commit needs them."
                             if fix_head else ""))
             self.values = dict(note=note, fixer=fixer, reviewer=reviewer, round=round, step=step, fix_head=fix_head,
-                               code_verdict=code_verdict, screenshot=screenshot)
+                               code_verdict=code_verdict, screenshot=screenshot, screenshot_checks=checks)
             self.save()
             if step in ("review", "screenshot"):
                 verdict = code_verdict
@@ -504,13 +516,21 @@ class Review:
                         self.handoff("review_failed", f"PR #{pr} review failed ({reviewer})", f"{outcome} {self.url}")
                         self.drop()
                         return 0
-                    verdict = code_verdict = "pass" if outcome.startswith("REVIEW: pass") else "changes"
-                    if self.screenshot_applies(reviewer):
+                    verdict = "pass" if outcome.startswith("REVIEW: pass") else "changes"
+                    body = pr_helpers.body(pr) if self.screenshot_enabled(reviewer) else None
+                    if body is not None and not pr_helpers.checks_none(body):
                         step = "screenshot"
-                        self.values.update(step=step, code_verdict=code_verdict)
+                        code_verdict = verdict
+                        checks = manual_checks(body)
+                        self.values.update(step=step, code_verdict=code_verdict, screenshot_checks=checks)
                         self.save()
+                elif not checks:   # a split checkpoint written before the manual checks were saved
+                    body = pr_helpers.body(pr)
+                    if body is not None and not pr_helpers.checks_none(body):
+                        checks = manual_checks(body)
                 if step == "screenshot":
-                    outcome = self.run_screenshot_review(round)
+                    outcome = (self.run_screenshot_review(round, checks) if checks
+                               else "RESULT: failed reading PR manual checks")
                     if not outcome.startswith(REVIEWED):
                         self.handoff("review_failed", f"PR #{pr} screenshot review failed", f"{outcome} {self.url}")
                         self.drop()
@@ -528,7 +548,8 @@ class Review:
             if step != "fix":
                 fix_head = git(wt, "rev-parse", "HEAD") or ""
             step = "fix"
-            self.values.update(step=step, fix_head=fix_head, code_verdict=code_verdict, screenshot=screenshot)
+            self.values.update(step=step, fix_head=fix_head, code_verdict=code_verdict, screenshot=screenshot,
+                               screenshot_checks="")
             self.save()
             if screenshot:
                 # A split review: the fixer reads both comments, or none (an incomplete one is no feedback).
@@ -558,7 +579,7 @@ class Review:
                 return 0
             self.fixed_by = fixer
             round, step = round + 1, "review"
-            code_verdict = screenshot = ""
+            code_verdict = screenshot = checks = ""
         self.drop()
         merge.Merger(self.env, self.hooks, pr, self.issue).merge_or_handoff(wt)
         return 0

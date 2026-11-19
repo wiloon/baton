@@ -143,7 +143,8 @@ class VendorTests(unittest.TestCase):
 
     # --- the screenshot reviewer: Claude or Codex, with the code review's exclusions ---
     def shots(self, **kwargs):
-        return vendors.pick(self.state, POOL, "screenshot_reviewer", POOL, "", "7", (), "contrib", now=NOW,
+        candidates = vendors.all_vendors(POOL, extra=["cursor"])
+        return vendors.pick(self.state, POOL, "screenshot_reviewer", candidates, "", "7", (), "contrib", now=NOW,
                             review=True, **kwargs)
 
     def wrote_with_codex(self, model, *others):
@@ -162,8 +163,12 @@ class VendorTests(unittest.TestCase):
         self.assertEqual(vendors.preference(role, "api", omitted), (["claude", "codex"], "reviewer"))
 
     def test_screenshot_preference_breaks_ties_and_never_picks_cursor(self):
-        with patch.dict(os.environ, {"PREFER_SCREENSHOT_REVIEWER": "cursor codex claude"}):
+        with patch.dict(os.environ, {"PREFER_SCREENSHOT_REVIEWER": "cursor codex claude",
+                                    "PREFER_SCREENSHOT_REVIEWER_OTHER": "cursor claude codex"}):
             self.assertEqual(self.shots()[0]["vendor"], "codex")
+            result, rc = self.shots(area="other")
+            self.assertEqual((result["vendor"], rc), ("claude", 0))
+            self.assertIn("preferred for screenshot_reviewer/other", result["reason"])
         with patch.dict(os.environ, {"PREFER_REVIEWER": "codex claude"}):   # omitted: the reviewer order
             self.assertEqual(self.shots()[0]["vendor"], "codex")
         with patch.dict(os.environ, {"PREFER_REVIEWER": "codex claude", "PREFER_SCREENSHOT_REVIEWER": "claude"}):

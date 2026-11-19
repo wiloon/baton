@@ -25,6 +25,7 @@ REF = re.compile(r"([A-Za-z0-9_./-]+\.[A-Za-z0-9]+):([0-9]+)(?:[-–]([0-9]+))?"
 HUNK = re.compile(r"\+[0-9]+(,[0-9]+)?")
 ISSUE_BODY_MAX = 60000
 REVIEW_MARKER = "<!-- baton-review "
+SCREENSHOT_REVIEW_MARKER = "<!-- baton-screenshot-review "
 FIX_MARKER = "<!-- baton-fix "
 ADOPTED = re.compile(r"`?:?\s+adopted\b", re.I)
 FILED_BUGS_MARKER = "<!-- baton-filed-bugs -->"
@@ -202,7 +203,8 @@ def follow_ups(pr, issue):
             other += f"- {text}\n"
 
     # Each review comment's Nits; a later round lists only what is new.
-    lines = ["" if line == "## Nits" else line for line in review_sections(reviews, "Nits")]
+    nit_reviews = [text for text in own if text.startswith((REVIEW_MARKER, SCREENSHOT_REVIEW_MARKER))]
+    lines = ["" if line == "## Nits" else line for line in review_sections(nit_reviews, "Nits")]
     lines = [line for line in lines if not re.fullmatch(r"\s*none\.?\s*", line, re.I)]
     while lines and not lines[0]:
         lines.pop(0)

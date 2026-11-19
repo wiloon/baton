@@ -525,7 +525,9 @@ class Ledger:
             raise ValueError('invalid bounded run metadata')
         now = time.time()
         run_id = str(uuid.uuid4())
-        stage = ('spec-review' if vendor == 'cursor' else 'spec-reply') if role == 'spec' else ('implement' if role == 'dev' else role)
+        stage = {'dev': 'implement', 'screenshot_review': 'review'}.get(role, role)
+        if role == 'spec':
+            stage = 'spec-review' if vendor == 'cursor' else 'spec-reply'
         record = dict(run_id=run_id, agent=vendor, role=role, stage=stage, repo=repo, status='running',
                       trace_id=uuid.uuid4().hex, span_id=uuid.uuid4().hex[:16],
                       started=now, heartbeat=now, deadline=now + minutes * 60 + 60,

@@ -2,12 +2,14 @@
 import copy
 import json
 import re
+import sys
 from pathlib import Path
 import tempfile
 import time
 import unittest
 from unittest.mock import patch
 from test_runner import t, OWNER
+from baton.config import ROUTE_ROLES, load
 
 
 class TaskTests(unittest.TestCase):
@@ -257,6 +259,43 @@ class TaskAlloyTests(unittest.TestCase):
 
 
 class SummaryContractTest(unittest.TestCase):
+    def test_route_roles_are_accepted_by_the_cli_and_collector(self):
+        root = Path(__file__).resolve().parents[2]
+        for name, count, roles in (('runner', 2, ROUTE_ROLES), ('codex', 4, ('screenshot_review',))):
+            alloy = (root / 'telemetry' / f'{name}.alloy').read_text()
+            filters = re.findall(r'IsMatch\(attributes\["baton.role"\], "([^"]+)"\)', alloy)
+            self.assertEqual(len(filters), count)
+            for pattern in filters:
+                for role in roles:
+                    self.assertRegex(role, pattern)
+            stages = re.findall(r'IsMatch\(attributes\["baton.stage"\], "([^"]+)"\)', alloy)
+            self.assertEqual(len(stages), count)
+            for pattern in stages:
+                self.assertRegex('review', pattern)
+
+        terra = load(root / 'config.example.toml').models.route('screenshot_review', 'codex').model
+        models = re.findall(r'IsMatch\(attributes\["model"\], "([^"]+)"\)', alloy)
+        self.assertEqual(len(models), 5)
+        for pattern in models:
+            self.assertRegex(terra, pattern)
+
+        with tempfile.TemporaryDirectory() as state, patch.object(t, 'identity', return_value=OWNER), \
+                patch.object(t.subprocess, 'run', side_effect=OSError), patch.object(t.subprocess, 'Popen'), \
+                patch.object(t, 'CONFIG_PATH', None):
+            ledger = t.Ledger(state)
+            for role in ROUTE_ROLES:
+                args = ['telemetry.py', '--state', state, 'begin', 'codex', role, '123', '60',
+                        '7', '8', '1', '--repo', 'test/repo']
+                with patch.object(sys, 'argv', args), patch('builtins.print') as printed:
+                    t.main()
+                run_id = printed.call_args.args[0]
+                record = ledger.end(run_id, 'success')
+                log = t.summary_payload(record)['resourceLogs'][0]['scopeLogs'][0]['logRecords'][0]
+                exported = {a['key']: a['value'].get('stringValue') for a in log['attributes']}
+                self.assertEqual(exported['baton.role'], role)
+                if role == 'screenshot_review':
+                    self.assertEqual(exported['baton.stage'], 'review')
+
     def test_every_summary_attribute_is_one_the_collector_keeps(self):
         alloy = (Path(__file__).resolve().parents[2] / 'telemetry/runner.alloy').read_text()
         kept = set(json.loads(re.search(r'keep_keys\(attributes, (\["event_id"[^\]]*\])\)', alloy).group(1)))

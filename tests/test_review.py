@@ -5,10 +5,11 @@ import json
 import os
 from pathlib import Path
 import time
+import uuid
 
 import pytest
 
-from baton import checkpoint, merge, pick, review, session, vendors
+from baton import checkpoint, merge, pick, review, session, tick, vendors
 from baton.config import load
 from baton.dispatch import dispatch as dispatch_run
 from baton.fix import fix_pr as fix_pr_run
@@ -285,6 +286,11 @@ def test_a_deferred_fixer_leaves_a_checkpoint_and_the_resume_goes_straight_to_th
     saved = loop.checkpoint()
     assert (saved["pr"], saved["round"], saved["step"], saved["fixer"], saved["ISSUE"]) == (str(PR), "1", "fix", "cursor", "297")
     assert saved["note"] == "a\nmulti-line 'note'" and saved["wt"] == str(loop.wt)
+    assert Path(loop.env["STATE"], f"review-pending-{PR}").read_bytes() == (
+        f"pr={PR}\nwt={loop.wt}\nnote=$'a\\nmulti-line \\'note\\''\n"
+        f"fixer=cursor\nreviewer=codex\nround=1\nstep=fix\nfix_head={loop.fixes[0]['head']}\n"
+        "fixed_by=''\nISSUE=297\n"
+    ).encode()
     assert len(loop.agents) == 1 and not loop.labelled("ready-for-human")
     # Resume: the fix runs again without another review.
     loop.reviews[:] = ["pass"]
@@ -487,6 +493,34 @@ def screenshot_comments(loop):
     return [c for c in loop.comments() if c.startswith("<!-- baton-screenshot-review ")]
 
 
+def resume_split_review(loop):
+    runner = tick.Tick({**loop.env, "SCREENSHOT_REVIEW": "1"})
+    loop.gh.set(state="OPEN")
+    return runner.pending_review(Path(loop.env["STATE"], f"review-pending-{PR}"))
+
+
+def test_screenshot_eligibility_and_prompt_use_one_body_read(loop, monkeypatch):
+    reads = iter([CHECKS_BODY, None])
+    monkeypatch.setattr(review.pr_helpers, "body", lambda pr: next(reads))
+    loop.reviews, loop.screens = ["pass"], ["pass"]
+    assert screen_run(loop) == 0
+    assert "The library at 390 px and 1280 px." in loop.agents[-1]["prompt"]
+    assert next(reads) is None
+    assert loop.merged == [PR]
+
+
+def test_a_resumed_screenshot_review_preserves_checks_when_the_body_is_unavailable(loop, monkeypatch):
+    loop.reviews, loop.screens = ["pass"], ["defer", "pass"]
+    with pytest.raises(Deferred):
+        screen_run(loop)
+    monkeypatch.setattr(review.pr_helpers, "body", lambda pr: None)
+    assert resume_split_review(loop) == 80
+    assert roles(loop) == ["review", "screenshot_review", "screenshot_review"]
+    assert "The library at 390 px and 1280 px." in loop.agents[-1]["prompt"]
+    assert loop.merged == [str(PR)] and len(screenshot_comments(loop)) == 1
+    assert not loop.checkpoint()
+
+
 def test_a_qualifying_round_runs_the_code_review_then_its_own_screenshot_review(loop):
     shoot(loop, "01-library-390.png")
     loop.reviews, loop.screens = ["pass"], ["pass"]
@@ -499,6 +533,22 @@ def test_a_qualifying_round_runs_the_code_review_then_its_own_screenshot_review(
     assert loop.comments()[1].endswith("## Screenshots\n- a.png — ok")
     assert dict(loop.artifacts)["review"] != dict(loop.artifacts)["screenshot_review"]
     assert loop.merged == [PR] and not loop.fixes
+
+
+def test_a_split_review_exports_both_verdicts_and_counts_one_round(loop, monkeypatch):
+    monkeypatch.setattr(review.telemetry.Telemetry, "enabled", True)
+    loop.reviews, loop.screens = ["pass"], ["pass"]
+    assert screen_run(loop) == 0
+    state = Path(session.resolve(loop.env).config.paths.state, "telemetry")
+    events = [json.loads(path.read_text()) for path in (state / "events").glob("*.json")]
+    verdicts = {event["event_kind"]: event for event in events if "verdict" in event["attrs"]}
+    assert set(verdicts) == {"review", "screenshot_review"}
+    head = sh(loop.wt, "git", "rev-parse", "HEAD")
+    pipeline = uuid.UUID(verdicts["review"]["task"]["pipeline_id"])
+    for kind, event in verdicts.items():
+        assert event["event_id"] == str(uuid.uuid5(pipeline, f"{kind}:{kind}:1:{head}"))
+        assert event["attrs"]["verdict"] == "pass"
+        assert event["task"]["review_rounds"] == 1
 
 
 def test_the_screenshot_reviewer_has_its_own_vendor_preference(loop, monkeypatch):
@@ -548,6 +598,27 @@ def test_screenshot_review_is_skipped_and_the_code_review_keeps_its_outcome(loop
     assert "baton-screenshot-review" not in loop.fixes[0]["feedback"]
 
 
+@pytest.mark.parametrize("first_pick", ["claude", "cursor"])
+def test_the_dispatched_code_reviewer_controls_screenshot_eligibility(loop, monkeypatch, first_pick):
+    # GitHub's owner opened the agent's PR. The recorded writer is Codex.
+    loop.gh.set(headRefName="owner/issue-297", author={"login": "owner"})
+    write_codex(loop, "gpt-6.2-astra")
+    picks = []
+
+    def choose_reviewer(self, current):
+        picks.append(current)
+        return first_pick if len(picks) == 1 else "cursor"
+
+    monkeypatch.setattr(review.Review, "review_vendor", choose_reviewer)
+    loop.reviews, loop.screens = ["pass"], ["pass"]
+    assert screen_run(loop) == 0
+    assert picks == ["pool"]
+    assert loop.agents[0]["vendor"] == first_pick
+    assert loop.comments()[0].startswith(f"<!-- baton-review round=1 by={first_pick} -->")
+    assert bool(screenshot_comments(loop)) == (first_pick != "cursor")
+    assert loop.merged == [PR]
+
+
 def test_a_failed_code_review_never_starts_the_screenshot_review(loop):
     loop.reviews = ["RESULT: failed boom"]
     assert screen_run(loop) == 0
@@ -570,6 +641,18 @@ def test_the_combined_feedback_is_bounded_and_keeps_both_sets_of_findings(loop, 
     # The unused share of the shorter comment goes to the longer one: the short one is whole.
     whole = "short review\n## Must fix\n1. {} finding\n## Nits\nnone"
     assert whole.format("CODE" if longer == "screenshot" else "SHOT") in feedback
+
+
+@pytest.mark.parametrize("limit", [1, 24])
+def test_tight_feedback_budgets_keep_findings_before_markers(loop, limit):
+    loop.review_text = "## Must fix\n1. Fix code\n## Nits\nnone"
+    loop.screen_text = "## Must fix\n1. Fix PNG\n## Nits\nnone"
+    loop.reviews, loop.screens = ["changes", "pass"], ["changes", "pass"]
+    assert screen_run(loop, REVIEW_CONTEXT_MAX_CHARS=str(limit)) == 0
+    feedback = loop.fixes[0]["feedback"]
+    assert 0 < len(feedback) <= limit
+    if limit > 1:
+        assert "1. Fix code\n\n1. Fix PNG" == feedback
 
 
 def test_the_code_prompts_leave_the_screenshots_to_their_own_run(loop, monkeypatch):
@@ -608,24 +691,39 @@ def test_the_screenshot_prompt_asks_for_one_must_fix_when_no_png_qualifies(loop)
 def test_the_screenshot_review_runs_on_its_base_route_in_every_round(loop, monkeypatch, vendor):
     from baton import claude_cli, codex_cli, dispatch
 
-    env = session.resolve(loop.env)
     calls = []
 
     def cli(args, log, minutes, child, **kwargs):
         calls.append((args, child))
-        log.write_text("")
+        prompt = args[-1] if vendor == "codex" else args[args.index("-p") + 1]
+        comment = "## Must fix\nnone\n## Nits\nnone\n## Screenshots\n- library.png — ok"
         if vendor == "codex":
-            Path(args[args.index("--output-last-message") + 1]).write_text("REVIEW: pass")
+            final = comment + "\nREVIEW: pass" if "Include the full review in your final message" in prompt else "REVIEW: pass"
+            Path(args[args.index("--output-last-message") + 1]).write_text(final)
+            log.write_text("")
+        else:
+            assert "with the Write tool" in prompt
+            round = len(calls)
+            Path(f"/tmp/baton-screenshot-review-{PR}-{round}.md").write_text(comment)
+            log.write_text(json.dumps({"type": "result", "result": "REVIEW: pass"}) + "\n")
         return 0
 
     monkeypatch.setattr(claude_cli if vendor == "claude" else codex_cli, "run_cli", cli)
     monkeypatch.setattr(dispatch.agents, "preflight", lambda *_: "")
-    monkeypatch.setattr(dispatch.vendors, "vendor_blocked", lambda *_: "")
-    monkeypatch.setattr(review.dispatch, "dispatch", dispatch_run)
-    rv = review.Review(env, review.telemetry.from_env(env, issue="297", pr=PR), PR, loop.wt, "297", "")
-    monkeypatch.setattr(rv, "screenshot_vendor", lambda: vendor)
-    for round in (1, 2):
-        rv.run_screenshot_review(round, "")
+    agent = review.dispatch.dispatch
+
+    def dispatch_at_cli_boundary(vendor, role, *args, **kwargs):
+        return (dispatch_run if role == "screenshot_review" else agent)(vendor, role, *args, **kwargs)
+
+    monkeypatch.setattr(review.dispatch, "dispatch", dispatch_at_cli_boundary)
+    monkeypatch.setenv("PREFER_SCREENSHOT_REVIEWER", vendor)
+    shoot(loop, "library.png")
+    loop.reviews = ["changes", "pass"]
+    assert screen_run(loop) == 0
+    assert loop.merged == [PR]
+    assert len(screenshot_comments(loop)) == 2
+    assert all("- library.png — ok" in comment and "REVIEW: pass" not in comment
+               for comment in screenshot_comments(loop))
     assert len(calls) == 2
     for args, child in calls:
         if vendor == "codex":
@@ -658,6 +756,17 @@ def test_a_screenshot_review_cannot_reuse_the_model_that_wrote_the_code(loop):
     assert roles(loop) == ["review"] and not screenshot_comments(loop)
     assert loop.labelled("ready-for-human") and not loop.merged and not loop.fixes
     assert not loop.checkpoint()
+
+
+def test_unknown_codex_writer_provenance_cannot_fall_back_to_codex_for_screenshots(loop):
+    vendors.record_author(loop.env["STATE"], PR, "codex")
+    loop.after["review"] = lambda: rest(loop, "claude", 60)
+    loop.reviews, loop.screens = ["pass"], ["pass"]
+    with pytest.raises(Deferred, match="claude: cooldown"):
+        screen_run(loop)
+    assert [(a["vendor"], a["role"]) for a in loop.agents] == [("claude", "review")]
+    assert loop.checkpoint()["step"] == "screenshot"
+    assert not loop.merged and not screenshot_comments(loop)
 
 
 @pytest.mark.parametrize("reported, posts", [("gpt-6.2-astra", False), ("gpt-6.1-sol", True)])
@@ -699,7 +808,7 @@ def test_a_deferred_screenshot_run_resumes_with_the_saved_code_verdict(loop):
     with pytest.raises(Deferred):
         screen_run(loop)
     assert loop.checkpoint()["step"] == "screenshot" and loop.checkpoint()["code_verdict"] == "changes"
-    assert loop.run(fixer="cursor", SCREENSHOT_REVIEW="1") == 0
+    assert resume_split_review(loop) == 80
     assert roles(loop) == ["review", "screenshot_review", "screenshot_review", "review", "screenshot_review"]
     assert len(loop.fixes) == 1 and "baton-screenshot-review round=1" in loop.fixes[0]["feedback"]
 
@@ -710,11 +819,11 @@ def test_a_deferred_fix_after_a_split_review_resumes_with_both_comments(loop):
     with pytest.raises(Deferred):
         screen_run(loop)
     assert loop.checkpoint()["step"] == "fix" and loop.checkpoint()["screenshot"] == "1"
-    assert loop.run(fixer="cursor", SCREENSHOT_REVIEW="1") == 0
+    assert resume_split_review(loop) == 80
     assert roles(loop) == ["review", "screenshot_review", "review", "screenshot_review"]
     for fix in loop.fixes:
         assert "<!-- baton-review round=1" in fix["feedback"] and "<!-- baton-screenshot-review round=1" in fix["feedback"]
-    assert loop.merged == [PR]
+    assert loop.merged == [str(PR)]
 
 
 def test_a_fix_checkpoint_without_screenshot_review_keeps_the_single_comment_path(loop):
@@ -730,7 +839,16 @@ def test_a_fix_checkpoint_without_screenshot_review_keeps_the_single_comment_pat
 
 @pytest.mark.parametrize("case", ["run failed", "missing artifact", "comment not posted", "comment missing at fix time"])
 def test_a_screenshot_review_that_fails_goes_to_the_owner_with_neither_fix_nor_merge(loop, monkeypatch, case):
-    loop.reviews, loop.screens = ["changes"], ["pass"]
+    loop.reviews = ["changes" if case == "comment missing at fix time" else "pass"]
+    loop.screens = ["pass"]
+    handoffs = []
+    handoff = review.Review.handoff
+
+    def record_handoff(self, reason, title, text):
+        handoffs.append(reason)
+        handoff(self, reason, title, text)
+
+    monkeypatch.setattr(review.Review, "handoff", record_handoff)
     if case == "run failed":
         loop.screens = ["RESULT: failed boom"]
     elif case == "missing artifact":
@@ -743,6 +861,7 @@ def test_a_screenshot_review_that_fails_goes_to_the_owner_with_neither_fix_nor_m
         monkeypatch.setattr(review, "agent_comment", lambda repo, owner, pr, marker, round:
                             "" if "screenshot" in marker else real(repo, owner, pr, marker, round))
     assert screen_run(loop) == 0
+    assert handoffs == ["review_failed"]
     assert loop.labelled("ready-for-human") and not loop.fixes and not loop.merged
     assert not loop.checkpoint()
     assert "stale" not in "".join(loop.comments())

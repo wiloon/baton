@@ -331,10 +331,14 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
     prefer, prefer_label = preference(role, area)
     preferred = f"preferred for {prefer_label}: {' '.join(prefer)}; " if prefer else ""
     excluded = set(exclude)
+    shots = role == "screenshot_reviewer"
+    if shots:
+        candidates = [vendor for vendor in candidates if vendor in ("claude", "codex")]
+        if current not in candidates:
+            current = ""
     same_vendor_review = False
     review_mode = "same-vendor-different-model"
     if review:
-        shots = role == "screenshot_reviewer"
         excluded.update(review_excluded(pr_state, pr, fixed_by))
         if "codex" in excluded and "codex" in candidates:
             review_mode = codex_review_mode(pr_state, pr, session.resolve().config.models.route(
