@@ -58,7 +58,7 @@ def test_repository_auto_merge_defaults_on_and_turns_off_per_repository(tmp_path
     ('quota_cap_claude = 0.9', 'quota_cap_claude = true'),
     ('vendor_pool = ["claude", "codex"]', 'vendor_pool = ["cursor"]'),
     ('vendor_pool = ["claude", "codex"]', 'vendor_pool = ["codex", "codex"]'),
-    ('codex = { model = "codex_fast" }', 'codex = { model = "codex_fast", effort = "secret-value" }'),
+    ('effort = "medium" }', 'effort = "secret-value" }'),
     ('reviewer = ["claude", "codex"]', 'reviewer = ["unknown"]'),
     ('reviewer = ["claude", "codex"]', 'reviewer = []'),
     ('chain_max = 5', 'chain_mxa = 5'),
@@ -129,10 +129,10 @@ def test_invalid_preference_suffix_and_empty_paths(tmp_path, old, new):
 
 
 @pytest.mark.parametrize('old,new,field', [
-    ('codex = { model = "codex_fast" }', 'codex = { model = "missing" }', 'models.routes.dev.codex.model'),
-    ('codex = { model = "codex_fast" }\n', '', 'models.routes.dev.codex'),
-    ('codex = { model = "codex_fast" }', 'codex = {}', 'models.routes.dev.codex.model'),
-    ('codex = { model = "codex_fast" }', 'codex = { model = "codex_fast", typo = "" }', 'models.routes.dev.codex'),
+    ('codex = { model = "codex_fast", effort = "medium" }', 'codex = { model = "missing" }', 'models.routes.dev.codex.model'),
+    ('codex = { model = "codex_fast", effort = "medium" }\n', '', 'models.routes.dev.codex'),
+    ('codex = { model = "codex_fast", effort = "medium" }', 'codex = {}', 'models.routes.dev.codex.model'),
+    ('codex = { model = "codex_fast", effort = "medium" }', 'codex = { model = "codex_fast", effort = "medium", typo = "" }', 'models.routes.dev.codex'),
     ('cursor = { model = "cursor_auto" }', 'cursor = { model = "cursor_auto", effort = "" }', 'models.routes.dev.cursor'),
     ('fallback_models_codex = [', 'fallback_models_codex = ["missing", ', 'models.fallback_models_codex'),
     ('quota_probe_model_claude = "claude_probe"', 'quota_probe_model_claude = "missing"', 'quota.quota_probe_model_claude'),

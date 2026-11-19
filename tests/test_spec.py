@@ -562,10 +562,10 @@ def test_claude_spec_revision_verifies_main_session_models(loop, monkeypatch, ro
 
     source = session.resolve(loop.env).config.source.read_text()
     if scenario == "shared":
-        source = source.replace('[models.routes.spec_followup]\nclaude = { model = "claude_fast" }',
+        source = source.replace('[models.routes.spec_followup]\nclaude = { model = "claude_fast", effort = "low" }',
                                 '[models.routes.spec_followup]\nclaude = { model = "claude_strong" }')
     if scenario == "inherited":
-        source = source.replace('[models.routes.spec_followup]\nclaude = { model = "claude_fast" }',
+        source = source.replace('[models.routes.spec_followup]\nclaude = { model = "claude_fast", effort = "low" }',
                                 '[models.routes.spec_followup]')
     s, path = live_spec(loop, monkeypatch, source)
     env = s.env

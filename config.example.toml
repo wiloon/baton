@@ -175,48 +175,50 @@ cursor_auto = "auto"
 cursor_analyst = "grok-4.7-high"
 
 # A follow-up entry replaces its vendor's base entry. Omitted vendors inherit the base.
-# Optional effort goes to Codex or Claude. Only Claude accepts subagent_model.
+# Optional effort goes to Codex or Claude (Cursor model IDs carry their own). A first round
+# steers the rest, so it gets more effort than a follow-up that re-checks earlier points (#63).
+# Only Claude accepts subagent_model.
 
 [models.routes.dev]
-claude = { model = "claude_fast" }
-codex = { model = "codex_fast" }
+claude = { model = "claude_fast", effort = "medium" }
+codex = { model = "codex_fast", effort = "medium" }
 cursor = { model = "cursor_auto" }
 
 [models.routes.fix]
-claude = { model = "claude_fast" }
-codex = { model = "codex_fast" }
+claude = { model = "claude_fast", effort = "medium" }
+codex = { model = "codex_fast", effort = "medium" }
 cursor = { model = "cursor_auto" }
 
 [models.routes.review]
-claude = { model = "claude_strong", subagent_model = "claude_fast" }
-codex = { model = "codex_strong" }
+claude = { model = "claude_strong", subagent_model = "claude_fast", effort = "high" }
+codex = { model = "codex_strong", effort = "high" }
 cursor = { model = "cursor_auto" }
 
 [models.routes.spec_review]
-claude = { model = "claude_strong" }
-codex = { model = "codex_strong" }
+claude = { model = "claude_strong", effort = "high" }
+codex = { model = "codex_strong", effort = "high" }
 cursor = { model = "cursor_auto" }
 
 [models.routes.spec]
-claude = { model = "claude_strong" }
-codex = { model = "codex_fast" }
+claude = { model = "claude_strong", effort = "medium" }
+codex = { model = "codex_fast", effort = "medium" }
 cursor = { model = "cursor_auto" }
 
 [models.routes.scan]
-claude = { model = "claude_fast" }
-codex = { model = "" }
+claude = { model = "claude_fast", effort = "low" }
+codex = { model = "", effort = "low" }
 cursor = { model = "cursor_auto" }
 
 [models.routes.review_followup]
-claude = { model = "claude_fast", subagent_model = "claude_fast" }
-codex = { model = "codex_fast" }
+claude = { model = "claude_fast", subagent_model = "claude_fast", effort = "low" }
+codex = { model = "codex_fast", effort = "low" }
 
 [models.routes.spec_review_followup]
-claude = { model = "claude_fast" }
-codex = { model = "codex_fast" }
+claude = { model = "claude_fast", effort = "low" }
+codex = { model = "codex_fast", effort = "low" }
 
 [models.routes.spec_followup]
-claude = { model = "claude_fast" }
+claude = { model = "claude_fast", effort = "low" }
 
 [quota]
 # Vendors picked by quota headroom (claude, codex), and the ones that run besides them without

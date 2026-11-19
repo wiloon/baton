@@ -163,6 +163,14 @@ def test_claude_end_line_reports_usage_and_cost(env):
     assert "REVIEW: pass in=2 out=4 cache_read=null cache_write=null cost=0.0025" in r.summary
 
 
+def test_claude_end_line_reports_the_requested_effort(env):
+    """Claude's stream does not echo the effort, so the end line shows what the route asked for (#63)."""
+    env.plan(stream=claude_stream("Done.\nREVIEW: pass"))
+    assert env.run("claude", "review", effort="high").summary.endswith(" effort=high")
+    env.plan(stream=claude_stream("Done.\nREVIEW: pass"))
+    assert env.run("claude", "review").summary.endswith(" effort=default")
+
+
 def test_codex_runs_without_unused_features_and_is_told_not_to_reread_agents_md(env):
     env.plan(stream=CODEX_STREAM, final="Looks right.\nREVIEW: pass")
     rollout(env)
