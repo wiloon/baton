@@ -37,7 +37,8 @@ codex  = { model = "codex_fast", effort = "low" }
 - Route model and subagent fields, fallback lists, the Claude quota probe setting and per-vendor
   retrospective model fields reference aliases. Unknown alias references are a `ConfigError`.
 - Config validation requires a base vendor entry for each of `dev`, `fix`, `review`,
-  `spec_review`, `spec` and `scan` for Claude, Codex and Cursor, which dispatch supports.
+  `screenshot_review`, `spec_review`, `spec` and `scan` for Claude, Codex and Cursor.
+  The Cursor screenshot route satisfies the base schema. Screenshot review selects Claude or Codex.
   Unknown roles, vendors and route fields are errors. Each entry requires a `model` field.
   Codex alone accepts `model = ""` to request its CLI default and omit `-m`. Cursor's
   `auto` is an alias value passed to its CLI.
@@ -68,6 +69,7 @@ and dispatch where applicable. An absent follow-up entry preserves the base assi
 | `spec_review` | Spec-review round greater than one, except Codex reviewing a preceding Codex revision. |
 | `spec` | Round-one Claude revision of a Claude review. Later Claude revisions after Claude review use the base entry, as do other revisions. A retry uses the original phase. |
 | `fix` | Fixing agent review feedback from review round greater than one. Fixes from round-one review, owner feedback, CI and verification repairs use the base entry. |
+| `screenshot_review` | Always use the base entry. Validation rejects `screenshot_review_followup`. |
 | `dev`, `scan` | Always use the base entry. |
 
 Quota probes and retrospective analysts use their dedicated alias settings and have no
@@ -102,9 +104,10 @@ The config remains valid and normal cross-vendor selection applies.
 - Vendor selection and preflight use the same resolved model and phase that dispatch
   requests. Code review retains the known different-model Codex fallback and the known
   same-model fallback in a fresh session. Spec review and revision after Codex require
-  two known, different Codex models. Same-vendor fallbacks retain ADR 0002's wait for
-  short cross-vendor quota blocks. Post-run eligibility and review mode use the actual
-  model reported by the run, which may differ after a capacity fallback.
+  two known, different Codex models. Screenshot review's Codex fallback requires a known
+  model distinct from every recorded Codex writer model (ADR 0005). Same-vendor fallbacks
+  retain ADR 0002's wait for short cross-vendor quota blocks. Post-run eligibility and review
+  mode use the actual model reported by the run, which may differ after a capacity fallback.
 - Carry the actual Claude main-session model from CLI output through dispatch and the runner's
   round record so revision selection can use the preceding review's reported model. Compare
   model identities, accounting for Claude CLI shorthand and concrete IDs for the same model.
@@ -120,3 +123,5 @@ The config remains valid and normal cross-vendor selection applies.
   retrospective alias defaults to keep the shipped assignments intact.
 - Issue #62, round 2: require distinct Claude models at selection and after dispatch so
   inherited routes and CLI fallbacks cannot turn a spec revision into same-model review.
+- Issue #67, round 1: define the base-only screenshot review route and its eligibility rules
+  so selection, validation and dispatch use the screenshot model consistently.
