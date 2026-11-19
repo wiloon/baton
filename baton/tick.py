@@ -37,7 +37,7 @@ import sys
 import tempfile
 import time
 
-from . import after_merge, checkpoint, dev, fix, hooks as telemetry, merge, names, notify, pick, pr as pr_helpers, pr_contract, review, scan, spec, tmp_sweep, vendors
+from . import after_merge, checkpoint, dev, fix, hooks as telemetry, maintenance, merge, names, notify, pick, pr as pr_helpers, pr_contract, review, scan, spec, tmp_sweep, vendors
 from .common import Deferred, git
 
 AGENT_REVIEW_NOTE = ("The PR description{issue} give the problem, its cause and the fix. Check the diagnosis first: does the "
@@ -723,19 +723,24 @@ def run(ticks):
         for i, area in enumerate(first.scan_areas):
             print(i, area)
         return 0
-    first.hooks().tick(manual)
-    if config.scheduling.paused is True and not manual:
+    paused = config.scheduling.paused is True and not manual
+    admitted = maintenance.admit(
+        runner_state, runner_state / "lock", acquire=not paused,
+        on_expired=lambda: notify.append(config.paths.logs, "maintenance expired"),
+    )
+    if admitted.reason is not None:
+        notify.append(config.paths.logs, f"maintenance ({admitted.reason})")
+        return 0
+    if paused:
         notify.append(config.paths.logs, "paused")
         return 0
-    lock = open(runner_state / "lock", "w")
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    lock = admitted.lock
+    if lock is None:
         notify.append(config.paths.logs, "busy (another tick holds the lock)")
-        lock.close()
         return 0
     for t in ticks:
         t.lock_file = lock
+    first.hooks().tick(manual)
     from .initialization import expire_context
     expire_context(config, first.clock())
     (runner_state / "chain-next").unlink(missing_ok=True)

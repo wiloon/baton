@@ -171,6 +171,29 @@ python -m baton file-scan DRAFT  file a kept draft as claude-found + needs-triag
 
 With several `[[repos]]`, put `--repo OWNER/NAME` before the command.
 
+### Maintenance mode
+
+Drain the pipeline before a deploy ([ADR 0003](docs/adr/0003-maintenance-mode-is-a-local-flag.md)):
+
+```text
+python -m baton.maintenance [--config PATH] on [--wait] [--timeout DURATION] [--ttl DURATION] [--reason TEXT]
+python -m baton.maintenance [--config PATH] off
+python -m baton.maintenance [--config PATH] status
+```
+
+While the flag is on, ticks (timer, manual and chained), the nightly run and the retrospectives
+worker start no new work; they log `maintenance (REASON)` and exit 0 (retrospectives print
+`{"state":"maintenance",...}`). Work already running finishes. `on --wait` returns 0 once the runner
+lock and the retrospectives worker lock are both free, and 75 when `--timeout` passes first (the flag
+stays on) or when `off` or a newer `on` replaced the request. A DURATION is a positive integer with an
+`s`, `m` or `h` suffix, such as `90s`, `30m` or `2h`. `--timeout` and `--ttl` default to `2h`. The flag
+expires after the TTL so an abandoned deploy cannot stop the pipeline: plain `on` lasts the TTL, `on
+--wait` lasts the timeout plus the TTL, and a successful wait restarts the full TTL when the drain
+completes. A malformed flag counts as active for 2h after its modification time. The next tick removes
+an expired flag and logs `maintenance expired`. `off` always succeeds; `status` shows on or off, the
+reason and expiry, and whether the runner and retrospectives locks are held. `baton.migrate` still
+runs while the flag is on. `scheduling.paused` stays the operator's long-term pause.
+
 ### systemd units
 
 | Unit | What it does |

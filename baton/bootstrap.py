@@ -33,17 +33,16 @@ def main(argv=None):
         print('Configuration valid')
         return 0
     if args.preflight:
-        import fcntl
         import subprocess
         invocation = session.create(config, repo=config.repos[0])
+        from . import maintenance
         lock = config.paths.state / 'lock'
         if lock.exists():
-            with lock.open('r') as file:
-                try:
-                    fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    print('Pipeline is busy', file=sys.stderr)
-                    return 75
+            with maintenance.admission(config.paths.state):
+                busy = maintenance.held(lock)
+            if busy:
+                print('Pipeline is busy', file=sys.stderr)
+                return 75
         checks = {'claude': [['claude', '--version']],
                   'codex': [['codex', '--version'], ['codex', 'login', 'status']],
                   'cursor': [['cursor-agent', '--version']]}

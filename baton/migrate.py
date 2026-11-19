@@ -24,11 +24,12 @@ import shutil
 import subprocess
 import sys
 
+from . import maintenance
 from .config import ConfigError, load, repo_dirs
 
 # The machine's, not a repository's: the lock and the tick's turn, vendor cooldowns and run counts,
 # quota and credential snapshots, telemetry/retrospectives, vendor leases, and old deploy backups.
-GLOBAL_STATE = re.compile(r"lock|last-repo|chain-next|telemetry|retrospectives|vendor-leases|quota-locks|quota-probes|deploy-backups|repos|"
+GLOBAL_STATE = re.compile(r"lock|maintenance(?:\.lock)?|last-repo|chain-next|telemetry|retrospectives|vendor-leases|quota-locks|quota-probes|deploy-backups|repos|"
                           r"(?:[a-z]+-)?cooldown-until|(?:[a-z]+-)?runs-\d{4}-\d\d-\d\d|"
                           r"(?:quota|credential)-[a-z]+\.json")
 LABELLED = re.compile(r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d \[[^\]\s]+/[^\]\s]+\] ")
@@ -158,12 +159,16 @@ def main(argv=None):
         print(f"Invalid configuration: {error}", file=sys.stderr)
         return 2
     config.paths.state.mkdir(parents=True, exist_ok=True)
-    with open(config.paths.state / "lock", "w") as lock:
+    # Not maintenance.admit: migrate runs while maintenance is active, but takes its lock under admission.
+    with maintenance.admission(config.paths.state):
+        lock = open(config.paths.state / "lock", "w")
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
+            lock.close()
             print("migrate: a tick holds the lock; try again when it ends", file=sys.stderr)
             return 75
+    with lock:
         migrate(config, args.repo, args.clone)
     return 0
 

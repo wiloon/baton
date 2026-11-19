@@ -207,7 +207,10 @@ def typed_legacy_test_inputs(request, monkeypatch):
     Existing regressions express overrides as Shell-era dictionaries. Convert those
     fixtures into typed dependencies while the assertions continue testing behavior.
     """
-    if request.path.name in ('test_config.py', 'test_initialization.py', 'test_bootstrap.py', 'test_repos.py', 'test_integrations.py') or ('telemetry' in str(request.path) and request.path.name != 'test_task_hooks.py'):
+    if request.path.name in (
+        'test_config.py', 'test_initialization.py', 'test_bootstrap.py', 'test_repos.py',
+        'test_integrations.py', 'test_maintenance.py',
+    ) or ('telemetry' in str(request.path) and request.path.name != 'test_task_hooks.py'):
         return
     from dataclasses import replace, fields
     from baton import session
