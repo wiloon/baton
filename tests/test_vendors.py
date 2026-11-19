@@ -141,6 +141,72 @@ class VendorTests(unittest.TestCase):
                 self.snap("codex", 0.10)
                 self.assertEqual(self.pick("contrib", candidates=POOL)[0]["vendor"], "codex")
 
+    # --- the screenshot reviewer: Claude or Codex, with the code review's exclusions ---
+    def shots(self, **kwargs):
+        return vendors.pick(self.state, POOL, "screenshot_reviewer", POOL, "", "7", (), "contrib", now=NOW,
+                            review=True, **kwargs)
+
+    def wrote_with_codex(self, model, *others):
+        Path(self.state, "pr-7-authors").write_text("".join(f"{v}\n" for v in ("codex", *others)))
+        Path(self.state, "pr-7-author-models").write_text(f"codex {model}\n")
+
+    def test_screenshot_preference_uses_its_keys_then_the_reviewer_keys(self):
+        env = {"PREFER_REVIEWER": "claude codex", "PREFER_REVIEWER_UI": "codex claude",
+               "PREFER_SCREENSHOT_REVIEWER": "codex claude", "PREFER_SCREENSHOT_REVIEWER_OTHER": "claude codex"}
+        role = "screenshot_reviewer"
+        self.assertEqual(vendors.preference(role, "other", env), (["claude", "codex"], f"{role}/other"))
+        self.assertEqual(vendors.preference(role, "ui", env), (["codex", "claude"], role))
+        self.assertEqual(vendors.area_keys(role, env), [f"{role}_other", "reviewer_ui"])
+        omitted = {"PREFER_REVIEWER": "claude codex", "PREFER_REVIEWER_UI": "codex claude"}
+        self.assertEqual(vendors.preference(role, "ui", omitted), (["codex", "claude"], "reviewer/ui"))
+        self.assertEqual(vendors.preference(role, "api", omitted), (["claude", "codex"], "reviewer"))
+
+    def test_screenshot_preference_breaks_ties_and_never_picks_cursor(self):
+        with patch.dict(os.environ, {"PREFER_SCREENSHOT_REVIEWER": "cursor codex claude"}):
+            self.assertEqual(self.shots()[0]["vendor"], "codex")
+        with patch.dict(os.environ, {"PREFER_REVIEWER": "codex claude"}):   # omitted: the reviewer order
+            self.assertEqual(self.shots()[0]["vendor"], "codex")
+        with patch.dict(os.environ, {"PREFER_REVIEWER": "codex claude", "PREFER_SCREENSHOT_REVIEWER": "claude"}):
+            self.assertEqual(self.shots()[0]["vendor"], "claude")
+        with patch.dict(os.environ, {"PREFER_SCREENSHOT_REVIEWER": "codex claude"}):
+            Path(self.state, "pr-7-authors").write_text("codex\n")   # eligibility comes before preference
+            Path(self.state, "pr-7-author-models").write_text("codex gpt-6.1-terra\n")
+            self.assertEqual(self.shots()[0]["vendor"], "claude")
+
+    def test_codex_may_review_screenshots_of_its_code_only_with_a_distinct_known_model(self):
+        self.wrote_with_codex("gpt-6.2-astra")
+        Path(self.state, "claude-cooldown-until").write_text(str(NOW + LONG_REST))
+        result, rc = self.shots()
+        self.assertEqual((result["vendor"], rc, result["review_mode"]), ("codex", 0, "same-vendor-different-model"))
+        self.assertFalse(vendors.screenshot_allowed(self.state, "7", "codex", "gpt-6.2-astra"))
+        self.assertTrue(vendors.screenshot_allowed(self.state, "7", "codex", "gpt-6.1-terra"))
+
+    def test_screenshot_review_never_reuses_a_codex_writer_model(self):
+        for written in ("gpt-6.1-terra", "unknown"):
+            self.wrote_with_codex(written, "claude")   # claude wrote it too: nobody is independent
+            result, rc = self.shots()
+            self.assertEqual((rc, result["silent"]), (0, True))
+            self.assertFalse(vendors.screenshot_allowed(self.state, "7", "codex", "gpt-6.1-terra"))
+            self.assertFalse(vendors.screenshot_allowed(self.state, "7", "codex", ""))
+            self.assertFalse(vendors.screenshot_allowed(self.state, "7", "claude", ""))
+
+    def test_a_claude_screenshot_review_waits_when_claude_alone_may_review_and_is_resting(self):
+        self.wrote_with_codex("gpt-6.1-terra")
+        Path(self.state, "claude-cooldown-until").write_text(str(NOW + LONG_REST))
+        result, rc = self.shots()
+        self.assertEqual(rc, 75)   # eligible but unavailable: the existing deferral, not a failure
+        self.assertIn("claude", result["reason"])
+
+    def test_a_short_claude_block_defers_the_codex_fallback_for_screenshots(self):
+        self.wrote_with_codex("gpt-6.2-astra")
+        Path(self.state, "claude-cooldown-until").write_text(str(NOW + 3600))
+        result, rc = self.shots()
+        self.assertEqual(rc, 75)
+        self.assertIn("waiting for claude", result["reason"])
+
+    def test_the_last_fixer_alone_is_excluded_from_the_screenshot_review(self):
+        self.assertEqual(self.shots(fixed_by="claude")[0]["vendor"], "codex")
+
     def test_area_preference_falls_back_to_the_role(self):
         env = {"PREFER_DEV": "claude codex", "PREFER_DEV_UI": "codex claude"}
         self.assertEqual(vendors.preference("dev", "ui", env), (["codex", "claude"], "dev/ui"))

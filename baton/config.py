@@ -108,7 +108,7 @@ def repo_dirs(paths, repo):
                     logs=paths.logs / slug, ctx=paths.ctx / slug)
 
 
-ROUTE_ROLES = ("dev", "fix", "review", "spec_review", "spec", "scan")
+ROUTE_ROLES = ("dev", "fix", "review", "screenshot_review", "spec_review", "spec", "scan")
 BUILTIN_ALIASES = {
     "claude_strong": "opus",
     "codex_fast": "gpt-6.2-sol",
@@ -129,6 +129,7 @@ class ModelSettings:
     budget_dev: float
     budget_fix: float
     budget_review: float
+    budget_screenshot_review: float
     budget_spec_review: float
     budget_spec: float
     budget_scan: float
@@ -252,7 +253,7 @@ SECTIONS = {"paths": Paths, "scheduling": Scheduling, "models": ModelSettings,
 # Integrations a runner may go without (#328): no section, no integration.
 OPTIONAL = {"linear": Linear, "telegram": Telegram, "retrospectives": Retrospectives}
 VENDORS = {"claude", "codex", "cursor"}
-ROLES = {"dev", "reviewer", "fixer", "spec_reviewer", "reviser", "retrospective"}
+ROLES = {"dev", "reviewer", "fixer", "screenshot_reviewer", "spec_reviewer", "reviser", "retrospective"}
 OTHER_AREA = "other"
 ENV_NAME = re.compile(r'[A-Z_][A-Z0-9_]*')
 # Variables the runner itself builds for the tools; a repository must not replace them.
@@ -321,7 +322,7 @@ def _model_alias(value, aliases, field):
 
 
 def _model_routes(raw, aliases):
-    names = set(ROUTE_ROLES) | {f"{role}_followup" for role in ROUTE_ROLES}
+    names = set(ROUTE_ROLES) | {f"{role}_followup" for role in ROUTE_ROLES if role != "screenshot_review"}
     if not isinstance(raw, dict) or raw.keys() - names:
         raise ConfigError("models.routes: expected tables for known roles")
     routes = []
@@ -423,9 +424,10 @@ def load(path: str | Path, *, home: Path | None = None) -> Config:
         raise ConfigError("preferences: expected a table")
     for key, order in preferences.items():
         role, _, area = key.partition('_') if key not in ROLES else (key, '', '')
-        # spec_reviewer may also carry an area suffix.
-        if key.startswith('spec_reviewer_'):
-            role, area = 'spec_reviewer', key[len('spec_reviewer_'):]
+        # spec_reviewer and screenshot_reviewer may also carry an area suffix.
+        for named in ('spec_reviewer', 'screenshot_reviewer'):
+            if key.startswith(named + '_'):
+                role, area = named, key[len(named) + 1:]
         if role not in ROLES or (key not in ROLES and area not in areas):
             raise ConfigError("preferences: unknown role or area")
         if not isinstance(order, list) or not order or any(type(v) is not str or v not in VENDORS for v in order) or len(set(order)) != len(order):

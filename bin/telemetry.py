@@ -22,7 +22,7 @@ from baton import timing
 
 VENDORS = ('claude', 'cursor', 'codex')
 CREDENTIAL_STALE_SECONDS = 24 * 60 * 60
-ROLES = ('spec', 'spec_review', 'review', 'fix', 'triage', 'scan', 'dev', 'probe')
+ROLES = ('spec', 'spec_review', 'review', 'screenshot_review', 'fix', 'triage', 'scan', 'dev', 'probe')
 STATUSES = ('success', 'failure', 'timeout', 'auth', 'quota', 'busy', 'interrupted')
 
 
@@ -271,7 +271,7 @@ def gh_timeline(repo, pr):
 
 
 # Task events are deliberately bounded metadata, never agent prose.
-EVENTS = ('started', 'run_completed', 'review', 'spec_review', 'fix', 'ci', 'verify', 'ci_fix', 'handoff', 'merged', 'attempt_completed')
+EVENTS = ('started', 'run_completed', 'review', 'screenshot_review', 'spec_review', 'fix', 'ci', 'verify', 'ci_fix', 'handoff', 'merged', 'attempt_completed')
 REASONS = ('none', 'auto_merge_off', 'manual_checks', 'review_failed', 'review_limit',
            'fix_failed', 'needs_info', 'no_commit', 'push_failed', 'spec_failed',
            'spec_limit', 'spec_rejected', 'ci_not_green', 'merge_failed', 'implementation_failed',

@@ -48,6 +48,13 @@ settings_match deny "git -C $TEST_ROOT push" || fail spec-settings-git-c-push
 ! settings_match allow "git -C $TEST_ROOT push" || fail spec-settings-allow-git-c-push
 [[ $(guard_decision spec_review "{\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"$TEST_ROOT/x\",\"content\":\"a\"}}") == deny ]] || fail guard-spec-review-write
 [[ $(guard_decision spec_review '{"tool_name":"Bash","tool_input":{"command":"gh issue comment 1 --body x"}}') == deny ]] || fail guard-spec-review-comment
+# The screenshot reviewer is read-only like the code reviewer; the runner publishes its comment.
+[[ $(guard_decision screenshot_review '{"tool_name":"Bash","tool_input":{"command":"git commit -m x"}}') == deny ]] || fail guard-screenshot-review-commit
+[[ $(guard_decision screenshot_review '{"tool_name":"Bash","tool_input":{"command":"git push origin HEAD"}}') == deny ]] || fail guard-screenshot-review-push
+[[ $(guard_decision screenshot_review '{"tool_name":"Bash","tool_input":{"command":"gh pr comment 1 --body x"}}') == deny ]] || fail guard-screenshot-review-comment
+[[ $(guard_decision screenshot_review '{"tool_name":"Bash","tool_input":{"command":"gh pr edit 1 --body x"}}') == deny ]] || fail guard-screenshot-review-edit
+[[ $(guard_decision screenshot_review "{\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"$TEST_ROOT/x\",\"content\":\"a\"}}") == deny ]] || fail guard-screenshot-review-write
+[[ $(guard_decision screenshot_review '{"tool_name":"Write","tool_input":{"file_path":"/tmp/baton-screenshot-review-1-1.md","content":"a"}}') == none ]] || fail guard-screenshot-review-artifact
 # Claude runs in dontAsk mode: a compound command (`cd x; F=y; wc $F`) is denied
 # even when each part is allowed. Every prompt Claude can get must say so.
 for prompt in dev fix review scan spec spec-review; do

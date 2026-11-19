@@ -15,7 +15,7 @@ class Deferred(Exception):
         self.vendor, self.reason = vendor, reason
 
 
-READONLY_ROLES = {"review", "spec_review"}
+READONLY_ROLES = {"review", "screenshot_review", "spec_review"}
 # dev and fix may need package downloads to run tests; GitHub credentials stay invalid.
 NETWORK_ROLES = {"dev", "fix"}
 

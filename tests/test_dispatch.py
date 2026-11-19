@@ -216,7 +216,7 @@ def test_shipped_codex_scan_leaves_model_to_cli(runner, monkeypatch):
     assert "-m" not in args
 
 
-@pytest.mark.parametrize("role", ["spec_review", "spec", "review", "fix"])
+@pytest.mark.parametrize("role", ["spec_review", "spec", "review", "screenshot_review", "fix"])
 def test_short_read_mostly_claude_runs_write_five_minute_cache(runner, role):
     runner.plan(stream=claude_stream("fine\nREVIEW: pass"))
     runner.run(role=role)
@@ -310,3 +310,31 @@ def test_vendor_lease_defers_workload_without_starting_or_counting(runner):
     assert out['rc'] == 75 and out['defer'] == 'vendor capacity reserved'
     assert not list(runner.state_dir.glob('runs-*'))
     assert not (runner.root/'fake/calls').exists()
+
+
+def test_a_claude_screenshot_review_gets_its_own_route_and_budget(runner):
+    runner.plan(stream=claude_stream("fine\nREVIEW: pass"))
+    out = runner.run(role="screenshot_review", env={"BUDGET_SCREENSHOT_REVIEW": "2.5"})
+    args = json.loads((runner.root / "fake" / "args.json").read_text())
+    assert out["outcome"] == "REVIEW: pass"
+    assert args[args.index("--max-budget-usd") + 1] == "2.5"
+    assert args[args.index("--model") + 1] == "opus" and args[args.index("--effort") + 1] == "low"
+    assert args[args.index("--settings") + 1] == "/s/settings.json"
+    assert runner.child_env()["BATON_AGENT_ROLE"] == "screenshot_review"
+
+
+def test_a_codex_screenshot_review_runs_terra_in_a_read_only_sandbox(runner, monkeypatch):
+    monkeypatch.setattr(dispatch.agents, "preflight", lambda *_: "")
+    runner.plan(stream=CODEX_STREAM, last="all fine\nREVIEW: changes\n")
+    out = runner.run("codex", "screenshot_review", output=str(runner.root / "shots.md"))
+    args = json.loads((runner.root / "fake" / "args.json").read_text())
+    assert args[args.index("-m") + 1] == "gpt-6.1-terra" and args[args.index("-s") + 1] == "read-only"
+    assert 'model_reasoning_effort="low"' in args
+    assert out["outcome"] == "REVIEW: changes" and (runner.root / "shots.md").read_text().strip() == "all fine"
+
+
+def test_a_codex_screenshot_review_without_its_artifact_fails(runner, monkeypatch):
+    monkeypatch.setattr(dispatch.agents, "preflight", lambda *_: "")
+    runner.plan(stream=CODEX_STREAM, last="REVIEW: pass\n")
+    out = runner.run("codex", "screenshot_review", output=str(runner.root / "shots.md"))
+    assert out["outcome"].startswith("RESULT: failed") and "no Codex review artifact" in out["outcome"]

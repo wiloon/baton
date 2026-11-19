@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 
 FIELDS = ("pr", "wt", "note", "fixer", "reviewer", "round", "step", "fix_head", "fixed_by", "ISSUE")
+OPTIONAL = ("code_verdict", "screenshot")
 SAFE = re.compile(r"[A-Za-z0-9_@%+=:,./-]*")   # bash leaves these unquoted
 NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 # $'...' escapes that stand for one byte
@@ -154,6 +155,9 @@ def read(path):
 def write(path, values):
     """The same lines `save_review_step` wrote: FIELDS in order, empty when unset."""
     text = "".join(f"{name}={quote('' if values.get(name) is None else str(values[name]))}\n" for name in FIELDS)
+    # The screenshot-review fields are written only for a round that has them: a checkpoint of
+    # a round without screenshot review keeps its old bytes.
+    text += "".join(f"{name}={quote(str(values[name]))}\n" for name in OPTIONAL if values.get(name))
     # Replace it whole: a runner killed mid-write never leaves half a checkpoint.
     temp = Path(f"{path}.{os.getpid()}.tmp")
     temp.write_bytes(text.encode("utf-8", "surrogateescape"))
