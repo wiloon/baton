@@ -195,8 +195,8 @@ def test_reloading_one_alias_changes_review_and_fix_cli_models(loop, monkeypatch
     env = session.resolve(loop.env)
     source = Path(loop.env["CTX"], "shared-route.toml")
     baseline = env.config.source.read_text().replace(
-        'claude = { model = "claude_strong", subagent_model = "claude_fast" }',
-        'claude = { model = "claude_fast", subagent_model = "claude_fast" }')
+        'claude = { model = "claude_strong", subagent_model = "claude_fast", effort = "high" }',
+        'claude = { model = "claude_fast", subagent_model = "claude_fast", effort = "high" }')
     calls = []
 
     def cli(args, log, minutes, child, **kwargs):
@@ -508,10 +508,10 @@ def test_review_round_routes_reach_cli(loop, monkeypatch, vendor, models):
     config = source.read_text().replace(
         'claude_strong = "opus"', 'claude_strong = "opus"\ncursor_later = "cursor-round-two"')
     config = config.replace(
-        'claude = { model = "claude_strong", subagent_model = "claude_fast" }',
+        'claude = { model = "claude_strong", subagent_model = "claude_fast", effort = "high" }',
         'claude = { model = "claude_strong", subagent_model = "claude_fast", effort = "high" }', 1)
     config = config.replace(
-        'claude = { model = "claude_fast", subagent_model = "claude_fast" }\ncodex = { model = "codex_fast" }',
+        'claude = { model = "claude_fast", subagent_model = "claude_fast", effort = "low" }\ncodex = { model = "codex_fast", effort = "low" }',
         'codex = { model = "codex_fast", effort = "low" }'
         + ('\ncursor = { model = "cursor_later" }' if vendor == "cursor" else ""))
     path = Path(loop.env["CTX"], "routes.toml")
@@ -541,7 +541,7 @@ def test_review_round_routes_reach_cli(loop, monkeypatch, vendor, models):
     flag = "-m" if vendor == "codex" else "--model"
     assert [args[args.index(flag) + 1] for args, _ in calls] == list(models)
     if vendor == "codex":
-        assert not any(arg.startswith("model_reasoning_effort=") for arg in calls[0][0])
+        assert 'model_reasoning_effort="high"' in calls[0][0]
         assert 'model_reasoning_effort="low"' in calls[1][0]
     if vendor == "claude":
         for args, child in calls:

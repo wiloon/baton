@@ -77,4 +77,4 @@ def run(req):
         outcome = f"RESULT: failed budget ${req.budget} exceeded (log {req.log})"
     used = usage(result)
     return Run(rc, outcome or f"RESULT: failed rc={rc} (log {req.log})", final, used,
-               f"{outcome or 'no result line'} {used}", model=main_model(text))
+               f"{outcome or 'no result line'} {used} effort={req.effort or 'default'}", model=main_model(text))
