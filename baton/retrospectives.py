@@ -4,7 +4,7 @@ python -m baton.retrospectives --config config.toml catch-up
 python -m baton.retrospectives --config config.toml episode PIPELINE_ID [--repo OWNER/NAME]
 """
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict
 import datetime as dt
 import fcntl
@@ -17,7 +17,7 @@ import tempfile
 import time
 import uuid
 
-from . import analyst_pool, vendor_policy, quota
+from . import analyst_pool, maintenance, vendor_policy, quota
 from .config import ConfigError, load
 from .retrospective_analyst import ANALYZER_VERSION, analyze, prompt_for
 from .retrospective_evidence import (EvidenceError, Ledger, VERSION, VOLATILE_POSTMERGE, digest, encoded, eligible,
@@ -188,9 +188,9 @@ def pinned(report, previous):
     report['evidence']['postmerge'] = fresh
 
 
-def run(config, state, root, output, repo='', pipeline='', retry=False):
+def run(config, state, root, output, repo='', pipeline='', retry=False, held=False):
     now = time.time()
-    with worker_lock(root) as acquired:
+    with (nullcontext(True) if held else worker_lock(root)) as acquired:
         if not acquired:
             return [dict(state='busy', reason='retrospective_worker_running')]
         attempts = journal(root)
@@ -338,8 +338,21 @@ def main(argv=None):
         if root == state or root in state.parents or root == telemetry or root.is_relative_to(telemetry) or (
                 output == state or output in state.parents or output == telemetry or output.is_relative_to(telemetry)):
             raise ConfigError('retrospective paths must not overwrite source state/telemetry')
-        results = run(config, state, root, output, args.repo,
-                      str(args.pipeline_id) if args.command == 'episode' else '', getattr(args, 'retry', False))
+        episode = str(args.pipeline_id) if args.command == 'episode' else ''
+        retry = getattr(args, 'retry', False)
+        if state == config.paths.state.resolve():
+            # The configured source drains through the default worker lock, also for a --work-state override.
+            default = state / 'retrospectives'
+            admitted = maintenance.admit(state, default / 'worker.lock')
+            if admitted.reason is not None:
+                results = [dict(state='maintenance', reason=admitted.reason)]
+            elif admitted.lock is None:
+                results = [dict(state='busy', reason='retrospective_worker_running')]
+            else:
+                with admitted.lock:
+                    results = run(config, state, root, output, args.repo, episode, retry, held=root == default.resolve())
+        else:
+            results = run(config, state, root, output, args.repo, episode, retry)
     except (ConfigError, EvidenceError) as error:
         print(f'Retrospective failed: {error}', file=sys.stderr)
         return 2
