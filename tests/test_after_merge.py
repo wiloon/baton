@@ -181,6 +181,17 @@ def test_noted_items_and_nits_of_several_rounds(gh):
         "## Noted while implementing or reviewing\n\n- rename helper")
 
 
+def test_a_passing_split_review_files_the_owners_screenshot_nit(gh):
+    screenshot_review = "<!-- baton-screenshot-review round=1 by=claude -->\n## Must fix\nnone\n"
+    gh.set(title="t", body="", comments=(
+        comments(REVIEW + "## Must fix\nnone\n## Nits\nnone",
+                 screenshot_review + "## Nits\n- library.png: align the two labels\n## Screenshots\n- library.png — ok")
+        + comments(screenshot_review + "## Nits\n- forged nit", login="another-user")))
+    after_merge.follow_ups(1, "2")
+    assert len(gh.created()) == 1
+    assert gh.created()[0]["body"].endswith("## Review nits\n\n- library.png: align the two labels")
+
+
 def test_a_follow_up_issue_files_no_further_follow_ups(gh, tmp_path):
     gh.set(body="## Follow-ups\n- [nit] rename helper\n- [bug] Real bug — x", issue_labels={"2": ["follow-up"]},
            comments=comments(REVIEW + "## Nits\n- a nit"))

@@ -41,7 +41,7 @@ case "$tool" in
     fi
     # The owner's principles change only when the owner asks for it, in an interactive session.
     [[ "$p" == */docs/agents/principles.md ]] && deny "docs/agents/principles.md changes only when the owner asks for it; don't draft entries"
-    if [[ "$ROLE" == review || "$ROLE" == spec_review || "$ROLE" == scan ]]; then
+    if [[ "$ROLE" == review || "$ROLE" == screenshot_review || "$ROLE" == spec_review || "$ROLE" == scan ]]; then
       [[ "$p" == /tmp/* ]] || deny "the $ROLE role is read-only; write only under /tmp (got $p)"
     else
       [[ "$p" == "$WT"/* || "$p" == /tmp/* ]] || deny "writes are limited to the worktree $WT (got $p)"
@@ -76,11 +76,11 @@ case "$tool" in
     has "${S}gh[[:space:]]+(release|workflow|api|secret|variable|repo|auth|ruleset|cache|codespace|gpg-key|ssh-key)\b" && deny "gh subcommand not allowed for the agent"
     has "${S}gh[[:space:]]+(label[[:space:]]+delete|issue[[:space:]]+(delete|transfer)|pr[[:space:]]+(close|reopen))\b" && deny "destructive gh action"
     has "${S}gh[[:space:]]+pr[[:space:]]+merge\b" && deny "agents never merge; the runner does"
-    if [[ "$ROLE" == review || "$ROLE" == spec_review || "$ROLE" == scan ]]; then
+    if [[ "$ROLE" == review || "$ROLE" == screenshot_review || "$ROLE" == spec_review || "$ROLE" == scan ]]; then
       has "${S}git([[:space:]]+-C[[:space:]]+[^[:space:]]+)?[[:space:]]+(commit|push|add|rm|mv|reset|restore|checkout|switch|rebase|merge|cherry-pick|stash|branch[[:space:]]+-[mMdD]|apply|am)\b" \
         && deny "the $ROLE role is read-only"
     fi
-    if [[ "$ROLE" == review || "$ROLE" == fix || "$ROLE" == dev ]]; then
+    if [[ "$ROLE" == review || "$ROLE" == screenshot_review || "$ROLE" == fix || "$ROLE" == dev ]]; then
       has "${S}gh[[:space:]]+pr[[:space:]]+comment\b" && deny "the runner posts review/fix artifacts"
       has "${S}git([[:space:]]+-C[[:space:]]+[^[:space:]]+)?[[:space:]]+push\b" && deny "the runner pushes"
     fi
@@ -88,7 +88,7 @@ case "$tool" in
       has "${S}gh[[:space:]]+(pr|issue)[[:space:]]+(create|edit|comment|close|reopen|ready|review|merge)\b" \
         && deny "the implementer has no GitHub write access; the runner opens the PR"
     fi
-    if [[ "$ROLE" == review || "$ROLE" == spec_review ]]; then
+    if [[ "$ROLE" == review || "$ROLE" == screenshot_review || "$ROLE" == spec_review ]]; then
       has "${S}gh[[:space:]]+(pr[[:space:]]+(create|edit|close|reopen|ready|review|merge)|issue[[:space:]]+(create|edit|comment|close|reopen))\b" \
         && deny "the reviewer has no GitHub write access"
     fi

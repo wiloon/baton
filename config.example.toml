@@ -115,8 +115,10 @@ signoff = false
 # "Manual checks to try" issue (ready-for-human) for a later trial of the whole app. Only PRs
 # merged after defer is first seen on are collected; turning it off and on again restarts that.
 manual_checks = "gate"
-# true: the pool reviewer also looks at the manual-check screenshots (Must fix for anything a
-# user would see as broken, or for missing screenshots), and every fixer re-shoots them.
+# true: after a successful pool code review of an agent PR with manual checks, a separate
+# screenshot review run (models.routes.screenshot_review, preferences.screenshot_reviewer) looks
+# at the manual-check screenshots: Must fix for anything a user would see as broken, or for
+# missing screenshots. Every fixer re-shoots them. Owner PRs and Cursor reviews skip it.
 screenshot_review = false
 # false: every PR of this repository waits for the owner (ready-for-human), even when
 # [scheduling].auto_merge is true. Use it for a repository whose changes you merge yourself.
@@ -144,6 +146,7 @@ api = "api"
 budget_dev = 10
 budget_fix = 5
 budget_review = 4
+budget_screenshot_review = 4
 budget_spec_review = 3
 budget_spec = 3
 budget_scan = 3
@@ -171,6 +174,7 @@ claude_probe = "haiku"
 codex_fast = "gpt-6.2-sol"
 codex_strong = "gpt-6.2-astra"
 codex_prev = "gpt-6.1-sol"
+codex_terra = "gpt-6.1-terra"
 cursor_auto = "auto"
 cursor_analyst = "grok-4.7-high"
 
@@ -192,6 +196,11 @@ cursor = { model = "cursor_auto" }
 [models.routes.review]
 claude = { model = "claude_strong", subagent_model = "claude_fast", effort = "high" }
 codex = { model = "codex_strong", effort = "high" }
+cursor = { model = "cursor_auto" }
+
+[models.routes.screenshot_review]
+claude = { model = "claude_strong", effort = "low" }
+codex = { model = "codex_terra", effort = "low" }
 cursor = { model = "cursor_auto" }
 
 [models.routes.spec_review]
@@ -248,8 +257,9 @@ same_vendor_wait_max_minutes = 360
 [preferences]
 # Vendor order by role, used only to break ties between vendors that may run (cooldowns, quota
 # caps and "the reviewer is not the author" filter first). Roles: dev, reviewer, fixer,
-# spec_reviewer, reviser; ROLE_AREA (dev_ui) for one of the repos.areas. Vendors not listed
-# can still be picked. An empty table keeps the plain quota order.
+# screenshot_reviewer (claude or codex only; omitted: the reviewer order), spec_reviewer, reviser;
+# ROLE_AREA (dev_ui) for one of the repos.areas. Vendors not listed can still be picked. An empty
+# table keeps the plain quota order.
 dev = ["cursor", "codex", "claude"]
 reviewer = ["claude", "codex"]
 

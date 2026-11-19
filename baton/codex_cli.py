@@ -13,6 +13,7 @@ from .common import Run, changed, child_env, events, git, read, restore, run_cli
 # The terminal verdict each role may end with (its final message's last line).
 VERDICTS = {
     "review": ("REVIEW: pass", "REVIEW: changes"),
+    "screenshot_review": ("REVIEW: pass", "REVIEW: changes"),
     "spec": ("SPEC: revised", "SPEC: human"),
     "fix": ("RESULT: fixed", "RESULT: needs-info"),
     "spec_review": ("SPEC: accept", "SPEC: changes", "SPEC: reject"),
@@ -168,8 +169,9 @@ def run(req):
     if not req.readonly and git(cwd, "status", "--porcelain"):
         outcome = f"RESULT: failed Codex left uncommitted changes in {cwd}"
     if not failed():
-        need = {"fix": "", "spec": ".comment", "review": ""}.get(req.role)
-        what = {"fix": "no Codex fix artifact", "spec": "no Codex spec reply artifact", "review": "no Codex review artifact"}
+        need = {"fix": "", "spec": ".comment", "review": "", "screenshot_review": ""}.get(req.role)
+        what = {"fix": "no Codex fix artifact", "spec": "no Codex spec reply artifact", "review": "no Codex review artifact",
+                "screenshot_review": "no Codex review artifact"}
         if need is not None and not _nonempty(f"{output}{need}"):
             outcome = f"RESULT: failed {what[req.role]}"
     text = read(req.log)

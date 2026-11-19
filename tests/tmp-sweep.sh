@@ -18,12 +18,15 @@ cd "$BATON_TMP_ROOT"
 mkdir app-45-lint-cache app-dev-45-shots app-450-lint-cache app-4-api.d baton-45-lint-cache
 touch app-45-integration.db app-pr45-unit.log app-dev-45.pr.md app-review-45-1.md \
   app-fix-45.md app-spec-45-2.body app-review-450-1.md app-pr4-unit.log other-45-x \
-  baton-dev-45.pr.md baton-review-45-1.md baton-fix-45.md baton-spec-45-2.body baton-review-450-1.md
+  baton-dev-45.pr.md baton-review-45-1.md baton-fix-45.md baton-spec-45-2.body baton-review-450-1.md \
+  baton-screenshot-review-45-1.md baton-screenshot-review-450-1.md
 "$BIN/tmp-sweep.sh" 45 not-a-number
 for f in app-45-lint-cache app-dev-45-shots app-45-integration.db app-pr45-unit.log \
   app-dev-45.pr.md app-review-45-1.md app-fix-45.md app-spec-45-2.body \
-  baton-45-lint-cache baton-dev-45.pr.md baton-review-45-1.md baton-fix-45.md baton-spec-45-2.body; do gone "$f"; done
-for f in app-450-lint-cache app-4-api.d app-review-450-1.md app-pr4-unit.log other-45-x baton-review-450-1.md; do kept "$f"; done
+  baton-45-lint-cache baton-dev-45.pr.md baton-review-45-1.md baton-fix-45.md baton-spec-45-2.body \
+  baton-screenshot-review-45-1.md; do gone "$f"; done
+for f in app-450-lint-cache app-4-api.d app-review-450-1.md app-pr4-unit.log other-45-x baton-review-450-1.md \
+  baton-screenshot-review-450-1.md; do kept "$f"; done
 rm -rf "${BATON_TMP_ROOT:?}"/* "$BATON_TMP_ROOT"/.[!.]* 2>/dev/null || true
 
 # --- stale sweep -----------------------------------------------------------------

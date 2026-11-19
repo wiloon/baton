@@ -22,7 +22,7 @@ from baton import maintenance, timing
 
 VENDORS = ('claude', 'cursor', 'codex')
 CREDENTIAL_STALE_SECONDS = 24 * 60 * 60
-ROLES = ('spec', 'spec_review', 'review', 'fix', 'triage', 'scan', 'dev', 'probe')
+ROLES = ('spec', 'spec_review', 'review', 'screenshot_review', 'fix', 'triage', 'scan', 'dev', 'probe')
 STATUSES = ('success', 'failure', 'timeout', 'auth', 'quota', 'busy', 'interrupted')
 
 
@@ -271,7 +271,7 @@ def gh_timeline(repo, pr):
 
 
 # Task events are deliberately bounded metadata, never agent prose.
-EVENTS = ('started', 'run_completed', 'review', 'spec_review', 'fix', 'ci', 'verify', 'ci_fix', 'handoff', 'merged', 'attempt_completed')
+EVENTS = ('started', 'run_completed', 'review', 'screenshot_review', 'spec_review', 'fix', 'ci', 'verify', 'ci_fix', 'handoff', 'merged', 'attempt_completed')
 REASONS = ('none', 'auto_merge_off', 'manual_checks', 'review_failed', 'review_limit',
            'fix_failed', 'needs_info', 'no_commit', 'push_failed', 'spec_failed',
            'spec_limit', 'spec_rejected', 'ci_not_green', 'merge_failed', 'implementation_failed',
@@ -525,7 +525,9 @@ class Ledger:
             raise ValueError('invalid bounded run metadata')
         now = time.time()
         run_id = str(uuid.uuid4())
-        stage = ('spec-review' if vendor == 'cursor' else 'spec-reply') if role == 'spec' else ('implement' if role == 'dev' else role)
+        stage = {'dev': 'implement', 'screenshot_review': 'review'}.get(role, role)
+        if role == 'spec':
+            stage = 'spec-review' if vendor == 'cursor' else 'spec-reply'
         record = dict(run_id=run_id, agent=vendor, role=role, stage=stage, repo=repo, status='running',
                       trace_id=uuid.uuid4().hex, span_id=uuid.uuid4().hex[:16],
                       started=now, heartbeat=now, deadline=now + minutes * 60 + 60,

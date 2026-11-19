@@ -20,7 +20,7 @@ import time
 import uuid
 
 SHA = re.compile(r"[a-f0-9]{40,64}")
-OTEL_STAGE = {"spec": "spec-reply", "spec_review": "spec-review", "review": "review", "fix": "fix"}
+OTEL_STAGE = {"spec": "spec-reply", "spec_review": "spec-review", "review": "review", "screenshot_review": "review", "fix": "fix"}
 
 
 @dataclass
@@ -133,7 +133,7 @@ class Telemetry:
         options = ["--verdict", verdict, "--agent", vendor, "--round", round, "--head-sha", head]
         if last := self._item().get("last_run_id"):
             options += ["--run-id", last]
-        if kind == "review":   # a count only (#227): the review text never leaves this function
+        if kind in ("review", "screenshot_review"):   # a count only (#227): the review text never leaves this function
             text = Path(review_file).read_text() if review_file and Path(review_file).is_file() \
                 and Path(review_file).stat().st_size else reply
             must = (self._call("must-fix", input=text) or "").strip()

@@ -41,7 +41,7 @@ sweep_task() {
     names=()
     for p in "${PREFIXES[@]}"; do
       names+=(-o -name "$p-$n-*" -o -name "$p-pr$n-*" -o -name "$p-dev-$n.*" -o -name "$p-dev-$n-*"
-              -o -name "$p-review-$n-*" -o -name "$p-fix-$n.md*" -o -name "$p-spec-$n-*")
+              -o -name "$p-review-$n-*" -o -name "$p-screenshot-review-$n-*" -o -name "$p-fix-$n.md*" -o -name "$p-spec-$n-*")
     done
     find "$TMP_ROOT" -mindepth 1 -maxdepth 1 -user "$me" \( "${names[@]:1}" \) \
       -exec rm -rf -- {} + 2>/dev/null

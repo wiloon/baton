@@ -28,7 +28,7 @@ from .common import Request
 # against 1.25x for five minutes. These roles finish in minutes with no long wait between model calls
 # (all 11 Claude fix runs up to 2026-11-01 idled 22 s or less). dev runs long test suites between
 # calls, and a five-minute cache would expire and be written again.
-FIVE_MINUTE_CACHE_ROLES = ("spec_review", "spec", "review", "fix")
+FIVE_MINUTE_CACHE_ROLES = ("spec_review", "spec", "review", "screenshot_review", "fix")
 
 
 @session.scoped

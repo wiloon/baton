@@ -98,6 +98,47 @@ def test_preferences_support_roles_and_areas(tmp_path):
     assert ('spec_reviewer_ui', ('codex', 'claude')) in c.preferences
 
 
+def test_the_shipped_config_routes_the_screenshot_review_for_all_three_vendors():
+    c = config.load(ROOT / 'config.example.toml', home=Path('/nonexistent'))
+    routes = {vendor: c.models.route('screenshot_review', vendor) for vendor in ('claude', 'codex', 'cursor')}
+    assert routes['codex'] == config.ModelRoute('gpt-6.1-terra', 'low')
+    assert routes['claude'] == config.ModelRoute('opus', 'low')
+    assert routes['cursor'] == config.ModelRoute('auto')
+    assert c.models.budget_screenshot_review == c.models.budget_review
+    # The base route serves every round: a follow-up table is rejected, so none can replace it.
+    assert c.models.route('screenshot_review', 'codex', followup=True) == routes['codex']
+
+
+def test_a_missing_screenshot_review_base_entry_is_rejected(tmp_path):
+    text = TEXT.replace('codex = { model = "codex_terra", effort = "low" }\n', '')
+    with pytest.raises(config.ConfigError, match='models.routes.screenshot_review.codex'):
+        config.load(write(tmp_path, text))
+
+
+def test_a_screenshot_review_follow_up_table_is_rejected(tmp_path):
+    text = TEXT + '\n[models.routes.screenshot_review_followup]\ncodex = { model = "codex_fast" }\n'
+    with pytest.raises(config.ConfigError, match='models.routes'):
+        config.load(write(tmp_path, text))
+
+
+def test_the_screenshot_review_budget_is_required(tmp_path):
+    with pytest.raises(config.ConfigError):
+        config.load(write(tmp_path, TEXT.replace('budget_screenshot_review = 4\n', '')))
+
+
+def test_screenshot_reviewer_preferences_take_the_role_and_area_keys(tmp_path):
+    c = config.load(write(tmp_path, TEXT.replace('reviewer = ["claude", "codex"]',
+                          'screenshot_reviewer = ["codex", "claude"]\nscreenshot_reviewer_ui = ["claude", "codex"]')))
+    assert ('screenshot_reviewer', ('codex', 'claude')) in c.preferences
+    assert ('screenshot_reviewer_ui', ('claude', 'codex')) in c.preferences
+
+
+def test_an_unknown_screenshot_reviewer_area_is_rejected(tmp_path):
+    with pytest.raises(config.ConfigError, match='preferences'):
+        config.load(write(tmp_path, TEXT.replace('reviewer = ["claude", "codex"]',
+                                                 'screenshot_reviewer_nowhere = ["claude"]')))
+
+
 def test_load_never_calls_initialization_or_subprocess(tmp_path, monkeypatch):
     def forbidden(*args, **kwargs):
         pytest.fail('configuration loading invoked an initialization side effect')

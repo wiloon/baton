@@ -173,15 +173,20 @@ def area_names(env=None):
 @session.scoped
 def area_keys(role, env=None):
     preferences = dict(session.resolve(env).config.preferences)
-    return [f'{role}_{area}' for area in area_names(env) if preferences.get(f'{role}_{area}')]
+    roles = (role, *PREFERENCE_FALLBACK.get(role, ()))
+    return [f'{r}_{area}' for r in roles for area in area_names(env) if preferences.get(f'{r}_{area}')]
+
+
+PREFERENCE_FALLBACK = {"screenshot_reviewer": ("reviewer",)}   # an omitted order is the code reviewer's
 
 
 @session.scoped
 def preference(role, area="", env=None):
     preferences = dict(session.resolve(env).config.preferences)
-    for key, label in ((f'{role}_{area}', f'{role}/{area}'), (role, role)):
-        if preferences.get(key):
-            return list(preferences[key]), label
+    for name in (role, *PREFERENCE_FALLBACK.get(role, ())):
+        for key, label in ((f'{name}_{area}', f'{name}/{area}'), (name, name)):
+            if preferences.get(key):
+                return list(preferences[key]), label
     return [], ''
 
 
@@ -248,6 +253,14 @@ def review_allowed(state, pr, vendor, model="", fixed_by=""):
     if vendor not in review_excluded(state, pr, fixed_by):
         return True
     return vendor == "codex" and bool(codex_review_mode(state, pr, model))
+
+
+def screenshot_allowed(state, pr, vendor, model="", fixed_by=""):
+    """The screenshot review may run on VENDOR: it did not write the PR, or it is Codex on a model
+    other than the one that wrote it (a same-model fresh session does not count)."""
+    if vendor not in review_excluded(state, pr, fixed_by):
+        return True
+    return vendor == "codex" and codex_review_mode(state, pr, model) == "same-vendor-different-model"
 
 
 def _quota_horizon(state, vendor, now):
@@ -318,14 +331,20 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
     prefer, prefer_label = preference(role, area)
     preferred = f"preferred for {prefer_label}: {' '.join(prefer)}; " if prefer else ""
     excluded = set(exclude)
+    shots = role == "screenshot_reviewer"
+    if shots:
+        candidates = [vendor for vendor in candidates if vendor in ("claude", "codex")]
+        if current not in candidates:
+            current = ""
     same_vendor_review = False
     review_mode = "same-vendor-different-model"
     if review:
         excluded.update(review_excluded(pr_state, pr, fixed_by))
         if "codex" in excluded and "codex" in candidates:
-            review_mode = codex_review_mode(pr_state, pr, session.resolve().config.models.route("review", "codex").model)
-            same_vendor_review = bool(review_mode)
-        if all(v in excluded for v in all_vendors(pool)) and not same_vendor_review:
+            review_mode = codex_review_mode(pr_state, pr, session.resolve().config.models.route(
+                "screenshot_review" if shots else "review", "codex").model)
+            same_vendor_review = review_mode == "same-vendor-different-model" if shots else bool(review_mode)
+        if all(v in excluded for v in (candidates if shots else all_vendors(pool))) and not same_vendor_review:
             chosen = current if current in all_vendors(pool) else pool[0]
             return {"vendor": chosen, "reason": "", "probe": [], "blocked": {},
                     "silent": True}, 0

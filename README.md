@@ -27,7 +27,7 @@ issue labelled ready-for-agent
   merge         [scheduling].auto_merge and the repository's [[repos]] auto_merge both true,
                 CI green, "## Manual checks" none -> merge; else ready-for-human
                 (manual_checks = "defer": the checks go to a "Manual checks to try" issue instead)
-                (screenshot_review = true: the reviewer also checks the manual-check screenshots)
+                (screenshot_review = true: a second, separate run checks the manual-check screenshots after the code review)
 ```
 
 **One step per tick.** A tick takes the configured repositories in turn. In each one it does the
@@ -217,8 +217,13 @@ choose whether `[scheduling].auto_merge` should be enabled. The optional
 
 Define model identifiers in `[models.aliases]` and reference those aliases in
 `[models.routes.<role>]` for each vendor. An optional `<role>_followup` entry replaces the
-vendor's whole base entry. If the vendor is omitted, its base entry carries over. Codex
-accepts `model = ""` for its CLI default. Cursor's shipped routes use the alias for `auto`.
+vendor's whole base entry. If the vendor is omitted, its base entry carries over.
+Screenshot review is base-only. Every round uses `[models.routes.screenshot_review]`.
+Set `[preferences].screenshot_reviewer` to order Claude and Codex for that run. The picker
+checks `screenshot_reviewer_<area>`, `screenshot_reviewer`, `reviewer_<area>`, and
+`reviewer` in that order.
+
+Codex accepts `model = ""` for its CLI default. Cursor's shipped routes use the alias for `auto`.
 Fallback lists, the Claude quota probe and retrospective model settings also use aliases.
 Migrate legacy flat model keys before validating a host config. Run records distinguish
 the requested model from the actual model when the CLI reports it.
