@@ -161,8 +161,19 @@ class Spec:
         return pr_helpers.gh(*args, "-R", self.repo)
 
     def pick(self, role, candidates, last_vendor, other_model, *, spec_followup=False):
-        return pick.choose(self.env, role, "agent" if role == "spec_reviewer" else "pool", "contrib", candidates,
-                           exclude=last_vendor, issue=self.issue, other_model=other_model, spec_followup=spec_followup)
+        vendor = pick.choose(self.env, role, "agent" if role == "spec_reviewer" else "pool", "contrib", candidates,
+                             exclude=last_vendor, issue=self.issue, other_model=other_model,
+                             spec_followup=spec_followup)
+        self.started()
+        return vendor
+
+    announce = ""
+
+    def started(self):
+        """The loop's notice, once per run and only after a vendor was picked (Deferred raises first)."""
+        if self.announce:
+            notify.notify(self.announce, self.url)
+            self.announce = ""
 
     # --- a revision starts from what the last one changed ---
     def mark_base(self, round):
@@ -473,7 +484,9 @@ class Spec:
             notify.log(f"spec worktree for #{n} failed")
             return False
         self.gh("issue", "edit", n, "--remove-label", "ready-for-human", "--add-label", "agent-wip")
-        notify.notify(f"#{n}: spec review (round {round}, {'revision' if step == 'revise' else step})", self.url)
+        # Sent by started() once a vendor is picked: a deferred tick (no vendor can run now) repeats every
+        # timer interval, and announcing each one floods the owner with notices of work that never ran.
+        self.announce = f"#{n}: spec review (round {round}, {'revision' if step == 'revise' else step})"
         while True:
             self.hooks.round = round
             self.path("spec-paused").write_text(f"{n}\n")
