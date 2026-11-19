@@ -364,7 +364,8 @@ def deferred_checks(pr, issue):
     """With manual_checks = "defer" the PR merged without the owner's look, so its
     `## Manual checks` go to one open tracking issue for a later trial of the whole app:
     a new issue, or a comment on the open one. Once per PR (#48), and only for PRs merged
-    after defer took effect (#52)."""
+    after defer took effect (#52). Checks the screenshot review verified are left out (#92):
+    the merge step wrote the rest to `deferred-checks-items-pr-N`."""
     env = session.resolve()
     since = defer_since(env)
     if since is None:
@@ -377,6 +378,9 @@ def deferred_checks(pr, issue):
         log(f"PR #{pr}: reading its manual checks failed; retried after the next merge step")
         return
     checks = md.section("Manual checks", body)
+    left = Path(str(env.dirs.state), f"deferred-checks-items-pr-{pr}")
+    if checks and left.exists():   # the screenshot review verified the rest (#92)
+        checks = left.read_text()
     if not checks:
         done.touch()
         return

@@ -5,7 +5,7 @@ calls the bash helpers made, and keeps their exit codes. Commands that change th
 print JSON: `changed`, and `log` for a runner.log line that bash writes.
 """
 
-from . import session
+from . import check_verdicts, md, session
 import argparse
 import json
 import os
@@ -289,12 +289,18 @@ def checks_none(text):
     return sections == 1 and len(answer) == 1 and bool(re.fullmatch(r"none\.?", answer[0].lower()))
 
 
-def gate(pr, defer=False):
+def gate(pr, defer=False, cleared=None):
     """After green CI: merge, hand off for a manual check, or queue a metadata review
     when the live description would close the wrong issue (preflight). DEFER: the
-    repository's manual checks wait for a later trial instead of the merge (#48)."""
+    repository's manual checks wait for a later trial instead of the merge (#48).
+    CLEARED: the manual checks the screenshot review verified, all of them (#92); they
+    clear the gate only while the live description still lists exactly those checks."""
     current = body(pr)
-    if current is None or not (defer or checks_none(current)):
+    if current is None:
+        return {"action": "manual_checks"}
+    verified = cleared is not None and check_verdicts.items(md.section("Manual checks", current)) == \
+        check_verdicts.items(cleared)
+    if not (defer or verified or checks_none(current)):
         return {"action": "manual_checks"}
     try:
         preflight(pr)

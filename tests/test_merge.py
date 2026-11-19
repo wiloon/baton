@@ -43,8 +43,11 @@ def run(gh, worktree, tmp_path, monkeypatch):
             state.events.append(" ".join(args[:2]) + (" agent-wip" if "agent-wip" in args else ""))
         return real_gh(*args, **kw)
     monkeypatch.setattr(pr_helpers, "gh", traced_gh)
-    monkeypatch.setattr(merge.notify, "notify", lambda title, text="": (state.events.append(f"notify {title}"), real_notify(title, text)))
-    monkeypatch.setattr(merge.notify, "send_shots", lambda pr: state.shots.append(pr))
+    state.texts = {}
+    monkeypatch.setattr(merge.notify, "notify", lambda title, text="": (state.events.append(f"notify {title}"),
+                                                                       state.texts.__setitem__(title, text), real_notify(title, text)))
+    state.shot_notes = []
+    monkeypatch.setattr(merge.notify, "send_shots", lambda pr, note="": (state.shots.append(pr), state.shot_notes.append(note)))
     monkeypatch.setattr(merge.Merger, "ci_green", lambda self, minutes: (state.events.append("ci"), state.greens.pop(0) if len(state.greens) > 1 else state.greens[0])[1])
     monkeypatch.setattr(merge.Merger, "ci_fix_round", lambda self, wt: (state.events.append("repair"), state.repair)[1])
     monkeypatch.setattr(merge.Merger, "after_merge", lambda self: state.events.append("after_merge"))
@@ -56,7 +59,8 @@ def run(gh, worktree, tmp_path, monkeypatch):
     def merger(**overrides):
         return merge.Merger({**env, **overrides}, merge.telemetry.from_env(env, issue=297, pr=PR), PR, "297")
     state.merger = merger
-    state.go = lambda wt=None, **overrides: merger(**overrides).merge_or_handoff(wt or str(worktree.wt))
+    state.go = lambda wt=None, screenshot=None, **overrides: merger(**overrides).merge_or_handoff(
+        wt or str(worktree.wt), screenshot)
     return state
 
 
@@ -104,6 +108,55 @@ def test_manual_checks_go_to_the_owner_with_screenshots(run):
     run.go()
     assert run.labelled("ready-for-human") and not run.merged() and run.shots == [PR]
     assert "notify PR #335 needs a manual check" in run.events
+
+
+# --- the screenshot review's verdicts (#92) --------------------------------------------------
+
+TWO = "- The library at 390 px.\n- Sign up and land back on Welcome."
+
+
+def verdicts(*lines):
+    return "<!-- baton-screenshot-review round=1 by=codex -->\n## Must fix\nnone\n\n## Checks\n" + "\n".join(lines)
+
+
+def test_checks_all_verified_by_the_screenshot_review_merge_and_the_shots_still_reach_the_owner(run):
+    run.gh.set(body=CLEAN.replace("none", TWO))
+    run.go(screenshot={"checks": TWO, "comment": verdicts("1. verified", "2. verified")})
+    assert run.merged() and not run.labelled("ready-for-human")
+    assert run.shots == [PR] and "screenshot review" in run.shot_notes[0]
+    assert "notify PR #335 merged" in run.events
+
+
+def test_only_the_checks_left_for_the_owner_are_handed_over(run):
+    run.gh.set(body=CLEAN.replace("none", TWO))
+    run.go(screenshot={"checks": TWO, "comment": verdicts("1. verified", "2. owner — a real sign-up")})
+    assert run.labelled("ready-for-human") and not run.merged() and run.shots == [PR]
+    text = run.texts["PR #335 needs a manual check"]
+    assert "Sign up and land back on Welcome." in text and "The library at 390 px." not in text
+
+
+@pytest.mark.parametrize("case", ["no verdicts", "checks changed", "issue checks", "issue unreadable"])
+def test_anything_short_of_verified_checks_goes_to_the_owner(run, case):
+    run.gh.set(body=CLEAN.replace("none", TWO))
+    comment = verdicts("1. verified", "2. verified")
+    if case == "no verdicts":
+        comment = "<!-- baton-screenshot-review round=1 by=codex -->\n## Screenshots\n- a.png — ok"
+    elif case == "checks changed":
+        run.gh.set(body=CLEAN.replace("none", TWO + "\n- A new check."))
+    elif case == "issue checks":
+        run.gh.set(issues={"297": {"state": "OPEN", "body": "## Manual checks\n- Sign up for real."}})
+    else:
+        run.gh.fail("issue-view")
+    run.go(screenshot={"checks": TWO, "comment": comment})
+    assert run.labelled("ready-for-human") and not run.merged()
+
+
+def test_deferred_checks_keep_only_what_the_screenshot_review_left(run):
+    run.gh.set(body=CLEAN.replace("none", TWO))
+    run.go(MANUAL_CHECKS="defer", screenshot={"checks": TWO, "comment": verdicts("1. verified", "2. owner")})
+    assert run.merged()
+    left = Path(run.env["STATE"], f"deferred-checks-items-pr-{PR}").read_text()
+    assert left == "- Sign up and land back on Welcome.\n"
 
 
 def test_deferred_manual_checks_do_not_stop_the_merge(run):

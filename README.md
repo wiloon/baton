@@ -27,7 +27,8 @@ issue labelled ready-for-agent
   merge         [scheduling].auto_merge and the repository's [[repos]] auto_merge both true,
                 CI green, "## Manual checks" none -> merge; else ready-for-human
                 (manual_checks = "defer": the checks go to a "Manual checks to try" issue instead)
-                (screenshot_review = true: a second, separate run checks the manual-check screenshots after the code review)
+                (screenshot_review = true: a second, separate run checks the manual-check screenshots after the code review;
+                 every check verified -> merge; otherwise only the unverified ones go to the owner, ADR 0006)
 ```
 
 **One step per tick.** A tick takes the configured repositories in turn. In each one it does the
