@@ -5,7 +5,6 @@ night. The hook gets a fresh worktree with the repository's env files; exit 0 is
 last output line is the summary. It takes the runner's lock because such checks may bind fixed
 ports, and a run in progress wins: the night is skipped. Anything but green reaches the owner.
 """
-import fcntl
 from pathlib import Path
 import re
 import socket
@@ -13,6 +12,7 @@ import subprocess
 import sys
 import time
 
+from . import maintenance
 from .dev import copy_env_files
 
 WORKTREE = "nightly"
@@ -39,12 +39,14 @@ def run(*, state, logs, wt_root, repo, env_files, hook, tools, notify, log):
     if hook is None:
         log("nightly: no nightly hook configured; nothing to run")
         return 0
-    with open(Path(state, "lock"), "w") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            log("nightly: pipeline busy; skipped tonight")
-            return BUSY
+    admitted = maintenance.admit(state, Path(state, "lock"))
+    if admitted.reason is not None:
+        log(f"nightly: maintenance ({admitted.reason})")
+        return 0
+    if admitted.lock is None:
+        log("nightly: pipeline busy; skipped tonight")
+        return BUSY
+    with admitted.lock:
         wt = Path(wt_root, WORKTREE)
         _remove(repo, wt, tools)
         fetched = _git(repo, "fetch", "-q", "--prune", "origin", env=tools)

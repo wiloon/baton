@@ -18,7 +18,7 @@ import urllib.request
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from baton import timing
+from baton import maintenance, timing
 
 VENDORS = ('claude', 'cursor', 'codex')
 CREDENTIAL_STALE_SECONDS = 24 * 60 * 60
@@ -807,7 +807,7 @@ def retrospective_running(state):
         stream = (Path(state) / 'retrospectives' / 'worker.lock').open('r')
     except FileNotFoundError:
         return 0
-    with stream:
+    with stream, maintenance.admission(state):
         try:
             fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -1034,7 +1034,7 @@ def collect(ledger, config, output):
     attempt(lambda: contribution_metrics(ledger.state, emit, now), None)
 
     def lock_held():
-        with (ledger.state / 'lock').open('a') as stream:
+        with maintenance.admission(ledger.state), (ledger.state / 'lock').open('a') as stream:
             try:
                 fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 return 0

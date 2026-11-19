@@ -18,6 +18,7 @@
       "Bash(git *)", "Bash(gh *)",
       "Bash(go *)", "Bash(gofmt *)", "Bash(golangci-lint *)",
       "Bash(pnpm *)", "Bash(npx *)", "Bash(node *)", "Bash(corepack *)",
+      "Bash(uv run *)", "Bash(python3 *)", "Bash(python *)", "Bash(pytest *)",
       "Bash(task *)", "Bash(mise *)", "Bash(xvfb-run *)",
       "Bash(ls *)", "Bash(ls)", "Bash(cat *)", "Bash(head *)", "Bash(tail *)", "Bash(wc *)",
       "Bash(grep *)", "Bash(rg *)", "Bash(find *)", "Bash(sed *)", "Bash(awk *)", "Bash(jq *)",

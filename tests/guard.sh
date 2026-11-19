@@ -6,6 +6,9 @@ BIN=$(cd "$(dirname "$0")/../bin" && pwd)
 TEST_ROOT=$(mktemp -d)
 trap 'rm -rf "$TEST_ROOT"' EXIT
 STATE="$TEST_ROOT/state"; mkdir -p "$STATE"
+# The agent worktree as guard.sh sees it. It need not exist, and it must not sit under /tmp
+# (writable for every role) or behind a symlink (macOS mktemp: /var -> /private/var).
+WT=/nonexistent/baton-guard-wt
 fail() { echo "FAIL: $*" >&2; exit 1; }
 for vendor in cursor codex; do
   decision=$(printf '{"tool_name":"Write","tool_input":{"content":"by=%s"}}' "$vendor" \
@@ -15,7 +18,7 @@ done
 # Implementers commit but never push or write to GitHub; a spec reviewer is read-only.
 guard_decision() {   # ROLE TOOL_JSON -> deny, or none when the guard stays silent
   local d
-  d=$(printf '%s' "$2" | BATON_AGENT=1 BATON_AGENT_ROLE=$1 BATON_AGENT_WORKTREE="$TEST_ROOT" BATON_AGENT_LOGS="$STATE" bash "$BIN/guard.sh" \
+  d=$(printf '%s' "$2" | BATON_AGENT=1 BATON_AGENT_ROLE=$1 BATON_AGENT_WORKTREE="$WT" BATON_AGENT_LOGS="$STATE" bash "$BIN/guard.sh" \
     | jq -r '.hookSpecificOutput.permissionDecision')
   echo "${d:-none}"
 }
@@ -23,13 +26,41 @@ guard_decision() {   # ROLE TOOL_JSON -> deny, or none when the guard stays sile
 [[ $(guard_decision dev '{"tool_name":"Bash","tool_input":{"command":"gh pr create --fill"}}') == deny ]] || fail guard-dev-pr
 [[ $(guard_decision dev '{"tool_name":"Bash","tool_input":{"command":"git commit -m x"}}') == none ]] || fail guard-dev-commit
 [[ $(guard_decision spec_review '{"tool_name":"Bash","tool_input":{"command":"git commit -m x"}}') == deny ]] || fail guard-spec-review-commit
-git_c_commit=$(jq -nc --arg cmd "git -C $TEST_ROOT commit -m x" '{tool_name:"Bash",tool_input:{command:$cmd}}')
-git_c_add=$(jq -nc --arg cmd "git -C $TEST_ROOT add file" '{tool_name:"Bash",tool_input:{command:$cmd}}')
-git_c_push=$(jq -nc --arg cmd "git -C $TEST_ROOT push" '{tool_name:"Bash",tool_input:{command:$cmd}}')
+git_c_commit=$(jq -nc --arg cmd "git -C $WT commit -m x" '{tool_name:"Bash",tool_input:{command:$cmd}}')
+git_c_add=$(jq -nc --arg cmd "git -C $WT add file" '{tool_name:"Bash",tool_input:{command:$cmd}}')
+git_c_push=$(jq -nc --arg cmd "git -C $WT push" '{tool_name:"Bash",tool_input:{command:$cmd}}')
 [[ $(guard_decision spec "$git_c_commit") == none ]] || fail guard-spec-git-c-commit
 [[ $(guard_decision spec "$git_c_add") == none ]] || fail guard-spec-git-c-add
 [[ $(guard_decision spec "$git_c_push") == deny ]] || fail guard-spec-git-c-push
 [[ $(guard_decision spec_review "$git_c_commit") == deny ]] || fail guard-spec-review-git-c-commit
+# #84: test files in the worktree may hold vendor markers as fixtures; anything the runner
+# could post (files under /tmp) and non-test code still may not.
+marker_write() {   # PATH -> Write tool JSON whose content holds a vendor marker
+  jq -nc --arg p "$1" '{tool_name:"Write",tool_input:{file_path:$p,content:"<!-- baton-fix by=codex -->"}}'
+}
+marker_edit() {
+  jq -nc --arg p "$1" '{tool_name:"Edit",tool_input:{file_path:$p,old_string:"a",new_string:"by=cursor"}}'
+}
+for f in tests/test_review.py pkg/review_test.go src/review.test.ts web/__tests__/x.js test/x.py; do
+  [[ $(guard_decision dev "$(marker_write "$WT/$f")") == none ]] || fail "guard-marker-test-file $f"
+  [[ $(guard_decision fix "$(marker_edit "$WT/$f")") == none ]] || fail "guard-marker-test-edit $f"
+done
+for f in "$WT/baton/review.py" "$WT/README.md" /tmp/reply.md /tmp/tests/reply.md "$WT/tests/../baton/x.py"; do
+  [[ $(guard_decision dev "$(marker_write "$f")") == deny ]] || fail "guard-marker-non-test $f"
+done
+[[ $(guard_decision dev '{"tool_name":"Bash","tool_input":{"command":"echo by=codex > tests/x"}}') == deny ]] || fail guard-marker-bash
+# #84: the dev/fix settings run each repo's own checks, Python included.
+dev_allows() {
+  local rule pattern
+  while IFS= read -r rule; do
+    pattern=${rule#Bash(}; pattern=${pattern%)}
+    [[ $1 == $pattern ]] && return 0
+  done < <(jq -r '.permissions.allow[] | select(startswith("Bash("))' "$BIN/settings.json")
+  return 1
+}
+for cmd in "uv run --frozen pytest -q" "python3 -m pytest -q" "pytest -q tests/test_review.py"; do
+  dev_allows "$cmd" || fail "dev settings do not allow $cmd"
+done
 # Check the settings patterns as well as the guard: silence from the hook alone
 # does not allow a command in Claude's dontAsk mode.
 settings_match() { # allow|deny COMMAND
@@ -40,13 +71,13 @@ settings_match() { # allow|deny COMMAND
   done < <(jq -r --arg kind "$1" '.permissions[$kind][] | select(startswith("Bash("))' "$BIN/spec-settings.json")
   return 1
 }
-for cmd in "git add file" "git commit -m x" "git -C $TEST_ROOT add file" "git -C $TEST_ROOT commit -m x"; do
+for cmd in "git add file" "git commit -m x" "git -C $WT add file" "git -C $WT commit -m x"; do
   settings_match allow "$cmd" || fail "spec settings do not allow $cmd"
   ! settings_match deny "$cmd" || fail "spec settings deny $cmd"
 done
-settings_match deny "git -C $TEST_ROOT push" || fail spec-settings-git-c-push
-! settings_match allow "git -C $TEST_ROOT push" || fail spec-settings-allow-git-c-push
-[[ $(guard_decision spec_review "{\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"$TEST_ROOT/x\",\"content\":\"a\"}}") == deny ]] || fail guard-spec-review-write
+settings_match deny "git -C $WT push" || fail spec-settings-git-c-push
+! settings_match allow "git -C $WT push" || fail spec-settings-allow-git-c-push
+[[ $(guard_decision spec_review "{\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"$WT/x\",\"content\":\"a\"}}") == deny ]] || fail guard-spec-review-write
 [[ $(guard_decision spec_review '{"tool_name":"Bash","tool_input":{"command":"gh issue comment 1 --body x"}}') == deny ]] || fail guard-spec-review-comment
 # The screenshot reviewer is read-only like the code reviewer; the runner publishes its comment.
 [[ $(guard_decision screenshot_review '{"tool_name":"Bash","tool_input":{"command":"git commit -m x"}}') == deny ]] || fail guard-screenshot-review-commit

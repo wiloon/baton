@@ -22,12 +22,23 @@ deny() {
 
 case "$tool" in
   Edit|Write|NotebookEdit|MultiEdit)
-    # Vendor markers belong to the runner; an agent writing one could
-    # impersonate another vendor and approve its own work.
-    jq -e '[.tool_input.content, .tool_input.new_string, .tool_input.new_source, (.tool_input.edits // [] | .[].new_string)]
-      | map(strings) | any(test("by=(cursor|codex)"))' <<<"$input" >/dev/null && deny "vendor markers are reserved for the runner"
     p=$(jq -r '.tool_input.file_path // .tool_input.notebook_path // ""' <<<"$input")
     p=$(realpath -m -- "$p")
+    # Vendor markers belong to the runner; an agent writing one could
+    # impersonate another vendor and approve its own work. The runner reads markers
+    # only from what it posts to GitHub, never from committed files, so test files in
+    # the worktree may hold them as fixtures (baton's own tests do, #84).
+    is_test_file() {
+      local wt; wt=$(realpath -m -- "$WT")   # resolved like $p
+      [[ "$p" == "$wt"/* ]] || return 1
+      local rel=${p#"$wt"/} base=${p##*/}
+      [[ "/$rel" == */tests/* || "/$rel" == */test/* || "/$rel" == */__tests__/* \
+        || "$base" == test_* || "$base" == *_test.* || "$base" == *.test.* || "$base" == *.spec.* ]]
+    }
+    if ! is_test_file; then
+      jq -e '[.tool_input.content, .tool_input.new_string, .tool_input.new_source, (.tool_input.edits // [] | .[].new_string)]
+        | map(strings) | any(test("by=(cursor|codex)"))' <<<"$input" >/dev/null && deny "vendor markers are reserved for the runner"
+    fi
     # The owner's principles change only when the owner asks for it, in an interactive session.
     [[ "$p" == */docs/agents/principles.md ]] && deny "docs/agents/principles.md changes only when the owner asks for it; don't draft entries"
     if [[ "$ROLE" == review || "$ROLE" == screenshot_review || "$ROLE" == spec_review || "$ROLE" == scan ]]; then
