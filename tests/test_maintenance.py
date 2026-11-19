@@ -3,6 +3,7 @@
 Everything goes through the production commands with isolated state, a controlled clock for
 expiry and real flock contention from independent file descriptors."""
 import fcntl
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -21,10 +22,16 @@ ROOT = Path(__file__).resolve().parents[1]
 class Host:
     def __init__(self, tmp_path, monkeypatch):
         self.root = tmp_path
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
         self.state, self.logs = tmp_path / "state", tmp_path / "logs"
+        self.bin = tmp_path / "bin"
+        self.bin.mkdir()
         text = (ROOT / "config.example.toml").read_text()
         for key in ("state", "logs", "ctx", "clones", "wt_root"):
             text = re.sub(rf'(?m)^{key} = .*$', f'{key} = "{tmp_path / key}"', text)
+        text = re.sub(r'(?m)^path_prefix = .*$', f'path_prefix = ["{self.bin}"]', text)
         self.hook = tmp_path / "nightly-hook"
         self.hook_ran = tmp_path / "hook-ran"
         self.hook.write_text(f"#!/bin/sh\ntouch {self.hook_ran}\n")
@@ -34,11 +41,9 @@ class Host:
         self.config = tmp_path / "config.toml"
         self.config.write_text(text)
         self.gh_calls = tmp_path / "gh-calls"
-        bin_dir = tmp_path / "bin"
-        bin_dir.mkdir()
-        (bin_dir / "gh").write_text(f'#!/bin/sh\necho "$@" >> {self.gh_calls}\necho "[]"\n')
-        (bin_dir / "gh").chmod(0o755)
-        monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+        (self.bin / "gh").write_text(f'#!/bin/sh\necho "$@" >> {self.gh_calls}\necho "[]"\n')
+        (self.bin / "gh").chmod(0o755)
+        monkeypatch.setenv("PATH", f"{self.bin}{os.pathsep}{os.environ['PATH']}")
         self.clock = [1_000_000.0]
         monkeypatch.setattr(maintenance, "now", lambda: self.clock[0])
         monkeypatch.setattr(maintenance, "POLL", 0.02)
@@ -132,6 +137,28 @@ def test_default_ttl_is_two_hours(host):
     assert host.flag()["expires"] == host.clock[0] + 7200
 
 
+def test_on_starts_the_ttl_after_queued_publication(host, monkeypatch):
+    gate = host.hold("maintenance.lock")
+    queued = threading.Event()
+    flock = fcntl.flock
+
+    def observe(file, operation):
+        if Path(file.name).name == "maintenance.lock":
+            queued.set()
+        return flock(file, operation)
+
+    monkeypatch.setattr(fcntl, "flock", observe)
+    waiter, box = run_thread(lambda: host.maint("on", "--ttl", "1s"))
+    try:
+        assert queued.wait(5)
+        host.clock[0] += 10
+    finally:
+        gate.close()
+        waiter.join(5)
+    assert box["rc"] == 0
+    assert host.flag()["expires"] == 1_000_011
+
+
 def test_an_expired_flag_is_off_and_a_malformed_one_lasts_the_default_ttl(host, capsys):
     host.maint("on", "--ttl", "1m")
     host.clock[0] += 61
@@ -179,22 +206,84 @@ def test_wait_timeout_exits_75_and_leaves_the_flag(host, name, monkeypatch):
     held.close()
 
 
-def test_wait_keeps_the_flag_active_and_restarts_the_ttl_when_the_drain_ends(host, capsys):
+def test_wait_does_not_refresh_after_a_late_release(host, monkeypatch):
     held = host.hold("lock")
+    elapsed = [0.0]
+    monkeypatch.setattr(maintenance, "monotonic", lambda: elapsed[0])
+    monkeypatch.setattr(maintenance, "POLL", 2)
 
-    def later():
+    delays = []
+
+    def release_after_deadline(delay):
+        delays.append(delay)
+        elapsed[0] = 1.1
+        host.clock[0] += 1.1
+        held.close()
+
+    monkeypatch.setattr(maintenance.time, "sleep", release_after_deadline)
+    with held:
+        assert host.maint("on", "--wait", "--timeout", "1s", "--ttl", "5m") == 75
+    assert delays == [1.0]
+    assert host.flag()["expires"] == 1_000_301
+
+
+def test_wait_times_out_while_admission_is_held(host, monkeypatch):
+    elapsed = [0.0]
+    delays = []
+    gates = []
+    monkeypatch.setattr(maintenance, "monotonic", lambda: elapsed[0])
+    monkeypatch.setattr(maintenance, "POLL", 0.6)
+
+    def elapse(delay):
+        if not gates:
+            gates.append(host.hold("maintenance.lock"))
+        delays.append(delay)
+        elapsed[0] += delay
+
+    monkeypatch.setattr(maintenance.time, "sleep", elapse)
+    with host.hold("lock"):
+        waiter, box = run_thread(lambda: host.maint("on", "--wait", "--timeout", "1s", "--ttl", "5m"))
+        try:
+            waiter.join(5)
+            assert box.get("rc") == 75
+            assert delays == [0.6, 0.4]
+            assert host.flag()["expires"] == 1_000_301
+        finally:
+            for gate in gates:
+                gate.close()
+            waiter.join(5)
+
+
+def test_wait_keeps_the_flag_active_and_restarts_the_ttl_when_the_drain_ends(host, capsys):
+    tick = ["--config", str(host.config)]
+    held = host.hold("lock")
+    waiter, box = run_thread(lambda: host.maint("on", "--wait", "--timeout", "2h", "--ttl", "10s", "--reason", "deploy"))
+    try:
+        publication = host.state / "maintenance"
+        deadline = time.monotonic() + 5
+        while not publication.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert publication.exists()
         host.clock[0] += 5000
-    thread = release_later(held, 0.5, before=later)
-    waiter, box = run_thread(lambda: host.maint("on", "--wait", "--timeout", "2h", "--ttl", "10s", "--reason", "r"))
-    time.sleep(0.2)
-    capsys.readouterr()
-    host.maint("status")
-    assert "maintenance: on" in capsys.readouterr().out
-    assert host.flag()["expires"] == 1_000_000.0 + 7200 + 10
-    waiter.join()
-    thread.join()
+        assert host.maint("status") == 0
+        status = capsys.readouterr().out
+        assert "maintenance: on" in status and "runner lock: held" in status
+        assert "(in 2210s)" in status
+        assert bootstrap.main(tick) == 0
+        assert host.runner_log().count("maintenance (deploy)") == 1
+        assert waiter.is_alive()
+    finally:
+        held.close()
+        waiter.join(5)
     assert box["rc"] == 0
     assert host.flag()["expires"] == host.clock[0] + 10
+    assert host.maint("status") == 0
+    status = capsys.readouterr().out
+    assert "maintenance: on" in status and "runner lock: free" in status
+    assert "(in 10s)" in status
+    assert bootstrap.main(tick) == 0
+    assert host.runner_log().count("maintenance (deploy)") == 2
+    assert not host.gh_calls.exists()
 
 
 def test_a_waiter_leaves_a_later_request_intact(host):
@@ -233,6 +322,16 @@ def test_an_active_flag_skips_every_tick_without_github_calls(host, argv):
     assert not (host.state / "lock").exists() or fcntl_free(host.state / "lock")
 
 
+def test_a_scheduled_tick_does_not_launch_enabled_telemetry_in_maintenance(host):
+    (host.bin / "telemetry-enabled").touch()
+    marker = host.root / "telemetry-ran"
+    (host.bin / "telemetry.py").write_text(f"from pathlib import Path\nPath({str(marker)!r}).touch()\n")
+    assert host.maint("on", "--reason", "deploy") == 0
+    assert bootstrap.main(["--config", str(host.config)]) == 0
+    assert "maintenance (deploy)" in host.runner_log()
+    assert not marker.exists()
+
+
 def fcntl_free(path):
     with open(path, "a") as file:
         fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -253,23 +352,63 @@ def test_a_starter_queued_at_admission_sees_a_flag_published_meanwhile(host):
 
 
 def test_the_first_tick_after_expiry_removes_the_flag_and_proceeds(host):
+    git_calls = host.root / "git-calls"
+    git = host.bin / "git"
+    git.write_text(f'#!/bin/sh\necho "$@" >> {git_calls}\n')
+    git.chmod(0o755)
     host.maint("on", "--ttl", "1m")
     host.clock[0] += 61
-    bootstrap.main(["--config", str(host.config)])
+    assert bootstrap.main(["--config", str(host.config)]) == 0
     log = host.runner_log()
     assert "maintenance expired" in log
     assert "maintenance (" not in log
+    assert f"-C {host.root / 'clones/acme/app'} fetch -q --prune origin" in git_calls.read_text()
     assert not (host.state / "maintenance").exists()
 
 
-def test_a_malformed_flag_skips_ticks_for_the_fallback_window(host):
+def test_retrospectives_leaves_expiry_for_status_and_the_next_tick(host, capsys):
+    assert host.maint("on", "--ttl", "1s", "--reason", "deploy v5") == 0
+    assert host.maint("status") == 0
+    expiry = next(line for line in capsys.readouterr().out.splitlines() if line.startswith("expires:"))
+    host.clock[0] += 2
+    assert retro.main(["--config", str(host.config), "catch-up"]) == 0
+    assert lines(capsys)[0]["state"] == "idle"
+    assert host.maint("status") == 0
+    status = capsys.readouterr().out
+    assert "maintenance: off" in status
+    assert "reason: deploy v5" in status
+    assert expiry.removesuffix(" (in 1s)") + " (expired)" in status
+    assert (host.state / "maintenance").exists()
+
+    host.config.write_text(host.text.replace("paused = false", "paused = true"))
+    assert bootstrap.main(["--config", str(host.config)]) == 0
+    assert not (host.state / "maintenance").exists()
+    assert "maintenance expired" in host.runner_log()
+
+
+@pytest.mark.parametrize("payload", [
+    b"garbage",
+    b"\xff",
+    b'{"expires": 2000000, "reason": 42}',
+    b'{"expires": ' + b'9' * 400 + b', "reason": "deploy"}',
+    b'{"expires": 1e100, "reason": "deploy"}',
+])
+def test_a_malformed_flag_skips_ticks_for_the_fallback_window(host, capsys, payload):
     path = host.state / "maintenance"
-    path.write_text("garbage")
+    path.write_bytes(payload)
     os.utime(path, (host.clock[0], host.clock[0]))
+    host.clock[0] += 7199
+    assert host.maint("status") == 0
+    status = capsys.readouterr().out
+    assert "maintenance: on" in status and "reason: invalid flag" in status
+    assert "(in 1s)" in status
     assert bootstrap.main(["--config", str(host.config)]) == 0
     assert "maintenance (invalid flag)" in host.runner_log()
-    host.clock[0] += 7201
-    bootstrap.main(["--config", str(host.config)])
+    host.clock[0] += 2
+    assert host.maint("status") == 0
+    assert "maintenance: off" in capsys.readouterr().out
+    host.config.write_text(host.text.replace("paused = false", "paused = true"))
+    assert bootstrap.main(["--config", str(host.config)]) == 0
     assert "maintenance expired" in host.runner_log()
     assert not path.exists()
 
@@ -342,6 +481,46 @@ def test_migrate_still_reports_a_busy_pipeline(host, capsys):
     held = host.hold("lock")
     assert migrate.main(["acme/app", "--config", str(host.config)]) == 75
     held.close()
+
+
+@pytest.mark.parametrize("work_lock", ["lock", "retrospectives/worker.lock"])
+def test_migrate_waits_for_a_collectors_probe_without_reporting_a_busy_pipeline(host, monkeypatch, work_lock):
+    spec = importlib.util.spec_from_file_location("maintenance_telemetry", ROOT / "bin/telemetry.py")
+    telemetry = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(telemetry)
+    monkeypatch.setattr(telemetry, "unit_state", lambda: (1, 1, 0))
+    assert host.maint("on", "--wait") == 0
+    metrics = host.root / "metrics"
+    ledger = telemetry.Ledger(host.state)
+    probe_held, resume_probe = threading.Event(), threading.Event()
+    flock = fcntl.flock
+    probe_path = host.state / work_lock
+    gate_path = host.state / "maintenance.lock"
+
+    def contend(file, operation):
+        path = Path(file.name)
+        if path == gate_path and threading.current_thread() is threading.main_thread():
+            try:
+                return flock(file, operation | fcntl.LOCK_NB)
+            except BlockingIOError:
+                # Migrate has reached the gate while collection still owns the work-lock probe.
+                resume_probe.set()
+        result = flock(file, operation)
+        if path == probe_path and operation == fcntl.LOCK_EX | fcntl.LOCK_NB and not probe_held.is_set():
+            probe_held.set()
+            assert resume_probe.wait(5)
+        return result
+
+    monkeypatch.setattr(fcntl, "flock", contend)
+    collector, _ = run_thread(lambda: telemetry.collect(ledger, host.config, metrics))
+    try:
+        assert probe_held.wait(5)
+        assert migrate.main(["acme/app", "--config", str(host.config)]) == 0
+        assert resume_probe.is_set()
+    finally:
+        resume_probe.set()
+        collector.join(5)
+    assert "baton_state_collect_success 1" in metrics.read_text()
 
 
 def test_the_flag_files_are_not_legacy_state(host):

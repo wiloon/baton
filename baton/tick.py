@@ -723,9 +723,11 @@ def run(ticks):
         for i, area in enumerate(first.scan_areas):
             print(i, area)
         return 0
-    first.hooks().tick(manual)
     paused = config.scheduling.paused is True and not manual
-    admitted = maintenance.admit(runner_state, runner_state / "lock", lambda m: notify.append(config.paths.logs, m), acquire=not paused)
+    admitted = maintenance.admit(
+        runner_state, runner_state / "lock", acquire=not paused,
+        on_expired=lambda: notify.append(config.paths.logs, "maintenance expired"),
+    )
     if admitted.reason is not None:
         notify.append(config.paths.logs, f"maintenance ({admitted.reason})")
         return 0
@@ -738,6 +740,7 @@ def run(ticks):
         return 0
     for t in ticks:
         t.lock_file = lock
+    first.hooks().tick(manual)
     from .initialization import expire_context
     expire_context(config, first.clock())
     (runner_state / "chain-next").unlink(missing_ok=True)

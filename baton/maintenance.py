@@ -44,14 +44,31 @@ def duration(text):
     return int(match[1]) * UNITS[match[2]]
 
 
+def wait_for_poll(deadline):
+    remaining = deadline - monotonic()
+    if remaining > 0:
+        time.sleep(min(POLL, remaining))
+
+
 @contextmanager
-def admission(state):
-    """The short exclusive lock that serializes flag changes with work-lock acquisition."""
+def admission(state, *, deadline=None):
+    """Serialize flag changes and work-lock acquisition; yield False if a deadline expires."""
     state = Path(state)
     state.mkdir(parents=True, exist_ok=True)
     with open(state / ADMISSION, "a") as file:
-        fcntl.flock(file, fcntl.LOCK_EX)
-        yield
+        if deadline is None:
+            fcntl.flock(file, fcntl.LOCK_EX)
+            yield True
+            return
+        while monotonic() < deadline:
+            try:
+                fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                wait_for_poll(deadline)
+            else:
+                yield True
+                return
+        yield False
 
 
 def read_flag(state):
@@ -59,20 +76,24 @@ def read_flag(state):
     through its modification time plus the default TTL, with the reason `invalid flag`."""
     path = Path(state) / FLAG
     try:
-        text = path.read_text()
         mtime = path.stat().st_mtime
     except FileNotFoundError:
         return None
-    except (OSError, UnicodeDecodeError):
+    except OSError:
         return (now() + DEFAULT, INVALID, "")
     try:
-        data = json.loads(text)
+        data = json.loads(path.read_text(encoding="utf-8"))
         expires = data["expires"]
         if isinstance(expires, bool) or not isinstance(expires, (int, float)) or not math.isfinite(expires):
             raise ValueError
-        reason = data.get("reason", "")
-        return (float(expires), reason if isinstance(reason, str) else INVALID, str(data.get("id", "")))
-    except (ValueError, KeyError, TypeError, AttributeError):
+        time.localtime(expires)  # status must be able to display the stored timestamp
+        reason, token = data.get("reason", ""), data.get("id", "")
+        if not isinstance(reason, str) or not isinstance(token, str):
+            raise ValueError
+        return (float(expires), reason, token)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, KeyError, TypeError, OverflowError, RecursionError):
         return (mtime + DEFAULT, INVALID, "")
 
 
@@ -90,18 +111,18 @@ def write_flag(state, expires, reason, token):
         Path(name).unlink(missing_ok=True)
 
 
-def active(state, log=None):
-    """The reason maintenance is active, or None. An expired flag is removed (and logged through
-    LOG). Call under the admission lock."""
+def active(state, on_expired=None):
+    """The active reason, or None. The tick supplies ON_EXPIRED to remove and log an expired flag.
+    Call under the admission lock."""
     flag = read_flag(state)
     if flag is None:
         return None
     expires, reason, _ = flag
     if now() < expires:
         return " ".join(reason.split()) or "no reason given"
-    (Path(state) / FLAG).unlink(missing_ok=True)
-    if log:
-        log("maintenance expired")
+    if on_expired is not None:
+        (Path(state) / FLAG).unlink(missing_ok=True)
+        on_expired()
     return None
 
 
@@ -112,11 +133,11 @@ class Admission:
         self.lock, self.reason = lock, reason
 
 
-def admit(state, lock_path, log=None, acquire=True):
+def admit(state, lock_path, *, on_expired=None, acquire=True):
     """Check the flag and, when inactive, take LOCK_PATH without blocking, both under admission.
     With ACQUIRE false only the flag is checked. The admission lock is released before returning."""
     with admission(state):
-        reason = active(state, log)
+        reason = active(state, on_expired)
         if reason is not None:
             return Admission(reason=reason)
         if not acquire:
@@ -153,25 +174,26 @@ def probe(state):
 
 def turn_on(state, args):
     token = uuid.uuid4().hex
-    initial = now() + args.ttl + (args.timeout if args.wait else 0)
     with admission(state):
+        initial = now() + args.ttl + (args.timeout if args.wait else 0)
         write_flag(state, initial, args.reason, token)
     if not args.wait:
         return 0
     deadline = monotonic() + args.timeout
     while True:
-        with admission(state):
+        with admission(state, deadline=deadline) as acquired:
+            if not acquired or monotonic() >= deadline:
+                break
             flag = read_flag(state)
             if flag is None or flag[2] != token:
                 print("maintenance: the request was cleared or replaced while waiting", file=sys.stderr)
                 return BUSY
-            if not probe(state):
+            if not probe(state) and monotonic() < deadline:
                 write_flag(state, now() + args.ttl, args.reason, token)
                 return 0
-        if monotonic() >= deadline:
-            print(f"maintenance: the pipeline did not drain within {args.timeout}s; the flag stays on", file=sys.stderr)
-            return BUSY
-        time.sleep(POLL)
+        wait_for_poll(deadline)
+    print(f"maintenance: the pipeline did not drain within {args.timeout}s; the flag stays on", file=sys.stderr)
+    return BUSY
 
 
 def status(state):
@@ -179,12 +201,13 @@ def status(state):
         flag = read_flag(state)
         busy = probe(state)
         current = now()
-        if flag and current < flag[0]:
-            print("maintenance: on")
+        is_active = flag is not None and current < flag[0]
+        print(f"maintenance: {'on' if is_active else 'off'}")
+        if flag is not None:
             print(f"reason: {' '.join(flag[1].split()) or 'no reason given'}")
-            print(f"expires: {time.strftime('%F %T %z', time.localtime(flag[0]))} (in {int(flag[0] - current)}s)")
-        else:
-            print("maintenance: off")
+            expiry = time.strftime('%F %T %z', time.localtime(flag[0]))
+            remaining = f"in {int(flag[0] - current)}s" if is_active else "expired"
+            print(f"expires: {expiry} ({remaining})")
         print(f"runner lock: {'held' if 'runner' in busy else 'free'}")
         print(f"retrospectives lock: {'held' if 'retrospectives' in busy else 'free'}")
     return 0

@@ -39,7 +39,7 @@ def run(*, state, logs, wt_root, repo, env_files, hook, tools, notify, log):
     if hook is None:
         log("nightly: no nightly hook configured; nothing to run")
         return 0
-    admitted = maintenance.admit(state, Path(state, "lock"), log)
+    admitted = maintenance.admit(state, Path(state, "lock"))
     if admitted.reason is not None:
         log(f"nightly: maintenance ({admitted.reason})")
         return 0
