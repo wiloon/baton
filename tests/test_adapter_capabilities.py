@@ -215,15 +215,29 @@ def test_raw_refresh_cursor_still_propagates_errors(tmp_path):
                              fetch=lambda token: (_ for _ in ()).throw(OSError("boom")))
 
 
-def test_pick_defers_blocked_eligible_without_disallowed_alternative(stub_runner, monkeypatch):
+@pytest.mark.parametrize(("current", "pinned"), [("stub", True), ("claude", False)])
+def test_pick_defers_blocked_eligible_when_only_disallowed_vendor_is_free(stub_runner, monkeypatch, current, pinned):
+    cfg = stub_runner.config
+    cfg = replace(cfg, vendors=tuple(
+        replace(v, roles=tuple(r for r in v.roles if r != "reviewer")) if v.id == "codex" else v
+        for v in cfg.vendors))
+    sess = session.create(cfg, repo=cfg.repos[0])
+    monkeypatch.setattr(session, "resolve", lambda value=None: sess if value is None else value)
     state = stub_runner.state_dir
-    for vendor in ("stub", "claude", "codex", "cursor"):
+    for vendor in ("stub", "claude", "cursor"):
         (state / f"{vendor}-cooldown-until").write_text("1999999999\n")
     probes = []
     monkeypatch.setattr(pick.settle, "probe", lambda *a: probes.append(a[2]))
     with pytest.raises(Deferred, match="no vendor can run now"):
-        pick.choose(stub_runner.env, "dev", "stub", "contrib", ["stub", "claude", "codex", "cursor"])
+        pick.choose(sess, "reviewer", current, "contrib", ["stub", "claude", "codex", "cursor"], pinned=pinned)
     assert probes == []
+
+
+def test_record_log_leaves_non_probe_run_vendor_state_untouched(stub_runner):
+    log = stub_runner.root / "cursor.log"
+    log.write_text('{"type":"result"}\n')
+    quota.record_log(str(stub_runner.state_dir), "cursor", log, time.time())
+    assert not (stub_runner.state_dir / "quota-cursor.json").exists()
 
 
 def test_absent_followup_route_inherits_base_for_stub(tmp_path):

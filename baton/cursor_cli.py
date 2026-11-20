@@ -37,6 +37,11 @@ FIX_RESUMABLE_VIA_REPLY = True
 READONLY_RESET = True
 FIVE_MINUTE_CACHE_ROLES = ()
 KINDS = ("RESULT", "SPEC", "REVIEW")
+USAGE_EVENT = "result"
+USAGE_FIELDS = {"input_tokens": "inputTokens", "cache_read_tokens": "cacheReadTokens",
+                "cache_write_tokens": "cacheWriteTokens", "output_tokens": "outputTokens"}
+USAGE_CACHE_IN_INPUT = False
+SPEC_STAGE = "spec-review"
 
 
 def configure(role, route, settings, env):
@@ -135,3 +140,15 @@ def run(req):
         restore(req.cwd, head)
         outcome = f"RESULT: failed Cursor changed files in a read-only {req.role}"
     return Run(rc, outcome, reply, used, summary)
+
+
+def reconnect_row(row):
+    return (row.get("type"), row.get("subtype")) == ("connection", "reconnecting")
+
+
+def log_model(row, codex_home=None):
+    """(done, model) for one log row; done stops the scan."""
+    if row.get("type") == "system" and row.get("subtype") == "init":
+        model = row.get("model")
+        return True, None if str(model).lower() == "auto" else model
+    return False, None

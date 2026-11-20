@@ -2,6 +2,7 @@
 credentials are invalid. Codex writes artifacts into a scratch directory inside the
 worktree; only the runner copies them out (markers stripped) to the path the caller
 named, so only the runner publishes artifacts and markers."""
+import json
 import os
 import re
 import shutil
@@ -43,6 +44,13 @@ GITHUB_ACCESS = "denied"
 FIX_RESUMABLE_VIA_REPLY = False
 READONLY_RESET = True
 FIVE_MINUTE_CACHE_ROLES = ()
+USAGE_EVENT = "turn.completed"
+USAGE_FIELDS = {"input_tokens": "input_tokens", "cache_read_tokens": "cached_input_tokens",
+                "cache_write_tokens": "cache_write_input_tokens", "output_tokens": "output_tokens",
+                "reasoning_tokens": "reasoning_output_tokens"}
+# Codex counts cached tokens inside input_tokens; telemetry stores them separately.
+USAGE_CACHE_IN_INPUT = True
+SPEC_STAGE = "spec-reply"
 OTEL = "http://127.0.0.1:4318/v1/"
 OTEL_STAGE = {"spec": "spec-reply", "spec_review": "spec-review", "review": "review",
               "screenshot_review": "review", "fix": "fix"}
@@ -282,3 +290,30 @@ def _nonempty(path):
         return Path(path).stat().st_size > 0
     except OSError:
         return False
+
+
+def reconnect_row(row):
+    return False
+
+
+def codex_model(thread, codex_home=None):
+    if not re.fullmatch(r"[A-Za-z0-9-]{1,80}", thread):
+        return None
+    sessions = Path(codex_home or os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "sessions"
+    for rollout in sessions.rglob(f"rollout-*-{thread}.jsonl"):
+        with rollout.open() as stream:
+            for line in stream:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(row, dict) and row.get("type") == "turn_context":
+                    return (row.get("payload") or {}).get("model")
+    return None
+
+
+def log_model(row, codex_home=None):
+    """(done, model) for one log row; done stops the scan."""
+    if row.get("type") == "thread.started" and row.get("thread_id"):
+        return True, codex_model(str(row["thread_id"]), codex_home)
+    return False, None

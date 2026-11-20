@@ -241,11 +241,11 @@ def fresh(state, vendor, now, minutes):
 
 def record_log(state, vendor, log, now):
     """Merge the quota a run's LOG reported into VENDOR's snapshot via the adapter parser."""
-    lines = Path(log).read_text(errors="replace").splitlines() if Path(log).exists() else []
-    parse = getattr(agents.ADAPTERS.get(vendor), "parse_quota_log", None)
-    if not parse:
+    adapter = agents.ADAPTERS.get(vendor)
+    if adapter is None or adapter.QUOTA_SOURCE != "probe-run":
         return
-    record(state, vendor, parse(lines), now)
+    lines = Path(log).read_text(errors="replace").splitlines() if Path(log).exists() else []
+    record(state, vendor, adapter.parse_quota_log(lines), now)
 
 
 def mark_probed(state, vendor, now):

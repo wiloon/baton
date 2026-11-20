@@ -7,7 +7,7 @@ that outlive a call (the task's pipeline id, the last run's id) are kept in the 
 file named by BATON_TELEMETRY_ITEM, created by begin_item and removed by finish_item.
 """
 
-from . import agents, codex_cli, pr as pr_helpers, session
+from . import agents, pr as pr_helpers, session
 import argparse
 from dataclasses import dataclass
 import json
@@ -20,8 +20,6 @@ import time
 import uuid
 
 SHA = re.compile(r"[a-f0-9]{40,64}")
-# Codex owns the stage map; kept here for callers that still import it.
-OTEL_STAGE = codex_cli.OTEL_STAGE
 
 
 @dataclass

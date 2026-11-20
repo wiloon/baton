@@ -38,6 +38,11 @@ FIX_RESUMABLE_VIA_REPLY = True
 READONLY_RESET = True
 FIVE_MINUTE_CACHE_ROLES = ()
 KINDS = ("RESULT", "REVIEW", "SPEC")
+USAGE_EVENT = "result"
+USAGE_FIELDS = {"input_tokens": "input_tokens", "cache_read_tokens": "cache_read_input_tokens",
+                "cache_write_tokens": "cache_creation_input_tokens", "output_tokens": "output_tokens"}
+USAGE_CACHE_IN_INPUT = False
+SPEC_STAGE = "spec-reply"
 PROBE_PROMPT = "Reply with the word ok."
 
 
@@ -134,3 +139,14 @@ def run(req):
         restore(req.cwd, head)
         outcome = f"RESULT: failed Stub changed files in a read-only {req.role}"
     return Run(rc, outcome, reply, "", f"{outcome} model={model or req.model}", model=model or req.model)
+
+
+def reconnect_row(row):
+    return False
+
+
+def log_model(row, codex_home=None):
+    """(done, model) for one log row; done stops the scan."""
+    if row.get("type") == "system" and row.get("subtype") == "init":
+        return True, row.get("model")
+    return False, None

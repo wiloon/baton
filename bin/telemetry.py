@@ -81,6 +81,7 @@ def locked(path):
 
 def usage(vendor, log, status):
     """Only completed single-turn/result usage is validated; never guess totals."""
+    adapter = agents.ADAPTERS[vendor]
     events = []
     reconnected = False
     try:
@@ -90,10 +91,9 @@ def usage(vendor, log, status):
                     row = json.loads(line)
                 except ValueError:
                     continue
-                # After a reconnect Cursor's result covers far less than the run did (#596, #470).
-                if vendor == 'cursor' and isinstance(row, dict) and (row.get('type'), row.get('subtype')) == ('connection', 'reconnecting'):
+                if isinstance(row, dict) and adapter.reconnect_row(row):
                     reconnected = True
-                if isinstance(row, dict) and row.get('type') == ('turn.completed' if vendor == 'codex' else 'result'):
+                if isinstance(row, dict) and row.get('type') == adapter.USAGE_EVENT:
                     events.append(row)
     except OSError:
         pass
@@ -101,20 +101,12 @@ def usage(vendor, log, status):
     if len(events) != 1 or not isinstance(events[0].get('usage'), dict):
         return result
     raw = events[0]['usage']
-    fields = {
-        'codex': {'input_tokens': 'input_tokens', 'cache_read_tokens': 'cached_input_tokens',
-                  'cache_write_tokens': 'cache_write_input_tokens', 'output_tokens': 'output_tokens',
-                  'reasoning_tokens': 'reasoning_output_tokens'},
-        'cursor': {'input_tokens': 'inputTokens', 'cache_read_tokens': 'cacheReadTokens',
-                   'cache_write_tokens': 'cacheWriteTokens', 'output_tokens': 'outputTokens'},
-        'claude': {'input_tokens': 'input_tokens', 'cache_read_tokens': 'cache_read_input_tokens',
-                   'cache_write_tokens': 'cache_creation_input_tokens', 'output_tokens': 'output_tokens'},
-    }[vendor]
+    fields = adapter.USAGE_FIELDS
     for target, source in fields.items():
         value = raw.get(source)
         if type(value) is int and 0 <= value <= 10**12:
             result[target] = value
-    if vendor == 'codex':
+    if adapter.USAGE_CACHE_IN_INPUT:
         if 'input_tokens' not in result or 'cache_read_tokens' not in result:
             result.pop('input_tokens', None)
         elif result['cache_read_tokens'] <= result['input_tokens']:
@@ -146,33 +138,12 @@ def run_model(vendor, log, codex_home=None):
                     continue
                 if not isinstance(row, dict):
                     continue
-                if vendor in ('claude', 'cursor') and row.get('type') == 'system' and row.get('subtype') == 'init':
-                    model = row.get('model')
-                    if vendor == 'cursor' and str(model).lower() == 'auto':
-                        model = None
-                    break
-                if vendor == 'codex' and row.get('type') == 'thread.started' and row.get('thread_id'):
-                    model = codex_model(str(row['thread_id']), codex_home)
+                done, model = agents.ADAPTERS[vendor].log_model(row, codex_home)
+                if done:
                     break
     except OSError:
         pass
     return model if isinstance(model, str) and MODEL_RE.fullmatch(model) else 'unknown'
-
-
-def codex_model(thread, codex_home=None):
-    if not re.fullmatch(r'[A-Za-z0-9-]{1,80}', thread):
-        return None
-    sessions = Path(codex_home or os.environ.get('CODEX_HOME') or Path.home() / '.codex') / 'sessions'
-    for rollout in sessions.rglob(f'rollout-*-{thread}.jsonl'):
-        with rollout.open() as stream:
-            for line in stream:
-                try:
-                    row = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(row, dict) and row.get('type') == 'turn_context':
-                    return (row.get('payload') or {}).get('model')
-    return None
 
 
 def must_fix_count(text):
@@ -532,7 +503,7 @@ class Ledger:
         run_id = str(uuid.uuid4())
         stage = {'dev': 'implement', 'screenshot_review': 'review'}.get(role, role)
         if role == 'spec':
-            stage = 'spec-review' if vendor == 'cursor' else 'spec-reply'
+            stage = agents.ADAPTERS[vendor].SPEC_STAGE
         record = dict(run_id=run_id, agent=vendor, role=role, stage=stage, repo=repo, status='running',
                       trace_id=uuid.uuid4().hex, span_id=uuid.uuid4().hex[:16],
                       started=now, heartbeat=now, deadline=now + minutes * 60 + 60,

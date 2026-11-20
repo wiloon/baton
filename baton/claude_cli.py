@@ -38,6 +38,11 @@ READONLY_RESET = False
 # Short roles finish in minutes; a five-minute cache avoids writing the hour-long cache at 2x.
 FIVE_MINUTE_CACHE_ROLES = ("spec_review", "spec", "review", "screenshot_review", "fix")
 KINDS = ("RESULT", "REVIEW", "VERDICT", "SCAN", "SPEC")
+USAGE_EVENT = "result"
+USAGE_FIELDS = {"input_tokens": "input_tokens", "cache_read_tokens": "cache_read_input_tokens",
+                "cache_write_tokens": "cache_creation_input_tokens", "output_tokens": "output_tokens"}
+USAGE_CACHE_IN_INPUT = False
+SPEC_STAGE = "spec-reply"
 PROBE_PROMPT = "Reply with the word ok."
 MODEL = re.compile(
     r"(?P<prefix>claude-)?(?P<family>opus|sonnet|haiku)(?P<version>(?:-[0-9]+)*?)(?:-(?P<snapshot>[0-9]{8}))?"
@@ -166,3 +171,14 @@ def run(req):
     used = usage(result)
     return Run(rc, outcome or f"RESULT: failed rc={rc} (log {req.log})", final, used,
                f"{outcome or 'no result line'} {used} effort={req.effort or 'default'}", model=main_model(text))
+
+
+def reconnect_row(row):
+    return False
+
+
+def log_model(row, codex_home=None):
+    """(done, model) for one log row; done stops the scan."""
+    if row.get("type") == "system" and row.get("subtype") == "init":
+        return True, row.get("model")
+    return False, None

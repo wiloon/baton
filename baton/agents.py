@@ -151,11 +151,6 @@ def classify(vendor, rc, log_text, outcome="", cooldown_hours=COOLDOWN_HOURS):
     return "success", None
 
 
-def started(text):
-    """True once a busy-rerun adapter began a command, edit or message: a rerun could repeat it."""
-    return codex_cli.work_started(text)
-
-
 def preflight(vendor):
     """None when VENDOR's CLI can run, else the failed outcome (an auth failure)."""
     check = getattr(ADAPTERS[vendor], "preflight", None)

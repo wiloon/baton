@@ -24,8 +24,6 @@ import time
 from . import agents, capacity, hooks as telemetry, notify, settle, vendors
 from .common import LEASE_REASON, Request
 
-# Kept for callers/tests that still import the short-role set; Claude owns the policy.
-FIVE_MINUTE_CACHE_ROLES = agents.ADAPTERS["claude"].FIVE_MINUTE_CACHE_ROLES
 
 
 SECRET_ROLES = ("dev", "fix")

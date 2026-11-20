@@ -53,11 +53,6 @@ def refresh_api(state, vendor):
         notify.log(f"quota {vendor}: week {week['used']:.0%} (resets epoch {week['resets_at']})")
 
 
-def refresh_cursor(state):
-    """Cursor's API refresh (wrapper for callers and tests that name Cursor)."""
-    refresh_api(state, "cursor")
-
-
 def record_quota(state, vendor, log):
     """Keep the quota the run reported."""
     adapter = agents.ADAPTERS[vendor]
