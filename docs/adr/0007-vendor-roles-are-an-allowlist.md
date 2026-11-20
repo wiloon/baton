@@ -15,6 +15,11 @@ including on retries, pinned selections and same-vendor fallback. Preferences on
 eligible vendors. When an order is inherited from another role, filter it to the destination
 role's eligible vendors.
 
+Adapter modules declare capabilities and policies. The runner selects behaviour through the
+registered adapter for the role. Configuration declares which vendors are enabled, grants
+their roles and supplies existing settings such as routes and quota limits. The same registry
+of adapters supplies validation and dispatch. Adding an adapter requires a catalog entry.
+
 ## Considered options
 
 - **Preferences alone:** keeps more work moving during a quota block but can send a task
@@ -36,3 +41,5 @@ role's eligible vendors.
 ## Revision record
 
 - Issue #103: record the hard role allowlist and its effect on selection, waiting and handoff.
+- Issue #106: route behaviour through registered adapter capabilities so another adapter can
+  use existing workflow roles without adding vendor branches or new configuration fields.
