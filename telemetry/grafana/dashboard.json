@@ -100,25 +100,12 @@
       {
         "name": "agent",
         "label": "Agent",
-        "type": "custom",
-        "query": "claude,cursor,codex",
-        "options": [
-          {
-            "text": "claude",
-            "value": "claude",
-            "selected": false
-          },
-          {
-            "text": "cursor",
-            "value": "cursor",
-            "selected": false
-          },
-          {
-            "text": "codex",
-            "value": "codex",
-            "selected": false
-          }
-        ],
+        "type": "query",
+        "query": {
+          "query": "label_values(baton_vendor_info{hostname=\"$host\"}, agent)",
+          "refId": "agent"
+        },
+        "options": [],
         "current": {
           "text": "All",
           "value": "$__all"
@@ -126,7 +113,14 @@
         "includeAll": true,
         "allValue": ".*",
         "multi": true,
-        "hide": 0
+        "hide": 0,
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${prometheus}"
+        },
+        "definition": "label_values(baton_vendor_info{hostname=\"$host\"}, agent)",
+        "refresh": 1,
+        "sort": 1
       },
       {
         "name": "role",
@@ -233,11 +227,11 @@
             "type": "prometheus",
             "uid": "${prometheus}"
           },
-          "expr": "(clamp_max((max by (agent) (max_over_time(baton_activity_in_interval{hostname=\"$host\"}[$__interval])) or on(agent) max by (agent) (max_over_time(baton_running_by_agent{hostname=\"$host\"}[$__interval]))), 1) and on() (max(baton_state_collect_success{hostname=\"$host\"}) == 1 and (time() - max(baton_activity_observed_at_seconds{hostname=\"$host\"})) < 150 and max(up{job=\"$node_job\",hostname=\"$host\"}) == 1)) or on(agent) (label_replace(vector(-1), \"agent\", \"claude\", \"\", \"\") or label_replace(vector(-1), \"agent\", \"cursor\", \"\", \"\") or label_replace(vector(-1), \"agent\", \"codex\", \"\", \"\"))",
+          "expr": "((clamp_max((max by (agent) (max_over_time(baton_activity_in_interval{hostname=\"$host\"}[$__interval])) or on(agent) max by (agent) (max_over_time(baton_running_by_agent{hostname=\"$host\"}[$__interval]))), 1) and on() (max(baton_state_collect_success{hostname=\"$host\"}) == 1 and (time() - max(baton_activity_observed_at_seconds{hostname=\"$host\"})) < 150 and max(up{job=\"$node_job\",hostname=\"$host\"}) == 1)) * on(agent) group_left(display_name) ((max by (agent, display_name) (baton_vendor_info{hostname=\"$host\"}) or on() max by (agent, display_name) (last_over_time(baton_vendor_info{hostname=\"$host\"}[5m]))) or on() label_join(group by (agent) (present_over_time(baton_running_by_agent{hostname=\"$host\"}[$__interval])), \"display_name\", \"\", \"agent\"))) or on(agent) (-1 * (max by (agent, display_name) (baton_vendor_info{hostname=\"$host\"}) or on() max by (agent, display_name) (last_over_time(baton_vendor_info{hostname=\"$host\"}[5m]))))",
           "instant": false,
           "range": true,
           "format": "time_series",
-          "legendFormat": "{{agent}}",
+          "legendFormat": "{{display_name}}",
           "editorMode": "code"
         }
       ],
@@ -285,44 +279,7 @@
           },
           "noValue": "Unknown"
         },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "claude"
-            },
-            "properties": [
-              {
-                "id": "displayName",
-                "value": "Claude Code"
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "cursor"
-            },
-            "properties": [
-              {
-                "id": "displayName",
-                "value": "Cursor Agent"
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "codex"
-            },
-            "properties": [
-              {
-                "id": "displayName",
-                "value": "Codex"
-              }
-            ]
-          }
-        ]
+        "overrides": []
       },
       "options": {
         "mergeValues": true,
@@ -442,7 +399,7 @@
         "w": 24,
         "h": 8
       },
-      "description": "Account/provider quota, shared across model calls; not per-model budgets. Headroom (pp) is percentage points of account quota below the configured weekly cap. Quota gate does not predict role/PR selection. Stale balances are last observed values. Reset-pending/unknown balances are N/A. Cursor has no 5h quota window. Data age is time since the oldest required authentication, 5h or weekly observation. Unsupported Cursor 5h is excluded; missing or invalid required timestamps are Unknown. Reset is time until the window resets. The underlying authentication and quota timestamps remain independent. Credential status shows the latest authentication result; check results age to Stale after 24 hours, while an explicit authentication failure remains visible until a later success.",
+      "description": "Account/provider quota, shared across model calls; not per-model budgets. Headroom (pp) is percentage points of account quota below the configured weekly cap. Quota gate does not predict role/PR selection. Stale balances are last observed values. Reset-pending/unknown balances are N/A. Data age is time since the oldest required authentication, 5h or weekly observation. Unsupported 5h windows are excluded; missing or invalid required timestamps are Unknown. Reset is time until the window resets. The underlying authentication and quota timestamps remain independent. Credential status shows the latest authentication result; check results age to Stale after 24 hours, while an explicit authentication failure remains visible until a later success.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prometheus}"
@@ -558,7 +515,7 @@
             "type": "prometheus",
             "uid": "${prometheus}"
           },
-          "expr": "(time() - min by (agent) (baton_credential_observed_at_seconds{hostname=\"$host\",agent=~\"${agent:regex}\"} or baton_quota_observed_at_seconds{hostname=\"$host\",agent=~\"${agent:regex}\",window=~\"five_hour|seven_day\"})) and on(agent) (max by (agent) ((baton_credential_observed_at_seconds{hostname=\"$host\",agent=~\"${agent:regex}\"} > 0) <= time())) and on(agent) (max by (agent) ((baton_quota_observed_at_seconds{hostname=\"$host\",agent=~\"${agent:regex}\",window=\"seven_day\"} > 0) <= time())) and on(agent) (max by (agent) ((baton_quota_observed_at_seconds{hostname=\"$host\",agent=~\"${agent:regex}\",window=\"five_hour\"} > 0) <= time()) or max by (agent) (baton_quota_window_state{hostname=\"$host\",agent=~\"${agent:regex}\",agent=\"cursor\",window=\"five_hour\"} == 4))",
+          "expr": "(time() - min by (agent) (baton_credential_observed_at_seconds{hostname=\"$host\",agent=~\"${agent:regex}\"} or baton_quota_observed_at_seconds{hostname=\"$host\",agent=~\"${agent:regex}\",window=~\"five_hour|seven_day\"})) and on(agent) (max by (agent) ((baton_credential_observed_at_seconds{hostname=\"$host\",agent=~\"${agent:regex}\"} > 0) <= time())) and on(agent) (max by (agent) ((baton_quota_observed_at_seconds{hostname=\"$host\",agent=~\"${agent:regex}\",window=\"seven_day\"} > 0) <= time())) and on(agent) (max by (agent) ((baton_quota_observed_at_seconds{hostname=\"$host\",agent=~\"${agent:regex}\",window=\"five_hour\"} > 0) <= time()) or max by (agent) (baton_quota_window_state{hostname=\"$host\",agent=~\"${agent:regex}\",window=\"five_hour\"} == 4))",
           "legendFormat": "{{agent}}",
           "instant": true,
           "range": false,
@@ -936,7 +893,7 @@
               },
               {
                 "id": "description",
-                "value": "Age of the oldest required authentication or quota observation. Unsupported Cursor 5h is excluded. Unknown means a required timestamp is missing, invalid or in the future. Independent source timestamps remain available as metrics."
+                "value": "Age of the oldest required authentication or quota observation. Unsupported 5h windows are excluded. Unknown means a required timestamp is missing, invalid or in the future. Independent source timestamps remain available as metrics."
               }
             ]
           },
@@ -1034,7 +991,7 @@
             "type": "prometheus",
             "uid": "${prometheus}"
           },
-          "expr": "(clamp_max(max by (agent) (baton_running_by_agent{hostname=\"$host\"}), 1) and on() (max(baton_state_collect_success{hostname=\"$host\"}) == 1 and (time() - max(baton_activity_observed_at_seconds{hostname=\"$host\"})) < 150 and max(up{job=\"$node_job\",hostname=\"$host\"}) == 1)) or on(agent) (label_replace(vector(-1), \"agent\", \"claude\", \"\", \"\") or label_replace(vector(-1), \"agent\", \"cursor\", \"\", \"\") or label_replace(vector(-1), \"agent\", \"codex\", \"\", \"\"))",
+          "expr": "((clamp_max(max by (agent) (baton_running_by_agent{hostname=\"$host\"}), 1) and on() (max(baton_state_collect_success{hostname=\"$host\"}) == 1 and (time() - max(baton_activity_observed_at_seconds{hostname=\"$host\"})) < 150 and max(up{job=\"$node_job\",hostname=\"$host\"}) == 1)) * on(agent) group_left(display_name) ((max by (agent, display_name) (baton_vendor_info{hostname=\"$host\"}) or on() max by (agent, display_name) (last_over_time(baton_vendor_info{hostname=\"$host\"}[5m]))) or on() label_join(group by (agent) (baton_running_by_agent{hostname=\"$host\"}), \"display_name\", \"\", \"agent\"))) or on(agent) (-1 * (max by (agent, display_name) (baton_vendor_info{hostname=\"$host\"}) or on() max by (agent, display_name) (last_over_time(baton_vendor_info{hostname=\"$host\"}[5m]))))",
           "instant": true,
           "range": false,
           "format": "table",
@@ -1074,27 +1031,28 @@
               "issue": true,
               "repo_issue": true,
               "pr": true,
-              "repo_pr": true
+              "repo_pr": true,
+              "agent": true
             },
             "indexByName": {
-              "agent": 0,
               "Value #A": 1,
               "role": 2,
               "stage": 3,
               "repo": 4,
               "Value #B": 7,
               "issue_link": 5,
-              "pr_link": 6
+              "pr_link": 6,
+              "display_name": 0
             },
             "renameByName": {
-              "agent": "Agent",
               "Value #A": "State",
               "role": "Role",
               "stage": "Stage",
               "repo": "Repo",
               "Value #B": "Elapsed",
               "issue_link": "Issue",
-              "pr_link": "PR"
+              "pr_link": "PR",
+              "display_name": "Agent"
             }
           }
         }
@@ -1154,33 +1112,6 @@
                 "value": {
                   "type": "color-text"
                 }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Agent"
-            },
-            "properties": [
-              {
-                "id": "mappings",
-                "value": [
-                  {
-                    "type": "value",
-                    "options": {
-                      "claude": {
-                        "text": "Claude Code"
-                      },
-                      "cursor": {
-                        "text": "Cursor Agent"
-                      },
-                      "codex": {
-                        "text": "Codex"
-                      }
-                    }
-                  }
-                ]
               }
             ]
           },
@@ -1312,7 +1243,7 @@
       },
       "options": {
         "mode": "markdown",
-        "content": "**5h / Weekly Remaining** = account quota left in the provider window. Weekly resets follow the provider, not calendar weeks. **Runner Left (pp)** = max(weekly cap \u2212 used, 0), in percentage points of account quota. Limits come from the runner's effective configuration.\n\n**Fresh / Stale** refer to each window\u2019s last successful observation; stale balances retain that value. **Reset pending / Unknown / Unsupported** show N/A until data is available. Cursor has no quota source. Probe attempts do not refresh observation times. **Quota Gate** covers quota and cooldown only; role rules, PR contributions and reviewer exclusions also affect dispatch."
+        "content": "**5h / Weekly Remaining** = account quota left in the provider window. Weekly resets follow the provider, not calendar weeks. **Runner Left (pp)** = max(weekly cap \u2212 used, 0), in percentage points of account quota. Limits come from the runner's effective configuration.\n\n**Fresh / Stale** refer to each window\u2019s last successful observation; stale balances retain that value. **Reset pending / Unknown / Unsupported** show N/A until data is available. Available quota windows depend on the provider. Probe attempts do not refresh observation times. **Quota Gate** covers quota and cooldown only; role rules, PR contributions and reviewer exclusions also affect dispatch."
       }
     },
     {
