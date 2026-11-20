@@ -506,20 +506,20 @@ class Review:
                         self.drop()
                         return 0
                     verdict = "pass" if outcome.startswith("REVIEW: pass") else "changes"
-                    body = pr_helpers.body(pr) if self.screenshot_enabled(reviewer) else None
-                    if body is not None and not pr_helpers.checks_none(body):
-                        step = "screenshot"
-                        code_verdict = verdict
-                        checks = check_section.all_blocks(body).strip()
-                        self.values.update(step=step, code_verdict=code_verdict, screenshot_checks=checks)
-                        self.save()
-                elif not checks:   # a split checkpoint written before the manual checks were saved
+                if step == "screenshot" or self.screenshot_enabled(reviewer):
                     body = pr_helpers.body(pr)
-                    if body is not None and not pr_helpers.checks_none(body):
-                        checks = check_section.all_blocks(body).strip()
-                if step == "screenshot":
-                    outcome = (self.run_screenshot_review(round, checks) if checks
-                               else "RESULT: failed reading PR manual checks")
+                    # If the body read fails on resume, keep the checks saved with the code verdict.
+                    if body is not None:
+                        if check_section.items(body):
+                            checks = check_section.read(body)
+                        else:
+                            checks = ""
+                if checks:
+                    step = "screenshot"
+                    code_verdict = verdict
+                    self.values.update(step=step, code_verdict=code_verdict, screenshot_checks=checks)
+                    self.save()
+                    outcome = self.run_screenshot_review(round, checks)
                     if not outcome.startswith(REVIEWED):
                         self.handoff("review_failed", f"PR #{pr} screenshot review failed", f"{outcome} {self.url}")
                         self.drop()

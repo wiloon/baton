@@ -95,7 +95,7 @@ def test_refused_edit_keeps_the_checks_for_a_retry(gh, dirs):
 def test_gate(gh):
     gh.set(headRefName="cursor/issue-242", body=BODY.replace("## Checks to verify\nnone", "## Checks to verify\n- look"),
            commits=[], closingIssuesReferences=[])
-    assert pr.gate(7) == {"action": "manual_checks"}
+    assert pr.gate(7)["action"] == "manual_checks"
     gh.set(body=BODY)
     assert pr.gate(7) == {"action": "merge"}
     partial = PARTIAL + "\n\n## Checks to verify\nnone"
@@ -106,7 +106,7 @@ def test_gate(gh):
     result = pr.gate(7)
     assert result["action"] == "queue_review" and "closing keywords" in result["reason"]
     gh.fail("view")
-    assert pr.gate(7) == {"action": "manual_checks"}
+    assert pr.gate(7)["action"] == "manual_checks"
 
 
 # --- the checks section under either name (#94) ----------------------------------------
@@ -121,30 +121,29 @@ def with_section(heading, text):
 @BOTH_HEADINGS
 def test_gate_reads_the_section_under_either_name(gh, heading):
     gh.set(headRefName="cursor/issue-242", commits=[], closingIssuesReferences=[], body=with_section(heading, "- look"))
-    assert pr.gate(7) == {"action": "manual_checks"}                    # a list hands off
+    assert pr.gate(7)["action"] == "manual_checks"                    # a list hands off
     assert pr.gate(7, cleared="- look") == {"action": "merge"}          # verdicts covering every item merge
     gh.set(body=with_section(heading, "none"))
     assert pr.gate(7) == {"action": "merge"}                            # none merges
 
 
-@pytest.mark.parametrize("body", [
-    BODY.replace("## Checks to verify\nnone\n\n", ""),
-    BODY.replace("## Before release", "## Checks to verify\n- look\n\n## Before release"),
-    BODY.replace("## Before release", "## Manual checks\n- look\n\n## Before release"),
-    BODY.replace("## Checks to verify\nnone", "## Manual checks\n- look").replace(
-        "## Before release", "## Manual checks\n- look\n\n## Before release"),
+@pytest.mark.parametrize("body, cleared", [
+    (BODY.replace("## Checks to verify\nnone\n\n", ""), ""),
+    (with_section("Checks to verify", "- look\n\n## Checks to verify\n- listen"), "- look\n- listen"),
+    (with_section("Manual checks", "- look\n\n## Checks to verify\n- listen"), "- look\n- listen"),
+    (with_section("Manual checks", "- look\n\n## Manual checks\n- listen"), "- look\n- listen"),
 ], ids=["no section", "two sections", "one old one new", "two old"])
-def test_a_body_that_is_not_well_formed_never_clears_the_gate(gh, body):
+def test_a_body_that_is_not_well_formed_never_clears_the_gate(gh, body, cleared):
     gh.set(headRefName="cursor/issue-242", commits=[], closingIssuesReferences=[], body=body)
-    assert pr.gate(7) == {"action": "manual_checks"}
-    assert pr.gate(7, cleared="- look") == {"action": "manual_checks"}
+    assert pr.gate(7)["action"] == "manual_checks"
+    assert pr.gate(7, cleared=cleared)["action"] == "manual_checks"
 
 
 @BOTH_HEADINGS
 def test_an_empty_section_never_clears_the_gate(gh, heading):
     gh.set(headRefName="cursor/issue-242", commits=[], closingIssuesReferences=[], body=with_section(heading, ""))
-    assert pr.gate(7, cleared="") == {"action": "manual_checks"}
-    assert pr.gate(7) == {"action": "manual_checks"}
+    assert pr.gate(7, cleared="")["action"] == "manual_checks"
+    assert pr.gate(7)["action"] == "manual_checks"
 
 
 def test_checks_none_matches_the_heading_exactly():

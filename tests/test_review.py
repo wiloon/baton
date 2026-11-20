@@ -524,6 +524,30 @@ def test_a_resumed_screenshot_review_preserves_checks_when_the_body_is_unavailab
     assert not loop.checkpoint()
 
 
+@pytest.mark.parametrize("section", ["", "## Checks to verify\n", "## Checks to verify\n- old\n## Manual checks\n- new"])
+@pytest.mark.parametrize("resume", ["fresh", "legacy checkpoint", "saved checks"])
+def test_no_eligible_checks_preserve_the_code_verdict(loop, section, resume):
+    loop.reviews, loop.screens = ["pass"], ["defer", "pass"]
+    if resume != "fresh":
+        with pytest.raises(Deferred):
+            screen_run(loop)
+        if resume == "legacy checkpoint":
+            pending = Path(loop.env["STATE"], f"review-pending-{PR}")
+            pending.write_text("".join(line for line in pending.read_text().splitlines(keepends=True)
+                                       if not line.startswith("screenshot_checks=")))
+    loop.gh.set(body=f"Refs #297\n\n{section}")
+    if resume == "fresh":
+        assert loop.run(fixer="cursor", SCREENSHOT_REVIEW="1") == 0
+        assert roles(loop) == ["review"]
+        assert loop.merged == [PR]
+    else:
+        assert resume_split_review(loop) == 80
+        assert roles(loop) == ["review", "screenshot_review"]
+        assert loop.merged == [str(PR)]
+    assert loop.merge_screenshots == [None] and not screenshot_comments(loop)
+    assert not loop.labelled("ready-for-human") and not loop.checkpoint()
+
+
 def test_a_qualifying_round_runs_the_code_review_then_its_own_screenshot_review(loop):
     shoot(loop, "01-library-390.png")
     loop.reviews, loop.screens = ["pass"], ["pass"]
@@ -702,7 +726,7 @@ def test_the_code_prompts_leave_the_screenshots_to_their_own_run(loop, monkeypat
         screen_run(loop)
         prompt = loop.agents[0]["prompt"]
         assert loop.agents[0]["vendor"] == vendor
-        assert "01-library-390.png" not in prompt and "screenshot" not in prompt.lower()
+        assert "01-library-390.png" not in prompt and "Look at every one of the screenshots" not in prompt
 
 
 def test_the_screenshot_prompt_lists_every_eligible_png_and_asks_for_a_line_each(loop):

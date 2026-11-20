@@ -819,11 +819,13 @@ def re_context(prompt):
 
 
 def test_the_dev_body_is_published_under_the_new_checks_heading(devrun):
-    devrun.script = [implements(body="Summary\n\nRefs #300\n\n## Manual checks\n- Open the page\n- Open the map\n")]
+    check_lines = ["- Open the page  ", "- Open the map  "]
+    devrun.script = [implements(body="Summary\n\nRefs #300\n\n## Manual checks\n" + "\n".join(check_lines) + "\n")]
     devrun.go()
     create, = devrun.gh.ran("pr", "create")
     body = create[create.index("--body") + 1]
-    assert "## Checks to verify\n- Open the page\n- Open the map" in body and "Manual checks" not in body
+    assert body.splitlines()[-3:] == ["## Checks to verify", *check_lines]
+    assert "## Manual checks" not in body
 
 
 def test_the_gate_result_goes_in_the_pr_description(devrun, monkeypatch):

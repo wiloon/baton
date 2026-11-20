@@ -367,6 +367,8 @@ def deferred_remainder(path, body):
     try:
         saved = json.loads(path.read_text())
         source, left = saved["source"], saved["left"]
+        if not isinstance(source, list) or not isinstance(left, list):
+            return None
         if not all(isinstance(item, str) for item in (*source, *left)):
             return None
     except (OSError, ValueError, KeyError, TypeError):

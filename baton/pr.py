@@ -282,14 +282,15 @@ def gate(pr, defer=False, cleared=None):
     when the live description would close the wrong issue (preflight). DEFER: the
     repository's manual checks wait for a later trial instead of the merge (#48).
     CLEARED: the manual checks the screenshot review verified, all of them (#92); they
-    clear the gate only while the live description still lists exactly those checks."""
+    clear the gate only while the live description still lists exactly those checks.
+    A checks handoff includes the body that caused it, when it could be read."""
     current = body(pr)
     if current is None:
         return {"action": "manual_checks"}
     listed = checks.items(current)   # none unless the body has exactly one checks section
     verified = cleared is not None and bool(listed) and listed == check_verdicts.items(cleared)
     if not (defer or verified or checks_none(current)):
-        return {"action": "manual_checks"}
+        return {"action": "manual_checks", "body": current}
     try:
         preflight(pr)
     except ValueError as error:

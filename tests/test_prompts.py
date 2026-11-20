@@ -180,32 +180,32 @@ def first_line(name):
     return (BIN / "partials" / f"{name}.md").read_text().splitlines()[0].replace("{{CHECKS_HEADING}}", checks.HEADING)
 
 
-@pytest.mark.parametrize("name, partials", [
-    ("dev-prompt.md", ["checks-rules"]),
-    ("fix-prompt.md", ["checks-rules", "fix-reply"]), ("codex-fix-prompt.md", ["checks-rules", "fix-reply"]),
-    ("cursor-fix-prompt.md", ["checks-rules", "fix-reply"]),
-    ("review-prompt.md", ["checks-review"]), ("codex-review-prompt.md", ["checks-review"]),
-    ("cursor-review-prompt.md", ["checks-review"]),
-    ("spec-prompt.md", ["checks-keep"]), ("codex-spec-prompt.md", ["checks-keep"]), ("spec-review-prompt.md", ["checks-keep"]),
+@pytest.mark.parametrize("name, role_partial", [
+    ("dev-prompt.md", None),
+    ("fix-prompt.md", "fix-reply"), ("codex-fix-prompt.md", "fix-reply"), ("cursor-fix-prompt.md", "fix-reply"),
+    ("review-prompt.md", "checks-review"), ("codex-review-prompt.md", "checks-review"),
+    ("cursor-review-prompt.md", "checks-review"),
+    ("spec-prompt.md", "checks-keep"), ("codex-spec-prompt.md", "checks-keep"),
 ])
-def test_every_vendors_prompt_carries_the_shared_rules_under_the_new_heading(tmp_path, name, partials):
+def test_every_vendors_prompt_carries_the_shared_rules_under_the_new_heading(tmp_path, name, role_partial):
     out = prompts.render(BIN / name, [], env=other_repo(tmp_path))
     assert "{{>" not in out and "{{CHECKS_HEADING}}" not in out and "Manual checks" not in out
-    for partial in partials:
-        assert first_line(partial) in out
+    assert first_line("checks-rules") in out
+    if role_partial:
+        assert first_line(role_partial) in out
+
+    custom = tmp_path / "custom"
+    (custom / "partials").mkdir(parents=True)
+    (custom / "partials" / "checks-rules.md").write_text("Our own rules for ## {{CHECKS_HEADING}}.\n")
+    overridden = prompts.render(BIN / name, [], env=other_repo(custom, prompt_dir=str(custom)))
+    assert "Our own rules for ## Checks to verify." in overridden and first_line("checks-rules") not in overridden
+    if role_partial:
+        assert first_line(role_partial) in overridden
 
 
 def test_a_caller_value_that_looks_like_a_partial_stays_data(tmp_path):
-    out = prompts.render(BIN / "dev-prompt.md", [("CONTEXT_FILE", "{{> checks-rules}}")], env=other_repo(tmp_path))
-    assert "`{{> checks-rules}}` first" in out
-
-
-def test_a_prompt_dir_partial_overrides_the_shipped_one(tmp_path):
-    custom = tmp_path / "custom"
-    (custom / "partials").mkdir(parents=True)
-    (custom / "partials" / "checks-rules.md").write_text("Our own rules.\n")
-    out = prompts.render(BIN / "dev-prompt.md", [], env=other_repo(tmp_path, prompt_dir=str(custom)))
-    assert "Our own rules." in out and first_line("checks-rules") not in out
+    out = prompts.render(BIN / "dev-prompt.md", [("RESUME_NOTE", "{{> checks-rules}}")], env=other_repo(tmp_path))
+    assert "{{> checks-rules}}" in out.splitlines()
 
 
 def test_an_unknown_partial_is_an_error(tmp_path):

@@ -201,7 +201,7 @@ class Merger:
             self.handoff("auto_merge_off", f"PR #{pr} review passed",
                          f"Auto-merge is off{where}; ready for you." + (f" {listed}\n{url}" if listed else f" {url}"))
             if not deferred and (body is None or not pr_helpers.checks_none(body)):
-                notify.send_shots(pr, left=owed)
+                notify.send_shots(pr, note="Checks for you" if left is None else "", left=owed)
             return
         if not self.ci_green(45):
             if self.ci_fix_round(wt) != 0 or not self.ci_green(45):
@@ -220,11 +220,13 @@ class Merger:
             notify.notify(f"PR #{pr}: metadata review queued", f"{gate['reason']} {url}")
             return
         if gate.get("action") != "merge":   # the checks, or no answer: the owner decides
-            owed = self.owed(left, body)
+            live_body = gate.get("body")
+            left = self.left_for_owner(screenshot, live_body)
+            owed = self.owed(left, live_body if live_body is not None else body)
             listed = self.left_text(left, owed)
             self.handoff("manual_checks", f"PR #{pr} needs a manual check",
                          "Review and CI passed." + (f" {listed}\n{url}" if listed else f" {url}"))
-            notify.send_shots(pr, left=owed)
+            notify.send_shots(pr, note="Checks for you" if left is None else "", left=owed)
             return
         if deferred:   # the remainder belongs to this attempt, never to an earlier one
             if left is None:

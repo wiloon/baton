@@ -66,7 +66,8 @@ def prepare(body, issue, required_completion=None):
     # Agents may copy the current body, but only the runner emits protocol markers.
     body = re.sub(r"<!-- baton-.*?-->", "", body, flags=re.S)
     body = FIELD.sub("", body)
-    body = LINK.sub(lambda match: "" if match[2] == issue else match[0], body).strip()
+    # Keep trailing spaces on the last line, which may be an owner's check.
+    body = LINK.sub(lambda match: "" if match[2] == issue else match[0], body).lstrip().rstrip("\r\n")
     keyword = "Closes" if completion == "complete" else "Refs"
     return f"<!-- baton-task issue={issue} completion={completion} -->\n\n{keyword} #{issue}\n\n{body}\n"
 

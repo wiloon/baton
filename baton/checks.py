@@ -66,12 +66,17 @@ def all_blocks(body):
 def items(body):
     """The checks of a well-formed body, one per list item; none when it is not well-formed."""
     text = read(body)
-    return check_verdicts.items(text) if text is not None else []
+    return _block_items(text) if text is not None else []
 
 
 def recovery_items(body):
     """The checks of every checks section, for a body of any form."""
-    return check_verdicts.items(all_blocks(body))
+    lines, found = _sections(body)
+    return [item for span in found for item in _block_items(_text(lines, span))]
+
+
+def _block_items(text):
+    return [] if _is_none(text) else check_verdicts.items(text)
 
 
 def lines(body):
@@ -86,8 +91,10 @@ def is_none(body):
     """True when the body is well-formed and its section's one non-empty line, tool attribution
     lines aside, is "none" or "none." (#265)."""
     text = read(body)
-    if text is None:
-        return False
+    return text is not None and _is_none(text)
+
+
+def _is_none(text):
     answer = [line for line in (re.sub(r"^[-*\s]+", "", line) for line in text.split("\n"))
               if line and not ATTRIBUTION.match(line)]
     return len(answer) == 1 and bool(re.fullmatch(r"none\.?", answer[0].lower()))

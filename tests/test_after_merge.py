@@ -477,11 +477,29 @@ def test_without_a_usable_remainder_every_current_check_is_sent(gh, deferred, sa
     assert "- [ ] Open a book.\n- [ ] Open a map.\n" in issue["body"]
 
 
-def test_deferred_recovery_sends_the_checks_of_both_blocks(gh, deferred):
-    gh.set(body=body_with(("Manual checks", "- Open a book."), ("Checks to verify", "- Open a map.")), title="feat: covers")
+@pytest.mark.parametrize("left", ["", {}, [1]], ids=["string", "object", "non-string item"])
+def test_a_malformed_remainder_with_matching_source_sends_the_current_check(gh, deferred, left):
+    gh.set(body=body_with(("Checks to verify", "- Open the map")))
+    Path(deferred.parent, "deferred-checks-items-pr-32").write_text(remainder(["Open the map"], left))
     after_merge.deferred_checks(32, "6")
     [issue] = gh.created()
-    assert "- [ ] Open a book.\n- [ ] Open a map.\n" in issue["body"]
+    assert issue["body"].endswith("- [ ] Open the map\n")
+
+
+@pytest.mark.parametrize("first, second, expected", [
+    ("- Open a book.", "- Open a map.", ["Open a book.", "Open a map."]),
+    ("Open a book.", "Open a map.", ["Open a book.", "Open a map."]),
+    ("none", "none.", []),
+    ("none\n\n🤖 Generated with Test Tool", "Open a map.", ["Open a map."]),
+], ids=["lists", "plain text", "both none", "none with attribution"])
+def test_deferred_recovery_handles_each_checks_block(gh, deferred, first, second, expected):
+    gh.set(body=body_with(("Manual checks", first), ("Checks to verify", second)), title="feat: covers")
+    after_merge.deferred_checks(32, "6")
+    if expected:
+        [issue] = gh.created()
+        assert issue["body"].split("\n\n")[-1].splitlines() == [f"- [ ] {item}" for item in expected]
+    else:
+        assert gh.created() == []
     assert Path(deferred.parent, "deferred-checks-pr-32").exists()
 
 

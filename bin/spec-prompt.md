@@ -17,6 +17,7 @@ The worktree {{WORKTREE}} is on branch `{{BRANCH}}` (`main` plus ADR revisions f
 3. Edits:
    - **Issue body:** write the complete new body to `{{OUT}}.body` with the Write tool (only when it changes). Keep any first-line `<!-- baton-… -->` marker. Fix stale facts in place; don't append a changelog.
    - **Runner sections:** `## E2E gate` is exactly one line (targets and options, or `none`) with nothing after it. The runner refuses an accept of a body that breaks it, and the point comes back to you.
+   {{> checks-rules}}
    {{> checks-keep}}
    - **ADRs:** edit them in the worktree, then commit (`docs(adr): …`, one commit is fine). Changing a decision's substance: add a line to the ADR's revision record (add one if it has none) naming issue #{{ISSUE}} and the reason. Match the ADR's language.
    - Don't touch code, tests or the owner's principles, and leave no uncommitted changes.
