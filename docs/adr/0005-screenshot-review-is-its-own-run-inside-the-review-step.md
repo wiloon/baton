@@ -70,13 +70,21 @@ fix                        reads both, answers Must fix and design findings, re-
   (`<!-- baton-fix by=<vendor> round=<n> -->`), so a review reads only the answers given since
   the previous screenshot review. That review must judge every open id in the block exactly
   once under `## Design answers`. An id with no valid, single answer stays open, however many
-  rounds pass. A held finding the fixer adopted (or did not answer) stays open. A held finding
-  the fixer rejected is a disagreement for the owner. Only a valid `resolved` answer closes an
-  id, and nothing closes a disagreement, so a later review that omits one, or a round with no
-  screenshot review, cannot drop it.
+  rounds pass. Only the fixer's *current* answer decides a disposition: the answer to that id
+  in the fix replies since the previous screenshot review, which must be exactly one valid line
+  (an id answered twice, even identically, or in two of those replies, counts as unanswered).
+  An earlier round's answer is history: the block shows it, labelled as earlier, but it never
+  makes a disagreement and never closes an id. A held finding whose current answer is
+  `rejected` is a disagreement for the owner; a held finding the fixer adopted, did not answer,
+  or answered ambiguously stays open. Only a valid `resolved` answer closes an id, and nothing
+  closes a disagreement, so a later review that omits one, or a round with no screenshot
+  review, cannot drop it.
 - A fix run that commits nothing is not a `no_commit` hand-off when its reply answers every
   design finding (all `rejected`) and the feedback had no Must fix item: the next round's
   screenshot review judges the rejections. The fixer still re-shoots as the fix rules say.
+  Cursor's fix resumes after a deferred description update without a second agent run, so it
+  saves its validated design answers with the pending request on the first pass and the resumed
+  run decides from them; a resume with no saved answers is a `no_commit` hand-off, as before.
 - Design findings, and the fixer's answers given to the next screenshot review, are complete
   numbered records: they are never cut inside an item. If they do not fit
   `review_context_max_chars` whole, the PR goes to the owner (`review_failed`) instead of the
@@ -101,3 +109,7 @@ fix                        reads both, answers Must fix and design findings, re-
   comment, supplies every open finding to each fixer and later screenshot review, so an omitted
   finding cannot lose its place, be confused with a renumbered one, or skip a round without
   screenshots; the whole-record rule also covers the posted fix reply under a reply cap.
+- Issue #96, round 4: only the fixer's current answer (one valid line in the replies since the
+  previous screenshot review) can turn a held finding into a disagreement, so a stale rejection
+  from an earlier round cannot reach the owner; and Cursor's rejection-only decision survives
+  its deferred resume through saved answers instead of an empty reply.

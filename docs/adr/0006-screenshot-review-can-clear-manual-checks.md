@@ -29,7 +29,8 @@ merge gate (manual_checks = "gate"), after review passed and CI is green
   no usable verdicts            -> ready-for-human, as before
 manual_checks = "defer"         -> merge; only the unverified checks go to "Checks to try"
                                    (a check blocked by a design finding goes there with the finding,
-                                   also when the verdicts are unusable)
+                                   also when the verdicts are unusable; the remainder is computed
+                                   from the body the gate allowed the merge on)
 any round's open design finding or disagreement that no current check carries
                                 -> ready-for-human, whatever manual_checks says, even when
                                    the checks section is `none` (#96)
@@ -114,3 +115,9 @@ that an unsettled design finding with no current check to carry it goes to the o
   remainder is then written with every current check (not removed) and records, per check, the
   carried finding's text and the fixer's answer, which the tracker adds to that check. Without
   carried findings, unusable verdicts still remove the remainder, as before.
+- Issue #96, round 4: a gate that allows the merge returns the body it read, and the merge step
+  computes the unverified checks and the saved remainder from that body, not from its own
+  earlier read, so a check added between the reads cannot make the tracker discard the
+  remainder and the finding's text with it. When the tracker still falls back to every current
+  check (the body changed after the merge), it adds the recorded carried text to each current
+  check whose text matches.
