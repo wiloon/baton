@@ -100,9 +100,12 @@ def host(tmp_path, monkeypatch):
     monkeypatch.setenv('BATON_TELEMETRY_ITEM', 'PRIVATE_ITEM')
     monkeypatch.setenv('OTEL_RESOURCE_ATTRIBUTES', 'PRIVATE_OTEL')
     c = config.load(ROOT/'config.example.toml')
-    c = replace(c, paths=replace(c.paths, state=state), environment=replace(c.environment, path_prefix=()),
+    vendors = tuple(v for v in c.vendors if v.id == 'claude')
+    caps = tuple((v.id, v.cap) for v in vendors)
+    c = replace(c, vendors=vendors, paths=replace(c.paths, state=state),
+                environment=replace(c.environment, path_prefix=()),
                 retrospectives=replace(c.retrospectives, enabled=True),
-                quota=replace(c.quota, vendor_pool=('claude',)))
+                quota=replace(c.quota, vendor_pool=('claude',), vendor_extra=(), caps=caps))
     now = time.time()
     (state/'credential-claude.json').write_text(json.dumps(dict(result='authenticated', observed_at=now)))
     (state/'quota-claude.json').write_text(json.dumps(dict(observed_at=now, windows={
@@ -494,8 +497,13 @@ def test_unchanged_capacity_deferral_does_not_grow_report_history(host):
 
 
 def enable_vendors(host, vendors=('claude', 'codex', 'cursor')):
-    host.config=replace(host.config, quota=replace(host.config.quota,
-        vendor_pool=tuple(v for v in vendors if v!='cursor'), vendor_extra=('cursor',) if 'cursor' in vendors else ()))
+    baseline = config.load(ROOT / 'config.example.toml')
+    kept = tuple(v for v in baseline.vendors if v.id in vendors)
+    pool = tuple(v.id for v in kept if v.quota == 'pool')
+    extra = tuple(v.id for v in kept if v.quota == 'extra')
+    caps = tuple((v.id, v.cap) for v in kept)
+    host.config = replace(host.config, vendors=kept,
+                          quota=replace(baseline.quota, vendor_pool=pool, vendor_extra=extra, caps=caps))
     now=time.time()
     for vendor in vendors:
         (host.state/f'credential-{vendor}.json').write_text(json.dumps(dict(result='authenticated',observed_at=now)))

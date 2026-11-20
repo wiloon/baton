@@ -27,20 +27,23 @@ from zoneinfo import ZoneInfo
 from . import claude_cli, codex_cli, cursor_cli
 from .common import Request, events, read
 
-ADAPTERS = {"claude": claude_cli, "cursor": cursor_cli, "codex": codex_cli}
+ADAPTERS = {mod.ID: mod for mod in (claude_cli, cursor_cli, codex_cli)}
+CATALOG = frozenset(ADAPTERS)
+
+
+def prompt_file(vendor, stem):
+    return f"{ADAPTERS[vendor].PROMPT_PREFIX}{stem}-prompt.md"
 STATUSES = ("success", "failure", "timeout", "quota", "busy", "auth")
 
 # Match explicit quota messages, never bare 429/rate-limit/overloaded errors (those are
-# BUSY below). Claude
-# phrases come from the previous runner. Cursor phrases are conservative guesses until
-# captured on the runner host; Codex usage_limit_reached/usage-limit text is present in the local
-# CLI binary. Authentication is classified before quota. An auth failure is handled
+# BUSY below). Phrases live with each adapter so a disabled vendor still classifies
+# historical logs. Authentication is classified before quota. An auth failure is handled
 # like an exhausted quota: the vendor rests COOLDOWN_HOURS (no reset time to read) and
 # the item waits for another vendor or the owner's new login.
 QUOTA = {
-    "claude": r"usage limit|session limit|hit your .*limit|limit reached|out of (extra )?usage|rate_limit_error",
-    "cursor": r"usage limit (reached|exceeded)|(monthly|weekly|daily) (usage |request )?limit (reached|exceeded)|(insufficient|exhausted) quota",
-    "codex": r"usage_limit_reached|hit your usage limit|usage limit (reached|exceeded)|insufficient_quota",
+    claude_cli.ID: r"usage limit|session limit|hit your .*limit|limit reached|out of (extra )?usage|rate_limit_error",
+    cursor_cli.ID: r"usage limit (reached|exceeded)|(monthly|weekly|daily) (usage |request )?limit (reached|exceeded)|(insufficient|exhausted) quota",
+    codex_cli.ID: r"usage_limit_reached|hit your usage limit|usage limit (reached|exceeded)|insufficient_quota",
 }
 AUTH = (r"authentication (failed|required)|failed to authenticate|unauthorized|invalid[_ ]api[_ ]key|invalid[_ ]token"
         r"|(token|session) (has )?expired|please (log|sign) in|login required|not (logged|signed) in")

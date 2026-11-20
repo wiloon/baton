@@ -27,8 +27,6 @@ def full_text(baseline=None):
     head, rest = baseline.split('[[repos]]\n', 1)
     tail = rest[rest.index('\n[models]\n') + 1:]
     entry = (ROOT / 'tests/fixtures/repo.toml').read_text().split('[[repos]]\n', 1)[1]
-    # Cursor too, so the tests see every vendor.
-    tail = tail.replace('vendor_extra = []', 'vendor_extra = ["cursor"]')
     return head + '[[repos]]\n' + entry + '\n' + tail
 
 
@@ -252,8 +250,26 @@ def typed_legacy_test_inputs(request, monkeypatch):
         # AUTO_MERGE names both switches; REPO_AUTO_MERGE sets only the repository's.
         if 'REPO_AUTO_MERGE' in env:
             repo = replace(repo, auto_merge=env['REPO_AUTO_MERGE'] == '1')
-        # Legacy helpers used 95% when no per-vendor cap was configured.
-        sections['quota'] = replace(sections['quota'], quota_cap_claude=float(env.get('QUOTA_CAP_CLAUDE','.95')))
+        if 'QUOTA_CAP_CLAUDE' in env:
+            caps = dict(config.quota.caps)
+            caps['claude'] = float(env['QUOTA_CAP_CLAUDE'])
+            sections['quota'] = replace(sections['quota'], caps=tuple(caps.items()))
+        if env.get('VENDOR_EXTRA') == '':
+            vendors = tuple(v for v in config.vendors if v.quota != 'extra')
+            sections['quota'] = replace(sections['quota'],
+                                        vendor_pool=tuple(v.id for v in vendors if v.quota == 'pool'),
+                                        vendor_extra=(), caps=tuple((v.id, v.cap) for v in vendors))
+            config = replace(config, vendors=vendors)
+        elif 'VENDOR_POOL' in env:
+            pool = tuple(env['VENDOR_POOL'].split())
+            keep = set(pool) | {v.id for v in config.vendors if v.quota == 'extra'}
+            vendors = tuple(v for v in config.vendors if v.id in keep)
+            vendor_pool = tuple(v.id for v in vendors if v.id in pool)
+            vendor_extra = tuple(v.id for v in vendors if v.quota == 'extra')
+            caps = tuple((v.id, v.cap) for v in vendors)
+            sections['quota'] = replace(sections['quota'], vendor_pool=vendor_pool,
+                                        vendor_extra=vendor_extra, caps=caps)
+            config = replace(config, vendors=vendors)
         # Legacy vectors have Linear and Telegram configured, their files under HOME unless named.
         secrets = home / '.config/baton'
         linear = Linear(env_file=Path(env.get('LINEAR_ENV') or secrets / 'linear.env'), team_id='team',

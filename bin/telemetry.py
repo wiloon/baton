@@ -18,9 +18,9 @@ import urllib.request
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from baton import maintenance, timing
+from baton import agents, maintenance, timing
 
-VENDORS = ('claude', 'cursor', 'codex')
+VENDORS = tuple(sorted(agents.CATALOG))
 CREDENTIAL_STALE_SECONDS = 24 * 60 * 60
 ROLES = ('spec', 'spec_review', 'review', 'screenshot_review', 'fix', 'triage', 'scan', 'dev', 'probe')
 STATUSES = ('success', 'failure', 'timeout', 'auth', 'quota', 'busy', 'interrupted')
@@ -521,8 +521,12 @@ class Ledger:
         return self.root / 'runs' / (str(uuid.UUID(run_id)) + '.json')
 
     def begin(self, vendor, role, pid, minutes, issue=0, pr=0, round_=0, *, repo, requested_model=''):
-        if vendor not in VENDORS or role not in ROLES or not 1 <= minutes <= 1440:
+        if vendor not in agents.CATALOG or role not in ROLES or not 1 <= minutes <= 1440:
             raise ValueError('invalid bounded run metadata')
+        declared = _declared_from_runner_config()
+        if CONFIG_PATH is not None:
+            if declared is None or vendor not in declared:
+                raise ValueError('vendor not in effective registry')
         now = time.time()
         run_id = str(uuid.uuid4())
         stage = {'dev': 'implement', 'screenshot_review': 'review'}.get(role, role)
@@ -541,7 +545,7 @@ class Ledger:
             record['pipeline_id'] = task['pipeline_id']
         record.update(fingerprints(Path(__file__).parent))
         try:
-            executable = 'cursor-agent' if vendor == 'cursor' else vendor
+            executable = agents.ADAPTERS[vendor].VERSION_EXECUTABLE
             output = subprocess.run([executable, '--version'], capture_output=True, text=True, timeout=3, check=True).stdout
             version = re.search(r'(?<![A-Za-z0-9])[0-9][0-9A-Za-z.+-]{0,63}', output)
             if version:
@@ -679,9 +683,24 @@ def unit_state():
 
 def _runner_config(config):
     # bin/ and baton/ are siblings; collection never invokes bootstrap.
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from baton.config import load
     return load(config)
+
+
+def _declared(config):
+    try:
+        return _runner_config(config).declared()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _declared_from_runner_config():
+    if CONFIG_PATH is None:
+        return None
+    try:
+        return _runner_config(CONFIG_PATH).declared()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
 
 
 def settings(config):
@@ -689,24 +708,28 @@ def settings(config):
 
 
 def quota_settings(config):
-    quota = _runner_config(config).quota
-    return [quota.quota_cap_claude, quota.quota_cap_codex, quota.quota_cap_cursor,
+    cfg = _runner_config(config)
+    quota = cfg.quota
+    caps = {vendor: cfg.cap(vendor) for vendor in cfg.declared()}
+    return [caps.get('claude', math.nan), caps.get('codex', math.nan), caps.get('cursor', math.nan),
             quota.quota_five_hour_max, quota.quota_stale_minutes]
 
 
-def quota_metrics(state, config, emit, now):
+def quota_metrics(state, config, emit, now, declared=None):
     """Account quota, never inferred from token counts or successful probes.
 
     Window state: 0 unknown, 1 fresh, 2 stale, 3 reset pending, 4 unsupported,
     5 invalid. Gate: 0 unknown, 1 within quota, 2 5h limit, 3 weekly limit,
     4 cooldown. This is a quota gate, not a prediction of role/PR selection.
     """
+    if declared is None:
+        return
     try:
         claude_cap, codex_cap, cursor_cap, five_cap, stale_minutes = quota_settings(config)
         caps = {'claude': claude_cap, 'codex': codex_cap, 'cursor': cursor_cap}
     except (OSError, ValueError, subprocess.SubprocessError):
-        caps, five_cap, stale_minutes = {}, math.nan, math.nan
-    for vendor in VENDORS:
+        return
+    for vendor in declared:
         labels = '{agent="' + vendor + '"}'
         gate, blocked, states = 0, 0, []
         try:
@@ -722,7 +745,12 @@ def quota_metrics(state, config, emit, now):
             wl = '{agent="' + vendor + '",window="' + window + '"}'
             raw = snap.get('windows', {}).get(window)
             # Cursor reports only a weekly window, and only once its usage API answered.
-            status = 4 if vendor == 'cursor' and raw is None else (5 if malformed else 0)
+            if window not in agents.ADAPTERS[vendor].QUOTA_WINDOWS:
+                status = 4
+            elif malformed:
+                status = 5
+            elif raw is None:
+                status = 0
             used = reset = observed = math.nan
             cap = five_cap if window == 'five_hour' else caps.get(vendor, math.nan)
             if raw is not None:
@@ -762,10 +790,12 @@ def quota_metrics(state, config, emit, now):
         emit('quota_gate', gate, labels)
 
 
-def credential_metrics(state, emit, now):
+def credential_metrics(state, emit, now, declared=None):
     """Expose the latest provider auth check; successful checks age to Stale."""
+    if declared is None:
+        return
     states = {'authenticated': 1, 'auth_expired': 2, 'probe_failed': 3}
-    for vendor in VENDORS:
+    for vendor in declared:
         value, observed = 0, math.nan
         try:
             record = read(state / ('credential-' + vendor + '.json'))
@@ -1021,16 +1051,30 @@ def collect(ledger, config, output):
     cfg = attempt(lambda: settings(config), [None] * 4)
     emit('paused', cfg[0] if cfg[0] is not None else 'NaN')
     date = dt.datetime.now().strftime('%Y-%m-%d')  # the host's local timezone, every collect
-    for vendor, cap in zip(VENDORS, cfg[1:]):
-        labels = '{agent="' + vendor + '"}'
-        emit('cap_configured', int(cap is not None) if cfg[0] is not None else 'NaN', labels)
-        emit('daily_cap', cap if cap is not None else 'NaN', labels)
-        prefix = '' if vendor == 'claude' else vendor + '-'
-        emit('runs_today', attempt(lambda: count(ledger.state / f'{prefix}runs-{date}'), math.nan), labels)
-        emit('cooldown_until_seconds', attempt(lambda: count(ledger.state / (vendor + '-cooldown-until')), math.nan), labels)
+    def load_declared():
+        found = _declared(config)
+        if not found:
+            raise ValueError('no declared vendors')
+        return tuple(found)
 
-    quota_metrics(ledger.state, config, emit, now)
-    credential_metrics(ledger.state, emit, now)
+    declared = attempt(load_declared, None)
+    if declared is not None:
+        cfg_obj = _runner_config(config)
+        quota_by_id = {v.id: v.quota for v in cfg_obj.vendors}
+        for vendor in declared:
+            adapter = agents.ADAPTERS[vendor]
+            info = (f'{{agent="{vendor}",display_name="{adapter.DISPLAY_NAME}",'
+                    f'quota="{quota_by_id[vendor]}"}}')
+            emit('vendor_info', 1, info)
+            labels = '{agent="' + vendor + '"}'
+            cap = cfg_obj.cap(vendor)
+            emit('cap_configured', int(cap is not None), labels)
+            emit('daily_cap', cap, labels)
+            emit('runs_today', attempt(lambda v=vendor, a=adapter: count(ledger.state / f'{a.RUNS_STEM}-{date}'), math.nan), labels)
+            emit('cooldown_until_seconds', attempt(lambda v=vendor: count(ledger.state / f'{v}-cooldown-until'), math.nan), labels)
+
+    quota_metrics(ledger.state, config, emit, now, declared)
+    credential_metrics(ledger.state, emit, now, declared)
     attempt(lambda: contribution_metrics(ledger.state, emit, now), None)
 
     def lock_held():

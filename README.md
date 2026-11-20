@@ -104,7 +104,7 @@ existing alternatives, replacement criteria and the proposed boundary for model-
 - at least one agent CLI, logged in with its subscription:
   - Claude Code (`claude`)
   - Codex (`codex`)
-  - Cursor (`cursor-agent`) as an optional extra vendor (`vendor_extra = ["cursor"]`)
+  - Cursor (`cursor-agent`) as an optional extra vendor (`[vendors.cursor]` with `quota = "extra"`)
 - whatever the watched repository's own checks need (its toolchain; `mise.toml` here pins one
   for everything under `~/baton`, edit it to suit)
 
@@ -121,8 +121,8 @@ cp config.example.toml config.toml
 
 # 2. Point it at a repository: edit the [[repos]] entry in config.toml
 #    (gh_repo, owner, ci_command, ...).
-#    Set [quota].vendor_pool to the CLIs you installed, e.g. ["codex"] or ["claude"].
-#    Cursor is optional: vendor_extra = ["cursor"] enables it.
+#    Declare each CLI under [vendors.<id>] with adapter, roles, quota ("pool" or
+#    "extra") and cap. Cursor is optional: omit [vendors.cursor] to disable it.
 #    Both [scheduling] and the [[repos]] entry must allow auto-merge.
 #    For a first run, set [scheduling].auto_merge = false to inspect the PR yourself.
 #    Set auto_merge = false in a [[repos]] entry to merge that repository's PRs yourself.

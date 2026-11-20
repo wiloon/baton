@@ -709,6 +709,20 @@ def test_a_failed_scan_worktree_keeps_the_rotation(ctx, monkeypatch):
     assert not ctx.path("scan-area").exists() and not ctx.path("scan-last").exists()
 
 
+def test_scan_fallback_skips_when_no_vendor_has_scan_role(ctx, monkeypatch):
+    from baton.config import Config
+    real = Config.for_role
+    monkeypatch.setattr(Config, "for_role",
+                        lambda self, role, pool_only=False: () if role == "scan" else real(self, role, pool_only=pool_only))
+    t = fallback(ctx)
+    ctx.path("scan-area").write_text("1\n")
+    assert t.scan_fallback() is None
+    assert not ctx.scans
+    assert "scan skipped: no vendor with scan role" in ctx.log()
+    assert ctx.path("scan-area").read_text() == "1\n"
+    assert not ctx.path("scan-last").exists()
+
+
 # --- follow-ups of owner-merged PRs -----------------------------------------------------------------------------------
 def test_follow_ups_are_filed_for_pr_the_owner_merged(ctx, monkeypatch):
     reviewed = {"number": 5, "headRefName": "cursor/issue-9", "body": "Refs #9",

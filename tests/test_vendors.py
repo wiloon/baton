@@ -190,7 +190,7 @@ class VendorTests(unittest.TestCase):
         for written in ("gpt-6.1-terra", "unknown"):
             self.wrote_with_codex(written, "claude")   # claude wrote it too: nobody is independent
             result, rc = self.shots()
-            self.assertEqual((rc, result["silent"]), (0, True))
+            self.assertEqual((rc, result.get("exhausted")), (0, True))
             self.assertFalse(vendors.screenshot_allowed(self.state, "7", "codex", "gpt-6.1-terra"))
             self.assertFalse(vendors.screenshot_allowed(self.state, "7", "codex", ""))
             self.assertFalse(vendors.screenshot_allowed(self.state, "7", "claude", ""))
@@ -267,7 +267,7 @@ class VendorTests(unittest.TestCase):
         # A whole-PR review by any writer is handed to the owner.
         result, rc = vendors.pick(self.state, POOL, "review", [*POOL, "cursor"],
                                   current="claude", pr="7", by="contrib", now=NOW, review=True)
-        self.assertEqual((result["vendor"], rc), ("claude", 0))
+        self.assertEqual((result.get("exhausted"), rc), (True, 0))
         self.assertEqual(vendors.review_excluded(self.state, "7", "claude"), ["claude"])
         result, rc = vendors.pick(self.state, POOL, "review", [*POOL, "cursor"],
                                   pr="7", by="contrib", now=NOW, review=True,

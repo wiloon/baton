@@ -31,7 +31,7 @@ import subprocess
 import sys
 import time
 
-from . import claude_cli, dispatch, e2e_gate, fix, hooks as telemetry, md, merge, notify, pick, pr as pr_helpers, prompts, review, vendors
+from . import agents, claude_cli, dispatch, e2e_gate, fix, hooks as telemetry, md, merge, notify, pick, pr as pr_helpers, prompts, review, vendors
 from .common import Deferred, changed, git, permission_denials, push, restore, strip_markers
 
 REPLY_CAP = 60000
@@ -105,12 +105,19 @@ def last_model(env, issue, kind, round, vendor=""):
         if (len(fields) >= 6 and fields[2:4] == [repo, "end"]
                 and fields[4] in (tag, f"{tag}-rerun") and fields[5] == "rc=0"):
             first = fields[6] if len(fields) > 6 else ""
-            if first.startswith("claude_model="):
-                found = "" if vendor == "codex" else first.split("=", 1)[1]
+            if vendor in agents.ADAPTERS:
+                label = agents.ADAPTERS[vendor].MODEL_LOG_LABEL
+                prefix = f"{label}=" if label else ""
+                if prefix and first.startswith(prefix):
+                    found = first.split("=", 1)[1]
+                elif label:
+                    found = ""
+                else:
+                    found = next((field.split("=", 1)[1] for field in fields[6:] if field.startswith("model=")), "")
+            elif first.startswith("claude_model="):
+                found = first.split("=", 1)[1]
             else:
-                # Codex end lines put the reported model after the outcome and usage.
-                found = "" if vendor == "claude" else next(
-                    (field.split("=", 1)[1] for field in fields[6:] if field.startswith("model=")), "")
+                found = next((field.split("=", 1)[1] for field in fields[6:] if field.startswith("model=")), "")
     return found
 
 
@@ -253,7 +260,7 @@ class Spec:
     def record(self, vendor, model):
         if not self.pr:
             return
-        if vendor == "codex":
+        if agents.ADAPTERS[vendor].RECORDS_AUTHOR_MODEL:
             vendors.record_author_model(self.state, self.pr, vendor, model or "unknown")
         vendors.record_author(self.state, self.pr, vendor)
 
@@ -386,7 +393,7 @@ class Spec:
         reviser = self.pick("reviser", list(env.config.quota.vendor_pool), last_vendor, other_model,
                             spec_followup=claude_followup)
         self.mark_base(round)
-        template = self.self_dir / (f"codex-spec-prompt.md" if reviser == "codex" else "spec-prompt.md")
+        template = self.self_dir / agents.prompt_file(reviser, "spec")
         prompt = self.render(
             template, ISSUE=n, GH_REPO=self.repo, WORKTREE=str(wt), BRANCH=self.branch, ROUND=str(round),
             CONTEXT_FILE=str(context), OUT=out_base)

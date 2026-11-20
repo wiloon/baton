@@ -17,7 +17,7 @@ import sys
 import tempfile
 import time
 
-from . import capacity, hooks as telemetry, notify, quota
+from . import agents, capacity, hooks as telemetry, notify, quota
 from .common import child_env, read
 
 PROBE_PROMPT = "Reply with the word ok."
@@ -29,7 +29,8 @@ PROBE_AUTH = (r'"error"\s*:\s*"authentication_failed"|Failed to authenticate|OAu
 
 def runs_file(state, vendor, day):
     """Runs per vendor and day, for telemetry only; nothing caps them."""
-    return Path(state, f"runs-{day}" if vendor == "claude" else f"{vendor}-runs-{day}")
+    stem = agents.ADAPTERS[vendor].RUNS_STEM
+    return Path(state, f"{stem}-{day}")
 
 
 def count_run(state, vendor, day=None):
@@ -55,9 +56,9 @@ def refresh_cursor(state):
 
 def record_quota(state, vendor, log):
     """Keep the quota the run reported."""
-    if vendor == "cursor":
+    if agents.ADAPTERS[vendor].QUOTA_SOURCE == "api":
         refresh_cursor(state)
-    elif vendor in ("claude", "codex") and log:
+    elif agents.ADAPTERS[vendor].QUOTA_SOURCE == "probe-run" and log:
         try:
             quota.record_log(state, vendor, log, time.time())
         except Exception:
@@ -111,7 +112,7 @@ def probe_command(vendor, model, directory):
 
 
 def probe(state, logs, vendor, model, *, needed=None):
-    if vendor not in ("claude", "codex", "cursor"):
+    if vendor not in agents.ADAPTERS:
         return
     with capacity.lease(state, vendor) as available:
         if available and (needed is None or needed()):
@@ -125,18 +126,19 @@ def _probe(state, logs, vendor, model):
     stale, and the owner's own sessions share the quota. Not counted against the daily
     caps. No repo context or usable credentials; Claude tools/MCP are disabled and
     Codex runs read-only. Cursor's probe is an API read: no agent runs and no usage is spent."""
-    if vendor not in ("claude", "codex", "cursor"):
+    adapter = agents.ADAPTERS.get(vendor)
+    if not adapter:
         return
     try:
         quota.mark_probed(state, vendor, int(time.time()))
     except Exception:
         return
-    if vendor == "cursor":
+    if adapter.QUOTA_SOURCE == "api":
         refresh_cursor(state)
         return
     log = Path(logs, f"{time.strftime('%F-%H%M%S')}-quota-probe-{vendor}.jsonl")
     hooks = telemetry.from_env()  # Global overhead, never charged to an issue's task totals.
-    probe_run = hooks.begin(vendor, "probe", 2, requested_model=model if vendor == "claude" else "")
+    probe_run = hooks.begin(vendor, "probe", 2, requested_model=model if adapter.PROBE_SENDS_MODEL else "")
     with tempfile.TemporaryDirectory() as directory:
         cmd, env = probe_command(vendor, model, directory)
         with open(log, "w") as out:
@@ -176,7 +178,8 @@ def main(argv=None):
     if args.command == "count":
         count_run(str(env.config.paths.state), args.vendor)
     elif args.command == "probe":
-        probe(str(env.config.paths.state), str(env.config.paths.logs), args.vendor, env.config.quota.quota_probe_model_claude)
+        probe(str(env.config.paths.state), str(env.config.paths.logs), args.vendor,
+              env.config.probe_model(args.vendor))
     else:
         rc, outcome, defer = settle(str(env.config.paths.state), args.vendor, args.status, args.rc, args.log, args.tag,
                                     args.cooldown_until, args.outcome, args.credential)

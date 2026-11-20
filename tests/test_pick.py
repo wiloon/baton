@@ -34,7 +34,7 @@ def log(env):
 
 def test_a_pool_pick_probes_stale_quota_and_logs_the_change(env):
     assert pick.choose(env, "v", "pool", "pool", ["claude", "codex"]) == "claude"
-    assert sorted(env["probes"]) == ["claude", "codex"]
+    assert env["probes"] == ["claude"]
     assert log(env)[-1] == "pool: v -> claude (was pool; claude=+0.00 codex=+0.00)"
     assert log(env)[0].startswith("selection: chosen=claude role=v")
 

@@ -21,7 +21,8 @@ import subprocess
 import sys
 import time
 
-from . import claude_cli, pr as pr_helpers, quota, vendor_policy
+from . import agents, claude_cli, pr as pr_helpers, quota, vendor_policy
+from .config import ROLES, ROUTE_ROLE
 
 
 def state_path(state, pr, kind):
@@ -180,13 +181,39 @@ def area_keys(role, env=None):
 PREFERENCE_FALLBACK = {"screenshot_reviewer": ("reviewer",)}   # an omitted order is the code reviewer's
 
 
+def _vendor_role(role):
+    return ROUTE_ROLE.get(role, role)
+
+
+def _role_eligible(role, pool_only=False, env=None):
+    """Declared vendors allowed for ROLE, with screenshot image input when needed."""
+    role = _vendor_role(role)
+    config = session.resolve(env).config
+    if role not in ROLES:
+        return set(config.declared())
+    allowed = set(config.for_role(role, pool_only=pool_only))
+    if role == "screenshot_reviewer":
+        allowed = {vendor for vendor in allowed if agents.ADAPTERS[vendor].IMAGES}
+    return allowed
+
+
+def _filter_preference(role, prefer, *, pool_only=False, env=None):
+    if not prefer:
+        return []
+    eligible = _role_eligible(role, pool_only=pool_only, env=env)
+    filtered = [vendor for vendor in prefer if vendor in eligible]
+    return filtered if filtered else []
+
+
 @session.scoped
 def preference(role, area="", env=None):
     preferences = dict(session.resolve(env).config.preferences)
+    pool_only = role == "reviser"
     for name in (role, *PREFERENCE_FALLBACK.get(role, ())):
+        dest = role if name == role else name
         for key, label in ((f'{name}_{area}', f'{name}/{area}'), (name, name)):
             if preferences.get(key):
-                return list(preferences[key]), label
+                return _filter_preference(dest, list(preferences[key]), pool_only=pool_only, env=env), label
     return [], ''
 
 
@@ -269,7 +296,7 @@ def _quota_horizon(state, vendor, now):
     config = session.resolve().config.quota
     if quota.stale(state, vendor, now, int(config.quota_stale_minutes)):
         return vendor_policy.SHORT
-    return quota.horizon(quota.load(state, vendor), getattr(config, f'quota_cap_{vendor}'),
+    return quota.horizon(quota.load(state, vendor), config.cap_of(vendor),
                          config.quota_five_hour_max, now) or vendor_policy.SHORT
 
 
@@ -310,7 +337,7 @@ def selection_details(state, pool, candidates, chosen, role, *, area="", now=Non
              "extra_policy=preference-before-pool-pace"]
     for vendor in dict.fromkeys(candidates):
         snap = quota.load(state, vendor)
-        cap = getattr(config, f'quota_cap_{vendor}')
+        cap = config.cap_of(vendor)
         score, blocked = quota.assess(snap, cap, config.quota_five_hour_max, now)
         week, reset = quota._used(snap, 'seven_day', now)
         week_text = f'{week:.1%}' if week is not None else 'unknown'
@@ -328,14 +355,18 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
     records (authors, contributions)."""
     now = int(time.time()) if now is None else now
     pr_state = state if pr_state is None else pr_state
+    config = session.resolve().config
+    vendor_role = _vendor_role(role)
+    pool_only = vendor_role == "reviser"
+    eligible = _role_eligible(role, pool_only=pool_only)
+    candidates = [vendor for vendor in candidates if vendor in eligible]
+    if current and current in config.declared() and current not in eligible:
+        current = ""
+    extra = list(config.extra())
     prefer, prefer_label = preference(role, area)
     preferred = f"preferred for {prefer_label}: {' '.join(prefer)}; " if prefer else ""
     excluded = set(exclude)
     shots = role == "screenshot_reviewer"
-    if shots:
-        candidates = [vendor for vendor in candidates if vendor in ("claude", "codex")]
-        if current not in candidates:
-            current = ""
     same_vendor_review = False
     review_mode = "same-vendor-different-model"
     if review:
@@ -344,16 +375,18 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
             review_mode = codex_review_mode(pr_state, pr, session.resolve().config.models.route(
                 "screenshot_review" if shots else "review", "codex").model)
             same_vendor_review = review_mode == "same-vendor-different-model" if shots else bool(review_mode)
-        if all(v in excluded for v in (candidates if shots else all_vendors(pool))) and not same_vendor_review:
-            chosen = current if current in all_vendors(pool) else pool[0]
-            return {"vendor": chosen, "reason": "", "probe": [], "blocked": {},
-                    "silent": True}, 0
+        review_pool = [v for v in (candidates if shots else all_vendors(pool, extra=extra)) if v in eligible]
+        if review_pool and all(v in excluded for v in review_pool) and not same_vendor_review:
+            return {"vendor": "", "reason": "all eligible reviewers excluded by authorship",
+                    "probe": [], "blocked": {}, "exhausted": True}, 0
     if role in ("reviser", "spec_reviewer") and "codex" in excluded and "codex" in candidates:
         route_role = "spec" if role == "reviser" else "spec_review"
         model = session.resolve().config.models.route(route_role, "codex").model
         same_vendor_review = bool(other_model and other_model != "unknown" and model
                                   and model != other_model)
     fallback = "codex" if same_vendor_review else ""
+    if fallback and fallback not in eligible:
+        fallback = ""
     if role == "reviser" and "claude" in excluded and "claude" in candidates:
         model = session.resolve().config.models.route("spec", "claude", followup=spec_followup).model
         if claude_cli.distinct_models(model, other_model):
@@ -372,11 +405,11 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
             blocked[vendor] = why
             horizons[vendor] = status.horizon
             continue
-        if vendor in (*pool, "cursor") and quota.stale(state, vendor, now,
-                                                       int(session.resolve().config.quota.quota_stale_minutes)):
+        if vendor in (*pool, *extra) and quota.stale(state, vendor, now,
+                                                       int(config.quota.quota_stale_minutes)):
             probe.append(vendor)
         ready.append(vendor)
-    if fallback and fallback not in ready and fallback not in blocked:
+    if fallback and fallback in eligible and fallback not in ready and fallback not in blocked:
         status = vendor_policy.availability(state, session.resolve().config.quota, fallback, now)
         why = status.detail
         if why:
@@ -410,7 +443,7 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
     # command error used to leave that vendor eligible in the shell implementation.
     eligible = []
     for vendor in ready:
-        if vendor in (*pool, "cursor"):
+        if vendor in (*pool, *extra):
             try:
                 chosen, summary = _quota_pick(state, [vendor], now)
             except Exception:

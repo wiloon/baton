@@ -2,7 +2,7 @@
 from contextlib import contextmanager
 from dataclasses import dataclass
 
-from . import capacity, vendor_policy
+from . import agents, capacity, vendor_policy
 
 
 @dataclass(frozen=True)
@@ -13,14 +13,15 @@ class Analyst:
 
 
 def candidates(config):
-    allowed = {*config.quota.vendor_pool, *config.quota.vendor_extra}
+    allowed = set(config.for_role("retrospective"))
     settings = config.retrospectives
     result = []
-    for vendor in ('claude', 'codex', 'cursor'):
-        if vendor in allowed:
-            model = getattr(settings, f'model_{vendor}')
-            effort = ('xhigh' if '-xhigh' in model else 'high') if vendor == 'cursor' else settings.effort
-            result.append(Analyst(vendor, model, effort))
+    for vendor in allowed:
+        if vendor not in agents.ADAPTERS:
+            continue
+        model = getattr(settings, f'model_{vendor}')
+        effort = agents.ADAPTERS[vendor].analyst_effort(model, settings.effort)
+        result.append(Analyst(vendor, model, effort))
     return result
 
 
@@ -32,7 +33,8 @@ def reserve(config, state, now, failed=()):
     """
     choices = {c.vendor: c for c in candidates(config)}
     preferences = dict(config.preferences)
-    prefer = preferences.get('retrospective', preferences.get('reviewer', ('claude', 'codex', 'cursor')))
+    prefer = preferences.get('retrospective', preferences.get('reviewer', ()))
+    prefer = [vendor for vendor in prefer if vendor in choices]
     selection = dict(role='retrospective', strategy='review_preference_and_quota_pace',
                      preference=list(prefer), blocked={}, reason='vendor_disabled')
     ready = []

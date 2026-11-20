@@ -155,20 +155,6 @@ budget_screenshot_review = 4
 budget_spec_review = 3
 budget_spec = 3
 budget_scan = 3
-# Claude Code: minutes before a run is killed.
-max_minutes = 150
-# Cursor: minutes before a run is killed.
-cursor_max_minutes = 60
-# When a vendor's servers are full ("at capacity", "overloaded"), the run moves to the first of
-# these that differs from its model: Claude Code through --fallback-model, Codex by one rerun.
-# If that is full too, the vendor rests for busy_minutes.
-fallback_models_claude = ["claude_fast", "claude_strong"]
-fallback_models_codex = ["codex_prev", "codex_strong"]
-# Codex: minutes before a run is killed.
-codex_max_minutes = 60
-# Directories Codex's sandbox may write besides the worktree (--add-dir): package and build
-# caches. They must include environment.gocache, gomodcache, gotmpdir and node_compile_cache.
-codex_cache_dirs = ["~/.local/share/pnpm", "~/.local/state/pnpm", "~/.cache/pnpm", "~/.cache/node/corepack", "~/.cache/node-compile-cache", "~/.cache/ms-playwright", "~/.cache/go-build", "~/go/pkg/mod", "~/.cache/go-tmp", "~/.cache/uv"]
 # How long a vendor rests when its fallback model is full too.
 busy_minutes = 30
 
@@ -206,7 +192,6 @@ cursor = { model = "cursor_auto" }
 [models.routes.screenshot_review]
 claude = { model = "claude_strong", effort = "low" }
 codex = { model = "codex_terra", effort = "low" }
-cursor = { model = "cursor_auto" }
 
 [models.routes.spec_review]
 claude = { model = "claude_strong", effort = "high" }
@@ -216,12 +201,9 @@ cursor = { model = "cursor_auto" }
 [models.routes.spec]
 claude = { model = "claude_strong", effort = "medium" }
 codex = { model = "codex_fast", effort = "medium" }
-cursor = { model = "cursor_auto" }
 
 [models.routes.scan]
 claude = { model = "claude_fast", effort = "low" }
-codex = { model = "", effort = "low" }
-cursor = { model = "cursor_auto" }
 
 [models.routes.review_followup]
 claude = { model = "claude_fast", subagent_model = "claude_fast", effort = "low" }
@@ -234,23 +216,36 @@ codex = { model = "codex_fast", effort = "low" }
 [models.routes.spec_followup]
 claude = { model = "claude_fast", effort = "low" }
 
+[vendors.claude]
+adapter = "claude"
+roles = ["dev", "fixer", "reviewer", "screenshot_reviewer", "spec_reviewer", "reviser", "retrospective", "scan"]
+quota = "pool"
+cap = 0.90
+max_minutes = 150
+fallback_models = ["claude_fast", "claude_strong"]
+quota_probe_model = "claude_probe"
+
+[vendors.codex]
+adapter = "codex"
+roles = ["dev", "fixer", "reviewer", "screenshot_reviewer", "spec_reviewer", "reviser", "retrospective"]
+quota = "pool"
+cap = 0.95
+max_minutes = 60
+fallback_models = ["codex_prev", "codex_strong"]
+cache_dirs = ["~/.local/share/pnpm", "~/.local/state/pnpm", "~/.cache/pnpm", "~/.cache/node/corepack", "~/.cache/node-compile-cache", "~/.cache/ms-playwright", "~/.cache/go-build", "~/go/pkg/mod", "~/.cache/go-tmp", "~/.cache/uv"]
+
+[vendors.cursor]
+adapter = "cursor"
+roles = ["dev", "fixer", "reviewer", "spec_reviewer", "retrospective"]
+quota = "extra"
+cap = 0.95
+max_minutes = 60
+
 [quota]
-# Vendors picked by quota headroom (claude, codex), and the ones that run besides them without
-# that balance: [] or ["cursor"]. Preflight checks only these vendors' CLIs.
-vendor_pool = ["claude", "codex"]
-vendor_extra = []
-# The share of a vendor's weekly quota the runner may use (0-1). The rest is left for your own
-# sessions on the same subscription. Within the caps, the vendor furthest behind its weekly pace
-# is picked.
-quota_cap_claude = 0.9
-quota_cap_codex = 0.95
-quota_cap_cursor = 0.95
 # No vendor runs while its 5-hour window is at least this full.
 quota_five_hour_max = 0.9
 # A quota snapshot older than this is refreshed (by a one-turn probe run) before a pick relies on it.
 quota_stale_minutes = 30
-# The Claude model the probe runs on.
-quota_probe_model_claude = "claude_probe"
 # Independent quota worker retries incomplete probes with exponential backoff.
 quota_probe_retry_minutes = 5
 quota_probe_max_retry_minutes = 60
@@ -281,7 +276,7 @@ node_extra_ca_certs = ""
 goproxy = ""
 # false: corepack downloads a package manager without asking (COREPACK_ENABLE_DOWNLOAD_PROMPT=0).
 corepack_enable_download_prompt = false
-# Go and pnpm caches outside /tmp, shared by every worktree (also in codex_cache_dirs).
+# Go and pnpm caches outside /tmp, shared by every worktree (also in vendors.codex.cache_dirs).
 gocache = "~/.cache/go-build"
 gomodcache = "~/go/pkg/mod"
 gotmpdir = "~/.cache/go-tmp"
@@ -306,7 +301,7 @@ enable_claudeai_mcp_servers = false
 # env_file = "~/.config/baton/telegram.env"   # TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
 # Optional evidence analysis: share review quota/preference policy, restricted to Opus/Sol/Grok 4.7.
-# Global quota.vendor_pool/vendor_extra still determines which CLI vendors are enabled.
+# Declared [vendors.*] tables determine which CLI vendors are enabled and which roles they run.
 # preferences.retrospective overrides preferences.reviewer for this role (otherwise reused).
 [retrospectives]
 enabled = false

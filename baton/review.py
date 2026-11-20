@@ -21,8 +21,8 @@ import re
 import sys
 import time
 
-from . import check_verdicts, checkpoint, dispatch, fix, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, vendors
-from .common import Deferred, changed, git, restore, strip_markers
+from . import agents, check_verdicts, checkpoint, dispatch, fix, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, vendors
+from .common import Deferred, Exhausted, changed, git, restore, strip_markers
 
 REPLY_CAP = 60000
 REVIEWED = ("REVIEW: pass", "REVIEW: changes")
@@ -274,14 +274,21 @@ class Review:
         return pick.all_vendors(self.env)
 
     def review_vendor(self, current):
-        """The reviewer with the fewest lines in the PR. When every vendor is excluded it stays
-        as it is, so review_allowed hands the PR to the owner."""
+        """The reviewer with the fewest lines in the PR. When every vendor is excluded, Exhausted
+        ends the step with a ready-for-human handoff."""
         return pick.choose(self.env, "reviewer", current, "review", self.vendors(), pr=str(self.pr),
                            issue=self.issue, fixed_by=self.fixed_by)
 
     def review_allowed(self, vendor, model=""):
         """Persisted authors survive restarts and role changes: a vendor that wrote the PR does
         not review it. The PR goes to the owner otherwise."""
+        cfg = self.env.config
+        if vendor not in cfg.declared() or not cfg.allows(vendor, "reviewer"):
+            self.label("--add-label", "ready-for-human")
+            self.hooks.task("handoff", "review_failed", "--pr", str(self.pr), "--reason", "review_failed")
+            notify.notify(f"PR #{self.pr} needs you",
+                          f"Reviewer {vendor} is not configured for code review.")
+            return False
         if vendors.review_allowed(self.state, self.pr, vendor, model, self.fixed_by):
             return True
         self.label("--add-label", "ready-for-human")
@@ -367,7 +374,7 @@ class Review:
             return outcome
         review_file = Path(f"/tmp/baton-review-{pr}-{round}.md")
         review_file.unlink(missing_ok=True)
-        template = "codex-review-prompt.md" if reviewer == "codex" else "review-prompt.md"
+        template = agents.prompt_file(reviewer, "review")
         out = self.agent(reviewer, "review", self.render(
             template, PR=str(pr), ISSUE=self.issue or "unknown", GH_REPO=self.repo, WORKTREE=str(wt), ROUND=str(round),
             MAX_ROUNDS=str(self.max_rounds), ROUND_NOTE=note, SKILL_STEP=skill,
@@ -397,7 +404,8 @@ class Review:
     # --- the screenshot review (#67): its own run after a successful code review ---
     def screenshot_enabled(self, reviewer):
         """Whether to check the PR body for screenshot review after this code review."""
-        return (self.env.repo.screenshot_review and reviewer != "cursor"
+        return (self.env.repo.screenshot_review
+                and not agents.ADAPTERS[reviewer].SKIP_SCREENSHOT_AFTER_REVIEW
                 and "owner" not in vendors.review_excluded(self.state, self.pr))
 
     def screenshot_vendor(self):
@@ -422,7 +430,16 @@ class Review:
         pr, wt = self.pr, self.wt
         self.hooks.round = round
         head = git(wt, "rev-parse", "HEAD") or ""
-        vendor = self.screenshot_vendor()
+        try:
+            vendor = self.screenshot_vendor()
+        except Exhausted as exhausted:
+            self.label("--add-label", "ready-for-human")
+            notify.notify(f"PR #{pr} needs you", exhausted.reason or "No screenshot reviewer available.")
+            return "RESULT: failed no screenshot reviewer"
+        cfg = self.env.config
+        if vendor not in cfg.declared() or not cfg.allows(vendor, "screenshot_reviewer"):
+            self.label("--add-label", "ready-for-human")
+            return "RESULT: failed screenshot reviewer not role-allowed"
         route = self.env.config.models.route("screenshot_review", vendor)
         if not vendors.screenshot_allowed(self.state, pr, vendor, route.model, self.fixed_by):
             return "RESULT: failed screenshot reviewer model may be a PR author"
@@ -431,7 +448,8 @@ class Review:
         context.write_text(issue_context(self.env, self.issue) if re.fullmatch(r"\d+", str(self.issue or "")) else "")
         review_file = Path(f"/tmp/baton-screenshot-review-{pr}-{round}.md")
         review_file.unlink(missing_ok=True)
-        delivery = ("Include the full review in your final message, above the verdict line." if vendor == "codex"
+        adapter = agents.ADAPTERS[vendor]
+        delivery = (adapter.SCREENSHOT_DELIVERY if adapter.SCREENSHOT_DELIVERY != "file"
                     else f"Write the comment to `{review_file}` with the Write tool.")
         out = self.agent(vendor, "screenshot_review", self.render(
             "screenshot-review-prompt.md", PR=str(pr), ISSUE=self.issue or "unknown", GH_REPO=self.repo,
@@ -484,6 +502,9 @@ class Review:
             code_verdict, screenshot = saved.get("code_verdict", ""), saved.get("screenshot", "")
             checks = saved.get("screenshot_checks", "")
             self.fixed_by, self.issue = saved.get("fixed_by", ""), saved.get("ISSUE", "")
+        cfg = self.env.config
+        if reviewer not in ("pool",) and (reviewer not in cfg.declared() or not cfg.allows(reviewer, "reviewer")):
+            reviewer = "pool"
         if self.seed():
             self.seed_contrib()
         self.label("--remove-label", "ready-for-human")
@@ -508,7 +529,13 @@ class Review:
                     # A disabled or resting Cursor is re-picked like any pool vendor.
                     if (reviewer != "cursor" or reviewer not in self.vendors()
                             or vendors.vendor_blocked(str(self.env.config.paths.state), "cursor")):
-                        reviewer = self.review_vendor(reviewer)
+                        try:
+                            reviewer = self.review_vendor(reviewer)
+                        except Exhausted as exhausted:
+                            self.handoff("review_failed", f"PR #{pr} needs you",
+                                         exhausted.reason or "No eligible reviewer for this PR.")
+                            self.drop()
+                            return 0
                         self.values["reviewer"] = reviewer
                         self.save()
                     outcome = self.run_review(round, rnote, reviewer)

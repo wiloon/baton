@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # Vendor roles are an allowlist

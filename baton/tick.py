@@ -683,13 +683,27 @@ class Tick:
         if waiting >= max_waiting:
             self.log(f"no scan; {waiting} claude-found issue(s) still wait for Cursor")
             return None
+        if not self.env.config.for_role("scan"):
+            self.log("scan skipped: no vendor with scan role")
+            return None
         self.item(self.scan_item)
         return 0
 
     def scan_item(self):
-        why = vendors.vendor_blocked(str(self.runner_state), "claude")
-        if why:
-            return self.defer("claude", why)
+        scanners = self.env.config.for_role("scan")
+        if not scanners:
+            self.log("scan skipped: no vendor with scan role")
+            return None
+        vendor = ""
+        blocked = ""
+        for candidate in scanners:
+            status = vendors.vendor_blocked(str(self.runner_state), candidate)
+            if not status:
+                vendor = candidate
+                break
+            blocked = status
+        if not vendor:
+            return self.defer(scanners[0], blocked or f"{scanners[0]} blocked")
         path = self.state / "scan-area"
         try:
             index = int(path.read_text().strip()) % len(self.scan_areas)

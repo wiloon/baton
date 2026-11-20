@@ -186,8 +186,12 @@ def test_claude_quota_probe_alias_matches_cli_and_telemetry(runner, monkeypatch,
     path = runner.root / "routes.toml"
     path.write_text(env.config.source.read_text().replace('claude_probe = "haiku"',
                                                          'claude_probe = "claude-haiku-4-5"'))
-    quota = replace(load(path).quota, vendor_pool=("claude",), vendor_extra=())
-    env.config = replace(env.config, quota=quota)
+    loaded = load(path, home=runner.root / 'home')
+    vendors = tuple(v for v in loaded.vendors if v.id == 'claude')
+    quota = replace(loaded.quota, vendor_pool=('claude',), vendor_extra=(),
+                    caps=(('claude', loaded.cap('claude')),))
+    paths = replace(loaded.paths, state=runner.state_dir, logs=runner.root / 'logs')
+    env.config = replace(loaded, quota=quota, vendors=vendors, paths=paths)
     resolve = session.resolve
     monkeypatch.setattr(session, "resolve", lambda value=None: resolve(env if value is None else value))
     runner.plan(stream=claude_stream("ok"))
@@ -208,12 +212,9 @@ def test_claude_quota_probe_alias_matches_cli_and_telemetry(runner, monkeypatch,
     assert requests == [("claude", "probe", "claude-haiku-4-5")]
 
 
-def test_shipped_codex_scan_leaves_model_to_cli(runner, monkeypatch):
-    monkeypatch.setattr(dispatch.agents, "preflight", lambda *_: "")
-    runner.plan(stream=CODEX_STREAM, last="SCAN: clean\n")
-    runner.run("codex", "scan")
-    args = json.loads((runner.root / "fake" / "args.json").read_text())
-    assert "-m" not in args
+def test_codex_adapter_does_not_support_scan_role():
+    from baton import codex_cli
+    assert "scan" not in codex_cli.SUPPORTED_ROLES
 
 
 @pytest.mark.parametrize("role", ["spec_review", "spec", "review", "screenshot_review", "fix"])

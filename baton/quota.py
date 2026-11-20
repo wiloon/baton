@@ -15,7 +15,7 @@ Cursor's output carries none: refresh_cursor asks the dashboard API its IDE uses
                                print the vendor to use and a one-line summary; exit 1 if none
 """
 
-from . import session
+from . import agents, session
 import glob
 import json
 from contextlib import contextmanager
@@ -178,7 +178,7 @@ def record(state, vendor, windows, now):
 def fresh(state, vendor, now, minutes):
     """A probe attempt or a successful call without quota data is not an observation."""
     snap = load(state, vendor) or {}
-    required = {'seven_day'} if vendor == 'cursor' else {'five_hour', 'seven_day'}
+    required = set(agents.ADAPTERS[vendor].QUOTA_WINDOWS)
     try:
         windows = snap.get('windows') or {}
         return required <= windows.keys() and all(
@@ -192,12 +192,10 @@ def fresh(state, vendor, now, minutes):
 def record_log(state, vendor, log, now):
     """Merge the quota a run's LOG reported into VENDOR's snapshot (Claude and Codex only)."""
     lines = Path(log).read_text(errors="replace").splitlines() if Path(log).exists() else []
-    if vendor == "claude":
-        windows = parse_claude(lines)
-    elif vendor == "codex":
-        windows = parse_codex(lines, os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"))
-    else:
+    parse = getattr(agents.ADAPTERS.get(vendor), "parse_quota_log", None)
+    if not parse:
         return
+    windows = parse(lines, os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"))
     record(state, vendor, windows, now)
 
 
@@ -333,7 +331,8 @@ def main(argv):
             else:
                 prefer = args[1].split()
             args = args[2:]
-        caps = {v: getattr(session.resolve().config.quota, f"quota_cap_{v}") for v in args}
+        cfg = session.resolve().config
+        caps = {v: cfg.cap(v) for v in args}
         chosen, summary = pick(args, {v: load(state, v) for v in args}, caps,
                                float(session.resolve().config.quota.quota_five_hour_max), now, current,
                                prefer)
