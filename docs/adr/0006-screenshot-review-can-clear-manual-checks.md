@@ -30,7 +30,9 @@ merge gate (manual_checks = "gate"), after review passed and CI is green
 manual_checks = "defer"         -> merge; only the unverified checks go to "Checks to try"
                                    (a check blocked by a design finding goes there with the finding,
                                    also when the verdicts are unusable; the remainder is computed
-                                   from the body the gate allowed the merge on)
+                                   from the body the gate allowed the merge on; a finding whose
+                                   check later leaves the body is still posted, with its
+                                   original check text)
 any round's open design finding or disagreement that no current check carries
                                 -> ready-for-human, whatever manual_checks says, even when
                                    the checks section is `none` (#96)
@@ -121,3 +123,9 @@ that an unsettled design finding with no current check to carry it goes to the o
   remainder and the finding's text with it. When the tracker still falls back to every current
   check (the body changed after the merge), it adds the recorded carried text to each current
   check whose text matches.
+- Issue #96, round 5: the tracker never drops a recorded carried finding. One whose check no
+  current check of the merged body matches (the check was edited out after the gate's read, or
+  the section became `none`) is posted as its own entry, with the check's original text, the
+  finding and the fixer's answer or both positions of a disagreement; a merged body with no
+  checks still gets those entries before tracking is marked done. The guard in the gate can
+  only see the body up to the merge, and a finding the owner never sees would be merged unseen.

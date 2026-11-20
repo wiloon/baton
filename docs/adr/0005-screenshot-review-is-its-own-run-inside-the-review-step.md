@@ -68,7 +68,10 @@ fix                        reads both, answers Must fix and design findings, re-
   review) and into every screenshot prompt after round 1. The fixer answers and the reviewer
   judges by id, never by the comment's local number. A fix comment carries its round
   (`<!-- baton-fix by=<vendor> round=<n> -->`), so a review reads only the answers given since
-  the previous screenshot review. That review must judge every open id in the block exactly
+  the previous screenshot review. A round's fixer runs with that round's number, after its
+  screenshot review, so the replies since the previous screenshot review are the fix comments
+  with `previous screenshot round <= round < current round` (the fix that answered round 1's
+  review is `round=1`; with no previous screenshot review the lower bound is round 1). That review must judge every open id in the block exactly
   once under `## Design answers`. An id with no valid, single answer stays open, however many
   rounds pass. Only the fixer's *current* answer decides a disposition: the answer to that id
   in the fix replies since the previous screenshot review, which must be exactly one valid line
@@ -113,3 +116,7 @@ fix                        reads both, answers Must fix and design findings, re-
   previous screenshot review) can turn a held finding into a disagreement, so a stale rejection
   from an earlier round cannot reach the owner; and Cursor's rejection-only decision survives
   its deferred resume through saved answers instead of an empty reply.
+- Issue #96, round 5: the reply window is `previous screenshot round <= fix round < current
+  round`, because the loop runs a round's fixer under the same round number as the screenshot
+  review it answers; a window that started after the previous review's round would miss exactly
+  the answers that review asked for.
