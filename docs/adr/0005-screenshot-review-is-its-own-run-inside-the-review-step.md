@@ -59,21 +59,31 @@ fix                        reads both, answers Must fix and design findings, re-
   0006), which leaves the blocked checks to the owner, instead of a `review_limit` hand-off.
   When feedback is cut, the design findings survive with the Must fix section.
 - The runner tracks the design exchange itself and does not trust a later review to repeat it.
-  A fix comment carries its round (`<!-- baton-fix by=<vendor> round=<n> -->`), so the next
-  screenshot review is given the answers to its own previous findings. That review must judge
-  every previous finding exactly once under `## Design answers`. A finding with no valid,
-  single answer stays open. A held finding the fixer adopted stays open. A held finding the
-  fixer rejected is a disagreement for the owner. The loop's checkpoint carries open findings
-  and disagreements (with the text of the checks they block) across rounds and a deferred
-  resume, so a later review that omits them, or a later round with no screenshot review, cannot
-  drop them.
+  Each finding gets a stable id when the runner first reads it, `D<round>.<n>` (the round that
+  raised it and its number there); the id never changes, so a later round's finding with the
+  same number is a different finding. The loop's checkpoint holds every open finding by id (with
+  the text of the checks it blocks) and every disagreement, across rounds and a deferred resume.
+  From the checkpoint the runner renders one `Open design findings` block, by id, into every fix
+  feedback (also a round with no screenshot review, whose fixer otherwise sees only the code
+  review) and into every screenshot prompt after round 1. The fixer answers and the reviewer
+  judges by id, never by the comment's local number. A fix comment carries its round
+  (`<!-- baton-fix by=<vendor> round=<n> -->`), so a review reads only the answers given since
+  the previous screenshot review. That review must judge every open id in the block exactly
+  once under `## Design answers`. An id with no valid, single answer stays open, however many
+  rounds pass. A held finding the fixer adopted (or did not answer) stays open. A held finding
+  the fixer rejected is a disagreement for the owner. Only a valid `resolved` answer closes an
+  id, and nothing closes a disagreement, so a later review that omits one, or a round with no
+  screenshot review, cannot drop it.
 - A fix run that commits nothing is not a `no_commit` hand-off when its reply answers every
   design finding (all `rejected`) and the feedback had no Must fix item: the next round's
   screenshot review judges the rejections. The fixer still re-shoots as the fix rules say.
 - Design findings, and the fixer's answers given to the next screenshot review, are complete
   numbered records: they are never cut inside an item. If they do not fit
   `review_context_max_chars` whole, the PR goes to the owner (`review_failed`) instead of the
-  loop sending a partial exchange.
+  loop sending a partial exchange. The same holds where the fixer's reply is posted: a reply
+  cap (Cursor's `REPLY_CAP`) cuts only the text outside the reply's `## Design findings`
+  section, which is kept whole first; if that section alone does not fit, the fix hands off
+  (`fix_failed`) instead of posting a partial answer that would parse as a complete one.
 
 ## Revision record
 
@@ -87,3 +97,7 @@ fix                        reads both, answers Must fix and design findings, re-
   design answers and carries open findings and disagreements across rounds, and an exchange
   that does not fit the context budget is handed off whole instead of cut, so an incomplete
   exchange can never clear a check.
+- Issue #96, round 3: findings carry stable `D<round>.<n>` ids and the runner, not the previous
+  comment, supplies every open finding to each fixer and later screenshot review, so an omitted
+  finding cannot lose its place, be confused with a renumbered one, or skip a round without
+  screenshots; the whole-record rule also covers the posted fix reply under a reply cap.

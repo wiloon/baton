@@ -28,7 +28,8 @@ merge gate (manual_checks = "gate"), after review passed and CI is green
   any check not verified        -> ready-for-human, listing only those checks
   no usable verdicts            -> ready-for-human, as before
 manual_checks = "defer"         -> merge; only the unverified checks go to "Checks to try"
-                                   (a check blocked by a design finding goes there with the finding)
+                                   (a check blocked by a design finding goes there with the finding,
+                                   also when the verdicts are unusable)
 any round's open design finding or disagreement that no current check carries
                                 -> ready-for-human, whatever manual_checks says, even when
                                    the checks section is `none` (#96)
@@ -106,3 +107,10 @@ that an unsettled design finding with no current check to carry it goes to the o
   changed, or the section became `none`, after the review that raised it) has no check to defer
   or hand off, so it sends the PR to ready-for-human in every mode, per "missing information never
   merges".
+- Issue #96, round 3: the unmatched-finding guard runs inside `pr.gate`, on the same live body
+  read that decides `none`, `defer` or `verified`, because the merge step reads the body once
+  before the gate and the checks can change between the reads. Under `defer`, a carried finding
+  keeps its text on the way to "Checks to try" even when the verdicts are unusable: the saved
+  remainder is then written with every current check (not removed) and records, per check, the
+  carried finding's text and the fixer's answer, which the tracker adds to that check. Without
+  carried findings, unusable verdicts still remove the remainder, as before.
