@@ -29,8 +29,10 @@ manual_checks = "defer"         -> merge; only the unverified checks go to "Manu
 
 "No usable verdicts" covers every case where the runner can't be sure: no screenshot review in
 the last round (setting off, owner-authored PR, Cursor review), a `## Checks` section without
-exactly one valid verdict per check, and a PR description whose checks changed after the review.
-Missing information never merges.
+exactly one valid verdict per check, a PR description whose checks changed after the review,
+a description whose checks section is missing, repeated or empty (no item to verify), and one
+that carries both the old and the new heading. Missing information never merges: zero items
+verified is not "every check verified". `none` and `defer` are separate paths and are unchanged.
 
 ## Considered options
 
@@ -55,3 +57,9 @@ Missing information never merges.
 - A UI change can now reach `main` without the owner's look. The screenshots still reach the
   owner on Telegram after the merge, captioned "merged after screenshot review".
 - A broken verdict in a review that passed (an inconsistent reply) is treated as not verified.
+
+## Revisions
+
+- Issue #94: screenshot clearance needs at least one parsed check and a complete verdict set
+  on a well-formed checks section (exactly one, under either heading). An empty section used to
+  compare `[] == []` and could clear the gate with no check verified.
