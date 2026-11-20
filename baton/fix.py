@@ -3,7 +3,7 @@
 
 A fixer addresses feedback on a PR in its worktree; the runner posts the reply, applies the
 description and task requests, verifies the commits (with repair runs), records who wrote
-what, pushes, and refreshes the Manual checks. Every gate that stops hands the PR to the
+what, pushes, and refreshes the checks. Every gate that stops hands the PR to the
 owner the same way: label ready-for-human, a telemetry handoff, a Telegram message.
 
 Prints JSON for the bash caller, which keeps `defer_vendor` (it exits the item's subshell):
@@ -181,21 +181,21 @@ class Runner:
         if log:
             notify.log(log)
         if rc != 0:
-            return self.handoff(pr, "", f"{who}PR #{pr}: Manual checks not refreshed",
+            return self.handoff(pr, "", f"{who}PR #{pr}: Checks not refreshed",
                                 f"The fix is pushed but the description may still list stale checks. {url}")
         return 0
 
     def recheck_without_commit(self, pr, who, url, description_changed=False):
         """(rc, changed) for a fix with no commit: a re-check the fixer gave still reaches the
         description, and the next review checks it. No re-check leaves the description alone,
-        unless the fixer rewrote it: its own `## Manual checks` must not reach the merge gate."""
+        unless the fixer rewrote it: its own checks section must not reach the merge gate."""
         if not description_changed and not pr_helpers.fixer_gave_checks(self.ctx, pr):
             return 0, False
         rc, changed, log = pr_helpers.apply_checks(pr, self.ctx)
         if log:
             notify.log(log)
         if rc != 0:
-            return self.handoff(pr, "", f"{who}PR #{pr}: Manual checks not refreshed",
+            return self.handoff(pr, "", f"{who}PR #{pr}: Checks not refreshed",
                                 f"The description may still list stale checks. {url}"), False
         return 0, changed
 

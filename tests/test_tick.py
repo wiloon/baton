@@ -818,6 +818,14 @@ def re_context(prompt):
     return re.search(r"[^\s`]*issue-300-dev-[^\s`]+\.md", prompt).group(0)
 
 
+def test_the_dev_body_is_published_under_the_new_checks_heading(devrun):
+    devrun.script = [implements(body="Summary\n\nRefs #300\n\n## Manual checks\n- Open the page\n- Open the map\n")]
+    devrun.go()
+    create, = devrun.gh.ran("pr", "create")
+    body = create[create.index("--body") + 1]
+    assert "## Checks to verify\n- Open the page\n- Open the map" in body and "Manual checks" not in body
+
+
 def test_the_gate_result_goes_in_the_pr_description(devrun, monkeypatch):
     def verify(self, *args):
         self.gate_result = "E2E gate passed: e2e/a.spec.ts --repeat-each=15 (15 passed)"

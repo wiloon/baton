@@ -4,7 +4,7 @@ import json
 import re
 import sys
 
-from . import names
+from . import checks as checks_section, names
 
 MARKER = re.compile(r"<!-- baton-task issue=(\d+) completion=(partial|complete) -->")
 LINK = re.compile(r"(?im)^\s*(refs?|closes|fixes|resolves)\s+#(\d+)\s*$")
@@ -13,7 +13,6 @@ CLOSING = re.compile(
     r"(?:(?:[\w.-]+/[\w.-]+)?#|https://github\.com/[\w.-]+/[\w.-]+/issues/)(\d+)\b"
 )
 FIELD = re.compile(r"(?im)^Task completion:\s*(partial|complete)\s*$")
-CHECKS = re.compile(r"(?i)##\s+Manual checks:?\s*")
 ADVANCED = re.compile(r"(?ims)^##\s+Acceptance advanced:?\s*$(.*?)(?=^##\s|\Z)")
 NOT_RECHECKED = "Not re-checked after the fix run."
 
@@ -83,10 +82,10 @@ def retarget(body, issue, completion):
 
 
 def split_checks(reply):
-    """A fix reply's last `## Manual checks` block, and the reply without it (#155).
+    """A fix reply's last checks block, under either heading,, and the reply without it (#155).
     The block ends at the next heading or the TASK:/RESULT: lines."""
     lines = reply.replace("\r\n", "\n").split("\n")
-    starts = [i for i, line in enumerate(lines) if CHECKS.fullmatch(line)]
+    starts = [i for i, line in enumerate(lines) if checks_section.is_heading(line)]
     if not starts:
         return None, reply
     start = end = starts[-1]
@@ -98,25 +97,10 @@ def split_checks(reply):
 
 
 def set_checks(body, checks):
-    """Replace the body's `## Manual checks` section with the fixer's re-check of the
-    whole PR. No answer reads as not re-checked, which the merge gate hands off."""
+    """Replace the body's checks sections with one canonical section holding the fixer's
+    re-check of the whole PR. No answer reads as not re-checked, which the merge gate hands off."""
     checks = re.sub(r"<!-- baton-.*?-->", "", checks or "", flags=re.S).strip() or NOT_RECHECKED
-    lines = body.replace("\r\n", "\n").split("\n")
-    out, done, skipping = [], False, False
-    for line in lines:
-        if line.startswith("## "):
-            skipping = False
-            if CHECKS.fullmatch(line):
-                skipping = True  # a duplicate section would also reach the gate: drop it
-                if not done:
-                    out += ["## Manual checks", checks, ""]
-                    done = True
-                continue
-        if not skipping:
-            out.append(line)
-    if not done:
-        return body.rstrip("\n") + f"\n\n## Manual checks\n{checks}\n"
-    return "\n".join(out)
+    return checks_section.set_checks(body, checks)
 
 
 def preflight(pr):

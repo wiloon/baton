@@ -5,7 +5,7 @@ calls the bash helpers made, and keeps their exit codes. Commands that change th
 print JSON: `changed`, and `log` for a runner.log line that bash writes.
 """
 
-from . import check_verdicts, md, session
+from . import check_verdicts, checks, session
 import argparse
 import json
 import os
@@ -19,8 +19,6 @@ import time
 from . import pr_contract
 
 TASK_LINE = re.compile(r"TASK: (partial|complete)")
-# Footers a coding tool appends to whatever section ends the body.
-ATTRIBUTION = re.compile(r"(🤖 Generated with |co-authored-by:)", re.IGNORECASE)
 
 
 # A gh failure worth another try: the network or GitHub's edge, not the request (#46).
@@ -237,7 +235,7 @@ def checks_file(ctx, pr):
 
 
 def split_checks(pr, reply, ctx):
-    """REPLY without its `## Manual checks` block, which is kept for apply_checks (#155).
+    """REPLY without its checks block, which is kept for apply_checks (#155).
     The file outlives a deferred Cursor fix's resume."""
     checks, rest = pr_contract.split_checks(reply)
     checks_file(ctx, pr).write_text(json.dumps({"checks": checks}) + "\n")
@@ -245,7 +243,7 @@ def split_checks(pr, reply, ctx):
 
 
 def fixer_gave_checks(ctx, pr):
-    """True when the fixer's reply held a `## Manual checks` block, saved by split_checks."""
+    """True when the fixer's reply held a checks block, saved by split_checks."""
     try:
         return json.loads(checks_file(ctx, pr).read_text())["checks"] is not None
     except (OSError, ValueError, KeyError, TypeError):
@@ -254,7 +252,7 @@ def fixer_gave_checks(ctx, pr):
 
 def apply_checks(pr, ctx):
     """After a fix, the fixer's re-check of the whole PR replaces the body's
-    `## Manual checks`; none given reads "Not re-checked", which the merge gate hands
+    checks section; none given reads "Not re-checked", which the merge gate hands
     off. Returns (rc, changed, log): rc 1 while GitHub may still hold the old section."""
     file = checks_file(ctx, pr)
     try:
@@ -271,22 +269,12 @@ def apply_checks(pr, ctx):
         if result.returncode != 0:
             return 1, False, ""
     file.unlink(missing_ok=True)
-    return 0, changed, f"PR #{pr}: Manual checks refreshed after the fix" if changed else ""
+    return 0, changed, f"PR #{pr}: checks refreshed after the fix" if changed else ""
 
 
 def checks_none(text):
-    """True when a body has one `## Manual checks` section and it says exactly none:
-    its one non-empty line, tool attribution lines aside, is "none" or "none." (#265)."""
-    on, sections, lines = False, 0, []
-    for line in text.split("\n"):
-        if line.startswith("## "):
-            on = line.startswith("## Manual checks")
-            sections += on
-        elif on:
-            lines.append(line)
-    answer = [line for line in (re.sub(r"^[-*\s]+", "", line.replace("\r", "")) for line in lines)
-              if line and not ATTRIBUTION.match(line)]
-    return sections == 1 and len(answer) == 1 and bool(re.fullmatch(r"none\.?", answer[0].lower()))
+    """True when a body has one checks section and it says exactly none (#265)."""
+    return checks.is_none(text)
 
 
 def gate(pr, defer=False, cleared=None):
@@ -298,8 +286,8 @@ def gate(pr, defer=False, cleared=None):
     current = body(pr)
     if current is None:
         return {"action": "manual_checks"}
-    verified = cleared is not None and check_verdicts.items(md.section("Manual checks", current)) == \
-        check_verdicts.items(cleared)
+    listed = checks.items(current)   # none unless the body has exactly one checks section
+    verified = cleared is not None and bool(listed) and listed == check_verdicts.items(cleared)
     if not (defer or verified or checks_none(current)):
         return {"action": "manual_checks"}
     try:

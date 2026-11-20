@@ -9,7 +9,7 @@ import pytest
 from baton import pr
 
 BODY = ("<!-- baton-task issue=242 completion=complete -->\n\nCloses #242\n\n"
-        "## What changed\nDisabled buttons.\n\n## Manual checks\nnone\n\n"
+        "## What changed\nDisabled buttons.\n\n## Checks to verify\nnone\n\n"
         "## Before release\nnone\n\n## Follow-ups\n- [nit] tidy copy")
 PARTIAL = ("<!-- baton-task issue=419 completion=partial -->\n\nRefs #419\n\n"
            "This PR leaves the parent issue open.\n\n## What changed\nA test.")
@@ -38,27 +38,27 @@ def edits(gh):
      "Co-Authored-By: Claude <noreply@anthropic.com>", True),
 ])
 def test_checks_none(section, none):
-    assert pr.checks_none(f"## What changed\nX.\n\n## Manual checks\n{section}\n\n## Before release\nnone") is none
+    assert pr.checks_none(f"## What changed\nX.\n\n## Checks to verify\n{section}\n\n## Before release\nnone") is none
 
 
 def test_checks_none_needs_the_section():
     assert not pr.checks_none("## What changed\nnone\n\n## Before release\nnone")
-    assert pr.checks_none("## Manual checks:\nnone")
+    assert pr.checks_none("## Checks to verify:\nnone")
 
 
 def test_checks_none_with_two_sections_is_false():
-    assert not pr.checks_none("## Manual checks\nnone\n\n## Notes\nX.\n\n## Manual checks\nnone")
+    assert not pr.checks_none("## Checks to verify\nnone\n\n## Notes\nX.\n\n## Checks to verify\nnone")
 
 
 def test_fix_reply_block_replaces_the_section_and_leaves_the_reply(gh, dirs):
     _, ctx = dirs
     gh.set(body=BODY)
-    reply = pr.split_checks(7, "## Must fix\n1. adopted — brand colours\n\n## Manual checks\n"
+    reply = pr.split_checks(7, "## Must fix\n1. adopted — brand colours\n\n## Checks to verify\n"
                                "- /billing: Subscribe buttons use the brand colour\n\nRESULT: fixed\n", ctx)
     assert "Manual checks" not in reply and "adopted — brand colours" in reply
-    assert pr.apply_checks(7, ctx) == (0, True, "PR #7: Manual checks refreshed after the fix")
+    assert pr.apply_checks(7, ctx) == (0, True, "PR #7: checks refreshed after the fix")
     body = gh.pr["body"]
-    assert "## Manual checks\n- /billing: Subscribe buttons use the brand colour\n" in body
+    assert "## Checks to verify\n- /billing: Subscribe buttons use the brand colour\n" in body
     assert not pr.checks_none(body)
     assert "Disabled buttons." in body and "- [nit] tidy copy" in body and "## Before release\nnone" in body
     assert not Path(ctx, "pr-7-fix-checks.json").exists()
@@ -69,14 +69,14 @@ def test_fix_without_a_block_is_not_rechecked(gh, dirs):
     gh.set(body=BODY)
     pr.split_checks(7, "## Must fix\nnone\n\nRESULT: fixed\n", ctx)
     assert pr.apply_checks(7, ctx)[:2] == (0, True)
-    assert "## Manual checks\nNot re-checked after the fix run.\n" in gh.pr["body"]
+    assert "## Checks to verify\nNot re-checked after the fix run.\n" in gh.pr["body"]
     assert not pr.checks_none(gh.pr["body"])
 
 
 def test_fix_that_rechecked_none_changes_nothing(gh, dirs):
     _, ctx = dirs
     gh.set(body=BODY)
-    pr.split_checks(7, "## Manual checks\nnone\n\nRESULT: fixed\n", ctx)
+    pr.split_checks(7, "## Checks to verify\nnone\n\nRESULT: fixed\n", ctx)
     assert pr.apply_checks(7, ctx) == (0, False, "")
     assert edits(gh) == []
 
@@ -84,7 +84,7 @@ def test_fix_that_rechecked_none_changes_nothing(gh, dirs):
 def test_refused_edit_keeps_the_checks_for_a_retry(gh, dirs):
     _, ctx = dirs
     gh.set(body=BODY)
-    pr.split_checks(7, "## Manual checks\n- /billing: brand colour\n\nRESULT: fixed\n", ctx)
+    pr.split_checks(7, "## Checks to verify\n- /billing: brand colour\n\nRESULT: fixed\n", ctx)
     gh.fail("edit")
     assert pr.apply_checks(7, ctx)[0] == 1
     assert Path(ctx, "pr-7-fix-checks.json").exists()
@@ -93,12 +93,12 @@ def test_refused_edit_keeps_the_checks_for_a_retry(gh, dirs):
 
 
 def test_gate(gh):
-    gh.set(headRefName="cursor/issue-242", body=BODY.replace("## Manual checks\nnone", "## Manual checks\n- look"),
+    gh.set(headRefName="cursor/issue-242", body=BODY.replace("## Checks to verify\nnone", "## Checks to verify\n- look"),
            commits=[], closingIssuesReferences=[])
     assert pr.gate(7) == {"action": "manual_checks"}
     gh.set(body=BODY)
     assert pr.gate(7) == {"action": "merge"}
-    partial = PARTIAL + "\n\n## Manual checks\nnone"
+    partial = PARTIAL + "\n\n## Checks to verify\nnone"
     gh.set(headRefName="cursor/issue-419", body=partial)
     result = pr.gate(7)
     assert result["action"] == "queue_review" and "Acceptance advanced" in result["reason"]
@@ -107,6 +107,70 @@ def test_gate(gh):
     assert result["action"] == "queue_review" and "closing keywords" in result["reason"]
     gh.fail("view")
     assert pr.gate(7) == {"action": "manual_checks"}
+
+
+# --- the checks section under either name (#94) ----------------------------------------
+
+BOTH_HEADINGS = pytest.mark.parametrize("heading", ["Manual checks", "Checks to verify"])
+
+
+def with_section(heading, text):
+    return BODY.replace("## Checks to verify\nnone", f"## {heading}\n{text}")
+
+
+@BOTH_HEADINGS
+def test_gate_reads_the_section_under_either_name(gh, heading):
+    gh.set(headRefName="cursor/issue-242", commits=[], closingIssuesReferences=[], body=with_section(heading, "- look"))
+    assert pr.gate(7) == {"action": "manual_checks"}                    # a list hands off
+    assert pr.gate(7, cleared="- look") == {"action": "merge"}          # verdicts covering every item merge
+    gh.set(body=with_section(heading, "none"))
+    assert pr.gate(7) == {"action": "merge"}                            # none merges
+
+
+@pytest.mark.parametrize("body", [
+    BODY.replace("## Checks to verify\nnone\n\n", ""),
+    BODY.replace("## Before release", "## Checks to verify\n- look\n\n## Before release"),
+    BODY.replace("## Before release", "## Manual checks\n- look\n\n## Before release"),
+    BODY.replace("## Checks to verify\nnone", "## Manual checks\n- look").replace(
+        "## Before release", "## Manual checks\n- look\n\n## Before release"),
+], ids=["no section", "two sections", "one old one new", "two old"])
+def test_a_body_that_is_not_well_formed_never_clears_the_gate(gh, body):
+    gh.set(headRefName="cursor/issue-242", commits=[], closingIssuesReferences=[], body=body)
+    assert pr.gate(7) == {"action": "manual_checks"}
+    assert pr.gate(7, cleared="- look") == {"action": "manual_checks"}
+
+
+@BOTH_HEADINGS
+def test_an_empty_section_never_clears_the_gate(gh, heading):
+    gh.set(headRefName="cursor/issue-242", commits=[], closingIssuesReferences=[], body=with_section(heading, ""))
+    assert pr.gate(7, cleared="") == {"action": "manual_checks"}
+    assert pr.gate(7) == {"action": "manual_checks"}
+
+
+def test_checks_none_matches_the_heading_exactly():
+    assert not pr.checks_none("## Manual checks to try\nnone")
+    assert not pr.checks_none("## Checks\nnone")
+    assert pr.checks_none("## manual CHECKS:\nnone")
+
+
+@BOTH_HEADINGS
+def test_a_fix_reply_under_either_name_leaves_one_canonical_section(gh, dirs, heading):
+    _, ctx = dirs
+    gh.set(body=with_section(heading, "- old"))
+    pr.split_checks(7, f"## Must fix\nnone\n\n## {heading}\n- new check\n\nRESULT: fixed\n", ctx)
+    assert pr.apply_checks(7, ctx)[:2] == (0, True)
+    body = gh.pr["body"]
+    assert body.count("## Checks to verify\n- new check\n") == 1 and "Manual checks" not in body
+
+
+def test_a_fix_reply_replaces_both_headings_of_the_body_with_one(gh, dirs):
+    _, ctx = dirs
+    gh.set(body=with_section("Manual checks", "- a").replace("## Before release", "## Checks to verify\n- b\n\n## Before release"))
+    pr.split_checks(7, "## Manual checks\n- first\n\n## Checks to verify\n- last\n\nRESULT: fixed\n", ctx)
+    pr.apply_checks(7, ctx)
+    body = gh.pr["body"]
+    assert body.count("## Checks to verify") == 1 and "Manual checks" not in body
+    assert "- last" in body and "- first" not in body and "- a\n" not in body and "- b\n" not in body
 
 
 # --- task relation ----------------------------------------------------------------------

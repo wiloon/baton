@@ -6,7 +6,7 @@ status: accepted
 
 With `screenshot_review` on, the screenshot review (ADR 0005) looks at every manual-check
 screenshot and can send a PR back for visual breakage. But it could not clear a PR: the merge
-gate handed every PR whose `## Manual checks` is not `none` to the owner, even when every
+gate handed every PR whose `## Checks to verify` is not `none` to the owner, even when every
 screenshot passed. The owner still opened every UI PR, and the review only filtered out the
 obviously broken ones. The owner wants the pipeline to be the same for every repository: the
 screenshot review checks a UI change, and only what it is still unsure about reaches the owner.
@@ -24,7 +24,7 @@ merge gate (manual_checks = "gate"), after review passed and CI is green
   every check verified          -> merge; the screenshots still go to Telegram
   any check not verified        -> ready-for-human, listing only those checks
   no usable verdicts            -> ready-for-human, as before
-manual_checks = "defer"         -> merge; only the unverified checks go to "Manual checks to try"
+manual_checks = "defer"         -> merge; only the unverified checks go to "Checks to try"
 ```
 
 "No usable verdicts" covers every case where the runner can't be sure: no screenshot review in
@@ -51,7 +51,7 @@ verified is not "every check verified". `none` and `defer` are separate paths an
   `owner`" is part of the instructions. The parser reads the form loosely (markdown emphasis, a
   list marker, `1:`) and the content strictly: a missing, repeated, unknown or out-of-range
   number reads as no verdicts.
-- Checks the owner wrote into the issue's own `## Manual checks` are judged like any other: the
+- Checks the owner wrote into the issue's own `## Checks to verify` are judged like any other: the
   owner decided (2026-11-19) that a check the screenshots prove needs no second look. The spec
   step still keeps them word for word, so the reviewer judges the owner's own wording.
 - A UI change can now reach `main` without the owner's look. The screenshots still reach the
@@ -77,3 +77,9 @@ verified is not "every check verified". `none` and `defer` are separate paths an
   otherwise it sends every current check. Under `defer` the merge goes ahead even when the checks
   changed between the merge step's two reads of the body, so a remainder computed from the
   earlier read could otherwise hide a check added in between.
+- Issue #94: the section is named `## Checks to verify`, and the tracking issue `Checks to try`,
+  because after the screenshot review only part of the list is still "manual". The old names
+  (`## Manual checks`, `Manual checks to try`) stay readable, so open PRs, issues and trackers
+  written before the rename keep working; the runner writes only the new name. One module
+  (`baton/checks.py`) reads and writes the section, and shared prompt rules live in
+  `bin/partials/`.

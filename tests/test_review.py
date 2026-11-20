@@ -471,7 +471,7 @@ def test_a_big_diff_runs_the_review_skill_only_when_matt_skills_are_installed(lo
 
 # --- screenshot review (#50) ----------------------------------------------------------------
 
-CHECKS_BODY = "Refs #297\n\n## Manual checks\n- The library at 390 px and 1280 px.\n"
+CHECKS_BODY = "Refs #297\n\n## Checks to verify\n- The library at 390 px and 1280 px.\n"
 
 
 def shoot(loop, *names):
@@ -538,10 +538,13 @@ def test_a_qualifying_round_runs_the_code_review_then_its_own_screenshot_review(
     assert loop.merged == [PR] and not loop.fixes
 
 
-def test_the_merge_step_gets_the_reviewed_checks_and_the_screenshot_comment(loop):
+@pytest.mark.parametrize("heading", ["Manual checks", "Checks to verify"])
+def test_the_merge_step_gets_the_reviewed_checks_and_the_screenshot_comment(loop, heading):
     loop.reviews, loop.screens = ["pass"], ["pass"]
     loop.screen_text = "## Must fix\nnone\n\n## Checks\n1. verified\n\n## Screenshots\n- a.png — ok"
-    assert screen_run(loop) == 0
+    loop.gh.set(body=CHECKS_BODY.replace("Checks to verify", heading))
+    assert loop.run(fixer="cursor", SCREENSHOT_REVIEW="1") == 0
+    assert "1. The library at 390 px and 1280 px." in loop.agents[1]["prompt"]
     [given] = loop.merge_screenshots
     assert given["checks"] == "- The library at 390 px and 1280 px."
     assert given["comment"].startswith("<!-- baton-screenshot-review round=1 by=") and "1. verified" in given["comment"]
@@ -615,7 +618,7 @@ def test_screenshot_review_is_skipped_and_the_code_review_keeps_its_outcome(loop
     if case == "setting off":
         overrides = {}
     elif case == "checks none":
-        body = "Refs #297\n\n## Manual checks\nnone\n"
+        body = "Refs #297\n\n## Checks to verify\nnone\n"
     elif case == "owner pr in the pool":
         loop.gh.set(headRefName="owner/issue-1", author={"login": "owner"})
     else:

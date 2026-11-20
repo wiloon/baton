@@ -21,7 +21,7 @@ import re
 import sys
 import time
 
-from . import check_verdicts, checkpoint, dispatch, fix, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, vendors
+from . import check_verdicts, checkpoint, checks as check_section, dispatch, fix, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, vendors
 from .common import Deferred, changed, git, restore, strip_markers
 
 REPLY_CAP = 60000
@@ -192,17 +192,6 @@ def combined_feedback(code, screenshot, limit):
         return (priority + rest)[:size]
 
     return f"{fit(code, code_parts, first)}\n\n{fit(screenshot, shot_parts, second)}"
-
-
-def manual_checks(body):
-    """The text under the PR's `## Manual checks` heading."""
-    on, lines = False, []
-    for line in (body or "").split("\n"):
-        if line.startswith("## "):
-            on = line.startswith("## Manual checks")
-        elif on:
-            lines.append(line)
-    return "\n".join(lines).strip()
 
 
 def human_feedback(repo, owner, pr):
@@ -409,7 +398,7 @@ class Review:
         """The screenshot reviewer's look at the manual-check screenshots (#50): every valid PNG,
         or one Must fix when there are none."""
         if not shots:
-            return ("This PR has `## Manual checks` but there are no screenshots: report one Must fix asking the "
+            return (f"This PR has `## {check_section.HEADING}` but there are no screenshots: report one Must fix asking the "
                     "author to shoot every manual-check item the way the repository's agent docs describe.")
         listed = "".join(f"\n   - `{path}`" for path in shots)
         return ("Look at every one of the screenshots of this PR's manual checks (Claude: the Read tool; "
@@ -521,13 +510,13 @@ class Review:
                     if body is not None and not pr_helpers.checks_none(body):
                         step = "screenshot"
                         code_verdict = verdict
-                        checks = manual_checks(body)
+                        checks = check_section.all_blocks(body).strip()
                         self.values.update(step=step, code_verdict=code_verdict, screenshot_checks=checks)
                         self.save()
                 elif not checks:   # a split checkpoint written before the manual checks were saved
                     body = pr_helpers.body(pr)
                     if body is not None and not pr_helpers.checks_none(body):
-                        checks = manual_checks(body)
+                        checks = check_section.all_blocks(body).strip()
                 if step == "screenshot":
                     outcome = (self.run_screenshot_review(round, checks) if checks
                                else "RESULT: failed reading PR manual checks")

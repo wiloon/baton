@@ -174,6 +174,15 @@ class TaskTests(unittest.TestCase):
         self.assertNotEqual(before['config_version'],after['config_version'])
         self.assertNotIn('PRIVATE',json.dumps(after))
 
+    def test_a_changed_prompt_partial_changes_the_workflow_version(self):
+        directory = self.state / 'bin'
+        (directory/'partials').mkdir(parents=True)
+        (directory/'run.sh').write_text('version one')
+        (directory/'partials'/'checks-rules.md').write_text('rules one')
+        before = t.fingerprints(directory)
+        (directory/'partials'/'checks-rules.md').write_text('rules two')
+        self.assertNotEqual(before['workflow_version'], t.fingerprints(directory)['workflow_version'])
+
     def test_verify_and_ci_fix_events_are_bounded(self):
         task = self.store.ensure(123, 456, repo='test/repo')
         pipeline = task['pipeline_id']

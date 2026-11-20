@@ -1,6 +1,7 @@
 """baton.after_merge and .md against a fake gh: side bugs filed once, nits on the
 PR's own code never filed (P-2), owner actions in Linear once per issue (P-3).
 Ported from tests/follow-ups.sh and tests/owner-actions.sh."""
+import json
 import re
 import io
 from pathlib import Path
@@ -32,15 +33,15 @@ def log_lines(tmp_path):
 # --- md --------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("text, found", [
-    ("## Manual checks\n- look\n## Next\nx", "- look\n"),
-    ("## Manual checks\r\nnone\r\n", ""),
-    ("## Manual checks\n- None.\n", ""),
-    ("## Manual checks\n\n", ""),
+    ("## Checks to verify\n- look\n## Next\nx", "- look\n"),
+    ("## Checks to verify\r\nnone\r\n", ""),
+    ("## Checks to verify\n- None.\n", ""),
+    ("## Checks to verify\n\n", ""),
     ("## Other\n- look", ""),
-    ("## Manual checks:\n- look", ""),   # the heading must match exactly
+    ("## Checks to verify:\n- look", ""),   # the heading must match exactly
 ])
 def test_section(text, found):
-    assert md.section("Manual checks", text) == found
+    assert md.section("Checks to verify", text) == found
 
 
 def test_items():
@@ -134,7 +135,7 @@ def test_a_nit_the_fix_round_adopted_is_not_filed(gh, tmp_path):
         "<!-- baton-fix by=claude -->\n## Must fix\nnone\n## Nits\n"
         "- `extension/e2e/x.spec.ts:20-24` adopted — added a note.\n"
         "- `extension/e2e/y.spec.ts:5` rejected — out of scope.\n"
-        "## Manual checks\nnone"))
+        "## Checks to verify\nnone"))
     after_merge.follow_ups(1, "2")
     body = gh.created()[0]["body"]
     assert "x.spec.ts" not in body and "y.spec.ts:5" in body and "z.spec.ts:7" in body
@@ -383,7 +384,7 @@ def test_a_bug_the_pr_names_by_number_is_not_filed_when_the_pr_opens(gh):
 
 # --- deferred manual checks (#48) -------------------------------------------------------
 
-DEFERRED = "Closes #6\n\n## Manual checks\n- Open the library at 390 px.\n- Open a book.\n\n## Before release\nnone\n"
+DEFERRED = "Closes #6\n\n## Checks to verify\n- Open the library at 390 px.\n- Open a book.\n\n## Before release\nnone\n"
 
 
 MERGED = "2026-11-14T10:00:00Z"
@@ -399,17 +400,21 @@ def deferred(monkeypatch, gh, tmp_path):
     return since
 
 
+def remainder(source, left):
+    return json.dumps({"source": source, "left": left})
+
+
 def test_deferred_checks_open_the_tracking_issue_when_none_is_open(gh, deferred):
     gh.set(body=DEFERRED, title="feat: covers")
     after_merge.deferred_checks(32, "6")
     [issue] = gh.created()
-    assert issue["title"] == "Manual checks to try" and issue["label"] == "ready-for-human"
+    assert issue["title"] == "Checks to try" and issue["label"] == "ready-for-human"
     assert issue["body"].endswith("### PR #32: feat: covers\nhttps://github.com/owner/app/pull/32\n\n"
                                   "- [ ] Open the library at 390 px.\n- [ ] Open a book.\n")
 
 
 def test_deferred_checks_are_appended_to_the_open_tracking_issue_once_per_pr(gh, deferred):
-    gh.set(body=DEFERRED, title="feat: covers", open_issues=[{"number": 41, "title": "Manual checks to try"}])
+    gh.set(body=DEFERRED, title="feat: covers", open_issues=[{"number": 41, "title": "Checks to try"}])
     after_merge.deferred_checks(32, "6")
     after_merge.deferred_checks(32, "6")
     comments = [c for c in gh.calls() if c[:3] == ["issue", "comment", "41"]]
@@ -419,7 +424,7 @@ def test_deferred_checks_are_appended_to_the_open_tracking_issue_once_per_pr(gh,
 
 def test_only_the_checks_the_screenshot_review_left_are_deferred(gh, deferred):
     gh.set(body=DEFERRED, title="feat: covers")
-    Path(deferred.parent, "deferred-checks-items-pr-32").write_text("- Open a book.\n")
+    Path(deferred.parent, "deferred-checks-items-pr-32").write_text(remainder(["Open the library at 390 px.", "Open a book."], ["Open a book."]))
     after_merge.deferred_checks(32, "6")
     [issue] = gh.created()
     assert issue["body"].endswith("\n\n- [ ] Open a book.\n") and "390 px" not in issue["body"]
@@ -427,16 +432,76 @@ def test_only_the_checks_the_screenshot_review_left_are_deferred(gh, deferred):
 
 def test_checks_the_screenshot_review_all_verified_add_nothing(gh, deferred):
     gh.set(body=DEFERRED, title="feat: covers")
-    Path(deferred.parent, "deferred-checks-items-pr-32").write_text("")
+    Path(deferred.parent, "deferred-checks-items-pr-32").write_text(remainder(["Open the library at 390 px.", "Open a book."], []))
     after_merge.deferred_checks(32, "6")
     assert gh.created() == [] and not [c for c in gh.calls() if c[:2] == ["issue", "comment"]]
+
+
+def body_with(*sections):
+    return "Closes #6\n\n" + "".join(f"## {heading}\n{text}\n\n" for heading, text in sections) + "## Before release\nnone\n"
+
+
+@pytest.mark.parametrize("heading", ["Manual checks", "Checks to verify"])
+def test_the_tracker_section_holds_the_left_items_under_either_name(gh, deferred, heading):
+    gh.set(body=body_with((heading, "- Open the library at 390 px.\n- Open a book.")), title="feat: covers")
+    Path(deferred.parent, "deferred-checks-items-pr-32").write_text(
+        remainder(["Open the library at 390 px.", "Open a book."], ["Open a book."]))
+    after_merge.deferred_checks(32, "6")
+    [issue] = gh.created()
+    assert issue["body"].endswith("\n\n- [ ] Open a book.\n") and "390 px" not in issue["body"]
+
+
+@pytest.mark.parametrize("heading", ["Manual checks", "Checks to verify"])
+def test_all_verified_marks_the_pr_done_under_either_name(gh, deferred, heading):
+    gh.set(body=body_with((heading, "- Open a book.")), title="feat: covers")
+    Path(deferred.parent, "deferred-checks-items-pr-32").write_text(remainder(["Open a book."], []))
+    after_merge.deferred_checks(32, "6")
+    assert gh.created() == [] and Path(deferred.parent, "deferred-checks-pr-32").exists()
+
+
+def test_a_remainder_computed_from_other_checks_is_not_trusted(gh, deferred):
+    gh.set(body=body_with(("Checks to verify", "- Open a book.\n- Added later.")), title="feat: covers")
+    Path(deferred.parent, "deferred-checks-items-pr-32").write_text(remainder(["Open a book."], []))
+    after_merge.deferred_checks(32, "6")
+    [issue] = gh.created()
+    assert "- [ ] Open a book.\n- [ ] Added later.\n" in issue["body"]
+
+
+@pytest.mark.parametrize("saved", [None, "not json", json.dumps({"source": "x"})], ids=["absent", "unreadable", "malformed"])
+def test_without_a_usable_remainder_every_current_check_is_sent(gh, deferred, saved):
+    gh.set(body=body_with(("Checks to verify", "- Open a book.\n- Open a map.")), title="feat: covers")
+    if saved is not None:
+        Path(deferred.parent, "deferred-checks-items-pr-32").write_text(saved)
+    after_merge.deferred_checks(32, "6")
+    [issue] = gh.created()
+    assert "- [ ] Open a book.\n- [ ] Open a map.\n" in issue["body"]
+
+
+def test_deferred_recovery_sends_the_checks_of_both_blocks(gh, deferred):
+    gh.set(body=body_with(("Manual checks", "- Open a book."), ("Checks to verify", "- Open a map.")), title="feat: covers")
+    after_merge.deferred_checks(32, "6")
+    [issue] = gh.created()
+    assert "- [ ] Open a book.\n- [ ] Open a map.\n" in issue["body"]
+    assert Path(deferred.parent, "deferred-checks-pr-32").exists()
+
+
+def test_an_empty_section_with_no_remainder_is_done_without_a_tracker_entry(gh, deferred):
+    gh.set(body=body_with(("Checks to verify", "")), title="feat: covers")
+    after_merge.deferred_checks(32, "6")
+    assert gh.created() == [] and Path(deferred.parent, "deferred-checks-pr-32").exists()
+
+
+def test_an_open_legacy_tracker_keeps_receiving_checks(gh, deferred):
+    gh.set(body=DEFERRED, title="feat: covers", open_issues=[{"number": 41, "title": "Manual checks to try"}])
+    after_merge.deferred_checks(32, "6")
+    assert gh.created() == [] and [c for c in gh.calls() if c[:3] == ["issue", "comment", "41"]]
 
 
 def test_no_checks_and_the_gate_setting_add_nothing(gh, monkeypatch):
     gh.set(body=DEFERRED, title="t")
     after_merge.deferred_checks(32, "6")   # MANUAL_CHECKS unset: "gate"
     monkeypatch.setenv("MANUAL_CHECKS", "defer")
-    gh.set(body="Closes #6\n\n## Manual checks\nnone\n")
+    gh.set(body="Closes #6\n\n## Checks to verify\nnone\n")
     after_merge.deferred_checks(33, "6")
     assert gh.created() == [] and not [c for c in gh.calls() if c[:2] == ["issue", "comment"]]
 

@@ -1,17 +1,20 @@
 """Unattended runs cannot answer a skill's confirmation step; the prompts say who does."""
 from pathlib import Path
 import re
+from types import SimpleNamespace
 
 import pytest
 
 from conftest import full_text
-from baton import config, initialization, prompts, session
+from baton import checks, config, initialization, prompts, session
 
 BIN = Path(__file__).resolve().parent.parent / "bin"
 
 
 def text(name):
-    return (BIN / name).read_text()
+    """The shipped template with its partials expanded and the checks heading filled in."""
+    expanded = prompts.expand_partials((BIN / name).read_text(), (BIN / "partials",), SimpleNamespace(prompt_dir=None))
+    return expanded.replace("{{CHECKS_HEADING}}", checks.HEADING)
 
 
 def test_dev_prompt_takes_the_test_seams_as_confirmed_and_never_blocks_on_a_skill():
@@ -150,7 +153,7 @@ def test_reviewers_flag_an_unproven_limitation(name):
 def test_spec_prompts_keep_the_gate_line_and_the_owners_manual_checks(name):
     prompt = text(name)
     assert "`## E2E gate` is exactly one line" in prompt or "`## E2E gate` must be exactly one line" in prompt
-    assert "`## Manual checks`" in prompt and "The runner refuses an accept" in prompt
+    assert "`## Checks to verify`" in prompt and "The runner refuses an accept" in prompt
 
 
 # --- #38: the verify-fix agent keeps to simple commands and retries a refused one ---
@@ -169,3 +172,45 @@ def test_the_spec_author_is_told_a_denied_command_is_no_reason_to_fail():
     text = (BIN / "spec-prompt.md").read_text()
     assert "A denied command blocks only that command" in text
     assert "never a reason for `RESULT: failed`" in text
+
+
+# --- shared partials (#94) ---------------------------------------------------------------
+
+def first_line(name):
+    return (BIN / "partials" / f"{name}.md").read_text().splitlines()[0].replace("{{CHECKS_HEADING}}", checks.HEADING)
+
+
+@pytest.mark.parametrize("name, partials", [
+    ("dev-prompt.md", ["checks-rules"]),
+    ("fix-prompt.md", ["checks-rules", "fix-reply"]), ("codex-fix-prompt.md", ["checks-rules", "fix-reply"]),
+    ("cursor-fix-prompt.md", ["checks-rules", "fix-reply"]),
+    ("review-prompt.md", ["checks-review"]), ("codex-review-prompt.md", ["checks-review"]),
+    ("cursor-review-prompt.md", ["checks-review"]),
+    ("spec-prompt.md", ["checks-keep"]), ("codex-spec-prompt.md", ["checks-keep"]), ("spec-review-prompt.md", ["checks-keep"]),
+])
+def test_every_vendors_prompt_carries_the_shared_rules_under_the_new_heading(tmp_path, name, partials):
+    out = prompts.render(BIN / name, [], env=other_repo(tmp_path))
+    assert "{{>" not in out and "{{CHECKS_HEADING}}" not in out and "Manual checks" not in out
+    for partial in partials:
+        assert first_line(partial) in out
+
+
+def test_a_caller_value_that_looks_like_a_partial_stays_data(tmp_path):
+    out = prompts.render(BIN / "dev-prompt.md", [("CONTEXT_FILE", "{{> checks-rules}}")], env=other_repo(tmp_path))
+    assert "`{{> checks-rules}}` first" in out
+
+
+def test_a_prompt_dir_partial_overrides_the_shipped_one(tmp_path):
+    custom = tmp_path / "custom"
+    (custom / "partials").mkdir(parents=True)
+    (custom / "partials" / "checks-rules.md").write_text("Our own rules.\n")
+    out = prompts.render(BIN / "dev-prompt.md", [], env=other_repo(tmp_path, prompt_dir=str(custom)))
+    assert "Our own rules." in out and first_line("checks-rules") not in out
+
+
+def test_an_unknown_partial_is_an_error(tmp_path):
+    custom = tmp_path / "custom"
+    custom.mkdir()
+    (custom / "scan-prompt.md").write_text("Scan.\n{{> nope}}\n")
+    with pytest.raises(ValueError, match="unknown prompt partial"):
+        prompts.render(BIN / "scan-prompt.md", [], env=other_repo(tmp_path, prompt_dir=str(custom)))

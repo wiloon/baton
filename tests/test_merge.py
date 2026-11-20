@@ -1,6 +1,7 @@
 """baton.merge: the merge or the handoff after a passed review, the CI repair round and the
 task recovery, against a real git worktree and the fake `gh` of conftest. Ported from
 tests/shots.sh, tests/verify.sh and tests/test_pr_lifecycle.py."""
+import json
 import os
 from pathlib import Path
 
@@ -11,8 +12,8 @@ from conftest import sh
 
 BIN = Path(__file__).resolve().parents[1] / "bin"
 PR = 335
-CLEAN = "Closes #297\n\n## Manual checks\nnone\n"
-PARTIAL = "Refs #297\n\n## Acceptance advanced\n- item one\n\n## Manual checks\nnone\n"
+CLEAN = "Closes #297\n\n## Checks to verify\nnone\n"
+PARTIAL = "Refs #297\n\n## Acceptance advanced\n- item one\n\n## Checks to verify\nnone\n"
 
 
 @pytest.fixture
@@ -46,8 +47,8 @@ def run(gh, worktree, tmp_path, monkeypatch):
     state.texts = {}
     monkeypatch.setattr(merge.notify, "notify", lambda title, text="": (state.events.append(f"notify {title}"),
                                                                        state.texts.__setitem__(title, text), real_notify(title, text)))
-    state.shot_notes = []
-    monkeypatch.setattr(merge.notify, "send_shots", lambda pr, note="": (state.shots.append(pr), state.shot_notes.append(note)))
+    state.shot_notes, state.shot_left = [], []
+    monkeypatch.setattr(merge.notify, "send_shots", lambda pr, note="", left=None: (state.shots.append(pr), state.shot_notes.append(note), state.shot_left.append(left)))
     monkeypatch.setattr(merge.Merger, "ci_green", lambda self, minutes: (state.events.append("ci"), state.greens.pop(0) if len(state.greens) > 1 else state.greens[0])[1])
     monkeypatch.setattr(merge.Merger, "ci_fix_round", lambda self, wt: (state.events.append("repair"), state.repair)[1])
     monkeypatch.setattr(merge.Merger, "after_merge", lambda self: state.events.append("after_merge"))
@@ -112,7 +113,9 @@ def test_manual_checks_go_to_the_owner_with_screenshots(run):
 
 # --- the screenshot review's verdicts (#92) --------------------------------------------------
 
-TWO = "- The library at 390 px.\n- Sign up and land back on Welcome."
+ONE = "The library at 390 px."
+SIGNUP = "Sign up and land back on Welcome."
+TWO = f"- {ONE}\n- {SIGNUP}"
 
 
 def verdicts(*lines):
@@ -149,7 +152,7 @@ def test_anything_short_of_verified_checks_goes_to_the_owner(run, case):
 
 def test_checks_the_owner_wrote_into_the_issue_merge_once_verified(run):
     run.gh.set(body=CLEAN.replace("none", TWO),
-               issues={"297": {"state": "OPEN", "body": "## Manual checks\n- Sign up and land back on Welcome."}})
+               issues={"297": {"state": "OPEN", "body": "## Checks to verify\n- Sign up and land back on Welcome."}})
     run.go(screenshot={"checks": TWO, "comment": verdicts("1. verified", "2. verified")})
     assert run.merged() and not run.labelled("ready-for-human")
 
@@ -158,8 +161,8 @@ def test_deferred_checks_keep_only_what_the_screenshot_review_left(run):
     run.gh.set(body=CLEAN.replace("none", TWO))
     run.go(MANUAL_CHECKS="defer", screenshot={"checks": TWO, "comment": verdicts("1. verified", "2. owner")})
     assert run.merged()
-    left = Path(run.env["STATE"], f"deferred-checks-items-pr-{PR}").read_text()
-    assert left == "- Sign up and land back on Welcome.\n"
+    saved = json.loads(Path(run.env["STATE"], f"deferred-checks-items-pr-{PR}").read_text())
+    assert saved == {"source": [ONE, SIGNUP], "left": [SIGNUP]}
 
 
 def test_deferred_manual_checks_do_not_stop_the_merge(run):
@@ -197,8 +200,106 @@ def test_auto_merge_off_hands_over_and_sends_screenshots_only_for_manual_checks(
     assert run.shots == [PR]
 
 
+# --- one section under either name, and what the owner is shown (#94) ------------------------
+
+BOTH_HEADINGS = pytest.mark.parametrize("heading", ["Manual checks", "Checks to verify"])
+
+
+def two_checks(heading):
+    return f"Closes #297\n\n## {heading}\n{TWO}\n"
+
+
+def remainder(run):
+    return Path(run.env["STATE"], f"deferred-checks-items-pr-{PR}")
+
+
+@BOTH_HEADINGS
+def test_verdicts_clear_or_partly_hand_off_under_either_name(run, heading):
+    run.gh.set(body=two_checks(heading))
+    run.go(screenshot={"checks": TWO, "comment": verdicts("1. verified", "2. owner")})
+    text = run.texts["PR #335 needs a manual check"]
+    assert not run.merged() and SIGNUP in text and ONE not in text and "left these checks for you" in text
+    assert run.shot_left == [[SIGNUP]]
+    run.go(screenshot={"checks": TWO, "comment": verdicts("1. verified", "2. verified")})
+    assert run.merged()
+
+
+@BOTH_HEADINGS
+def test_defer_writes_only_the_left_items_under_either_name(run, heading):
+    run.gh.set(body=two_checks(heading))
+    run.go(MANUAL_CHECKS="defer", screenshot={"checks": TWO, "comment": verdicts("1. verified", "2. owner")})
+    assert run.merged() and json.loads(remainder(run).read_text()) == {"source": [ONE, SIGNUP], "left": [SIGNUP]}
+
+
+@pytest.mark.parametrize("body", [
+    "Closes #297\n\n## Checks to verify\n\n",
+    "Closes #297\n\n## Manual checks\nnone\n\n## Checks to verify\n- a\n",
+    "Closes #297\n\n## Checks to verify\n- a\n\n## Checks to verify\n- a\n",
+    "Closes #297\n",
+], ids=["empty", "mixed", "duplicate", "missing"])
+def test_a_section_that_lists_nothing_or_is_not_well_formed_is_never_cleared_by_screenshots(run, body):
+    run.gh.set(body=body)
+    run.go(screenshot={"checks": "", "comment": verdicts("1. verified")})
+    assert not run.merged() and run.labelled("ready-for-human")
+    run.go(MANUAL_CHECKS="defer", screenshot={"checks": "", "comment": verdicts("1. verified")})
+    assert run.merged() and not remainder(run).exists()
+
+
+def test_a_not_well_formed_body_hands_the_owner_the_checks_of_every_section(run):
+    run.gh.set(body="Closes #297\n\n## Manual checks\n- a\n\n## Checks to verify\n- b\n")
+    run.go()
+    text = run.texts["PR #335 needs a manual check"]
+    assert not run.merged() and "Checks for you" in text and "- a" in text and "- b" in text
+    assert run.shot_left == [["a", "b"]]
+
+
+def test_unreadable_verdicts_are_no_verdicts(run):
+    run.gh.set(body=two_checks("Checks to verify"))
+    incomplete = verdicts("1. verified")   # the second check has no verdict
+    run.go(screenshot={"checks": TWO, "comment": incomplete})
+    text = run.texts["PR #335 needs a manual check"]
+    assert not run.merged() and "Checks for you" in text and ONE in text and SIGNUP in text
+    assert run.shot_left == [[ONE, SIGNUP]]
+    run.go(MANUAL_CHECKS="defer", screenshot={"checks": TWO, "comment": incomplete})
+    assert run.merged() and not remainder(run).exists()
+
+
+def test_a_failed_merge_leaves_no_remainder(run):
+    run.gh.set(body=two_checks("Checks to verify"))
+    run.gh.fail("merge")
+    run.go(MANUAL_CHECKS="defer", screenshot={"checks": TWO, "comment": verdicts("1. verified", "2. verified")})
+    assert run.labelled("ready-for-human") and not remainder(run).exists()
+
+
+def test_a_retry_replaces_the_remainder_of_an_earlier_attempt(run):
+    remainder(run).write_text(json.dumps({"source": [], "left": []}))   # planted by an earlier attempt
+    run.gh.set(body=two_checks("Checks to verify") + "- A new check.\n")
+    run.go(MANUAL_CHECKS="defer", screenshot={"checks": TWO, "comment": verdicts("1. verified", "2. verified")})
+    assert run.merged() and not remainder(run).exists()
+
+
+def test_a_check_added_between_the_two_reads_leaves_a_remainder_the_tracker_will_not_trust(run, monkeypatch):
+    reads = [two_checks("Checks to verify"), two_checks("Checks to verify") + "- Added later.\n"]
+    monkeypatch.setattr(pr_helpers, "body", lambda pr: reads.pop(0) if len(reads) > 1 else reads[0])
+    run.go(MANUAL_CHECKS="defer", screenshot={"checks": TWO, "comment": verdicts("1. verified", "2. verified")})
+    assert run.merged()
+    assert json.loads(remainder(run).read_text()) == {"source": [ONE, SIGNUP], "left": []}
+
+
+@pytest.mark.parametrize("verdict, left, listed", [
+    (("1. verified", "2. owner"), [SIGNUP], "left these checks for you"),
+    (None, [ONE, SIGNUP], "Checks for you"),
+], ids=["partial verdicts", "no verdicts"])
+def test_auto_merge_off_lists_what_is_left_in_the_handoff_and_the_caption(run, verdict, left, listed):
+    run.gh.set(body=two_checks("Checks to verify"))
+    run.go(AUTO_MERGE="0", screenshot={"checks": TWO, "comment": verdicts(*verdict)} if verdict else None)
+    text = run.texts["PR #335 review passed"]
+    assert listed in text and all(item in text for item in left) and run.shot_left == [left]
+    assert (ONE in text) == (ONE in left)
+
+
 def test_a_description_closing_the_wrong_issue_queues_a_metadata_review(run):
-    run.gh.set(body="Refs #297\nThis PR does not close #297.\n\n## Manual checks\nnone")
+    run.gh.set(body="Refs #297\nThis PR does not close #297.\n\n## Checks to verify\nnone")
     run.go()
     assert not run.merged() and run.labelled("agent-review") and not run.labelled("ready-for-human")
     assert any("merge preflight blocked" in line for line in run.log())

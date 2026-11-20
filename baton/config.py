@@ -83,7 +83,7 @@ class Repo:
     prompt_notes: Pairs
     # Agent commits get a Signed-off-by for their author before they are pushed (DCO, #44).
     signoff: bool = False
-    # "gate": a PR whose `## Manual checks` is not none waits for the owner. "defer": it merges,
+    # "gate": a PR whose checks section is not none waits for the owner. "defer": it merges,
     # and its checks go to one tracking issue for a later trial of the whole app (#48).
     manual_checks: str = "gate"
     # A second model reviews the manual-check screenshots, and fixers re-shoot them (#50).
