@@ -96,8 +96,6 @@ elif args[:2] == ["issue", "list"]:
     issues = [t if isinstance(t, dict) else {"title": t} for t in pr.get("open_issues", [])]
     print(json.dumps([{k: v for k, v in t.items() if k != "unindexed"} for t in issues
                       if not ("--search" in args and t.get("unindexed"))]))
-elif args[:2] == ["issue", "view"] and fails("issue-view"):
-    sys.exit(1)
 elif args[:2] == ["issue", "view"] and "--jq" in args:
     print(pr.get("issues", {}).get(args[2], {}).get(args[args.index("--jq") + 1].lstrip("."), ""))
 elif args[:2] == ["issue", "view"] and "title" in args[args.index("--json") + 1]:

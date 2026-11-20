@@ -123,7 +123,7 @@ manual_checks = "gate"
 # It also gives each manual check a verdict (ADR 0006): verified, broken or owner. When the last
 # round verified them all, the PR merges like one with no manual checks (the screenshots still
 # go to Telegram); otherwise only the checks left for the owner are handed over or deferred.
-# Checks written into the issue's own `## Manual checks` always stay with the owner.
+# Checks the owner wrote into the issue are judged the same way.
 screenshot_review = false
 # false: every PR of this repository waits for the owner (ready-for-human), even when
 # [scheduling].auto_merge is true. Use it for a repository whose changes you merge yourself.

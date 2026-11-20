@@ -146,14 +146,6 @@ class Merger:
             notify.log(f"PR #{self.pr}: after-merge filing failed")
 
     # --- the screenshot review's verdicts (#92, ADR 0006) ---
-    def owner_wrote_checks(self):
-        """True when the issue has its own `## Manual checks`, or its body can't be read: checks
-        the owner asked for stay the owner's."""
-        if not self.issue:
-            return False
-        result = pr_helpers.gh("issue", "view", str(self.issue), "-R", self.repo, "--json", "body", "--jq", ".body")
-        return result.returncode != 0 or bool(md.section("Manual checks", result.stdout or ""))
-
     def left_for_owner(self, screenshot, body):
         """The PR's manual checks the screenshot review did not verify; None when there is no
         usable review: none ran, or the description's checks changed since it ran."""
@@ -162,7 +154,7 @@ class Merger:
         checks = screenshot.get("checks") or ""
         if check_verdicts.items(md.section("Manual checks", body)) != check_verdicts.items(checks):
             return None
-        return check_verdicts.for_owner(checks, screenshot.get("comment") or "", self.owner_wrote_checks())
+        return check_verdicts.for_owner(checks, screenshot.get("comment") or "")
 
     def keep_deferred(self, left):
         """With manual_checks = "defer", only the checks LEFT go to the tracking issue (#48)."""

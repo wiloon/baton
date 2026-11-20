@@ -7,16 +7,18 @@ comment's `## Checks` section, numbered as the prompt numbered them:
     2. owner — a real sign-up and redirect
 
 `verified`: the screenshots show the item and it looks right. `broken`: they show it is wrong
-(a Must fix). `owner`: no screenshot can show it, or the reviewer is not sure. Anything less
-than one valid verdict per item reads as no verdicts, and then every item is the owner's.
-Pure: no I/O.
+(a Must fix). `owner`: no screenshot can show it, or the reviewer is not sure. The form is read
+loosely (markdown emphasis, a list marker, `1:`), the content strictly: anything less than one
+valid verdict per item reads as no verdicts, and then every item is the owner's. Pure: no I/O.
 """
 
 import re
 
 VERDICTS = ("verified", "broken", "owner")
 ITEM = re.compile(r"^\s{0,3}(?:[-*+]|\d+[.)])\s+(.*)$")
-VERDICT = re.compile(r"^\s*(\d+)[.)]\s+(\w+)\b", re.IGNORECASE)
+VERDICT = re.compile(r"^\s*(?:[-+]\s+)?(\d+)\s*[.):]\s*(\w+)\b", re.IGNORECASE)
+HEADING = re.compile(r"^#{1,6}\s")
+CHECKS_HEADING = re.compile(r"^#{2,3}\s+checks\s*:?\s*$", re.IGNORECASE)
 
 
 def items(checks):
@@ -46,8 +48,9 @@ def parse(comment, count):
     1..COUNT has exactly one of VERDICTS and no other number appears."""
     on, seen = False, {}
     for line in (comment or "").replace("\r", "").split("\n"):
-        if line.startswith("## "):
-            on = line.strip().lower() == "## checks"
+        line = re.sub(r"[*`_]", "", line)   # **1.** `verified`, _owner_: the same verdicts
+        if HEADING.match(line):
+            on = bool(CHECKS_HEADING.match(line.strip()))
             continue
         match = VERDICT.match(line) if on else None
         if not match:
@@ -61,11 +64,11 @@ def parse(comment, count):
     return [seen[n] for n in range(1, count + 1)]
 
 
-def for_owner(checks, comment, owner_wrote_checks):
+def for_owner(checks, comment):
     """The checks the owner still has to look at: those not `verified`, or all of them when the
-    verdicts are unreadable or the owner wrote manual checks into the issue."""
+    verdicts are unreadable. Checks the owner wrote into the issue are judged like any other."""
     listed = items(checks)
-    verdicts = None if owner_wrote_checks else parse(comment, len(listed))
+    verdicts = parse(comment, len(listed))
     if verdicts is None:
         return listed
     return [item for item, verdict in zip(listed, verdicts) if verdict != "verified"]

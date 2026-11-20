@@ -61,24 +61,39 @@ def test_a_review_without_a_checks_section_has_no_verdicts():
 
 def test_the_owner_gets_only_the_checks_not_verified():
     comment = review("1. verified", "2. verified", "3. owner — a real sign-up")
-    assert check_verdicts.for_owner(CHECKS, comment, owner_wrote_checks=False) == [ITEMS[2]]
+    assert check_verdicts.for_owner(CHECKS, comment) == [ITEMS[2]]
 
 
 def test_all_verified_leaves_nothing_for_the_owner():
     comment = review("1. verified", "2. verified", "3. verified")
-    assert check_verdicts.for_owner(CHECKS, comment, owner_wrote_checks=False) == []
+    assert check_verdicts.for_owner(CHECKS, comment) == []
 
 
 def test_a_broken_verdict_in_a_passed_review_still_goes_to_the_owner():
     comment = review("1. verified", "2. broken — no underline", "3. verified")
-    assert check_verdicts.for_owner(CHECKS, comment, owner_wrote_checks=False) == [ITEMS[1]]
+    assert check_verdicts.for_owner(CHECKS, comment) == [ITEMS[1]]
 
 
 def test_without_readable_verdicts_every_check_goes_to_the_owner():
-    assert check_verdicts.for_owner(CHECKS, "no checks section", owner_wrote_checks=False) == ITEMS
-    assert check_verdicts.for_owner(CHECKS, "", owner_wrote_checks=False) == ITEMS
+    assert check_verdicts.for_owner(CHECKS, "no checks section") == ITEMS
+    assert check_verdicts.for_owner(CHECKS, "") == ITEMS
 
 
-def test_checks_the_owner_wrote_into_the_issue_always_go_to_the_owner():
-    comment = review("1. verified", "2. verified", "3. verified")
-    assert check_verdicts.for_owner(CHECKS, comment, owner_wrote_checks=True) == ITEMS
+@pytest.mark.parametrize("lines", [
+    ("1. `verified`", "2. **verified**", "3. _owner_ — a real sign-up"),
+    ("- 1. verified", "* 2. verified", "3. owner"),
+    ("**1.** verified", "2: verified", "3) owner"),
+])
+def test_markdown_dressing_around_a_verdict_is_ignored(lines):
+    assert check_verdicts.parse(review(*lines), 3) == ["verified", "verified", "owner"]
+
+
+@pytest.mark.parametrize("heading", ["## Checks", "## **Checks**", "### Checks", "## Checks:"])
+def test_the_checks_heading_may_vary_a_little(heading):
+    comment = review("1. verified", "2. verified", "3. owner").replace("## Checks", heading)
+    assert check_verdicts.parse(comment, 3) == ["verified", "verified", "owner"]
+
+
+def test_numbered_lines_in_other_sections_are_not_verdicts():
+    comment = review("1. verified", "2. verified", "3. owner").replace("## Must fix\nnone", "## Must fix\n1. verified")
+    assert check_verdicts.parse(comment, 3) == ["verified", "verified", "owner"]

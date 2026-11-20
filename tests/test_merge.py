@@ -135,20 +135,23 @@ def test_only_the_checks_left_for_the_owner_are_handed_over(run):
     assert "Sign up and land back on Welcome." in text and "The library at 390 px." not in text
 
 
-@pytest.mark.parametrize("case", ["no verdicts", "checks changed", "issue checks", "issue unreadable"])
+@pytest.mark.parametrize("case", ["no verdicts", "checks changed"])
 def test_anything_short_of_verified_checks_goes_to_the_owner(run, case):
     run.gh.set(body=CLEAN.replace("none", TWO))
     comment = verdicts("1. verified", "2. verified")
     if case == "no verdicts":
         comment = "<!-- baton-screenshot-review round=1 by=codex -->\n## Screenshots\n- a.png — ok"
-    elif case == "checks changed":
-        run.gh.set(body=CLEAN.replace("none", TWO + "\n- A new check."))
-    elif case == "issue checks":
-        run.gh.set(issues={"297": {"state": "OPEN", "body": "## Manual checks\n- Sign up for real."}})
     else:
-        run.gh.fail("issue-view")
+        run.gh.set(body=CLEAN.replace("none", TWO + "\n- A new check."))
     run.go(screenshot={"checks": TWO, "comment": comment})
     assert run.labelled("ready-for-human") and not run.merged()
+
+
+def test_checks_the_owner_wrote_into_the_issue_merge_once_verified(run):
+    run.gh.set(body=CLEAN.replace("none", TWO),
+               issues={"297": {"state": "OPEN", "body": "## Manual checks\n- Sign up and land back on Welcome."}})
+    run.go(screenshot={"checks": TWO, "comment": verdicts("1. verified", "2. verified")})
+    assert run.merged() and not run.labelled("ready-for-human")
 
 
 def test_deferred_checks_keep_only_what_the_screenshot_review_left(run):

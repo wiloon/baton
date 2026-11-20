@@ -29,8 +29,8 @@ manual_checks = "defer"         -> merge; only the unverified checks go to "Manu
 
 "No usable verdicts" covers every case where the runner can't be sure: no screenshot review in
 the last round (setting off, owner-authored PR, Cursor review), a `## Checks` section without
-exactly one valid verdict per check, a PR description whose checks changed after the review, and
-an issue body the runner can't read. Missing information never merges.
+exactly one valid verdict per check, and a PR description whose checks changed after the review.
+Missing information never merges.
 
 ## Considered options
 
@@ -46,10 +46,12 @@ an issue body the runner can't read. Missing information never merges.
 ## Consequences
 
 - The prompt numbers the PR's manual checks and asks for a `## Checks` section; "when in doubt,
-  `owner`" is part of the instructions. The parser is strict: a missing, repeated, unknown or
-  out-of-range number reads as no verdicts.
-- Checks written into the issue's own `## Manual checks` are always the owner's: the owner asked
-  to see them. The spec step already keeps them word for word.
+  `owner`" is part of the instructions. The parser reads the form loosely (markdown emphasis, a
+  list marker, `1:`) and the content strictly: a missing, repeated, unknown or out-of-range
+  number reads as no verdicts.
+- Checks the owner wrote into the issue's own `## Manual checks` are judged like any other: the
+  owner decided (2026-11-19) that a check the screenshots prove needs no second look. The spec
+  step still keeps them word for word, so the reviewer judges the owner's own wording.
 - A UI change can now reach `main` without the owner's look. The screenshots still reach the
   owner on Telegram after the merge, captioned "merged after screenshot review".
 - A broken verdict in a review that passed (an inconsistent reply) is treated as not verified.
