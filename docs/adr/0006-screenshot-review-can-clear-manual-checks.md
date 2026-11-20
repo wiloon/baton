@@ -63,3 +63,8 @@ verified is not "every check verified". `none` and `defer` are separate paths an
 - Issue #94: screenshot clearance needs at least one parsed check and a complete verdict set
   on a well-formed checks section (exactly one, under either heading). An empty section used to
   compare `[] == []` and could clear the gate with no check verified.
+- Issue #94: unreadable verdicts are "no usable verdicts" in the hand-off and the tracker too,
+  not only in the gate: the runner no longer reports every check as "left by the screenshot
+  review" when it could not read the verdicts; the owner gets all current checks under the
+  no-verdicts wording. Under `defer`, an empty saved remainder (every check verified) is final
+  and adds nothing to the tracking issue.
