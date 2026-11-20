@@ -29,8 +29,10 @@ manual_checks = "defer"         -> merge; only the unverified checks go to "Manu
 
 "No usable verdicts" covers every case where the runner can't be sure: no screenshot review in
 the last round (setting off, owner-authored PR, Cursor review), a `## Checks` section without
-exactly one valid verdict per check, and a PR description whose checks changed after the review.
-Missing information never merges.
+exactly one valid verdict per check, a PR description whose checks changed after the review,
+a description whose checks section is missing, repeated or empty (no item to verify), and one
+that carries both the old and the new heading. Missing information never merges: zero items
+verified is not "every check verified". `none` and `defer` are separate paths and are unchanged.
 
 ## Considered options
 
@@ -55,3 +57,23 @@ Missing information never merges.
 - A UI change can now reach `main` without the owner's look. The screenshots still reach the
   owner on Telegram after the merge, captioned "merged after screenshot review".
 - A broken verdict in a review that passed (an inconsistent reply) is treated as not verified.
+
+## Revisions
+
+- Issue #94: screenshot clearance needs at least one parsed check and a complete verdict set
+  on a well-formed checks section (exactly one, under either heading). An empty section used to
+  compare `[] == []` and could clear the gate with no check verified.
+- Issue #94: unreadable verdicts are "no usable verdicts" in the hand-off and the tracker too,
+  not only in the gate: the runner no longer reports every check as "left by the screenshot
+  review" when it could not read the verdicts; the owner gets all current checks under the
+  no-verdicts wording. Under `defer`, an empty saved remainder (every check verified) is final
+  and adds nothing to the tracking issue.
+- Issue #94: the saved remainder belongs to the merge that succeeded. Every `defer` merge attempt
+  replaces it before merging (written after usable verdicts, removed otherwise) and removes it
+  when the merge fails, so a file left by a failed attempt cannot hide a retry's checks from the
+  tracking issue.
+- Issue #94: the saved remainder also records the checks it was computed from. The tracker uses
+  it only when the merged PR's body has one well-formed checks section with exactly those checks;
+  otherwise it sends every current check. Under `defer` the merge goes ahead even when the checks
+  changed between the merge step's two reads of the body, so a remainder computed from the
+  earlier read could otherwise hide a check added in between.
