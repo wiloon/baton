@@ -13,7 +13,7 @@ import re
 import subprocess
 import time
 
-from . import after_merge, dispatch, fix, md, names, pr as pr_helpers, pr_contract, prompts, spec, vendors
+from . import after_merge, agents, dispatch, fix, md, names, pr as pr_helpers, pr_contract, prompts, spec, vendors
 from .common import Deferred, git, push, strip_markers
 
 REPLY_CAP = 60000
@@ -134,7 +134,7 @@ def finish_opening(tick, intent, path):
             target.mkdir()  # an older run may have no screenshots
     state = str(tick.state)
     vendors.record_author(state, pr, vendor)
-    if vendor == "codex":
+    if agents.ADAPTERS[vendor].RECORDS_AUTHOR_MODEL:
         vendors.record_author_model(state, pr, vendor, intent["model"])
     if not vendors.state_path(state, pr, "contrib").exists():
         vendors.record_contrib(state, pr, vendor, intent["wt"], intent["base"])
@@ -167,7 +167,7 @@ def resume_opening(tick, path):
         wt = names.worktree_for(tick.wt_root, branch)
         if (not issue.isdecimal() or path != opening_path(tick, issue)
                 or names.issue_of(branch) != issue or intent["wt"] != str(wt)
-                or intent["vendor"] not in ("claude", "codex", "cursor")
+                or intent["vendor"] not in agents.ADAPTERS
                 or not re.fullmatch(r"[a-f0-9]{40,64}", intent["head"])
                 or not re.fullmatch(r"[a-f0-9]{40,64}", intent["base"])
                 or not isinstance(intent["model"], str)):

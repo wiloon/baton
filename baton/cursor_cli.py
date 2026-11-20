@@ -4,6 +4,25 @@ and comments for it. A read-only run that changed anything is reset here, before
 quota deferral could leave the change behind."""
 from .common import Run, changed, child_env, events, git, last_result, outcome_line, read, restore, run_cli
 
+ID = "cursor"
+DISPLAY_NAME = "Cursor"
+ANALYST_ALIAS = "cursor_analyst"
+SUPPORTED_ROLES = frozenset({
+    "dev", "fixer", "reviewer", "spec_reviewer", "retrospective",
+})
+QUOTA_SOURCE = "api"
+QUOTA_WINDOWS = frozenset({"seven_day"})
+IMAGES = False
+SCAN = False
+SKIP_SCREENSHOT_AFTER_REVIEW = True
+ROUTE_FIELDS = frozenset({"model"})
+EMPTY_MODEL_OK = False
+RECORDS_AUTHOR_MODEL = False
+DEFAULT_MAX_MINUTES = 60
+PREFLIGHT_CHECKS = (("cursor-agent", "--version"),)
+VERSION_EXECUTABLE = "cursor-agent"
+PROBE_SENDS_MODEL = False
+RUNS_STEM = "cursor-runs"
 KINDS = ("RESULT", "SPEC", "REVIEW")
 
 

@@ -34,7 +34,8 @@ def test_validate_and_scan_listing_do_not_touch_state(tmp_path, monkeypatch, cap
 
 def test_explicit_session_scopes_vendor_helpers(tmp_path):
     config = load(ROOT/'config.example.toml',home=tmp_path)
-    config = replace(config,quota=replace(config.quota,quota_cap_claude=.42),preferences=(('dev',('codex',)),))
+    caps = tuple((vid, 0.42 if vid == 'claude' else cap) for vid, cap in config.quota.caps)
+    config = replace(config, quota=replace(config.quota, caps=caps), preferences=(('dev', ('codex',)),))
     explicit = session.create(config,{})
     config.paths.state.mkdir(parents=True)
     quota.record(config.paths.state, 'claude', {'seven_day': {'used': .5, 'resets_at': 2000}}, 1000)

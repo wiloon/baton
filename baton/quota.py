@@ -15,7 +15,7 @@ Cursor's output carries none: refresh_cursor asks the dashboard API its IDE uses
                                print the vendor to use and a one-line summary; exit 1 if none
 """
 
-from . import session
+from . import agents, session
 import glob
 import json
 from contextlib import contextmanager
@@ -228,7 +228,7 @@ def record(state, vendor, windows, now):
 def fresh(state, vendor, now, minutes):
     """A probe attempt or a successful call without quota data is not an observation."""
     snap = load(state, vendor) or {}
-    required = {'seven_day'} if vendor == 'cursor' else {'five_hour', 'seven_day'}
+    required = set(agents.ADAPTERS[vendor].QUOTA_WINDOWS)
     try:
         windows = snap.get('windows') or {}
         return required <= windows.keys() and all(
@@ -358,7 +358,8 @@ def pick(vendors, snapshots, caps, five_hour_max, now, current=None, prefer=()):
 
 
 def main(argv):
-    state = str(session.resolve().config.paths.state)
+    cfg = session.resolve().config
+    state = str(cfg.paths.state)
     now = time.time()
     command, args = argv[0], argv[1:]
     if command == "record":
@@ -368,6 +369,9 @@ def main(argv):
         mark_probed(state, args[0], now)
         return 0
     if command == "refresh":
+        if reason := cfg.admission_error("cursor"):
+            print(reason, file=sys.stderr)
+            return 1
         print(json.dumps(refresh_cursor(state, now)))
         return 0
     if command == "credential":
@@ -383,9 +387,9 @@ def main(argv):
             else:
                 prefer = args[1].split()
             args = args[2:]
-        caps = {v: getattr(session.resolve().config.quota, f"quota_cap_{v}") for v in args}
+        caps = {v: cfg.cap(v) for v in args}
         chosen, summary = pick(args, {v: load(state, v) for v in args}, caps,
-                               float(session.resolve().config.quota.quota_five_hour_max), now, current,
+                               float(cfg.quota.quota_five_hour_max), now, current,
                                prefer)
         print(chosen or "")
         print(summary)

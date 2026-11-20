@@ -24,11 +24,15 @@ class QuotaMetricsTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.state = Path(self.tmp.name)
         self.config = self.state / 'config.toml'
-        self.config.write_text((BIN.parent / 'config.example.toml').read_text().replace('quota_cap_claude = 0.9', 'quota_cap_claude = 0.7'))
+        self.config.write_text((BIN.parent / 'config.example.toml').read_text().replace('cap = 0.90', 'cap = 0.70', 1))
 
     def metrics(self):
         values = {}
-        t.quota_metrics(self.state, self.config,
+        try:
+            effective = t._runner_config(self.config)
+        except ValueError:
+            effective = None
+        t.quota_metrics(self.state, effective,
                         lambda name, value, labels: values.__setitem__((name, labels), value), NOW)
         return values
 
@@ -45,7 +49,7 @@ class QuotaMetricsTests(unittest.TestCase):
         values = self.metrics()
         self.assertAlmostEqual(self.value(values,'quota_remaining_ratio',window='seven_day'), .38)
         self.assertAlmostEqual(self.value(values,'quota_runner_headroom_ratio',window='seven_day'), .08)
-        self.config.write_text(self.config.read_text().replace('quota_cap_claude = 0.7', 'quota_cap_claude = 0.6'))
+        self.config.write_text(self.config.read_text().replace('cap = 0.70', 'cap = 0.60', 1))
         values = self.metrics()
         self.assertEqual(self.value(values,'quota_gate'), 3)
         self.assertEqual(self.value(values,'quota_runner_headroom_ratio',window='seven_day'), 0)
@@ -112,8 +116,9 @@ class QuotaMetricsTests(unittest.TestCase):
             self.assertEqual(self.value(values,'quota_window_state',window='five_hour'),5)
             self.assertTrue(math.isnan(self.value(values,'quota_remaining_ratio',window='five_hour')))
         self.record()
-        self.config.write_text(self.config.read_text().replace('quota_cap_codex = 0.95', 'quota_cap_codex = nan'))
-        self.assertEqual(self.value(self.metrics(),'quota_gate'),0)
+        broken = self.config.read_text().replace('adapter = "codex"', 'adapter = "codex"\ncap = nan', 1)
+        self.config.write_text(broken)
+        self.assertEqual(self.metrics(), {})
 
 if __name__ == '__main__':
     unittest.main()

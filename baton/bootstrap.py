@@ -43,11 +43,10 @@ def main(argv=None):
             if busy:
                 print('Pipeline is busy', file=sys.stderr)
                 return 75
-        checks = {'claude': [['claude', '--version']],
-                  'codex': [['codex', '--version'], ['codex', 'login', 'status']],
-                  'cursor': [['cursor-agent', '--version']]}
+        from . import agents
         enabled = (*config.quota.vendor_pool, *config.quota.vendor_extra)
-        for command in [['gh', 'auth', 'status'], *(c for v in enabled for c in checks[v])]:
+        for command in [['gh', 'auth', 'status'],
+                        *(list(check) for v in enabled for check in agents.ADAPTERS[v].PREFLIGHT_CHECKS)]:
             try:
                 done = subprocess.run(command, env=invocation.tools, capture_output=True, timeout=30)
             except (OSError, subprocess.TimeoutExpired):
