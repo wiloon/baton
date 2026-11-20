@@ -68,3 +68,7 @@ verified is not "every check verified". `none` and `defer` are separate paths an
   review" when it could not read the verdicts; the owner gets all current checks under the
   no-verdicts wording. Under `defer`, an empty saved remainder (every check verified) is final
   and adds nothing to the tracking issue.
+- Issue #94: the saved remainder belongs to the merge that succeeded. Every `defer` merge attempt
+  replaces it before merging (written after usable verdicts, removed otherwise) and removes it
+  when the merge fails, so a file left by a failed attempt cannot hide a retry's checks from the
+  tracking issue.
