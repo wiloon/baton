@@ -1,0 +1,1 @@
+- **Owner's checks:** every line the owner wrote under the issue's checks section (`## {{CHECKS_HEADING}}`, or the section's former name in an older body) stays in that section word for word: never move it to `## Before release`, never reword it. A check the owner listed there is not an owner action. The runner refuses an accept of a body that drops one.

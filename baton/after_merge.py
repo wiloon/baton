@@ -17,7 +17,7 @@ import sys
 import urllib.error
 import urllib.request
 
-from . import credentials, md, notify as notifier
+from . import checks as check_section, credentials, md, notify as notifier
 from .notify import log, notify
 from .pr import body as pr_body, gh, view
 
@@ -325,7 +325,7 @@ def owner_actions(pr, issue):
     done.touch()
 
 
-TRACKER = "Manual checks to try"
+TRACKER = "Checks to try"
 
 
 def defer_since(env=None):
@@ -355,17 +355,34 @@ def open_tracker():
     if listed is None:
         return None
     try:
-        return next((str(i["number"]) for i in json.loads(listed or "[]") if i.get("title") == TRACKER), "")
+        return next((str(i["number"]) for i in json.loads(listed or "[]") if i.get("title") in (TRACKER, check_section.LEGACY_TRACKER)), "")
     except (ValueError, TypeError, KeyError):
         return None
 
 
+def deferred_remainder(path, body):
+    """The checks the merge step left for the owner, read from PATH; None unless the file is
+    readable and was computed from the very checks the merged BODY lists (a well-formed body
+    whose items equal the file's source items)."""
+    try:
+        saved = json.loads(path.read_text())
+        source, left = saved["source"], saved["left"]
+        if not isinstance(source, list) or not isinstance(left, list):
+            return None
+        if not all(isinstance(item, str) for item in (*source, *left)):
+            return None
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return left if check_section.items(body) == source and source else None
+
+
 def deferred_checks(pr, issue):
     """With manual_checks = "defer" the PR merged without the owner's look, so its
-    `## Manual checks` go to one open tracking issue for a later trial of the whole app:
-    a new issue, or a comment on the open one. Once per PR (#48), and only for PRs merged
-    after defer took effect (#52). Checks the screenshot review verified are left out (#92):
-    the merge step wrote the rest to `deferred-checks-items-pr-N`."""
+    checks go to one open tracking issue for a later trial of the whole app: a new issue, or a
+    comment on the open one. Once per PR (#48), and only for PRs merged after defer took effect
+    (#52). Checks the screenshot review verified are left out (#92) when the merge step's
+    `deferred-checks-items-pr-N` was computed from the checks the merged description still
+    lists; otherwise every check of every checks section is sent."""
     env = session.resolve()
     since = defer_since(env)
     if since is None:
@@ -375,13 +392,11 @@ def deferred_checks(pr, issue):
         return
     body = pr_body(pr)
     if body is None:
-        log(f"PR #{pr}: reading its manual checks failed; retried after the next merge step")
+        log(f"PR #{pr}: reading its checks failed; retried after the next merge step")
         return
-    checks = md.section("Manual checks", body)
-    left = Path(str(env.dirs.state), f"deferred-checks-items-pr-{pr}")
-    if checks and left.exists():   # the screenshot review verified the rest (#92)
-        checks = left.read_text()
-    if not checks:
+    left = deferred_remainder(Path(str(env.dirs.state), f"deferred-checks-items-pr-{pr}"), body)
+    listed_checks = left if left is not None else check_section.recovery_items(body)
+    if not listed_checks:   # no checks, none, or every one verified (#92)
         done.touch()
         return
     listed = stdout("pr", "view", str(pr), "-R", repo(), "--json", "title,mergedAt")
@@ -395,7 +410,8 @@ def deferred_checks(pr, issue):
     if merged < since:
         done.touch()   # merged through the gate, before defer: the owner had their look
         return
-    items = "".join(re.sub(r"^[-*]\s+(?!\[[ xX]\])", "- [ ] ", line) + "\n" for line in checks.rstrip("\n").split("\n"))
+    items = "".join(("- " if re.match(r"\[[ xX]\]", item) else "- [ ] ") + item.replace("\n", "\n  ") + "\n"
+                    for item in listed_checks)
     section = f"### PR #{pr}: {title}\nhttps://github.com/{repo()}/pull/{pr}\n\n{items}"
     tracker = open_tracker()
     if tracker is None:
@@ -406,11 +422,11 @@ def deferred_checks(pr, issue):
         ok = gh("issue", "comment", tracker, "-R", repo(), "--body", section).returncode == 0
     else:
         ok = stdout("issue", "create", "-R", repo(), "--label", "ready-for-human", "--title", TRACKER, "--body",
-                    "Manual checks of PRs that merged without the owner's look (`manual_checks = \"defer\"`). "
+                    "Checks of PRs that merged without the owner's look (`manual_checks = \"defer\"`). "
                     "Try them in one pass, tick what works, then close this issue; the next such PR opens "
                     f"a new one.\n\n{section}") is not None
     if not ok:
-        log(f"PR #{pr}: deferred manual checks lost: {checks}")
+        log(f"PR #{pr}: deferred checks lost: {items}")
 
 
 def main(argv=None):

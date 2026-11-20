@@ -18,7 +18,7 @@ BIN = Path(__file__).resolve().parents[1] / "bin"
 class PRLifecycleTests(unittest.TestCase):
     def test_partial_pr_creation_keeps_issue_open(self):
         # The production PR-body preparation (baton.dev) with Cursor's actual shape.
-        body = dev.pr_body("test: characterize billing\n\nRefs #297\n\n## Manual checks\nnone\n", "297")
+        body = dev.pr_body("test: characterize billing\n\nRefs #297\n\n## Checks to verify\nnone\n", "297")
         self.assertNotIn("Closes #297", body)
         self.assertIn("Refs #297", body)
 
@@ -38,7 +38,7 @@ class PRLifecycleTests(unittest.TestCase):
 
 
     BODY = ("<!-- baton-task issue=242 completion=complete -->\n\nCloses #242\n\n"
-            "## What changed\nDisabled buttons.\n\n## Manual checks\nnone. No colour changes.\n\n"
+            "## What changed\nDisabled buttons.\n\n## Checks to verify\nnone. No colour changes.\n\n"
             "## Before release\nnone\n\n## Follow-ups\n- [nit] tidy copy\n")
 
     def checks(self, command, value):
@@ -47,7 +47,7 @@ class PRLifecycleTests(unittest.TestCase):
         return result.stdout
 
     def test_fix_reply_manual_checks_are_split_from_the_posted_reply(self):
-        reply = ("## Must fix\n1. adopted — brand colours\n\n## Manual checks\n"
+        reply = ("## Must fix\n1. adopted — brand colours\n\n## Checks to verify\n"
                  "- /billing: Subscribe buttons use the brand colour\n\nTASK: complete\nRESULT: fixed\n")
         split = json.loads(self.checks("split-checks", reply))
         self.assertEqual(split["checks"], "- /billing: Subscribe buttons use the brand colour")
@@ -55,7 +55,7 @@ class PRLifecycleTests(unittest.TestCase):
         self.assertIn("1. adopted — brand colours", split["reply"])
         self.assertIn("TASK: complete\nRESULT: fixed", split["reply"])
         # Only the last block counts; an empty one is no answer.
-        self.assertIsNone(json.loads(self.checks("split-checks", "## Manual checks\n\nRESULT: fixed\n"))["checks"])
+        self.assertIsNone(json.loads(self.checks("split-checks", "## Checks to verify\n\nRESULT: fixed\n"))["checks"])
         self.assertIsNone(json.loads(self.checks("split-checks", "All done.\nRESULT: fixed\n"))["checks"])
 
     def test_fix_manual_checks_replace_only_that_section(self):
@@ -64,13 +64,13 @@ class PRLifecycleTests(unittest.TestCase):
         self.assertEqual(body, self.BODY.replace(
             "none. No colour changes.", "- /billing: Subscribe buttons use the brand colour"))
         none = self.checks("set-checks", json.dumps({"body": self.BODY, "checks": "none"}))
-        self.assertIn("## Manual checks\nnone\n\n## Before release\nnone\n", none)
+        self.assertIn("## Checks to verify\nnone\n\n## Before release\nnone\n", none)
 
     def test_missing_fix_manual_checks_fail_safe(self):
         body = self.checks("set-checks", json.dumps({"body": self.BODY, "checks": None}))
-        self.assertIn("## Manual checks\nNot re-checked after the fix run.\n\n## Before release", body)
+        self.assertIn("## Checks to verify\nNot re-checked after the fix run.\n\n## Before release", body)
         added = self.checks("set-checks", json.dumps({"body": "## What changed\nX.\n", "checks": "none"}))
-        self.assertEqual(added, "## What changed\nX.\n\n## Manual checks\nnone\n")
+        self.assertEqual(added, "## What changed\nX.\n\n## Checks to verify\nnone\n")
 
     def test_fix_manual_checks_cannot_forge_runner_markers(self):
         body = self.checks("set-checks", json.dumps(

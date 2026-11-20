@@ -732,7 +732,7 @@ def test_an_accept_that_moves_the_owners_manual_check_goes_back_to_the_reviser(g
     gated.script = [CHANGES, reviser(body=moved), ACCEPT, reviser(body=GATED + "\n## Before release\n- Deploy\n"), ACCEPT]
     assert gated.run() is True
     note, = refused(gated)
-    assert "- Open the popup in Chrome and pick the article" in note and "## Manual checks" in note
+    assert "- Open the popup in Chrome and pick the article" in note and "## Checks to verify" in note
     assert "ready-for-agent" in gated.gh.labels
 
 
@@ -742,6 +742,20 @@ def test_a_refused_accept_in_the_last_round_goes_to_the_owner(gated):
     assert gated.run() is False
     assert refused(gated) and "ready-for-human" in gated.gh.labels
     assert "ready-for-agent" not in gated.gh.labels and not gated.gh.posted("<!-- baton-verdict")
+
+
+def test_an_old_headed_owner_check_is_kept_by_a_revision_under_the_new_heading(gated):
+    revised = GATED.replace("## Manual checks", "## Checks to verify")
+    gated.script = [CHANGES, reviser(body=revised), ACCEPT]
+    assert gated.run() is True
+    assert not refused(gated) and "ready-for-agent" in gated.gh.labels
+
+
+def test_a_revision_under_the_old_heading_is_published_under_the_new_one(gated):
+    gated.script = [CHANGES, reviser(body=GATED), ACCEPT]
+    assert gated.run() is True
+    assert "## Checks to verify\n- Open the popup in Chrome and pick the article\n" in gated.gh.body
+    assert "## Manual checks" not in gated.gh.body
 
 
 def test_an_owner_body_without_manual_checks_needs_none_kept(gated):
