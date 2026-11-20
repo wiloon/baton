@@ -25,11 +25,12 @@ self_dir = "bin"
 matt_skills_root = "~/.claude/plugins/cache/mattpocock/mattpocock-skills"
 
 [scheduling]
-# Merge an agent PR whose review passed, CI is green and "## Manual checks" is none. false: every
+# Merge an agent PR whose review passed, CI is green and "## Checks to verify" is none (or the screenshot review verified every check). false: every
 # PR waits for the owner. A repository can also turn it off for itself ([[repos]] auto_merge).
 auto_merge = true
 # Per repository: no new issue starts while this many agent PRs are still in the review loop
-# (a PR handed to the owner, ready-for-human, doesn't count).
+# (a PR handed to the owner, ready-for-human, doesn't count). A PR whose next step is deferred for
+# vendor quota or cooldown lends its slot, so at most max_pending_prs + 1 issues are in flight.
 max_pending_prs = 1
 # Reviews per PR before it goes to the owner; each review but the last can be followed by a fix.
 max_review_rounds = 2
@@ -110,9 +111,9 @@ gate_option = ""
 # true when the repository requires a Signed-off-by on every commit (a DCO check): before each
 # push the runner adds one for the author to the agent's unpushed commits that lack it.
 signoff = false
-# "gate": a PR whose `## Manual checks` is not none waits for the owner (ready-for-human),
+# "gate": a PR whose `## Checks to verify` is not none waits for the owner (ready-for-human),
 # unless the screenshot review verified every check (below). "defer": it merges once review and
-# CI pass, and its checks are collected in one open "Manual checks to try" issue
+# CI pass, and its checks are collected in one open "Checks to try" issue
 # (ready-for-human) for a later trial of the whole app. Only PRs merged after defer is first seen
 # on are collected; turning it off and on again restarts that.
 manual_checks = "gate"

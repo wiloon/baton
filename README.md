@@ -25,8 +25,8 @@ issue labelled ready-for-agent
   review        a vendor that wrote none of the PR reviews it
   fix           answer the review or a failing CI check (up to max_review_rounds)
   merge         [scheduling].auto_merge and the repository's [[repos]] auto_merge both true,
-                CI green, "## Manual checks" none -> merge; else ready-for-human
-                (manual_checks = "defer": the checks go to a "Manual checks to try" issue instead)
+                CI green, "## Checks to verify" none, or every check verified by the screenshot review -> merge; else ready-for-human
+                (manual_checks = "defer": the checks go to a "Checks to try" issue instead)
                 (screenshot_review = true: a second, separate run checks the manual-check screenshots after the code review;
                  every check verified -> merge; otherwise only the unverified ones go to the owner, ADR 0006)
 ```
@@ -43,6 +43,13 @@ first thing it finds, in this order:
 When a step ends, the tick can go straight on to the next one, up to `chain_max`. With
 nothing to do and `scan` on, Claude scans one of the repository's `scan_areas` for bugs and files
 what it finds as an issue.
+
+**How many issues run at once.** `max_pending_prs` (per repository) is how many `agent-wip` issues
+may be in flight before baton starts a new one. A PR waiting for the owner (`ready-for-human`) is
+not counted. A PR whose next agent step was deferred for vendor quota or cooldown lends its slot
+until that step runs again without a deferral, so another vendor can start the next issue. At most
+`max_pending_prs + 1` counted issues are in flight through normal scheduling. When the cap blocks a
+start, the log lists each in-flight issue, its PR, and the saved deferral reason.
 
 **Picking a vendor.** For each run, baton drops the vendors that are resting after a limit or an
 auth failure, that are over their quota caps, or, for a review, that wrote any of the PR (when

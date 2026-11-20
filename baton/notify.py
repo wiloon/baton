@@ -17,7 +17,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-from . import md, pr as pr_helpers
+from . import checks as check_items, pr as pr_helpers
 
 SHOT_NAME = re.compile(r"[0-9]{2}-[a-z0-9-]+\.png")
 PNG = b"\x89PNG\r\n\x1a\n"
@@ -136,10 +136,11 @@ def shots(pr, ctx):
     return files
 
 
-def send_shots(pr, note=""):
-    """Best-effort Telegram delivery for a manual-check handoff, or after a merge the screenshot
+def send_shots(pr, note="", left=None):
+    """Best-effort Telegram delivery for a check handoff, or after a merge the screenshot
     review cleared (NOTE says so, #92); never affects the review outcome. Albums of ALBUM; the
-    first shot's caption carries the PR and its checks."""
+    first shot's caption carries the PR and the checks LEFT for the owner (a list; None reads
+    the description's)."""
     url = f"https://github.com/{session.resolve().repo.gh_repo}/pull/{pr}"
     files = shots(pr, str(session.resolve().dirs.ctx))
     if not files:
@@ -147,10 +148,12 @@ def send_shots(pr, note=""):
         return
     if not configured():
         return
-    checks = md.section("Manual checks", pr_helpers.body(pr) or "").rstrip("\n")
+    if left is None:   # a direct call: every check the description lists
+        left = check_items.recovery_items(pr_helpers.body(pr) or "")
+    checks = check_items.bullets(left)
     for start in range(0, len(files), ALBUM):
         group = list(enumerate(files[start:start + ALBUM], start))
-        captions = [(f"PR #{pr}: {note or 'manual checks'}\n{url}\n{p.name}\n{checks}"[:CAPTION_MAX].rstrip("\n")
+        captions = [(f"PR #{pr}: {note or 'checks left for you'}\n{url}\n{p.name}\n{checks}"[:CAPTION_MAX].rstrip("\n")
                      if j == 0 else p.name) for j, p in group]
         if len(group) == 1:   # Telegram albums need at least two photos.
             method, fields, attach = "sendPhoto", [("caption", captions[0])], [("photo", group[0][1])]

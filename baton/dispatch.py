@@ -22,7 +22,7 @@ import sys
 import time
 
 from . import agents, capacity, hooks as telemetry, notify, settle, vendors
-from .common import Request
+from .common import LEASE_REASON, Request
 
 # Claude Code writes its prompt cache with a one-hour lifetime by default, at 2x the input price
 # against 1.25x for five minutes. These roles finish in minutes with no long wait between model calls
@@ -92,7 +92,7 @@ def dispatch(vendor, role, prompt, tag, cwd, settings="", output="", env=None, h
     with capacity.lease(env.config.paths.state, vendor) as available:
         if not available:
             return {"rc": 75, "status": "deferred", "outcome": "", "reply": None,
-                    "model": "", "defer": "vendor capacity reserved"}
+                    "model": "", "defer": LEASE_REASON}
         return _dispatch(vendor, role, prompt, tag, cwd, settings, output, env, hooks)
 
 

@@ -1,6 +1,6 @@
 """Which manual checks the screenshot review cleared (#92, ADR 0006).
 
-The screenshot reviewer gives each item of a PR's `## Manual checks` one verdict in its
+The screenshot reviewer gives each item of a PR's checks section one verdict in its
 comment's `## Checks` section, numbered as the prompt numbered them:
 
     1. verified
@@ -22,7 +22,7 @@ CHECKS_HEADING = re.compile(r"^#{2,3}\s+checks\s*:?\s*$", re.IGNORECASE)
 
 
 def items(checks):
-    """The checks of a `## Manual checks` section: one per list item, continuation lines
+    """The checks of a checks section: one per list item, continuation lines
     included; text with no list is one check; "none" or nothing is no checks."""
     text = (checks or "").replace("\r", "").strip("\n")
     if re.fullmatch(r"(none)?", re.sub(r"[-*.\s]", "", text).lower()):

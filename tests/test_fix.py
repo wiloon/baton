@@ -14,7 +14,7 @@ BIN = Path(__file__).resolve().parents[1] / "bin"
 PR = 420
 URL = f"https://github.com/owner/app/pull/{PR}"
 BODY = ("<!-- baton-task issue=419 completion=partial -->\n\nRefs #419\n\n## What changed\nDisabled buttons.\n\n"
-        "## Manual checks\nnone\n\n## Before release\nnone\n\n## Follow-ups\n- [nit] tidy copy\n")
+        "## Checks to verify\nnone\n\n## Before release\nnone\n\n## Follow-ups\n- [nit] tidy copy\n")
 
 
 def env_ctx():
@@ -153,30 +153,30 @@ def section(body, heading):
 # --- Manual checks (tests/manual-checks.sh) -------------------------------------------------
 
 def test_a_recheck_replaces_the_section_and_the_posted_reply_drops_it(run):
-    run.agent({"file": "## Must fix\n1. adopted — brand colours\n\n## Manual checks\n- /billing: brand colour\n\nRESULT: fixed\n"})
+    run.agent({"file": "## Must fix\n1. adopted — brand colours\n\n## Checks to verify\n- /billing: brand colour\n\nRESULT: fixed\n"})
     assert run.fix()["rc"] == 0
-    assert section(run.body(), "Manual checks") == "- /billing: brand colour"
+    assert section(run.body(), "Checks to verify") == "- /billing: brand colour"
     assert section(run.body(), "What changed") == "Disabled buttons." and "- [nit] tidy copy" in run.body()
-    assert "adopted — brand colours" in run.comments()[0] and "Manual checks" not in run.comments()[0]
+    assert "adopted — brand colours" in run.comments()[0] and "Checks to verify" not in run.comments()[0]
     assert run.comments()[0].startswith("<!-- baton-fix by=claude -->\n")
 
 
 def test_a_missing_recheck_is_marked_so_the_gate_hands_off(run):
     run.agent({"file": "## Must fix\nnone\n\nRESULT: fixed\n"})
     assert run.fix("codex")["rc"] == 0
-    assert section(run.body(), "Manual checks") == "Not re-checked after the fix run."
+    assert section(run.body(), "Checks to verify") == "Not re-checked after the fix run."
 
 
 def test_a_recheck_that_says_none_stays_none(run):
-    run.agent({"file": "## Must fix\nnone\n\n## Manual checks\nnone\n\nRESULT: fixed\n"})
-    assert run.fix()["rc"] == 0 and section(run.body(), "Manual checks") == "none"
+    run.agent({"file": "## Must fix\nnone\n\n## Checks to verify\nnone\n\nRESULT: fixed\n"})
+    assert run.fix()["rc"] == 0 and section(run.body(), "Checks to verify") == "none"
 
 
 def test_a_failed_body_edit_hands_the_pr_to_the_owner(run, gh):
     gh.fail("edit")
-    run.agent({"file": "## Manual checks\n- /billing: brand colour\n\nRESULT: fixed\n"})
+    run.agent({"file": "## Checks to verify\n- /billing: brand colour\n\nRESULT: fixed\n"})
     assert run.fix()["rc"] == 1 and run.labelled()
-    assert any("Manual checks not refreshed" in line for line in run.runner_log())
+    assert any("Checks not refreshed" in line for line in run.runner_log())
 
 
 def cursor_plan(reply, **more):
@@ -184,21 +184,21 @@ def cursor_plan(reply, **more):
 
 
 def test_cursor_recheck_comes_from_its_reply(run):
-    run.agent(cursor_plan("## Must fix\n1. adopted\n\n## Manual checks\n- /billing: tab colour\n\nRESULT: fixed"))
+    run.agent(cursor_plan("## Must fix\n1. adopted\n\n## Checks to verify\n- /billing: tab colour\n\nRESULT: fixed"))
     assert run.fix("cursor")["rc"] == 0
-    assert section(run.body(), "Manual checks") == "- /billing: tab colour"
-    assert "Manual checks" not in run.comments()[0] and run.comments()[0].startswith("<!-- baton-fix by=cursor -->")
+    assert section(run.body(), "Checks to verify") == "- /billing: tab colour"
+    assert "Checks to verify" not in run.comments()[0] and run.comments()[0].startswith("<!-- baton-fix by=cursor -->")
 
 
 def test_a_description_request_github_refuses_defers_and_resumes_without_an_agent(run, gh):
-    request = BODY.replace("## Manual checks\nnone", "## Manual checks\n- /billing: badge")
-    run.agent(cursor_plan("## Manual checks\n- /billing: badge\n\nRESULT: fixed", request=request))
+    request = BODY.replace("## Checks to verify\nnone", "## Checks to verify\n- /billing: badge")
+    run.agent(cursor_plan("## Checks to verify\n- /billing: badge\n\nRESULT: fixed", request=request))
     gh.fail("edit")
     assert run.fix("cursor")["rc"] == 75
     assert len(run.agent_calls) == 1 and not run.labelled()
     gh.fail("edit", False)
     assert run.fix("cursor")["rc"] == 0 and len(run.agent_calls) == 1   # resumed: no second run
-    assert section(run.body(), "Manual checks") == "- /billing: badge"
+    assert section(run.body(), "Checks to verify") == "- /billing: badge"
 
 
 def test_a_description_only_cursor_fix_pushes_nothing_and_keeps_the_evidence(run, gh):
@@ -273,16 +273,16 @@ def test_a_fix_with_no_commit_stops_the_loop(run):
 
 def test_a_fix_that_only_rechecks_the_pr_updates_its_description_and_continues(run):
     run.agent({"commit": False, "file": "## Must fix\n1. adopted — listed the checks\n\n"
-                                        "## Manual checks\n- /reader: colours\n\nRESULT: fixed\n"})
+                                        "## Checks to verify\n- /reader: colours\n\nRESULT: fixed\n"})
     assert run.fix()["rc"] == 0 and not run.labelled()
-    assert section(run.body(), "Manual checks") == "- /reader: colours"
+    assert section(run.body(), "Checks to verify") == "- /reader: colours"
 
 
 def test_a_fix_with_no_commit_and_the_same_checks_stops_the_loop(run):
-    run.agent({"commit": False, "file": "## Must fix\nnone\n\n## Manual checks\nnone\n\nRESULT: fixed\n"})
+    run.agent({"commit": False, "file": "## Must fix\nnone\n\n## Checks to verify\nnone\n\nRESULT: fixed\n"})
     assert run.fix()["rc"] == 1 and run.labelled()
     assert any("The fix run made no commit" in line for line in run.runner_log())
-    assert section(run.body(), "Manual checks") == "none"
+    assert section(run.body(), "Checks to verify") == "none"
 
 
 def test_a_fix_with_no_commit_and_no_checks_stops_and_leaves_the_description(run):
@@ -292,9 +292,9 @@ def test_a_fix_with_no_commit_and_no_checks_stops_and_leaves_the_description(run
 
 
 def test_a_cursor_fix_that_only_rechecks_the_pr_updates_its_description_and_continues(run):
-    run.agent(cursor_plan("## Must fix\n1. adopted\n\n## Manual checks\n- /billing: badge\n\nRESULT: fixed", commit=False))
+    run.agent(cursor_plan("## Must fix\n1. adopted\n\n## Checks to verify\n- /billing: badge\n\nRESULT: fixed", commit=False))
     assert run.fix("cursor")["rc"] == 0 and not run.labelled()
-    assert section(run.body(), "Manual checks") == "- /billing: badge"
+    assert section(run.body(), "Checks to verify") == "- /billing: badge"
 
 
 def test_a_cursor_fix_with_no_commit_and_no_checks_stops_and_leaves_the_description(run):
@@ -349,8 +349,8 @@ def test_a_codex_failure_still_pushes_the_commits_it_made(run):
 
 # --- a description request from a fixer without GitHub access ---------------------------------
 
-NEW_DESCRIPTION = "## What changed\nCorrected text.\n\n## Manual checks\nnone\n"
-CHECKED = {"file": "## Must fix\n1. adopted\n\n## Manual checks\n- /billing: colour\n\nRESULT: fixed\n"}
+NEW_DESCRIPTION = "## What changed\nCorrected text.\n\n## Checks to verify\nnone\n"
+CHECKED = {"file": "## Must fix\n1. adopted\n\n## Checks to verify\n- /billing: colour\n\nRESULT: fixed\n"}
 
 
 def test_a_codex_fixer_can_read_the_current_description(run):
@@ -366,7 +366,7 @@ def test_a_description_request_is_applied_with_the_runners_relation_and_the_fixe
     assert run.fix("codex")["rc"] == 0 and run.pushed()
     assert "Corrected text." in run.body() and "Disabled buttons." not in run.body()
     assert "<!-- baton-task issue=419 completion=partial -->" in run.body() and "Refs #419" in run.body()
-    assert section(run.body(), "Manual checks") == "- /billing: colour"
+    assert section(run.body(), "Checks to verify") == "- /billing: colour"
 
 
 def test_a_description_only_fix_needs_no_commit(run):
@@ -378,7 +378,7 @@ def test_a_description_only_fix_needs_no_commit(run):
 def test_a_description_request_cannot_clear_manual_checks_without_a_recheck(run):
     run.agent({"commit": False, "file": "## Must fix\n1. adopted\n\nRESULT: fixed\n", "description": NEW_DESCRIPTION})
     run.fix("codex")
-    assert section(run.body(), "Manual checks") == "Not re-checked after the fix run."
+    assert section(run.body(), "Checks to verify") == "Not re-checked after the fix run."
 
 
 def test_an_invalid_description_request_keeps_the_body_and_still_pushes_the_commits(run):

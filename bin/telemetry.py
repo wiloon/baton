@@ -291,6 +291,7 @@ def fingerprints(directory):
         return h.hexdigest()
     sources = [directory / name for name in ('run.sh', 'verify.sh', 'telemetry.py')]
     sources += list(directory.glob('*-prompt.md')) + list(directory.glob('*settings.json'))
+    sources += list((directory / 'partials').glob('*.md'))   # shared prompt rules
     sources += list((directory.parent / 'baton').glob('*.py'))   # the Python side (ADR-0005)
     configs = [CONFIG_PATH or directory.parent / 'config.toml']
     configs = [p for p in configs if p.is_file()]

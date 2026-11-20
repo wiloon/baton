@@ -6,11 +6,12 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import time
 from types import SimpleNamespace
 
 import pytest
 
-from baton import dev, fix, merge, notify, pick, review, scan, spec, tick
+from baton import capacity, dev, fix, merge, notify, pick, review, scan, spec, tick
 from baton.common import Deferred
 from conftest import sh
 
@@ -33,6 +34,8 @@ class FakeGH:
         answer = self.answers.get(head, "[]" if list(args[1:2]) == ["list"] else "")
         if callable(answer):
             answer = answer(args)
+        if isinstance(answer, subprocess.CompletedProcess):
+            return answer
         if not isinstance(answer, str):
             answer = json.dumps(answer)
         return subprocess.CompletedProcess(args, 0, answer, "")
@@ -487,7 +490,379 @@ def test_an_issue_with_a_pr_is_skipped(ctx, monkeypatch, branch):
 
 def test_new_work_waits_while_an_issue_awaits_review(ctx):
     issues(ctx, ready=[issue(12)], pending=1)
-    assert ctx.make().next_issue() == "" and "1 issue(s) still waiting on review (agent-wip), cap 1" in ctx.log()
+    assert ctx.make().next_issue() == ""
+    assert "1 issue(s) still waiting on review (agent-wip), cap 1, 0 deferred, 1 not deferred" in ctx.log()
+    assert "#0: no open PR" in ctx.log()
+
+
+# --- a PR deferred on quota lends its slot (#99) --------------------------------------------------------------
+ORIGINAL_REVIEW_LOOP = tick.Tick.review_loop
+QUOTA = "quota claude=blocked(5h 94% >= 90%)"
+
+
+def flight(ctx, wip, ready=(), prs=None, labels=None, cap=None):
+    """WIP issues are in flight; PRS maps an issue to its open PR number, LABELS a PR to its labels."""
+    prs, labels = prs or {}, labels or {}
+    ctx.gh.answers["issue list"] = lambda args: [{"number": n} for n in wip] if "agent-wip" in args else \
+        ([] if "claude-found" in args else list(ready))
+    open_prs = [{"number": pr, "headRefName": f"agent/issue-{n}", "labels": [{"name": x} for x in labels.get(pr, ())]}
+                for n, pr in prs.items()]
+    ctx.gh.answers["pr list"] = lambda args: [] if "--label" in args else open_prs
+    for item in ready:
+        label_history(ctx, item["number"], [label_event(1, "owner")])
+    ctx.cap = cap
+
+
+def pr_state(ctx, state="OPEN", branch="agent/issue-5"):
+    def answer(args):
+        return f"{state}\n" if "--jq" in args else {"state": state, "headRefName": branch, "labels": []}
+    ctx.gh.answers["pr view"] = answer
+    ctx.gh.answers["issue view"] = {"state": "OPEN", "labels": [{"name": "agent-wip"}]}
+
+
+def defer_loop(monkeypatch, reason=QUOTA, vendor="pool"):
+    def loop(self, *a, **k):
+        raise Deferred(vendor, reason)
+    monkeypatch.setattr(tick.Tick, "review_loop", loop)
+
+
+def deferred_review(ctx, prs, **extra):
+    """Checkpoints for PRS, each yields on quota in the review loop: one pass of pending_reviews."""
+    for pr in prs:
+        checkpoint(ctx, pr=str(pr))
+    ctx.make(**extra).pending_reviews()
+
+
+def no_vendor_blocked(monkeypatch, seen=None):
+    monkeypatch.setattr(spec, "cursor_plan", lambda env, n: "plan")
+    monkeypatch.setattr(tick.Tick, "pick_vendor", lambda self, *a, **k: "codex")
+
+
+def test_a_review_deferred_on_quota_lends_its_slot(ctx, monkeypatch):
+    pr_state(ctx)
+    flight(ctx, wip=[5], ready=[issue(12)], prs={5: 11})
+    defer_loop(monkeypatch)
+    deferred_review(ctx, [11])
+    assert ctx.path("slot-deferred-11").exists()
+    assert ctx.log().count("lends its agent-wip slot") == 1
+    no_vendor_blocked(monkeypatch)
+    assert ctx.make().next_issue() == "12"
+    deferred_review(ctx, [11])   # a repeat deferral keeps the marker and does not log again
+    assert ctx.path("slot-deferred-11").exists()
+    assert ctx.log().count("lends its agent-wip slot") == 1
+    assert ctx.make().next_issue() == "12"
+
+
+@pytest.mark.parametrize("same_vendor", [False, True])
+def test_a_lease_only_wait_in_vendor_selection_keeps_the_cap(ctx, monkeypatch, same_vendor):
+    pr_state(ctx)
+    flight(ctx, wip=[5], ready=[issue(12)], prs={5: 11})
+    if same_vendor:
+        ctx.path("pr-11-authors").write_text("codex\n")
+        ctx.path("pr-11-author-models").write_text("codex another-model\n")
+        ctx.env["VENDOR_EXTRA"] = ""
+
+    def review_loop(self, *args, **kwargs):
+        if same_vendor:
+            pick.choose(self.env, "reviewer", "", "review", ["claude", "codex"], pr="11")
+        else:
+            self.pick_vendor("reviewer", "pool", ["claude"], current="")
+        pytest.fail("selection should defer")
+
+    monkeypatch.setattr(tick.Tick, "review_loop", review_loop)
+    checkpoint(ctx, pr="11")
+    t = ctx.make()
+    with capacity.lease(t.env.config.paths.state, "claude"):
+        t.pending_reviews()
+    expected = ("waiting for claude (vendor capacity reserved) instead of same-vendor codex" if same_vendor
+                else "no vendor can run now; claude: vendor capacity reserved")
+    assert expected in ctx.log()
+    assert not ctx.path("slot-deferred-11").exists()
+    no_vendor_blocked(monkeypatch)
+    assert ctx.make().next_issue() == ""
+
+
+def test_a_lent_slot_starts_nothing_when_every_vendor_is_blocked(ctx, monkeypatch):
+    pr_state(ctx)
+    flight(ctx, wip=[5], ready=[issue(12)], prs={5: 11})
+    defer_loop(monkeypatch)
+    deferred_review(ctx, [11])
+    monkeypatch.setattr(spec, "cursor_plan", lambda env, n: "plan")
+    monkeypatch.setattr(tick.Tick, "pick_vendor", lambda self, *a, **k: (_ for _ in ()).throw(Deferred("pool", QUOTA)))
+    assert ctx.make().next_issue() == ""
+    assert not ctx.path("slot-deferred-12").exists()   # the candidate's own deferral records nothing
+
+
+def test_the_tick_hands_the_candidate_to_dev_run_while_a_review_is_deferred(ctx, monkeypatch):
+    pr_state(ctx)
+    flight(ctx, wip=[5], ready=[issue(12)], prs={5: 11})
+    no_vendor_blocked(monkeypatch)
+    defer_loop(monkeypatch)
+    checkpoint(ctx, pr="11")
+    started = []
+    monkeypatch.setattr(dev, "run", lambda t, n: started.append(n) or 80)
+    monkeypatch.setattr(tick.session, "run_process", lambda *a, **k: subprocess.CompletedProcess(a, 0, "", ""))
+    monkeypatch.setattr(tick.Tick, "cleanup", lambda self: None)
+    monkeypatch.setattr(tick.Tick, "file_merged_follow_ups", lambda self: None)
+    assert ctx.make().work() == 0
+    assert started == ["12"]
+
+
+@pytest.mark.parametrize("cap, wip, deferred, started", [
+    (1, [5, 6], [5, 6], False),        # two deferred issues fill cap + 1
+    (2, [5, 6], [5], True),            # one deferred of two lets a third start
+    (2, [5, 6, 7], [5, 6, 7], False),  # three in flight block even when all are deferred
+    (1, [5], [], False),               # no deferral: the slot is held
+])
+def test_the_slots_lent_are_bounded(ctx, monkeypatch, cap, wip, deferred, started):
+    pr_state(ctx)
+    prs = {n: 10 + n for n in wip}
+    flight(ctx, wip=wip, ready=[issue(12)], prs=prs)
+    no_vendor_blocked(monkeypatch)
+    defer_loop(monkeypatch)
+
+    def view(args):
+        if "--jq" in args:
+            return "OPEN\n"
+        return {"state": "OPEN", "headRefName": f"agent/issue-{int(args[2]) - 10}", "labels": []}
+    ctx.gh.answers["pr view"] = view
+    for n in deferred:
+        checkpoint(ctx, pr=str(10 + n))
+    ctx.make(MAX_PENDING_PRS=str(cap)).pending_reviews()
+    assert {p.name for p in ctx.path(".").glob("slot-deferred-*")} == {f"slot-deferred-{10 + n}" for n in deferred}
+    assert (ctx.make(MAX_PENDING_PRS=str(cap)).next_issue() == "12") is started
+
+
+def test_the_cap_log_names_issues_prs_states_and_reasons(ctx, monkeypatch):
+    pr_state(ctx)
+    flight(ctx, wip=[5, 6], ready=[issue(12)], prs={5: 11})
+    defer_loop(monkeypatch)
+    deferred_review(ctx, [11])
+    assert ctx.make().next_issue() == ""
+    log = ctx.log()
+    assert "2 issue(s) still waiting on review (agent-wip), cap 1, 1 deferred, total limit 2 reached" in log
+    assert f"#5: PR #11 deferred (pool {QUOTA})" in log and "#6: no open PR" in log
+
+
+def test_a_resumed_review_that_completes_returns_the_slot(ctx, monkeypatch):
+    pr_state(ctx)
+    flight(ctx, wip=[5], ready=[issue(12)], prs={5: 11})
+    no_vendor_blocked(monkeypatch)
+    defer_loop(monkeypatch)
+    deferred_review(ctx, [11])
+    assert ctx.path("slot-deferred-11").exists()
+    monkeypatch.setattr(tick.Tick, "review_loop", lambda self, *a, **k: 0)
+    ctx.make().pending_reviews()
+    assert not ctx.path("slot-deferred-11").exists()
+    assert ctx.make().next_issue() == ""   # the PR still counts, and is no longer deferred
+
+
+def test_a_handoff_returns_the_slot(ctx, monkeypatch):
+    pr_state(ctx)
+    flight(ctx, wip=[5], ready=[issue(12)], prs={5: 11})
+    no_vendor_blocked(monkeypatch)
+    defer_loop(monkeypatch)
+    deferred_review(ctx, [11])
+    t = ctx.make()
+
+    def handoff():
+        t.active["pr"] = "11"
+        return 80
+    assert t.item(handoff) == 80
+    assert not ctx.path("slot-deferred-11").exists()
+    assert ctx.make().next_issue() == ""
+
+
+@pytest.mark.parametrize("state", ["MERGED", "CLOSED"])
+def test_a_checkpoint_of_a_finished_pr_returns_the_slot(ctx, monkeypatch, state):
+    pr_state(ctx)
+    flight(ctx, wip=[5], ready=[issue(12)], prs={5: 11})
+    defer_loop(monkeypatch)
+    deferred_review(ctx, [11])
+    pr_state(ctx, state)
+    ctx.make().pending_reviews()
+    assert not ctx.path("slot-deferred-11").exists() and not ctx.path("review-pending-11").exists()
+
+
+@pytest.mark.parametrize("skip", ["other-pr", "lookup-failed"])
+def test_a_checkpoint_that_does_not_resume_keeps_its_loan(ctx, monkeypatch, skip):
+    pr_state(ctx)
+    defer_loop(monkeypatch)
+    deferred_review(ctx, [11])
+    assert ctx.path("slot-deferred-11").exists()
+    if skip == "lookup-failed":
+        ctx.gh.fails.add("pr view")
+    args = ("review", "12") if skip == "other-pr" else ()
+    assert ctx.make(*args).pending_reviews() is None
+    assert ctx.path("slot-deferred-11").exists()
+    assert ctx.path("review-pending-11").exists()
+
+
+def test_failed_wip_listing_blocks_admission(ctx, monkeypatch):
+    pr_state(ctx)
+    flight(ctx, wip=[5, 6], ready=[issue(12)], prs={5: 11, 6: 13})
+    defer_loop(monkeypatch)
+    deferred_review(ctx, [11])
+    no_vendor_blocked(monkeypatch)
+    answer = ctx.gh.answers["issue list"]
+    ctx.gh.answers["issue list"] = lambda args: (
+        subprocess.CompletedProcess(args, 1, "", "boom") if "agent-wip" in args else answer(args))
+    assert ctx.make().next_issue() == ""
+    assert ctx.path("slot-deferred-11").exists()
+    ctx.gh.answers["issue list"] = answer
+    assert ctx.make().next_issue() == ""
+
+
+def test_a_live_pr_beyond_the_first_page_keeps_its_loan(ctx, monkeypatch):
+    pr_state(ctx)
+    flight(ctx, wip=[5], ready=[issue(12)], prs={5: 11})
+    defer_loop(monkeypatch)
+    deferred_review(ctx, [11])
+    no_vendor_blocked(monkeypatch)
+    newer = [{"number": n, "head": {"ref": f"feature/{n}"}, "labels": []} for n in range(100, 200)]
+    older = {"number": 11, "head": {"ref": "agent/issue-5"}, "labels": []}
+    ctx.gh.answers["pr list"] = [{**p, "headRefName": p["head"]["ref"]} for p in newer]
+    ctx.gh.answers["api repos/owner/app/pulls?state=open&per_page=100"] = [newer, [older]]
+    assert ctx.make().next_issue() == "12"
+    assert ctx.path("slot-deferred-11").exists()
+
+
+def test_wip_issues_beyond_the_first_page_count_toward_the_cap(ctx, monkeypatch):
+    numbers = list(range(100, 201))
+    flight(ctx, wip=numbers[:100], ready=[issue(12)])
+    no_vendor_blocked(monkeypatch)
+    ctx.gh.answers["api repos/owner/app/issues?state=open&labels=agent-wip&per_page=100"] = [
+        [{"number": n} for n in numbers[:100]], [{"number": numbers[-1]}]]
+    assert ctx.make(MAX_PENDING_PRS="101").next_issue() == ""
+
+
+def test_an_agent_fix_deferred_in_vendor_selection_lends_its_slot(ctx, monkeypatch):
+    pr_state(ctx)
+    flight(ctx, wip=[5], ready=[issue(12)], prs={5: 11})
+    ctx.gh.answers["pr list"] = lambda args: [{"number": 11, "headRefName": "agent/issue-5", "labels": []}]
+    Path(ctx.env["WT_ROOT"], "agent-5").mkdir(parents=True)
+    monkeypatch.setattr(tick.session, "run_process", lambda *a, **k: subprocess.CompletedProcess(a, 0, "", ""))
+    monkeypatch.setattr(tick.review, "human_feedback", lambda *a: "please fix")
+    monkeypatch.setattr(tick.vendors, "seed_authors", lambda *a: 0)
+    monkeypatch.setattr(tick.vendors, "seed_contrib", lambda *a: [])
+    t = ctx.make()
+    for vendor in t.all_vendors():
+        cooldown = Path(t.env.config.paths.state, f"{vendor}-cooldown-until")
+        cooldown.write_text(f"{int(time.time()) + 3600}\n")
+    assert t.item(lambda: t.fix_item("11", "agent/issue-5")) == 75
+    assert ctx.path("slot-deferred-11").exists()
+    no_vendor_blocked(monkeypatch)
+    assert ctx.make().next_issue() == "12"
+    # closure of the PR with no review checkpoint: the next admission discards the marker
+    flight(ctx, wip=[5], ready=[issue(12)], prs={})
+    assert ctx.make().next_issue() == ""
+    assert not ctx.path("slot-deferred-11").exists()
+
+
+def test_a_handoff_clears_an_agent_fix_marker(ctx, monkeypatch):
+    pr_state(ctx)
+    t = ctx.make()
+    t.active = {"pr": ""}
+    ctx.path("slot-deferred-11").write_text(json.dumps({"vendor": "pool", "reason": QUOTA}))
+    assert t.item(lambda: t.active.update(pr="11") or 80) == 80
+    assert not ctx.path("slot-deferred-11").exists()
+
+
+def defer_inside_review(monkeypatch):
+    monkeypatch.setattr(tick.Tick, "review_loop", ORIGINAL_REVIEW_LOOP)
+
+    def defer(self, *args):
+        raise Deferred("codex", QUOTA)
+
+    monkeypatch.setattr(review.Review, "loop", defer)
+
+
+def test_the_first_review_after_opening_a_pr_can_lend_the_slot(devrun, monkeypatch):
+    pr_state(devrun, branch="agent/issue-300")
+    devrun.gh.answers["issue view"].update(title="A title", body="A body")
+    flight(devrun, wip=[300], ready=[issue(12)], prs={300: 301})
+    defer_inside_review(monkeypatch)
+    devrun.script = [implements()]
+    _, rc = devrun.go()
+    assert rc == 75
+    assert devrun.gh.ran("pr", "create")
+    assert not devrun.gh.ran("issue", "edit", "300", "-R", "owner/app", "--remove-label", "agent-wip")
+    assert devrun.path("slot-deferred-301").exists()
+    assert devrun.make().next_issue() == "12"
+
+
+@pytest.mark.parametrize("how", ["lease", "candidate", "closed", "no-wip"])
+def test_other_deferrals_leave_no_marker(ctx, monkeypatch, how):
+    pr_state(ctx)
+    t = ctx.make()
+    if how == "lease":
+        defer_loop(monkeypatch, "vendor capacity reserved", "codex")
+        checkpoint(ctx, pr="11")
+        ctx.make().pending_reviews()
+    elif how == "candidate":
+        flight(ctx, wip=[], ready=[issue(12)])
+        monkeypatch.setattr(spec, "cursor_plan", lambda env, n: "plan")
+        monkeypatch.setattr(tick.Tick, "pick_vendor", lambda self, *a, **k: (_ for _ in ()).throw(Deferred("pool", QUOTA)))
+        assert t.next_issue() == ""
+    elif how == "closed":
+        pr_state(ctx, "CLOSED")
+        defer_inside_review(monkeypatch)
+        assert t.item(lambda: t.review_loop("11", "/wt", "n")) == 75
+    else:
+        ctx.gh.answers["issue view"]["labels"] = []
+        defer_loop(monkeypatch)
+        checkpoint(ctx, pr="11")
+        ctx.make().pending_reviews()
+    assert not list(ctx.path(".").glob("slot-deferred-*"))
+
+
+def test_a_github_description_update_failure_does_not_lend_a_slot(ctx, monkeypatch):
+    pr_state(ctx)
+    body = "<!-- baton-task issue=5 completion=partial -->\n\nRefs #5\n\n## Manual checks\nnone\n"
+    original_view = ctx.gh.answers["pr view"]
+
+    def view_pr(args):
+        fields = args[args.index("--json") + 1]
+        if fields == "body":
+            return body
+        if fields == "headRefName,body":
+            return {"headRefName": "agent/issue-5", "body": body}
+        return original_view(args)
+
+    ctx.gh.answers["pr view"] = view_pr
+    ctx.gh.answers["pr edit"] = lambda args: (
+        subprocess.CompletedProcess(args, 1, "", "boom") if "--body-file" in args else "")
+    ctx.path("pr-body-base-11").write_text(body)
+    Path(ctx.env["CTX"], "pr-11-body.md").write_text(body + "\n## Summary\nCorrected description.\n")
+    checkpoint(ctx, pr="11", step="fix", wt=str(ctx.repo))
+    monkeypatch.setattr(tick.Tick, "review_loop", ORIGINAL_REVIEW_LOOP)
+    monkeypatch.setattr(pick, "choose", lambda *args, **kwargs: "cursor")
+    assert ctx.make().pending_reviews() == 0
+    assert "PR #11: description update deferred after GitHub failure" in ctx.log()
+    assert not ctx.path("slot-deferred-11").exists()
+
+
+def test_a_relabelled_pr_cannot_use_an_old_marker(ctx, monkeypatch):
+    pr_state(ctx)
+    flight(ctx, wip=[5], ready=[issue(12)], prs={5: 11})
+    defer_loop(monkeypatch)
+    deferred_review(ctx, [11])
+    flight(ctx, wip=[5], ready=[issue(12)], prs={5: 11}, labels={11: ["ready-for-human"]})
+    no_vendor_blocked(monkeypatch)
+    assert ctx.make().next_issue() == "12"
+    assert not ctx.path("slot-deferred-11").exists()
+    flight(ctx, wip=[5], ready=[issue(12)], prs={5: 11})   # back in the agents' hands, no deferral on record
+    assert ctx.make().next_issue() == ""
+    assert "deferred (" not in ctx.log().rsplit("not starting new work", 1)[1]
+
+
+def test_a_closed_issue_with_agent_wip_cannot_lend_a_slot(ctx, monkeypatch):
+    pr_state(ctx)
+    ctx.gh.answers["issue view"]["state"] = "CLOSED"
+    defer_loop(monkeypatch)
+    deferred_review(ctx, [11])
+    assert not ctx.path("slot-deferred-11").exists()
+    assert "lends its agent-wip slot" not in ctx.log()
 
 
 def test_a_pr_waiting_for_the_owner_does_not_hold_up_new_work(ctx, monkeypatch):
@@ -833,6 +1208,16 @@ def re_context(prompt):
     return re.search(r"[^\s`]*issue-300-dev-[^\s`]+\.md", prompt).group(0)
 
 
+def test_the_dev_body_is_published_under_the_new_checks_heading(devrun):
+    check_lines = ["- Open the page  ", "- Open the map  "]
+    devrun.script = [implements(body="Summary\n\nRefs #300\n\n## Manual checks\n" + "\n".join(check_lines) + "\n")]
+    devrun.go()
+    create, = devrun.gh.ran("pr", "create")
+    body = create[create.index("--body") + 1]
+    assert body.splitlines()[-3:] == ["## Checks to verify", *check_lines]
+    assert "## Manual checks" not in body
+
+
 def test_the_gate_result_goes_in_the_pr_description(devrun, monkeypatch):
     def verify(self, *args):
         self.gate_result = "E2E gate passed: e2e/a.spec.ts --repeat-each=15 (15 passed)"
@@ -1033,6 +1418,7 @@ def test_a_deferred_dev_run_releases_the_issue(devrun):
     t, rc = devrun.go()
     assert rc == 75 and "DEFERRED: codex codex cooldown" in devrun.log()
     assert devrun.gh.ran("issue", "edit", "300", "-R", "owner/app", "--remove-label", "agent-wip")
+    assert not list(devrun.path(".").glob("slot-deferred-*"))
 
 
 def test_the_worktree_gets_the_agents_env_files(devrun, worktree):

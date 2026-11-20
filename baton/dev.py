@@ -13,7 +13,7 @@ import re
 import subprocess
 import time
 
-from . import after_merge, agents, dispatch, fix, md, names, pr as pr_helpers, pr_contract, prompts, spec, vendors
+from . import after_merge, agents, checks as check_section, dispatch, fix, md, names, pr as pr_helpers, pr_contract, prompts, spec, vendors
 from .common import Deferred, git, push, strip_markers
 
 REPLY_CAP = 60000
@@ -270,7 +270,7 @@ def run(tick, issue):
         return 1
     lines = Path(body).read_text().split("\n")
     try:
-        text = pr_body(Path(body).read_text(), issue)
+        text = pr_body(check_section.canonicalize(Path(body).read_text()), issue)
     except ValueError:
         pr_helpers.gh("issue", "edit", issue, "-R", repo, "--remove-label", "agent-wip", "--add-label", "ready-for-human")
         tick.notify(f"#{issue}: invalid PR task relation", f"Review the completion field in {body}. {url}")

@@ -14,6 +14,7 @@ CLI for the bash callers that stay (the tick's recovery, the spec round, the cle
 
 from . import session
 import argparse
+import json
 import os
 from pathlib import Path
 import re
@@ -21,7 +22,7 @@ import subprocess
 import sys
 import time
 
-from . import after_merge, check_verdicts, ci, fix, hooks as telemetry, md, names, notify, pick, pr as pr_helpers
+from . import after_merge, check_verdicts, checks, ci, fix, hooks as telemetry, names, notify, pick, pr as pr_helpers
 from .common import Deferred, git
 
 
@@ -147,43 +148,69 @@ class Merger:
 
     # --- the screenshot review's verdicts (#92, ADR 0006) ---
     def left_for_owner(self, screenshot, body):
-        """The PR's manual checks the screenshot review did not verify; None when there is no
-        usable review: none ran, or the description's checks changed since it ran."""
+        """The PR's checks the screenshot review did not verify; None when there is no usable
+        review: none ran, the body is not well-formed or lists no check, the description's
+        checks changed since it ran, or its verdicts are unreadable."""
         if not screenshot or body is None:
             return None
-        checks = screenshot.get("checks") or ""
-        if check_verdicts.items(md.section("Manual checks", body)) != check_verdicts.items(checks):
+        listed = checks.items(body)
+        if not listed or listed != check_verdicts.items(screenshot.get("checks") or ""):
             return None
-        return check_verdicts.for_owner(checks, screenshot.get("comment") or "")
+        verdicts = check_verdicts.parse(screenshot.get("comment") or "", len(listed))
+        if verdicts is None:
+            return None
+        return [item for item, verdict in zip(listed, verdicts) if verdict != "verified"]
 
-    def keep_deferred(self, left):
-        """With manual_checks = "defer", only the checks LEFT go to the tracking issue (#48)."""
-        lines = "".join("- " + item.replace("\n", "\n  ") + "\n" for item in left)
-        Path(self.state, f"deferred-checks-items-pr-{self.pr}").write_text(lines)
+    def remainder(self):
+        return Path(self.state, f"deferred-checks-items-pr-{self.pr}")
+
+    def keep_deferred(self, source, left):
+        """With manual_checks = "defer", only the checks LEFT go to the tracking issue (#48). The
+        file records the SOURCE checks they were computed from too, so the tracker trusts it
+        only while the merged description still lists them."""
+        self.remainder().write_text(json.dumps({"source": source, "left": left}) + "\n")
+
+    def drop_deferred(self):
+        self.remainder().unlink(missing_ok=True)
+
+    def owed(self, left, body):
+        """What a hand-off shows the owner: the checks left after a usable screenshot review,
+        else every current check (of every checks section when the body is not well-formed)."""
+        return left if left is not None else checks.recovery_items(body or "")
+
+    def left_text(self, left, owed):
+        if not owed:
+            return ""
+        lead = "The screenshot review left these checks for you" if left is not None else "Checks for you"
+        return f"{lead}:" + "".join(f"\n- {item}" for item in owed)
 
     # --- the review passed ---
     def merge_or_handoff(self, wt, screenshot=None):
         """Merge when auto-merge is on for the runner and for this repository, CI is green and
-        "## Manual checks" is none, the screenshot review verified every check (SCREENSHOT:
+        the checks section is none, the screenshot review verified every check (SCREENSHOT:
         the reviewed checks and the round's screenshot review comment, #92), or the repository
-        defers manual checks (#48); otherwise label it ready-for-human."""
+        defers checks (#48); otherwise label it ready-for-human."""
         pr, url = self.pr, self.url
+        deferred = self.env.repo.manual_checks == "defer"
         if self.env.config.scheduling.auto_merge is not True or self.env.repo.auto_merge is not True:
             where = "" if self.env.config.scheduling.auto_merge is not True else f" for {self.repo}"
-            self.handoff("auto_merge_off", f"PR #{pr} review passed", f"Auto-merge is off{where}; ready for you. {url}")
             body = pr_helpers.body(pr)
-            deferred = self.env.repo.manual_checks == "defer"
+            left = self.left_for_owner(screenshot, body)
+            owed = self.owed(left, body)
+            listed = self.left_text(left, owed)
+            self.handoff("auto_merge_off", f"PR #{pr} review passed",
+                         f"Auto-merge is off{where}; ready for you." + (f" {listed}\n{url}" if listed else f" {url}"))
             if not deferred and (body is None or not pr_helpers.checks_none(body)):
-                notify.send_shots(pr)
+                notify.send_shots(pr, note="Checks for you" if left is None else "", left=owed)
             return
         if not self.ci_green(45):
             if self.ci_fix_round(wt) != 0 or not self.ci_green(45):
                 self.handoff("ci_not_green", f"PR #{pr}: CI not green", f"Review passed but CI failed or timed out. {url}")
                 return
-        deferred = self.env.repo.manual_checks == "defer"
-        left = None
+        body, left = None, None
         try:
-            left = self.left_for_owner(screenshot, pr_helpers.body(pr) if screenshot else None)
+            body = pr_helpers.body(pr)
+            left = self.left_for_owner(screenshot, body)
             gate = pr_helpers.gate(pr, defer=deferred, cleared=screenshot["checks"] if left == [] else None)
         except Exception:
             gate = {"action": "manual_checks"}
@@ -192,17 +219,23 @@ class Merger:
             self.label("--add-label", "agent-review")
             notify.notify(f"PR #{pr}: metadata review queued", f"{gate['reason']} {url}")
             return
-        if gate.get("action") != "merge":   # manual checks, or no answer: the owner decides
-            listed = "".join(f"\n- {item}" for item in left or ())
-            text = (f"Review and CI passed. The screenshot review left these checks for you:{listed}\n{url}" if left
-                    else f"Review and CI passed. {url}")
-            self.handoff("manual_checks", f"PR #{pr} needs a manual check", text)
-            notify.send_shots(pr)
+        if gate.get("action") != "merge":   # the checks, or no answer: the owner decides
+            live_body = gate.get("body")
+            left = self.left_for_owner(screenshot, live_body)
+            owed = self.owed(left, live_body if live_body is not None else body)
+            listed = self.left_text(left, owed)
+            self.handoff("manual_checks", f"PR #{pr} needs a manual check",
+                         "Review and CI passed." + (f" {listed}\n{url}" if listed else f" {url}"))
+            notify.send_shots(pr, note="Checks for you" if left is None else "", left=owed)
             return
-        if deferred and left is not None:
-            self.keep_deferred(left)
+        if deferred:   # the remainder belongs to this attempt, never to an earlier one
+            if left is None:
+                self.drop_deferred()
+            else:
+                self.keep_deferred(checks.items(body), left)
         merged = pr_helpers.gh("pr", "merge", str(pr), "-R", self.repo, "--merge")
         if merged.returncode != 0:
+            self.drop_deferred()
             self.handoff("merge_failed", f"PR #{pr} merge failed", f"{url}{pr_helpers.why(merged)}")
             return
         self.hooks.task("merged", "merged")
@@ -211,7 +244,7 @@ class Merger:
         if remove_worktree(str(self.env.dirs.clone), wt):
             notify.log(f"cleaned up worktree {wt}")
         if left == [] and not deferred:   # merged on the screenshot review: the owner can still look
-            notify.send_shots(pr, note="merged after screenshot review")
+            notify.send_shots(pr, note="merged after screenshot review", left=checks.items(body))
         session.run_process(["rm", "-rf", str(Path(self.ctx, f"pr-{pr}-shots"))])
         if self.issue:
             pr_helpers.gh("issue", "edit", self.issue, "-R", self.repo, "--remove-label", "agent-wip")
