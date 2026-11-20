@@ -13,6 +13,10 @@ cooldown), the item defers and waits for that vendor rather than falling back. T
 symmetric across vendors: Claude out of its 5-hour window makes a Codex-written PR wait for
 Claude just as Codex out of its 5-hour window makes Claude's work wait for Codex.
 
+Apply this comparison to declared vendors eligible for the role (ADR 0007) and the
+current task. A same-vendor fallback must be role-allowed and pass its adapter's model
+eligibility policy (ADRs 0004 and 0005).
+
 ## Considered options
 
 - **Fall back whenever the other vendor is blocked (previous behaviour):** keeps the pipeline
@@ -31,8 +35,8 @@ Claude just as Codex out of its 5-hour window makes Claude's work wait for Codex
   refresh it before deciding to self-review.
 - There is no overall wait limit. A 5-hour window resets on its own, and a vendor that stays
   blocked turns into a long block (weekly cap or long cooldown) that then allows the fallback.
-- Applies to every role that has a same-vendor fallback: code review, spec review and spec
-  revision.
+- Applies to every role that has a same-vendor fallback: code review, screenshot review,
+  spec review and spec revision.
 - The wait applies to the deferred item. An agent PR waiting on quota or cooldown can lend its
   `max_pending_prs` slot to another issue in the same repository. The repository can admit at
   most one extra issue above the cap. Existing PR work keeps priority over new issues.
@@ -41,3 +45,5 @@ Claude just as Codex out of its 5-hour window makes Claude's work wait for Codex
 
 - Issue #99: let a quota-deferred PR lend its slot so work eligible for a free vendor can start
   while the PR waits for independent review.
+- Issue #103: scope fallback and short-block waiting to role-eligible vendors so a vendor
+  outside the registry or allowlist cannot run or hold up the step.
