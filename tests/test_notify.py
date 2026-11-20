@@ -135,6 +135,12 @@ def test_an_album_with_the_checks_on_the_first_shot(telegram, tmp_path):
     assert telegram.requests[0][3] == 120
 
 
+def test_shots_sent_after_a_merge_say_so_in_the_caption(telegram, tmp_path):
+    shot(tmp_path, "01-theme-light.png")
+    notify.send_shots(7, note="merged after screenshot review")
+    assert telegram.form(0)["caption"].startswith("PR #7: merged after screenshot review\nhttps://")
+
+
 def test_albums_of_ten(telegram, tmp_path):
     for n in range(1, 13):
         shot(tmp_path, f"{n:02}-theme-light.png")

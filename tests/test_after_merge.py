@@ -417,6 +417,21 @@ def test_deferred_checks_are_appended_to_the_open_tracking_issue_once_per_pr(gh,
     assert comments[0][comments[0].index("--body") + 1].startswith("### PR #32: feat: covers\n")
 
 
+def test_only_the_checks_the_screenshot_review_left_are_deferred(gh, deferred):
+    gh.set(body=DEFERRED, title="feat: covers")
+    Path(deferred.parent, "deferred-checks-items-pr-32").write_text("- Open a book.\n")
+    after_merge.deferred_checks(32, "6")
+    [issue] = gh.created()
+    assert issue["body"].endswith("\n\n- [ ] Open a book.\n") and "390 px" not in issue["body"]
+
+
+def test_checks_the_screenshot_review_all_verified_add_nothing(gh, deferred):
+    gh.set(body=DEFERRED, title="feat: covers")
+    Path(deferred.parent, "deferred-checks-items-pr-32").write_text("")
+    after_merge.deferred_checks(32, "6")
+    assert gh.created() == [] and not [c for c in gh.calls() if c[:2] == ["issue", "comment"]]
+
+
 def test_no_checks_and_the_gate_setting_add_nothing(gh, monkeypatch):
     gh.set(body=DEFERRED, title="t")
     after_merge.deferred_checks(32, "6")   # MANUAL_CHECKS unset: "gate"

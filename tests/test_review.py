@@ -86,7 +86,10 @@ def loop(gh, worktree, tmp_path, monkeypatch):
 
     monkeypatch.setattr(review.dispatch, "dispatch", agent)
     monkeypatch.setattr(review.fix, "fix_pr", fix_pr)
-    monkeypatch.setattr(merge.Merger, "merge_or_handoff", lambda self, wt: state.merged.append(self.pr))
+    state.merge_screenshots = []
+    monkeypatch.setattr(merge.Merger, "merge_or_handoff",
+                        lambda self, wt, screenshot=None: (state.merged.append(self.pr),
+                                                           state.merge_screenshots.append(screenshot)))
 
     def run(note="note", fixer="agent", reviewer="pool", fixed_by="", issue="297", **env_overrides):
         hooks = review.telemetry.from_env({**env, **env_overrides}, issue=issue, pr=PR)
@@ -533,6 +536,38 @@ def test_a_qualifying_round_runs_the_code_review_then_its_own_screenshot_review(
     assert loop.comments()[1].endswith("## Screenshots\n- a.png — ok")
     assert dict(loop.artifacts)["review"] != dict(loop.artifacts)["screenshot_review"]
     assert loop.merged == [PR] and not loop.fixes
+
+
+def test_the_merge_step_gets_the_reviewed_checks_and_the_screenshot_comment(loop):
+    loop.reviews, loop.screens = ["pass"], ["pass"]
+    loop.screen_text = "## Must fix\nnone\n\n## Checks\n1. verified\n\n## Screenshots\n- a.png — ok"
+    assert screen_run(loop) == 0
+    [given] = loop.merge_screenshots
+    assert given["checks"] == "- The library at 390 px and 1280 px."
+    assert given["comment"].startswith("<!-- baton-screenshot-review round=1 by=") and "1. verified" in given["comment"]
+
+
+def test_the_merge_step_reads_the_screenshot_comment_of_the_last_round(loop):
+    loop.reviews, loop.screens = ["pass", "pass"], ["changes", "pass"]
+    assert screen_run(loop) == 0
+    [given] = loop.merge_screenshots
+    assert given["comment"].startswith("<!-- baton-screenshot-review round=2 by=")
+
+
+def test_a_round_without_screenshot_review_gives_the_merge_step_no_verdicts(loop):
+    loop.reviews = ["pass"]
+    loop.gh.set(body=CHECKS_BODY)
+    assert loop.run(fixer="cursor") == 0   # SCREENSHOT_REVIEW off
+    assert loop.merge_screenshots == [None]
+
+
+def test_the_screenshot_prompt_numbers_the_checks_and_asks_for_a_verdict_each(loop):
+    loop.reviews, loop.screens = ["pass"], ["pass"]
+    screen_run(loop)
+    prompt = loop.agents[1]["prompt"]
+    assert "1. The library at 390 px and 1280 px." in prompt
+    assert "## Checks" in prompt and all(word in prompt for word in ("`verified`", "`broken`", "`owner`"))
+    assert "not sure" in prompt
 
 
 def test_a_split_review_exports_both_verdicts_and_counts_one_round(loop, monkeypatch):

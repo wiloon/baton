@@ -21,7 +21,7 @@ import re
 import sys
 import time
 
-from . import checkpoint, dispatch, fix, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, vendors
+from . import check_verdicts, checkpoint, dispatch, fix, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, vendors
 from .common import Deferred, changed, git, restore, strip_markers
 
 REPLY_CAP = 60000
@@ -436,7 +436,7 @@ class Review:
         out = self.agent(vendor, "screenshot_review", self.render(
             "screenshot-review-prompt.md", PR=str(pr), ISSUE=self.issue or "unknown", GH_REPO=self.repo,
             WORKTREE=str(wt), ROUND=str(round), MAX_ROUNDS=str(self.max_rounds), CONTEXT_FILE=str(context),
-            MANUAL_CHECKS=cut(checks, limit), SHOTS_STEP=self.shots_step(notify.shots(pr, self.ctx)), DELIVERY=delivery),
+            MANUAL_CHECKS=cut(check_verdicts.numbered(checks), limit), SHOTS_STEP=self.shots_step(notify.shots(pr, self.ctx)), DELIVERY=delivery),
             f"pr-{pr}-screenshot-review-{round}", str(self.self_dir / "review-settings.json"), str(review_file), self.env)
         outcome, model = out["outcome"], out["model"] or ""
         if not vendors.screenshot_allowed(self.state, pr, vendor, model, self.fixed_by):
@@ -581,7 +581,10 @@ class Review:
             round, step = round + 1, "review"
             code_verdict = screenshot = checks = ""
         self.drop()
-        merge.Merger(self.env, self.hooks, pr, self.issue).merge_or_handoff(wt)
+        # The last round's screenshot verdicts decide which manual checks still need the owner (#92).
+        shots = ({"checks": checks, "comment": agent_comment(self.repo, self.owner, pr, "baton-screenshot-review", round)}
+                 if screenshot else None)
+        merge.Merger(self.env, self.hooks, pr, self.issue).merge_or_handoff(wt, shots)
         return 0
 
 

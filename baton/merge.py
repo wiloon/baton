@@ -21,7 +21,7 @@ import subprocess
 import sys
 import time
 
-from . import after_merge, ci, fix, hooks as telemetry, names, notify, pick, pr as pr_helpers
+from . import after_merge, check_verdicts, ci, fix, hooks as telemetry, md, names, notify, pick, pr as pr_helpers
 from .common import Deferred, git
 
 
@@ -145,11 +145,28 @@ class Merger:
             notify.log(f"PR #{self.pr}: after-merge failed: {exc}")
             notify.log(f"PR #{self.pr}: after-merge filing failed")
 
+    # --- the screenshot review's verdicts (#92, ADR 0006) ---
+    def left_for_owner(self, screenshot, body):
+        """The PR's manual checks the screenshot review did not verify; None when there is no
+        usable review: none ran, or the description's checks changed since it ran."""
+        if not screenshot or body is None:
+            return None
+        checks = screenshot.get("checks") or ""
+        if check_verdicts.items(md.section("Manual checks", body)) != check_verdicts.items(checks):
+            return None
+        return check_verdicts.for_owner(checks, screenshot.get("comment") or "")
+
+    def keep_deferred(self, left):
+        """With manual_checks = "defer", only the checks LEFT go to the tracking issue (#48)."""
+        lines = "".join("- " + item.replace("\n", "\n  ") + "\n" for item in left)
+        Path(self.state, f"deferred-checks-items-pr-{self.pr}").write_text(lines)
+
     # --- the review passed ---
-    def merge_or_handoff(self, wt):
+    def merge_or_handoff(self, wt, screenshot=None):
         """Merge when auto-merge is on for the runner and for this repository, CI is green and
-        "## Manual checks" is none, or the repository defers manual checks (#48); otherwise label
-        it ready-for-human."""
+        "## Manual checks" is none, the screenshot review verified every check (SCREENSHOT:
+        the reviewed checks and the round's screenshot review comment, #92), or the repository
+        defers manual checks (#48); otherwise label it ready-for-human."""
         pr, url = self.pr, self.url
         if self.env.config.scheduling.auto_merge is not True or self.env.repo.auto_merge is not True:
             where = "" if self.env.config.scheduling.auto_merge is not True else f" for {self.repo}"
@@ -163,8 +180,11 @@ class Merger:
             if self.ci_fix_round(wt) != 0 or not self.ci_green(45):
                 self.handoff("ci_not_green", f"PR #{pr}: CI not green", f"Review passed but CI failed or timed out. {url}")
                 return
+        deferred = self.env.repo.manual_checks == "defer"
+        left = None
         try:
-            gate = pr_helpers.gate(pr, defer=self.env.repo.manual_checks == "defer")
+            left = self.left_for_owner(screenshot, pr_helpers.body(pr) if screenshot else None)
+            gate = pr_helpers.gate(pr, defer=deferred, cleared=screenshot["checks"] if left == [] else None)
         except Exception:
             gate = {"action": "manual_checks"}
         if gate.get("action") == "queue_review":
@@ -173,9 +193,14 @@ class Merger:
             notify.notify(f"PR #{pr}: metadata review queued", f"{gate['reason']} {url}")
             return
         if gate.get("action") != "merge":   # manual checks, or no answer: the owner decides
-            self.handoff("manual_checks", f"PR #{pr} needs a manual check", f"Review and CI passed. {url}")
+            listed = "".join(f"\n- {item}" for item in left or ())
+            text = (f"Review and CI passed. The screenshot review left these checks for you:{listed}\n{url}" if left
+                    else f"Review and CI passed. {url}")
+            self.handoff("manual_checks", f"PR #{pr} needs a manual check", text)
             notify.send_shots(pr)
             return
+        if deferred and left is not None:
+            self.keep_deferred(left)
         merged = pr_helpers.gh("pr", "merge", str(pr), "-R", self.repo, "--merge")
         if merged.returncode != 0:
             self.handoff("merge_failed", f"PR #{pr} merge failed", f"{url}{pr_helpers.why(merged)}")
@@ -185,6 +210,8 @@ class Merger:
         # A partial PR keeps its issue open; release it for the next slice below.
         if remove_worktree(str(self.env.dirs.clone), wt):
             notify.log(f"cleaned up worktree {wt}")
+        if left == [] and not deferred:   # merged on the screenshot review: the owner can still look
+            notify.send_shots(pr, note="merged after screenshot review")
         session.run_process(["rm", "-rf", str(Path(self.ctx, f"pr-{pr}-shots"))])
         if self.issue:
             pr_helpers.gh("issue", "edit", self.issue, "-R", self.repo, "--remove-label", "agent-wip")
