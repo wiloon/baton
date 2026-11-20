@@ -29,7 +29,8 @@ matt_skills_root = "~/.claude/plugins/cache/mattpocock/mattpocock-skills"
 # PR waits for the owner. A repository can also turn it off for itself ([[repos]] auto_merge).
 auto_merge = true
 # Per repository: no new issue starts while this many agent PRs are still in the review loop
-# (a PR handed to the owner, ready-for-human, doesn't count).
+# (a PR handed to the owner, ready-for-human, doesn't count). A PR whose next step is deferred for
+# vendor quota or cooldown lends its slot, so at most max_pending_prs + 1 issues are in flight.
 max_pending_prs = 1
 # Reviews per PR before it goes to the owner; each review but the last can be followed by a fix.
 max_review_rounds = 2

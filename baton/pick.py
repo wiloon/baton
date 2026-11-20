@@ -35,7 +35,7 @@ def choose(env, role, current, mode, candidates, *, pr="", exclude="", issue="",
     area = vendors.task_area(env.repo.gh_repo, pr, issue) if vendors.area_keys(role, env) else ""
     result, rc = vendors.pick(state, pool, role, candidates, current, pr, exclude.split(), area=area, **kwargs)
     if rc == 75:
-        raise Deferred("pool", result["reason"])
+        raise Deferred("pool", result["reason"], lends_slot=result["lends_slot"])
     if result.get("exhausted"):
         raise Exhausted(role, result.get("reason", ""))
     vendor = result["vendor"]

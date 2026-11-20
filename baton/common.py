@@ -7,12 +7,17 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+LEASE_REASON = "vendor capacity reserved"
+
+
 class Deferred(Exception):
     """The item must yield: VENDOR (or "pool") cannot run now, for REASON. The bash caller
-    rests the vendor (defer_vendor exits the item's subshell, so it stays in bash)."""
-    def __init__(self, vendor, reason):
+    rests the vendor (defer_vendor exits the item's subshell, so it stays in bash).
+    Dispatch uses its direct reason by default; vendor selection supplies the slot decision."""
+    def __init__(self, vendor, reason, *, lends_slot=None):
         super().__init__(f"{vendor}: {reason}")
         self.vendor, self.reason = vendor, reason
+        self.lends_slot = reason != LEASE_REASON if lends_slot is None else lends_slot
 
 
 class Exhausted(Exception):

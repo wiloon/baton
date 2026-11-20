@@ -44,6 +44,13 @@ When a step ends, the tick can go straight on to the next one, up to `chain_max`
 nothing to do and `scan` on, Claude scans one of the repository's `scan_areas` for bugs and files
 what it finds as an issue.
 
+**How many issues run at once.** `max_pending_prs` (per repository) is how many `agent-wip` issues
+may be in flight before baton starts a new one. A PR waiting for the owner (`ready-for-human`) is
+not counted. A PR whose next agent step was deferred for vendor quota or cooldown lends its slot
+until that step runs again without a deferral, so another vendor can start the next issue. At most
+`max_pending_prs + 1` counted issues are in flight through normal scheduling. When the cap blocks a
+start, the log lists each in-flight issue, its PR, and the saved deferral reason.
+
 **Picking a vendor.** For each run, baton drops the vendors that are resting after a limit or an
 auth failure, that are over their quota caps, or, for a review, that wrote any of the PR (when
 every vendor did, the same vendor reviews on a different model). That same-vendor fallback waits
