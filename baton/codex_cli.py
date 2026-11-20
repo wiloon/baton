@@ -3,6 +3,7 @@ credentials are invalid. Codex writes artifacts into a scratch directory inside 
 worktree; only the runner copies them out (markers stripped) to the path the caller
 named, so only the runner publishes artifacts and markers."""
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -19,6 +20,7 @@ SUPPORTED_ROLES = frozenset({
 })
 QUOTA_SOURCE = "probe-run"
 QUOTA_WINDOWS = frozenset({"five_hour", "seven_day"})
+QUOTA_ERROR = r"usage_limit_reached|hit your usage limit|usage limit (reached|exceeded)|insufficient_quota"
 IMAGES = True
 SCAN = False
 SKIP_SCREENSHOT_AFTER_REVIEW = False
@@ -30,7 +32,82 @@ PREFLIGHT_CHECKS = (("codex", "--version"), ("codex", "login", "status"))
 VERSION_EXECUTABLE = "codex"
 PROBE_SENDS_MODEL = False
 RUNS_STEM = "codex-runs"
+LOG_SUFFIX = "-codex"
+CONFIG_FIELDS = frozenset({"fallback_models", "cache_dirs"})
+BUSY_RERUN = True
+REQUIRES_CACHE_DIRS = True
+COMMIT_MARKERS = ()
+LEGACY_SEED_WITH_OWNER = False
+UNMARKED_AUTHOR_INFERENCE = True
+GITHUB_ACCESS = "denied"
+FIX_RESUMABLE_VIA_REPLY = False
+READONLY_RESET = True
+FIVE_MINUTE_CACHE_ROLES = ()
 OTEL = "http://127.0.0.1:4318/v1/"
+OTEL_STAGE = {"spec": "spec-reply", "spec_review": "spec-review", "review": "review",
+              "screenshot_review": "review", "fix": "fix"}
+PROBE_PROMPT = "Reply with the word ok."
+
+
+def configure(role, route, settings, env):
+    return route.model, settings.max_minutes, LOG_SUFFIX, {
+        "effort": route.effort, "fallback_models": " ".join(settings.fallback_models),
+        "add_dirs": list(map(str, env.caches)), "shots_dir": env.runtime.shots_dir,
+        "skills_dir": env.skills,
+    }
+
+
+def attach_dispatch_inputs(options, settings="", output=""):
+    options["output"] = output
+    return options
+
+
+def request_otel(run):
+    return bool(run)
+
+
+def run_env(role, run):
+    return {}
+
+
+def telemetry_env(role, run):
+    attrs = f"baton.run_id={run.run_id},baton.role={role}"
+    if run.issue:
+        attrs += f",baton.issue={run.issue}"
+    if run.pr:
+        attrs += f",baton.pr={run.pr}"
+    if role in OTEL_STAGE:
+        attrs += f",baton.stage={OTEL_STAGE[role]}"
+    if run.pipeline_id:
+        attrs += f",baton.pipeline_id={run.pipeline_id}"
+    return {"TRACEPARENT": f"00-{run.trace_id}-{run.span_id}-01", "OTEL_RESOURCE_ATTRIBUTES": attrs,
+            "OTEL_METRIC_EXPORT_INTERVAL": "1000"}
+
+
+def end_line_identity(model):
+    return ""
+
+
+def work_started(log_text):
+    return any(isinstance(obj, dict) and obj.get("type") in ("item.started", "item.completed")
+               for _, obj in events(log_text))
+
+
+def reported_model(run):
+    actual = re.search(r"\bmodel=([^\s]+)", run.summary)
+    return actual.group(1) if actual else run.model
+
+
+def probe_command(model, directory):
+    return ["codex", "exec", "--ignore-user-config", "--ignore-rules", "-s", "read-only", "--skip-git-repo-check",
+            "-C", str(directory), "--json", PROBE_PROMPT], {
+        "GH_TOKEN": "invalid", "GITHUB_TOKEN": "invalid", "GIT_SSH_COMMAND": "/bin/false"}
+
+
+def parse_quota_log(lines):
+    from . import quota
+    return quota.parse_codex(lines, os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"))
+
 
 # The terminal verdict each role may end with (its final message's last line).
 VERDICTS = {

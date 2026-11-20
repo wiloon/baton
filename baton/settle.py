@@ -20,7 +20,6 @@ import time
 from . import agents, capacity, hooks as telemetry, notify, quota
 from .common import child_env, read
 
-PROBE_PROMPT = "Reply with the word ok."
 # What an expired or missing login looks like in a probe's output (grep -Ei before).
 PROBE_AUTH = (r'"error"\s*:\s*"authentication_failed"|Failed to authenticate|OAuth session expired|authentication_error'
               r"|unauthorized|authentication (failed|required)|invalid[_ ]token|token (has )?expired"
@@ -42,23 +41,29 @@ def count_run(state, vendor, day=None):
     path.write_text(f"{before + 1}\n")
 
 
-def refresh_cursor(state):
-    """Cursor's usage comes from its API, not from a run's output; a failure only leaves it
-    unknown, which picks treat like before it was visible."""
+def refresh_api(state, vendor):
+    """An API-sourced adapter's usage; a failure only leaves it unknown."""
+    adapter = agents.ADAPTERS[vendor]
     try:
-        windows = quota.refresh_cursor(state, time.time())
+        windows = adapter.refresh_quota(state, time.time())
     except Exception as error:
-        notify.log(f"quota: refreshing cursor failed: {error}")
+        notify.log(f"quota: refreshing {vendor} failed: {error}")
         return
     if week := windows.get("seven_day"):
-        notify.log(f"quota cursor: week {week['used']:.0%} (resets epoch {week['resets_at']})")
+        notify.log(f"quota {vendor}: week {week['used']:.0%} (resets epoch {week['resets_at']})")
+
+
+def refresh_cursor(state):
+    """Cursor's API refresh (wrapper for callers and tests that name Cursor)."""
+    refresh_api(state, "cursor")
 
 
 def record_quota(state, vendor, log):
     """Keep the quota the run reported."""
-    if agents.ADAPTERS[vendor].QUOTA_SOURCE == "api":
-        refresh_cursor(state)
-    elif agents.ADAPTERS[vendor].QUOTA_SOURCE == "probe-run" and log:
+    adapter = agents.ADAPTERS[vendor]
+    if adapter.QUOTA_SOURCE == "api":
+        refresh_api(state, vendor)
+    elif adapter.QUOTA_SOURCE == "probe-run" and log:
         try:
             quota.record_log(state, vendor, log, time.time())
         except Exception:
@@ -103,12 +108,7 @@ def settle(state, vendor, status, rc, log, tag, deadline="", outcome="", credent
 
 
 def probe_command(vendor, model, directory):
-    if vendor == "claude":
-        return ["claude", "-p", PROBE_PROMPT, "--model", model, "--max-turns", "1", "--permission-mode", "dontAsk",
-                "--tools", "", "--disallowedTools", "mcp__*", "--output-format", "stream-json", "--verbose"], {}
-    return ["codex", "exec", "--ignore-user-config", "--ignore-rules", "-s", "read-only", "--skip-git-repo-check",
-            "-C", str(directory), "--json", PROBE_PROMPT], {
-        "GH_TOKEN": "invalid", "GITHUB_TOKEN": "invalid", "GIT_SSH_COMMAND": "/bin/false"}
+    return agents.ADAPTERS[vendor].probe_command(model, directory)
 
 
 def probe(state, logs, vendor, model, *, needed=None):
@@ -124,8 +124,8 @@ def probe(state, logs, vendor, model, *, needed=None):
 def _probe(state, logs, vendor, model):
     """One tiny request whose only use is the quota its output reports; the snapshot is
     stale, and the owner's own sessions share the quota. Not counted against the daily
-    caps. No repo context or usable credentials; Claude tools/MCP are disabled and
-    Codex runs read-only. Cursor's probe is an API read: no agent runs and no usage is spent."""
+    caps. No repo context or usable credentials; probe-run adapters disable tools or run
+    read-only. An API-sourced probe is a refresh: no agent runs and no usage is spent."""
     adapter = agents.ADAPTERS.get(vendor)
     if not adapter:
         return
@@ -134,7 +134,7 @@ def _probe(state, logs, vendor, model):
     except Exception:
         return
     if adapter.QUOTA_SOURCE == "api":
-        refresh_cursor(state)
+        refresh_api(state, vendor)
         return
     log = Path(logs, f"{time.strftime('%F-%H%M%S')}-quota-probe-{vendor}.jsonl")
     hooks = telemetry.from_env()  # Global overhead, never charged to an issue's task totals.

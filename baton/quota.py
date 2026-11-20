@@ -240,15 +240,12 @@ def fresh(state, vendor, now, minutes):
 
 
 def record_log(state, vendor, log, now):
-    """Merge the quota a run's LOG reported into VENDOR's snapshot (Claude and Codex only)."""
+    """Merge the quota a run's LOG reported into VENDOR's snapshot via the adapter parser."""
     lines = Path(log).read_text(errors="replace").splitlines() if Path(log).exists() else []
-    if vendor == "claude":
-        windows = parse_claude(lines)
-    elif vendor == "codex":
-        windows = parse_codex(lines, os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"))
-    else:
+    parse = getattr(agents.ADAPTERS.get(vendor), "parse_quota_log", None)
+    if not parse:
         return
-    record(state, vendor, windows, now)
+    record(state, vendor, parse(lines), now)
 
 
 def mark_probed(state, vendor, now):
@@ -260,7 +257,7 @@ def mark_probed(state, vendor, now):
 
 def credential(state, vendor, result, now):
     """Persist the latest credential check; auth expiry stays visible until success."""
-    if vendor not in ("claude", "codex", "cursor") or result not in (
+    if vendor not in agents.ADAPTERS or result not in (
             "authenticated", "auth_expired", "probe_failed"):
         raise ValueError("invalid credential result")
     path = Path(state, f"credential-{vendor}.json")
@@ -369,10 +366,12 @@ def main(argv):
         mark_probed(state, args[0], now)
         return 0
     if command == "refresh":
+        # Documented CLI form keeps the `cursor` argument; admission and the adapter hook
+        # are still Cursor's. The vendor argument is ignored (refresh with no args matches).
         if reason := cfg.admission_error("cursor"):
             print(reason, file=sys.stderr)
             return 1
-        print(json.dumps(refresh_cursor(state, now)))
+        print(json.dumps(agents.ADAPTERS["cursor"].refresh_quota(state, now)))
         return 0
     if command == "credential":
         credential(state, args[0], args[1], now)

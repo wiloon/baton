@@ -24,33 +24,27 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from . import claude_cli, codex_cli, cursor_cli
+from . import claude_cli, codex_cli, cursor_cli, stub_cli
 from .common import Request, events, read
 
-ADAPTERS = {mod.ID: mod for mod in (claude_cli, cursor_cli, codex_cli)}
+ADAPTERS = {mod.ID: mod for mod in (claude_cli, cursor_cli, codex_cli, stub_cli)}
 CATALOG = frozenset(ADAPTERS)
 
 
 STATUSES = ("success", "failure", "timeout", "quota", "busy", "auth")
 
-# Match explicit quota messages, never bare 429/rate-limit/overloaded errors (those are
-# BUSY below). Phrases live with each adapter so a disabled vendor still classifies
+# Quota phrases live on each adapter (QUOTA_ERROR) so a disabled vendor still classifies
 # historical logs. Authentication is classified before quota. An auth failure is handled
 # like an exhausted quota: the vendor rests COOLDOWN_HOURS (no reset time to read) and
 # the item waits for another vendor or the owner's new login.
-QUOTA = {
-    claude_cli.ID: r"usage limit|session limit|hit your .*limit|limit reached|out of (extra )?usage|rate_limit_error",
-    cursor_cli.ID: r"usage limit (reached|exceeded)|(monthly|weekly|daily) (usage |request )?limit (reached|exceeded)|(insufficient|exhausted) quota",
-    codex_cli.ID: r"usage_limit_reached|hit your usage limit|usage limit (reached|exceeded)|insufficient_quota",
-}
 AUTH = (r"authentication (failed|required)|failed to authenticate|unauthorized|invalid[_ ]api[_ ]key|invalid[_ ]token"
         r"|(token|session) (has )?expired|please (log|sign) in|login required|not (logged|signed) in")
 COOLDOWN_HOURS = 5
 # The vendor's servers are full (Codex "Selected model is at capacity", Claude API 529
 # overloaded_error). Not the account's quota and not the task's fault. The run first
-# moves to the fallback model (Claude's CLI does it itself, Codex is rerun once); if that
-# is full too, the vendor rests for BUSY_MINUTES and the item is retried, with another
-# vendor if one is free.
+# moves to the fallback model (Claude's CLI does it itself; adapters with BUSY_RERUN
+# rerun once); if that is full too, the vendor rests for BUSY_MINUTES and the item is
+# retried, with another vendor if one is free.
 BUSY = r"at capacity|overloaded"
 BUSY_MINUTES = 30
 
@@ -148,7 +142,7 @@ def classify(vendor, rc, log_text, outcome="", cooldown_hours=COOLDOWN_HOURS):
         return "timeout", None
     if re.search(AUTH, found, re.I):
         return "auth", int(time.time()) + cooldown_hours * 3600
-    if re.search(QUOTA[vendor], found, re.I):
+    if re.search(ADAPTERS[vendor].QUOTA_ERROR, found, re.I):
         return "quota", deadline(found, cooldown_hours)
     if re.search(BUSY, found, re.I):
         return "busy", int(time.time()) + BUSY_MINUTES * 60
@@ -158,9 +152,8 @@ def classify(vendor, rc, log_text, outcome="", cooldown_hours=COOLDOWN_HOURS):
 
 
 def started(text):
-    """True once a Codex run began a command, edit or message: a rerun could repeat it."""
-    return any(isinstance(obj, dict) and obj.get("type") in ("item.started", "item.completed")
-               for _, obj in events(text))
+    """True once a busy-rerun adapter began a command, edit or message: a rerun could repeat it."""
+    return codex_cli.work_started(text)
 
 
 def preflight(vendor):
@@ -170,19 +163,19 @@ def preflight(vendor):
 
 
 def run(req, cooldown_hours=COOLDOWN_HOURS):
+    adapter = ADAPTERS[req.vendor]
     if outcome := preflight(req.vendor):
         return RunResult("auth", outcome, "", "", str(req.log), 1, False, int(time.time()) + cooldown_hours * 3600, outcome)
-    r = ADAPTERS[req.vendor].run(req)
+    r = adapter.run(req)
     status, until = classify(req.vendor, r.rc, read(req.log), r.outcome, cooldown_hours)
-    if status == "busy" and req.vendor == "codex" and req.fallback and not started(read(req.log)):
+    if status == "busy" and adapter.BUSY_RERUN and req.fallback and not adapter.work_started(read(req.log)):
         # The first attempt keeps its log beside the rerun's; telemetry reads the rerun's.
         req.log.replace(f"{req.log}.busy")
         req = replace(req, model=req.fallback, fallback_models="")
-        r = ADAPTERS[req.vendor].run(req)
+        r = adapter.run(req)
         status, until = classify(req.vendor, r.rc, read(req.log), r.outcome, cooldown_hours)
-    actual = re.search(r"\bmodel=([^\s]+)", r.summary) if req.vendor == "codex" else None
     return RunResult(status, r.outcome, r.reply, r.usage, str(req.log), r.rc, r.rc in (124, 137), until,
-                     r.summary, actual.group(1) if actual else r.model)
+                     r.summary, adapter.reported_model(r))
 
 
 def main(argv=None):

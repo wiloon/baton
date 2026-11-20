@@ -13,6 +13,7 @@ SUPPORTED_ROLES = frozenset({
 })
 QUOTA_SOURCE = "probe-run"
 QUOTA_WINDOWS = frozenset({"five_hour", "seven_day"})
+QUOTA_ERROR = r"usage limit|session limit|hit your .*limit|limit reached|out of (extra )?usage|rate_limit_error"
 IMAGES = True
 SCAN = True
 SKIP_SCREENSHOT_AFTER_REVIEW = False
@@ -24,10 +25,77 @@ PREFLIGHT_CHECKS = (("claude", "--version"),)
 VERSION_EXECUTABLE = "claude"
 PROBE_SENDS_MODEL = True
 RUNS_STEM = "runs"
+LOG_SUFFIX = ""
+CONFIG_FIELDS = frozenset({"fallback_models", "quota_probe_model"})
+BUSY_RERUN = False
+REQUIRES_CACHE_DIRS = False
+COMMIT_MARKERS = ()
+LEGACY_SEED_WITH_OWNER = True
+UNMARKED_AUTHOR_INFERENCE = True
+GITHUB_ACCESS = "settings"
+FIX_RESUMABLE_VIA_REPLY = False
+READONLY_RESET = False
+# Short roles finish in minutes; a five-minute cache avoids writing the hour-long cache at 2x.
+FIVE_MINUTE_CACHE_ROLES = ("spec_review", "spec", "review", "screenshot_review", "fix")
 KINDS = ("RESULT", "REVIEW", "VERDICT", "SCAN", "SPEC")
+PROBE_PROMPT = "Reply with the word ok."
 MODEL = re.compile(
     r"(?P<prefix>claude-)?(?P<family>opus|sonnet|haiku)(?P<version>(?:-[0-9]+)*?)(?:-(?P<snapshot>[0-9]{8}))?"
 )
+
+
+def configure(role, route, settings, env):
+    return route.model, settings.max_minutes, LOG_SUFFIX, {
+        "fallback_models": " ".join(settings.fallback_models),
+        "budget": str(getattr(env.config.models, "budget_" + role)),
+        "repo": str(env.dirs.clone), "subagent_model": route.subagent_model,
+        "context_dir": str(env.dirs.ctx), "effort": route.effort,
+    }
+
+
+def attach_dispatch_inputs(options, settings="", output=""):
+    options["settings"] = settings
+    return options
+
+
+def request_otel(run):
+    return False
+
+
+def run_env(role, run):
+    return {"FORCE_PROMPT_CACHING_5M": "1"} if role in FIVE_MINUTE_CACHE_ROLES else {}
+
+
+def telemetry_env(role, run):
+    # Native metrics go to the loopback collector; logs/traces stay off until reviewed.
+    return {"CLAUDE_CODE_ENABLE_TELEMETRY": "1", "OTEL_METRICS_EXPORTER": "otlp",
+            "OTEL_LOGS_EXPORTER": "none", "OTEL_TRACES_EXPORTER": "none",
+            "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL": "http/protobuf",
+            "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": "http://127.0.0.1:4320/v1/metrics",
+            "OTEL_METRICS_INCLUDE_SESSION_ID": "false", "OTEL_METRICS_INCLUDE_ACCOUNT_UUID": "false",
+            "OTEL_METRICS_INCLUDE_VERSION": "false", "OTEL_METRIC_EXPORT_INTERVAL": "10000"}
+
+
+def end_line_identity(model):
+    return f"claude_model={model or 'unknown'} "
+
+
+def work_started(log_text):
+    return False
+
+
+def reported_model(run):
+    return run.model
+
+
+def probe_command(model, directory):
+    return ["claude", "-p", PROBE_PROMPT, "--model", model, "--max-turns", "1", "--permission-mode", "dontAsk",
+            "--tools", "", "--disallowedTools", "mcp__*", "--output-format", "stream-json", "--verbose"], {}
+
+
+def parse_quota_log(lines):
+    from . import quota
+    return quota.parse_claude(lines)
 
 
 def distinct_models(first, second):
