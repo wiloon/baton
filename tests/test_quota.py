@@ -95,6 +95,45 @@ class ParseTests(unittest.TestCase):
             self.assertEqual(quota.refresh_cursor(state, NOW, Path(state, "auth.json"), None), {})
             self.assertIsNone(quota.load(state, "cursor"))
 
+    def test_cursor_refresh_reads_a_login_kept_in_the_secret_store(self):
+        with tempfile.TemporaryDirectory() as state:
+            auth = Path(state, "auth.json")
+            auth.write_text(json.dumps({"storedIn": "os-secret-store"}))
+            seen = {}
+
+            def fetch(token):
+                seen["token"] = token
+                return cursor_usage(15)
+            windows = quota.refresh_cursor(state, NOW, auth, fetch,
+                                           lambda: json.dumps({"accessToken": "kept", "refreshToken": "r"}) + "\n")
+            self.assertEqual(seen["token"], "kept")
+            self.assertEqual(windows["seven_day"]["used"], 0.15)
+
+    def test_cursor_refresh_fails_loudly_when_the_stored_login_is_unreadable(self):
+        for lookup in (lambda: None, lambda: "", lambda: "not json", lambda: '{"refreshToken": "r"}'):
+            with tempfile.TemporaryDirectory() as state:
+                auth = Path(state, "auth.json")
+                auth.write_text(json.dumps({"storedIn": "os-secret-store"}))
+                quota.record(state, "cursor", {"seven_day": {"used": 0.002, "resets_at": NOW + HOUR}}, NOW - HOUR)
+                with self.assertRaises(quota.CursorLoginUnreadable):
+                    quota.refresh_cursor(state, NOW, auth, lambda token: self.fail("fetched"), lookup)
+                self.assertEqual(json.loads(Path(state, "credential-cursor.json").read_text())["result"], "probe_failed")
+                self.assertEqual(quota.load(state, "cursor")["observed_at"], NOW - HOUR)
+
+    def test_cursor_auth_file_without_any_token_fails_loudly(self):
+        with tempfile.TemporaryDirectory() as state:
+            auth = Path(state, "auth.json")
+            for content in ("{}", "not json"):
+                auth.write_text(content)
+                with self.assertRaises(quota.CursorLoginUnreadable):
+                    quota.cursor_token(auth, lambda: self.fail("looked up"))
+
+    def test_cursor_signed_out_is_no_login(self):
+        with tempfile.TemporaryDirectory() as state:
+            auth = Path(state, "auth.json")
+            auth.write_text(json.dumps({"signedOut": True}))
+            self.assertIsNone(quota.cursor_token(auth, lambda: self.fail("looked up")))
+
     def test_output_without_quota_data_records_nothing(self):
         self.assertEqual(quota.parse_claude(["not json", '{"type":"result"}']), {})
         with tempfile.TemporaryDirectory() as home:
