@@ -210,10 +210,9 @@ def preference(role, area="", env=None):
     preferences = dict(session.resolve(env).config.preferences)
     pool_only = role == "reviser"
     for name in (role, *PREFERENCE_FALLBACK.get(role, ())):
-        dest = role if name == role else name
         for key, label in ((f'{name}_{area}', f'{name}/{area}'), (name, name)):
             if preferences.get(key):
-                return _filter_preference(dest, list(preferences[key]), pool_only=pool_only, env=env), label
+                return _filter_preference(role, list(preferences[key]), pool_only=pool_only, env=env), label
     return [], ''
 
 
@@ -350,7 +349,7 @@ def selection_details(state, pool, candidates, chosen, role, *, area="", now=Non
 
 def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool",
          now=None, probe_only=False, review=False, fixed_by="", area="", other_model="", pr_state=None,
-         spec_followup=False):
+         spec_followup=False, pinned=False):
     """STATE: the machine's cooldowns and quota; PR_STATE (default STATE): the repository's PR
     records (authors, contributions)."""
     now = int(time.time()) if now is None else now
@@ -467,8 +466,9 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
     minimum = min(counts.values())
     tied = [v for v in eligible if counts[v] == minimum]
     chosen = tied[0]
-    if current in tied or len(tied) < 2:
-        chosen = current if current in tied else tied[0]
+    if (pinned and current in eligible) or current in tied:
+        chosen, preferred = current, ""
+    elif len(tied) < 2:
         preferred = ""
     elif prefer:
         chosen = _preferred(state, pool, tied, prefer, now)

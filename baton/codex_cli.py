@@ -27,18 +27,11 @@ EMPTY_MODEL_OK = True
 RECORDS_AUTHOR_MODEL = True
 DEFAULT_MAX_MINUTES = 60
 PREFLIGHT_CHECKS = (("codex", "--version"), ("codex", "login", "status"))
-PROMPT_PREFIX = "codex-"
-LOG_SUFFIX = "-codex"
-OTEL = True
-FIVE_MINUTE_CACHE = False
-MODEL_LOG_LABEL = ""
-GITHUB_VIA_RUNNER = True
-DISPATCH_SETTINGS = False
-DISPATCH_OUTPUT = True
 VERSION_EXECUTABLE = "codex"
 PROBE_SENDS_MODEL = False
 RUNS_STEM = "codex-runs"
-SCREENSHOT_DELIVERY = "Include the full review in your final message, above the verdict line."
+OTEL = "http://127.0.0.1:4318/v1/"
+
 # The terminal verdict each role may end with (its final message's last line).
 VERDICTS = {
     "review": ("REVIEW: pass", "REVIEW: changes"),
@@ -48,7 +41,6 @@ VERDICTS = {
     "spec_review": ("SPEC: accept", "SPEC: changes", "SPEC: reject"),
     "dev": ("RESULT: ready",),
 }
-OTEL_ENDPOINT = "http://127.0.0.1:4318/v1/"
 # Fixed context the runner's agents never use (measured with codex-cli 0.163.0: a "reply
 # ok" run in a mid-sized repository goes from 17.2K to 14.8K input tokens). The Matt skills reach Codex
 # as plain paths in the prompt, so the skills listing only names Codex's own.
@@ -157,7 +149,7 @@ def run(req):
     if req.otel:
         otel += ["-c", "otel.log_user_prompt=false"]
         for key, signal in (("exporter", "logs"), ("metrics_exporter", "metrics"), ("trace_exporter", "traces")):
-            otel += ["-c", f'otel.{key}={{otlp-http={{endpoint="{OTEL_ENDPOINT}{signal}",protocol="json"}}}}']
+            otel += ["-c", f'otel.{key}={{otlp-http={{endpoint="{OTEL}{signal}",protocol="json"}}}}']
     env = child_env(GH_TOKEN="invalid", GITHUB_TOKEN="invalid", GIT_SSH_COMMAND="/bin/false", GIT_TERMINAL_PROMPT="0", **req.env)
     rc = run_cli(["codex", "exec", "-c", 'approval_policy="never"',
                   "-c", f"sandbox_workspace_write.network_access={'true' if req.online else 'false'}",
@@ -213,80 +205,3 @@ def _nonempty(path):
         return Path(path).stat().st_size > 0
     except OSError:
         return False
-
-
-def dispatch_options(env, role, route, settings):
-    return {
-        "effort": route.effort,
-        "fallback_models": " ".join(settings.fallback_models),
-        "add_dirs": list(map(str, env.caches)),
-        "shots_dir": env.runtime.shots_dir,
-        "skills_dir": env.skills,
-    }
-
-
-def telemetry_child_env(run, role, otel_stage):
-    if not run:
-        return {}
-    attrs = f"baton.run_id={run.run_id},baton.role={role}"
-    if run.issue:
-        attrs += f",baton.issue={run.issue}"
-    if run.pr:
-        attrs += f",baton.pr={run.pr}"
-    if role in otel_stage:
-        attrs += f",baton.stage={otel_stage[role]}"
-    if run.pipeline_id:
-        attrs += f",baton.pipeline_id={run.pipeline_id}"
-    return {
-        "TRACEPARENT": f"00-{run.trace_id}-{run.span_id}-01",
-        "OTEL_RESOURCE_ATTRIBUTES": attrs,
-        "OTEL_METRIC_EXPORT_INTERVAL": "1000",
-    }
-
-
-def parse_quota_log(lines, codex_home=None):
-    from . import quota
-    import os
-    home = codex_home or os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
-    return quota.parse_codex(lines, home)
-
-
-def analyst_effort(model, default):
-    return default
-
-
-def analyst_command(analyst, workspace, env, settings):
-    disabled = ('shell_tool', 'unified_exec', 'view_image', 'multi_agent', 'hooks', 'memories',
-                'skill_mcp_dependency_install', 'skill_search', 'tool_suggest', 'goals', 'sleep_tool')
-    command = ['codex', 'exec', '--ignore-user-config', '--ignore-rules', '--ephemeral',
-               '--skip-git-repo-check', '-s', 'read-only', '-m', analyst.model,
-               '-c', 'approval_policy="never"', '-c', 'web_search="disabled"',
-               '-c', 'features.code_mode.enabled=false', '-c', 'project_doc_max_bytes=0',
-               '-c', 'skills.bundled.enabled=false', '-c', 'mcp_servers={}',
-               '-c', 'skills.include_instructions=false',
-               '-c', f'model_reasoning_effort="{analyst.effort}"', '--json']
-    for setting in UNUSED:
-        command += ['-c', setting]
-    for feature in disabled:
-        command += ['--disable', feature]
-    return [*command, '-']
-
-
-def parse_analyst_result(raw, events_fn, code_re, _final_message_fn):
-    text = raw.decode(errors='replace')
-    rows = [obj for _, obj in events_fn(text) if isinstance(obj, dict)]
-    result = next((r for r in reversed(rows) if r.get('type') == 'result'), {})
-    contexts = [r['payload'] for r in rows if r.get('type') == 'turn_context' and isinstance(r.get('payload'), dict)]
-    actual = 'unknown'
-    if contexts and code_re.fullmatch(str(contexts[-1].get('model', ''))):
-        actual = contexts[-1]['model']
-    messages = [r.get('item', {}).get('text', '') for r in rows
-                 if r.get('type') == 'item.completed' and isinstance(r.get('item'), dict)
-                 and r['item'].get('type') == 'agent_message']
-    reply = messages[-1] if messages else ''
-    valid = any(r.get('type') == 'turn.completed' for r in rows) and not any(
-        r.get('type') in ('error', 'turn.failed') for r in rows)
-    tool_use = any(r.get('type') in ('tool_call', 'tool_use') or
-                   (isinstance(r.get('item'), dict) and r['item'].get('type') in
-                    ('command_execution', 'file_change', 'mcp_tool_call', 'web_search')) for r in rows)
-    return rows, reply, valid, actual, [], tool_use

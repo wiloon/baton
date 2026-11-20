@@ -36,23 +36,25 @@ def scan_area(env, index, area):
     Deferred when Claude cannot run now; outcome None when the worktree failed."""
     env = session.resolve(env)
     state, wt = str(env.dirs.state), Path(str(env.dirs.worktrees), "scan")
-    if not refresh_worktree(str(env.dirs.clone), wt):
-        notify.log("scan worktree failed")
-        return None, ""
     scanners = env.config.for_role("scan")
     if not scanners:
-        notify.log("scan skipped: no vendor with scan role")
+        reason = "scan skipped: no vendor with scan role"
+        notify.log(reason)
+        print(reason, file=sys.stderr)
         return None, ""
     vendor = ""
     blocked = ""
     for candidate in scanners:
-        status = vendors.vendor_blocked(state, candidate)
+        status = vendors.vendor_blocked(env.config.paths.state, candidate)
         if not status:
             vendor = candidate
             break
         blocked = status
     if not vendor:
         raise Deferred(scanners[0], blocked or f"{scanners[0]} blocked")
+    if not refresh_worktree(str(env.dirs.clone), wt):
+        notify.log("scan worktree failed")
+        return None, ""
     out = f"/tmp/baton-scan-{time.strftime('%Y%m%d-%H%M%S')}"
     prompt = prompts.render(Path(str(env.config.paths.self_dir), "scan-prompt.md"),
                             [("AREA", area), ("GH_REPO", env.repo.gh_repo), ("WORKTREE", str(wt)), ("OUT", out)], env=env)

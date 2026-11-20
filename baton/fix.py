@@ -144,7 +144,7 @@ class Runner:
             if attempt >= self.max_verify:
                 return 1, failure, attempt
             if not self.env.config.allows(vendor, "fixer"):
-                return 1, failure, attempt + 1
+                return 1, failure, attempt
             attempt += 1
             head = git(wt, "rev-parse", "HEAD")
             reply_file.unlink(missing_ok=True)
@@ -223,9 +223,9 @@ class Runner:
         fix_file.unlink(missing_ok=True)
         description_request.unlink(missing_ok=True)
         Path(self.ctx, f"pr-{pr}-fix-checks.json").unlink(missing_ok=True)
-        template = agents.prompt_file(fixer, "fix")
+        template = "codex-fix-prompt.md" if fixer == "codex" else "fix-prompt.md"
         description = Path(self.ctx, f"pr-{pr}-description.md")
-        if agents.ADAPTERS[fixer].GITHUB_VIA_RUNNER:  # No GitHub access: the runner reads and writes the description.
+        if fixer in ("cursor", "codex"):  # No GitHub access: the runner reads and writes the description.
             description.write_text(pr_helpers.body(pr) or "")
         shots_note, env = "", None
         if self.env.repo.screenshot_review:   # the next review looks at fresh screenshots (#50)
@@ -243,7 +243,7 @@ class Runner:
                          f"pr-{pr}-fix{f'-{self.round}' if self.round else ''}", wt, str(fix_file), env)
         outcome, model = out["outcome"], out["model"] or "unknown"
         # A failed Codex run has no reply worth posting; its commits still reach the owner below.
-        if not (agents.ADAPTERS[fixer].GITHUB_VIA_RUNNER and outcome.startswith("RESULT: failed")):
+        if not (fixer in ("cursor", "codex") and outcome.startswith("RESULT: failed")):
             if fix_file.is_file() and fix_file.stat().st_size:
                 try:
                     rest = pr_helpers.split_checks(pr, strip_markers(fix_file.read_text()), self.ctx)

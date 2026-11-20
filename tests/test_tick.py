@@ -763,7 +763,8 @@ def devrun(ctx, worktree, monkeypatch):
     state.gh.answers["pr create"] = "https://github.com/owner/app/pull/301\n"
     monkeypatch.setattr(spec, "cursor_plan", lambda env, n: "the plan")
     monkeypatch.setattr(tick.Tick, "pick_vendor", lambda self, role, mode, cands, **k: "codex")
-    monkeypatch.setattr(fix.Runner, "verify", lambda self, *a: state.verify)
+    verify = fix.Runner.verify
+    monkeypatch.setattr(fix.Runner, "verify", lambda self, *a: state.verify if state.verify else verify(self, *a))
 
     def agent(vendor, role, prompt, tag, cwd, settings="", output="", env=None, hooks=None):
         state.runs.append({"vendor": vendor, "role": role, "tag": tag, "prompt": prompt, "cwd": cwd, "output": output, "env": env})
@@ -1063,3 +1064,54 @@ def test_a_failure_filing_side_bugs_does_not_stop_the_review(devrun, monkeypatch
     monkeypatch.setattr(tick.Tick, "review_loop", lambda self, *a, **k: seen.append(True))
     devrun.go()
     assert seen == [True] and "filing side bugs failed" in devrun.log()
+
+
+def test_queue_skips_blocked_spec_review_for_runnable_dev_issue(ctx, monkeypatch):
+    issues(ctx, ready=[issue(12), issue(13)])
+    monkeypatch.setattr(spec, "cursor_plan", lambda env, n: "plan" if n == "13" else "")
+    monkeypatch.setattr(spec, "spec_state", lambda env, n: ("", 0))
+    t = ctx.make()
+    config = t.env.config
+    from dataclasses import replace
+    from baton import pick, session
+
+    cursor = config.vendor("cursor")
+    config = replace(config, vendors=tuple(replace(v, roles=("dev",)) if v == cursor else v
+                                           for v in config.vendors))
+    t.env = session.create(config, repo=config.repos[0])
+    for vendor in ("claude", "codex"):
+        (config.paths.state / f"{vendor}-cooldown-until").write_text(str(t.now + 3600))
+    probed = []
+    monkeypatch.setattr(pick.settle, "probe", lambda state, logs, vendor, model: probed.append(vendor))
+    assert t.next_issue() == "13"
+    assert probed == ["cursor"]
+
+def test_dev_writer_without_fixer_role_hands_off_after_zero_repairs(devrun, monkeypatch):
+    from subprocess import CompletedProcess
+
+    devrun.script, devrun.verify = [implements()], None
+    monkeypatch.setattr(tick.Tick, "pick_vendor", lambda *a, **kw: "cursor")
+    monkeypatch.setattr(fix.Runner, "e2e_gate", lambda *a: "")
+    monkeypatch.setattr(fix.Runner, "agent", lambda *a: pytest.fail("verification repair started"))
+    run = fix.session.run_process
+
+    def failing_verify(args, **kwargs):
+        if Path(args[0]).name == "verify.sh":
+            return CompletedProcess(args, 1, "CI failed", "")
+        return run(args, **kwargs)
+
+    monkeypatch.setattr(fix.session, "run_process", failing_verify)
+    events = []
+    monkeypatch.setattr(tick.telemetry.Telemetry, "task", lambda self, *a: events.append(a))
+    t = devrun.make()
+    from dataclasses import replace
+    cfg = t.env.config
+    cursor = cfg.vendor("cursor")
+    cfg = replace(cfg, vendors=tuple(replace(v, roles=("dev",)) if v == cursor else v for v in cfg.vendors))
+    t.env = replace(t.env, config=cfg)
+    assert t.item(lambda: dev.run(t, devrun.issue)) == 80
+    note, = devrun.gh.ran("issue", "comment")
+    assert "after 0 of 2 fix rounds" in body_of(note)
+    assert ("handoff", "verify_failed", "--reason", "verify_failed") in events
+    assert not devrun.gh.ran("pr", "create")
+    assert "agent/issue-300" not in sh(devrun.repo, "git", "ls-remote", "--heads", "origin")

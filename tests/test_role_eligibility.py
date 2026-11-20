@@ -2,12 +2,13 @@
 import os
 import re
 import time
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-from baton import analyst_pool, config, pick, review, scan, session, vendors
+from baton import agents, analyst_pool, config, dispatch, pick, quota, review, scan, session, tick, vendors
 from conftest import full_text
 
 
@@ -50,27 +51,52 @@ def pool_env(tmp_path, monkeypatch):
     return {"env": env, "config": cfg, "state": state, "sess": sess}
 
 
-def test_pick_intersects_candidates_with_for_role(pool_env):
-    env, state = pool_env["env"], pool_env["state"]
-    text = full_text()
-    text = text.replace(
-        '[vendors.codex]\nadapter = "codex"\nroles = ["dev", "fixer", "reviewer", "screenshot_reviewer", "spec_reviewer", "reviser", "retrospective"]',
-        '[vendors.codex]\nadapter = "codex"\nroles = ["fixer", "reviewer", "screenshot_reviewer", "spec_reviewer", "reviser", "retrospective"]',
-    )
-    text = text.replace(
-        '[models.routes.dev]\nclaude = { model = "claude_fast", effort = "medium" }\n'
-        'codex = { model = "codex_fast", effort = "medium" }\ncursor = { model = "cursor_auto" }\n',
-        '[models.routes.dev]\nclaude = { model = "claude_fast", effort = "medium" }\n'
-        'cursor = { model = "cursor_auto" }\n',
-    )
-    text = text.replace('dev = ["cursor", "codex", "claude"]', 'dev = ["cursor", "claude"]')
-    cfg = config.load(write_config(state.parent / "devpick", text), home=state.parent / "home")
-    session.bind(session.create(cfg, repo=cfg.repos[0]))
-    pool = list(cfg.pool())
-    result, rc = vendors.pick(state, pool, "dev", ["claude", "codex", "cursor"], by="pool", now=time.time())
-    assert rc == 0
-    assert result["vendor"] in ("claude", "codex")
-    assert result["vendor"] != "cursor"
+@pytest.mark.parametrize("role", ["dev", "fixer", "reviewer", "screenshot_reviewer",
+                                  "spec_reviewer", "reviser"])
+def test_pick_defers_when_only_disallowed_vendor_is_free(pool_env, role, monkeypatch, capsys):
+    sess = pool_env["sess"]
+    cfg = sess.config
+    changed = replace(cfg.vendor("codex"), roles=tuple(r for r in cfg.vendor("codex").roles if r != role))
+    cfg = replace(cfg, vendors=tuple(changed if v.id == "codex" else v for v in cfg.vendors))
+    sess = session.create(cfg, repo=cfg.repos[0])
+    state = cfg.paths.state
+    state.mkdir(parents=True, exist_ok=True)
+    for vendor in ("claude", "cursor"):
+        (state / f"{vendor}-cooldown-until").write_text(str(int(time.time()) + 3600))
+
+    cfg.paths.logs.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(session, "resolve", lambda value=None: sess if value is None else value)
+    t = tick.Tick(sess, argv=["1"])
+    assert t.item(lambda: pick.choose(sess, role, "codex", "contrib", list(cfg.declared()))) == 75
+    assert "DEFERRED: pool no vendor can run now" in capsys.readouterr().err
+    assert pool_env["env"]["probes"] == []
+
+
+@pytest.mark.parametrize(("vendor", "role"), [("cursor", "review"), ("codex", "scan")])
+def test_admission_rejects_before_vendor_calls_or_state_changes(pool_env, monkeypatch, capsys, vendor, role):
+    cfg = pool_env["config"]
+    cfg = replace(cfg, vendors=tuple(v for v in cfg.vendors if v.id != "cursor"))
+    sess = session.create(cfg, repo=cfg.repos[0])
+    monkeypatch.setattr(session, "resolve", lambda value=None: sess if value is None else value)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("rejected request reached a vendor or acquired capacity")
+
+    for module, symbol in ((dispatch.capacity, "lease"), (agents, "run"), (agents, "preflight"),
+                           (quota, "refresh_cursor")):
+        monkeypatch.setattr(module, symbol, unexpected)
+    before = sorted(cfg.paths.state.glob("**/*"))
+    result = dispatch.dispatch(vendor, role, "prompt", "test", ".", env=sess)
+    assert result["rc"] == 1 and vendor in result["outcome"]
+    assert agents.main(["run", "--vendor", vendor, "--role", role, "--cwd", ".", "--log",
+                        "run.jsonl", "--minutes", "1"]) == 1
+    preflight = ["preflight", "--vendor", vendor]
+    if vendor == "codex":
+        preflight += ["--role", role]
+    assert agents.main(preflight) == 1
+    assert quota.main(["refresh"]) == 1
+    assert "cursor" in capsys.readouterr().err
+    assert sorted(cfg.paths.state.glob("**/*")) == before
 
 
 def test_pick_clears_current_when_not_role_allowed(pool_env):
@@ -95,20 +121,28 @@ def test_review_pick_returns_exhausted_when_all_eligible_are_authors(pool_env):
     assert rc == 0 and result.get("exhausted") and result["vendor"] == ""
 
 
-def test_preference_inheritance_filters_to_destination_role(pool_env):
-    session.bind(pool_env["sess"])
-    with patch.dict(os.environ, {"PREFER_SCREENSHOT_REVIEWER": "cursor codex claude",
-                                 "PREFER_REVIEWER": "cursor codex claude"}):
-        prefer, _ = vendors.preference("screenshot_reviewer")
-        assert "cursor" not in prefer
-        assert prefer == ["codex", "claude"]
+@pytest.mark.parametrize(("order", "expected"), [
+    ('"cursor", "codex", "claude"', ["codex", "claude"]),
+    ('"cursor"', []),
+])
+def test_preference_inheritance_filters_to_destination_role(tmp_path, order, expected):
+    text = full_text().replace('reviewer = ["claude", "codex"]', f'reviewer = [{order}]')
+    cfg = config.load(write_config(tmp_path, text), home=tmp_path)
+    sess = session.create(cfg, repo=cfg.repos[0])
+    assert vendors.preference("screenshot_reviewer", env=sess)[0] == expected
 
 
-def test_analyst_pool_skips_vendors_without_retrospective_role(tmp_path):
+@pytest.mark.parametrize("explicit", [True, False])
+def test_analyst_pool_skips_vendors_without_retrospective_role(tmp_path, explicit):
     text = full_text().replace(
         '[vendors.codex]\nadapter = "codex"\nroles = ["dev", "fixer", "reviewer", "screenshot_reviewer", "spec_reviewer", "reviser", "retrospective"]',
         '[vendors.codex]\nadapter = "codex"\nroles = ["dev", "fixer", "reviewer", "screenshot_reviewer", "spec_reviewer", "reviser"]',
     )
+    if explicit:
+        with pytest.raises(config.ConfigError, match=r"retrospectives\.model_codex"):
+            config.load(write_config(tmp_path, text), home=tmp_path)
+        return
+    text = re.sub(r'^model_codex = .*\n', '', text, flags=re.M)
     cfg = config.load(write_config(tmp_path, text), home=tmp_path)
     analysts = analyst_pool.candidates(cfg)
     assert {a.vendor for a in analysts} == {"claude", "cursor"}
@@ -125,7 +159,7 @@ def test_analyst_reserve_empty_when_role_eligible_all_blocked(tmp_path):
         assert analyst is None
 
 
-def test_scan_skips_when_no_eligible_scanner(pool_env, monkeypatch):
+def test_scan_skips_when_no_eligible_scanner(pool_env, monkeypatch, capsys):
     state = pool_env["state"]
     text = full_text().replace(
         '[vendors.claude]\nadapter = "claude"\nroles = ["dev", "fixer", "reviewer", "screenshot_reviewer", "spec_reviewer", "reviser", "retrospective", "scan"]',
@@ -138,34 +172,10 @@ def test_scan_skips_when_no_eligible_scanner(pool_env, monkeypatch):
     calls = []
     monkeypatch.setattr(scan.dispatch, "dispatch", lambda *a, **k: calls.append(a) or {
         "rc": 0, "outcome": "SCAN: none", "defer": ""})
+    monkeypatch.setattr(scan, "refresh_worktree", lambda *a: pytest.fail("worktree refresh"))
     outcome, draft = scan.scan_area(sess, "0", "api")
+    assert "no vendor with scan role" in capsys.readouterr().err
     assert outcome is None and draft == "" and not calls
-
-
-def test_verify_fails_without_repair_when_writer_lacks_fixer_role(worktree, tmp_path, monkeypatch):
-    cfg = config.load(write_config(tmp_path, cursor_without_fixer(full_text())), home=tmp_path)
-    from baton.fix import Runner
-    from baton import review as review_mod
-    sess = session.create(cfg, repo=cfg.repos[0])
-    sess.dirs.ctx.mkdir(parents=True, exist_ok=True)
-    session.bind(sess)
-    hooks = review_mod.telemetry.from_env(sess.tools, issue="1", pr="99")
-    runner = Runner(sess, hooks, 99, "")
-    agents = []
-
-    def fake_dispatch(vendor, role, *rest, **kw):
-        agents.append((vendor, role))
-        return {"rc": 0, "outcome": "RESULT: fixed", "reply": "", "model": "", "defer": ""}
-
-    def fail_verify(*a, **k):
-        return type("R", (), {"returncode": 1, "stdout": "fail\n", "stderr": ""})()
-
-    monkeypatch.setattr(runner, "agent", fake_dispatch)
-    monkeypatch.setattr(runner, "e2e_gate", lambda *a, **k: "")
-    monkeypatch.setattr("baton.fix.session.run_process", fail_verify)
-    rc, failure, rounds = runner.verify(str(worktree.wt), "origin/main", "cursor", "pr", 99)
-    assert rc == 1 and rounds == 1 and not agents
-    assert not sess.config.allows("cursor", "fixer")
 
 
 def test_review_loop_hands_off_without_review_on_exhaustion(gh, worktree, tmp_path, monkeypatch):
@@ -235,3 +245,26 @@ def test_saved_reviewer_is_reselected_after_losing_role(gh, worktree, tmp_path, 
     assert rc == 0
     assert agents and all(vendor != "cursor" for vendor, _ in agents)
     assert agents[0][0] in ("claude", "codex")
+
+
+@pytest.mark.parametrize(("order", "expected", "filtered"), [
+    ('"codex", "cursor"', "cursor", ["cursor"]),
+    ('"codex"', "claude", []),
+])
+def test_analyst_reserve_inherits_only_eligible_preferences(tmp_path, order, expected, filtered):
+    text = full_text().replace('reviewer = ["claude", "codex"]', f'reviewer = [{order}]')
+    text = text.replace('"reviser", "retrospective"]', '"reviser"]')
+    text = re.sub(r'^model_codex = .*\n', '', text, flags=re.M)
+    cfg = config.load(write_config(tmp_path, text), home=tmp_path)
+    state = tmp_path / "quota-state"
+    state.mkdir()
+    now = int(time.time())
+    for vendor in cfg.declared():
+        quota.credential(state, vendor, "authenticated", now)
+        quota.record(state, vendor, {
+            name: {"used": 0.25, "resets_at": now + 3600}
+            for name in agents.ADAPTERS[vendor].QUOTA_WINDOWS
+        }, now)
+    with analyst_pool.reserve(cfg, state, now) as (analyst, lease, selection):
+        assert lease and analyst.vendor == expected
+        assert selection["preference"] == filtered

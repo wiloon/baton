@@ -28,9 +28,12 @@ class QuotaMetricsTests(unittest.TestCase):
 
     def metrics(self):
         values = {}
-        t.quota_metrics(self.state, self.config,
-                        lambda name, value, labels: values.__setitem__((name, labels), value), NOW,
-                        declared=('claude', 'codex', 'cursor'))
+        try:
+            effective = t._runner_config(self.config)
+        except ValueError:
+            effective = None
+        t.quota_metrics(self.state, effective,
+                        lambda name, value, labels: values.__setitem__((name, labels), value), NOW)
         return values
 
     def value(self, values, name, vendor='claude', window=None):

@@ -277,7 +277,7 @@ class Review:
         """The reviewer with the fewest lines in the PR. When every vendor is excluded, Exhausted
         ends the step with a ready-for-human handoff."""
         return pick.choose(self.env, "reviewer", current, "review", self.vendors(), pr=str(self.pr),
-                           issue=self.issue, fixed_by=self.fixed_by)
+                           issue=self.issue, fixed_by=self.fixed_by, pinned=current == "cursor")
 
     def review_allowed(self, vendor, model=""):
         """Persisted authors survive restarts and role changes: a vendor that wrote the PR does
@@ -374,7 +374,7 @@ class Review:
             return outcome
         review_file = Path(f"/tmp/baton-review-{pr}-{round}.md")
         review_file.unlink(missing_ok=True)
-        template = agents.prompt_file(reviewer, "review")
+        template = "codex-review-prompt.md" if reviewer == "codex" else "review-prompt.md"
         out = self.agent(reviewer, "review", self.render(
             template, PR=str(pr), ISSUE=self.issue or "unknown", GH_REPO=self.repo, WORKTREE=str(wt), ROUND=str(round),
             MAX_ROUNDS=str(self.max_rounds), ROUND_NOTE=note, SKILL_STEP=skill,
@@ -430,15 +430,9 @@ class Review:
         pr, wt = self.pr, self.wt
         self.hooks.round = round
         head = git(wt, "rev-parse", "HEAD") or ""
-        try:
-            vendor = self.screenshot_vendor()
-        except Exhausted as exhausted:
-            self.label("--add-label", "ready-for-human")
-            notify.notify(f"PR #{pr} needs you", exhausted.reason or "No screenshot reviewer available.")
-            return "RESULT: failed no screenshot reviewer"
+        vendor = self.screenshot_vendor()
         cfg = self.env.config
         if vendor not in cfg.declared() or not cfg.allows(vendor, "screenshot_reviewer"):
-            self.label("--add-label", "ready-for-human")
             return "RESULT: failed screenshot reviewer not role-allowed"
         route = self.env.config.models.route("screenshot_review", vendor)
         if not vendors.screenshot_allowed(self.state, pr, vendor, route.model, self.fixed_by):
@@ -448,8 +442,7 @@ class Review:
         context.write_text(issue_context(self.env, self.issue) if re.fullmatch(r"\d+", str(self.issue or "")) else "")
         review_file = Path(f"/tmp/baton-screenshot-review-{pr}-{round}.md")
         review_file.unlink(missing_ok=True)
-        adapter = agents.ADAPTERS[vendor]
-        delivery = (adapter.SCREENSHOT_DELIVERY if adapter.SCREENSHOT_DELIVERY != "file"
+        delivery = ("Include the full review in your final message, above the verdict line." if vendor == "codex"
                     else f"Write the comment to `{review_file}` with the Write tool.")
         out = self.agent(vendor, "screenshot_review", self.render(
             "screenshot-review-prompt.md", PR=str(pr), ISSUE=self.issue or "unknown", GH_REPO=self.repo,
@@ -526,18 +519,15 @@ class Review:
             if step in ("review", "screenshot"):
                 verdict = code_verdict
                 if step == "review":
-                    # A disabled or resting Cursor is re-picked like any pool vendor.
-                    if (reviewer != "cursor" or reviewer not in self.vendors()
-                            or vendors.vendor_blocked(str(self.env.config.paths.state), "cursor")):
-                        try:
-                            reviewer = self.review_vendor(reviewer)
-                        except Exhausted as exhausted:
-                            self.handoff("review_failed", f"PR #{pr} needs you",
-                                         exhausted.reason or "No eligible reviewer for this PR.")
-                            self.drop()
-                            return 0
-                        self.values["reviewer"] = reviewer
-                        self.save()
+                    try:
+                        reviewer = self.review_vendor(reviewer)
+                    except Exhausted as exhausted:
+                        self.handoff("review_failed", f"PR #{pr} needs you",
+                                     exhausted.reason or "No eligible reviewer for this PR.")
+                        self.drop()
+                        return 0
+                    self.values["reviewer"] = reviewer
+                    self.save()
                     outcome = self.run_review(round, rnote, reviewer)
                     if not outcome.startswith(REVIEWED):
                         self.handoff("review_failed", f"PR #{pr} review failed ({reviewer})", f"{outcome} {self.url}")
@@ -556,8 +546,11 @@ class Review:
                     if body is not None and not pr_helpers.checks_none(body):
                         checks = manual_checks(body)
                 if step == "screenshot":
-                    outcome = (self.run_screenshot_review(round, checks) if checks
-                               else "RESULT: failed reading PR manual checks")
+                    try:
+                        outcome = (self.run_screenshot_review(round, checks) if checks
+                                   else "RESULT: failed reading PR manual checks")
+                    except Exhausted as exhausted:
+                        outcome = exhausted.reason or "No screenshot reviewer available."
                     if not outcome.startswith(REVIEWED):
                         self.handoff("review_failed", f"PR #{pr} screenshot review failed", f"{outcome} {self.url}")
                         self.drop()

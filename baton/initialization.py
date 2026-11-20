@@ -39,7 +39,7 @@ def skills_directory(root: Path) -> Path | None:
 
 def cache_directories(config: Config, ambient: Mapping[str, str], uid: int) -> tuple[Path, ...]:
     runtime = Path(ambient.get('XDG_RUNTIME_DIR') or '/tmp')
-    caches = [path for vendor in config.vendors for path in vendor.cache_dirs]
+    caches = config.vendor("codex").cache_dirs if "codex" in config.declared() else ()
     return (*caches, runtime / f'pnpm-store-operation-locks-{uid}')
 
 

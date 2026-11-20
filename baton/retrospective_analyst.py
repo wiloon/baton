@@ -16,6 +16,7 @@ import time
 
 from .initialization import child_environment
 from . import agents, quota
+from .codex_cli import UNUSED
 from .analyst_models import approved_model
 from .common import events
 from .cursor_cli import final_message
@@ -161,12 +162,96 @@ def bounded_process(command, prompt, workspace, env, seconds, max_bytes, lease_f
 
 
 def command_for(config, analyst, workspace, env):
-    return agents.ADAPTERS[analyst.vendor].analyst_command(analyst, workspace, env, config.retrospectives)
+    settings = config.retrospectives
+    if analyst.vendor == 'claude':
+        return ['claude', '--safe-mode', '-p', '--model', analyst.model, '--effort', analyst.effort,
+                '--output-format', 'json', '--tools', '', '--disallowedTools', '*',
+                '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--disable-slash-commands',
+                '--setting-sources', '', '--settings', '{"disableAllHooks":true}',
+                '--permission-mode', 'dontAsk', '--no-session-persistence', '--max-turns', '1',
+                '--max-budget-usd', str(settings.budget_usd)]
+    if analyst.vendor == 'codex':
+        disabled = ('shell_tool', 'unified_exec', 'view_image', 'multi_agent', 'hooks', 'memories',
+                    'skill_mcp_dependency_install', 'skill_search', 'tool_suggest', 'goals', 'sleep_tool')
+        command = ['codex', 'exec', '--ignore-user-config', '--ignore-rules', '--ephemeral',
+                   '--skip-git-repo-check', '-s', 'read-only', '-m', analyst.model,
+                   '-c', 'approval_policy="never"', '-c', 'web_search="disabled"',
+                   '-c', 'features.code_mode.enabled=false', '-c', 'project_doc_max_bytes=0',
+                   '-c', 'skills.bundled.enabled=false', '-c', 'mcp_servers={}',
+                   '-c', 'skills.include_instructions=false',
+                   '-c', f'model_reasoning_effort="{analyst.effort}"', '--json']
+        for setting in UNUSED:
+            command += ['-c', setting]
+        for feature in disabled:
+            command += ['--disable', feature]
+        return [*command, '-']
+    # Cursor's existing subscription supplies Grok. Never use Auto or --force.
+    directory = workspace / 'cursor-config'
+    directory.mkdir(mode=0o700)
+    denied = ['Shell(*)', 'Read(**)', 'Read(/**)', 'Write(**)', 'Write(/**)',
+              'WebFetch(*)', 'Mcp(*:*)']
+    (directory / 'cli-config.json').write_text(json.dumps(dict(
+        version=1, editor={'vimMode': False}, permissions={'allow': [], 'deny': denied})))
+    (directory / 'mcp.json').write_text('{"mcpServers":{}}')
+    auth = Path(os.environ.get('CURSOR_CONFIG_DIR') or Path.home() / '.config/cursor') / 'auth.json'
+    if auth.is_file():
+        (directory / 'auth.json').symlink_to(auth)
+    env['CURSOR_CONFIG_DIR'] = str(directory)
+    # Project permissions are an additional deny layer even on older config resolvers.
+    project = workspace / '.cursor'
+    project.mkdir(mode=0o700)
+    (project / 'cli.json').write_text(json.dumps({'permissions': {'allow': [], 'deny': denied}}))
+    return ['cursor-agent', '-p', '--mode', 'ask', '--trust', '--model', analyst.model,
+            '--output-format', 'stream-json']
 
 
 def parse_response(vendor, raw):
-    adapter = agents.ADAPTERS[vendor]
-    return adapter.parse_analyst_result(raw, events, CODE, final_message if vendor == 'cursor' else None)
+    text = raw.decode(errors='replace')
+    rows = [obj for _, obj in events(text) if isinstance(obj, dict)]
+    if vendor == 'claude':
+        # JSON output may be pretty-printed rather than JSON Lines.
+        try:
+            row = json.loads(text)
+            rows = [row] if isinstance(row, dict) else []
+        except ValueError:
+            pass
+    result = next((r for r in reversed(rows) if r.get('type') == 'result'), {})
+    actual = 'unknown'
+    models = result.get('modelUsage', {}) if vendor == 'claude' else {}
+    if isinstance(models, dict) and models and all(CODE.fullmatch(k) for k in models):
+        actual = next(iter(models)) if len(models) == 1 else 'mixed'
+    elif vendor == 'codex':
+        contexts = [r['payload'] for r in rows if r.get('type') == 'turn_context' and isinstance(r.get('payload'), dict)]
+        if contexts and CODE.fullmatch(str(contexts[-1].get('model', ''))):
+            actual = contexts[-1]['model']
+    elif CODE.fullmatch(str(result.get('actual_model', ''))):
+        actual = result['actual_model']
+    if vendor == 'codex':
+        messages = [r.get('item', {}).get('text', '') for r in rows
+                    if r.get('type') == 'item.completed' and isinstance(r.get('item'), dict) and r['item'].get('type') == 'agent_message']
+        reply = messages[-1] if messages else ''
+        valid = any(r.get('type') == 'turn.completed' for r in rows) and not any(
+            r.get('type') in ('error', 'turn.failed') for r in rows)
+    else:
+        reply = final_message(text) if vendor == 'cursor' else ''
+        reply = reply or result.get('result', '')
+        valid = bool(result) and not result.get('is_error') and result.get('subtype') == 'success'
+    tool_use = any(r.get('type') in ('tool_call', 'tool_use') or
+                   (isinstance(r.get('item'), dict) and r['item'].get('type') in
+                    ('command_execution', 'file_change', 'mcp_tool_call', 'web_search'))
+                   for r in rows)
+    if vendor == 'claude':
+        tool_use = tool_use or any(_claude_tool_event(row) for row in rows)
+    return rows, reply, valid, actual, sorted(models) if isinstance(models, dict) else [], tool_use
+
+
+def _claude_tool_event(node):
+    if isinstance(node, dict):
+        return node.get('type') in ('tool_call', 'tool_use', 'tool_result') or any(
+            _claude_tool_event(value) for value in node.values())
+    if isinstance(node, list):
+        return any(_claude_tool_event(value) for value in node)
+    return False
 
 
 def approved_actual(vendor, model):
@@ -181,7 +266,7 @@ def analyze(config, analyst, prompt, workspace, facts, lease_fd):
     deadline = time.monotonic() + settings.timeout_seconds
     env = environment(config)
     command = command_for(config, analyst, workspace, env)
-    executable = agents.ADAPTERS[analyst.vendor].VERSION_EXECUTABLE
+    executable = 'cursor-agent' if analyst.vendor == 'cursor' else analyst.vendor
     version = 'unknown'
     try:
         done = subprocess.run([executable, '--version'], env=env, cwd=workspace,
@@ -217,8 +302,8 @@ def analyze(config, analyst, prompt, workspace, facts, lease_fd):
     # missing; the independent quota worker can refresh them later.
     try:
         lines = raw.decode(errors='replace').splitlines()
-        parse = getattr(agents.ADAPTERS[analyst.vendor], 'parse_quota_log', None)
-        result['quota_windows'] = parse(lines, str(workspace)) if parse else {}
+        result['quota_windows'] = (quota.parse_claude(lines) if analyst.vendor == 'claude' else
+                                   quota.parse_codex(lines, str(workspace)) if analyst.vendor == 'codex' else {})
     except (ValueError, TypeError, KeyError, OverflowError):
         result['quota_windows'] = {}
     if diagnostics.get('cooldown_until'):

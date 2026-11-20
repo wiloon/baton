@@ -192,10 +192,12 @@ def fresh(state, vendor, now, minutes):
 def record_log(state, vendor, log, now):
     """Merge the quota a run's LOG reported into VENDOR's snapshot (Claude and Codex only)."""
     lines = Path(log).read_text(errors="replace").splitlines() if Path(log).exists() else []
-    parse = getattr(agents.ADAPTERS.get(vendor), "parse_quota_log", None)
-    if not parse:
+    if vendor == "claude":
+        windows = parse_claude(lines)
+    elif vendor == "codex":
+        windows = parse_codex(lines, os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"))
+    else:
         return
-    windows = parse(lines, os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"))
     record(state, vendor, windows, now)
 
 
@@ -306,7 +308,8 @@ def pick(vendors, snapshots, caps, five_hour_max, now, current=None, prefer=()):
 
 
 def main(argv):
-    state = str(session.resolve().config.paths.state)
+    cfg = session.resolve().config
+    state = str(cfg.paths.state)
     now = time.time()
     command, args = argv[0], argv[1:]
     if command == "record":
@@ -316,6 +319,9 @@ def main(argv):
         mark_probed(state, args[0], now)
         return 0
     if command == "refresh":
+        if reason := cfg.admission_error("cursor"):
+            print(reason, file=sys.stderr)
+            return 1
         print(json.dumps(refresh_cursor(state, now)))
         return 0
     if command == "credential":
@@ -331,10 +337,9 @@ def main(argv):
             else:
                 prefer = args[1].split()
             args = args[2:]
-        cfg = session.resolve().config
         caps = {v: cfg.cap(v) for v in args}
         chosen, summary = pick(args, {v: load(state, v) for v in args}, caps,
-                               float(session.resolve().config.quota.quota_five_hour_max), now, current,
+                               float(cfg.quota.quota_five_hour_max), now, current,
                                prefer)
         print(chosen or "")
         print(summary)

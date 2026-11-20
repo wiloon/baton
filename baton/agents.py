@@ -10,7 +10,7 @@ agent_run): run counts, cooldown files, quota snapshots, Telegram, telemetry, lo
 CLI (JSON on stdout):
     run --vendor V --role R --cwd DIR --log FILE --minutes N [...] < prompt
         exit 0 success, 1 failure/timeout, 75 quota/busy/auth
-    preflight --vendor V            exit 1 with the failed outcome when V cannot run
+    preflight --vendor V [--role R] exit 1 with the failed outcome when V cannot run
     classify --vendor V --rc N --log FILE [--outcome O]
     deadline TEXT                   the epoch a quota error says it resets
 """
@@ -31,8 +31,6 @@ ADAPTERS = {mod.ID: mod for mod in (claude_cli, cursor_cli, codex_cli)}
 CATALOG = frozenset(ADAPTERS)
 
 
-def prompt_file(vendor, stem):
-    return f"{ADAPTERS[vendor].PROMPT_PREFIX}{stem}-prompt.md"
 STATUSES = ("success", "failure", "timeout", "quota", "busy", "auth")
 
 # Match explicit quota messages, never bare 429/rate-limit/overloaded errors (those are
@@ -205,6 +203,7 @@ def main(argv=None):
     r.add_argument("--cooldown-hours", type=int, default=COOLDOWN_HOURS)
     f = sub.add_parser("preflight")
     f.add_argument("--vendor", required=True, choices=ADAPTERS)
+    f.add_argument("--role")
     c = sub.add_parser("classify")
     c.add_argument("--vendor", required=True, choices=ADAPTERS)
     c.add_argument("--rc", required=True, type=int)
@@ -223,6 +222,16 @@ def main(argv=None):
         status, until = classify(a.vendor, a.rc, read(a.log), a.outcome, a.cooldown_hours)
         print(json.dumps({"status": status, "cooldown_until": until}))
         return 0
+    from . import session
+    from .config import ConfigError
+
+    try:
+        reason = session.resolve().config.admission_error(a.vendor, a.role)
+    except ConfigError as error:
+        reason = str(error)
+    if reason:
+        print(json.dumps({"status": "failure", "outcome": f"RESULT: failed {reason}"}))
+        return 1
     if a.command == "preflight":
         outcome = preflight(a.vendor)
         print(json.dumps({"status": "auth" if outcome else "success", "outcome": outcome or ""}))

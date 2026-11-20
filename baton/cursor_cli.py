@@ -20,14 +20,6 @@ EMPTY_MODEL_OK = False
 RECORDS_AUTHOR_MODEL = False
 DEFAULT_MAX_MINUTES = 60
 PREFLIGHT_CHECKS = (("cursor-agent", "--version"),)
-PROMPT_PREFIX = "cursor-"
-LOG_SUFFIX = ""
-OTEL = False
-FIVE_MINUTE_CACHE = False
-MODEL_LOG_LABEL = ""
-GITHUB_VIA_RUNNER = True
-DISPATCH_SETTINGS = False
-DISPATCH_OUTPUT = False
 VERSION_EXECUTABLE = "cursor-agent"
 PROBE_SENDS_MODEL = False
 RUNS_STEM = "cursor-runs"
@@ -85,56 +77,3 @@ def run(req):
         restore(req.cwd, head)
         outcome = f"RESULT: failed Cursor changed files in a read-only {req.role}"
     return Run(rc, outcome, reply, used, summary)
-
-
-def dispatch_options(env, role, route, settings):
-    return {}
-
-
-def telemetry_child_env(run, role, otel_stage):
-    return {}
-
-
-def parse_quota_log(lines, _codex_home=None):
-    return {}
-
-
-def analyst_effort(model, default):
-    return 'xhigh' if '-xhigh' in model else 'high'
-
-
-def analyst_command(analyst, workspace, env, settings):
-    import json
-    import os
-    from pathlib import Path
-    directory = workspace / 'cursor-config'
-    directory.mkdir(mode=0o700)
-    denied = ['Shell(*)', 'Read(**)', 'Read(/**)', 'Write(**)', 'Write(/**)',
-              'WebFetch(*)', 'Mcp(*:*)']
-    (directory / 'cli-config.json').write_text(json.dumps(dict(
-        version=1, editor={'vimMode': False}, permissions={'allow': [], 'deny': denied})))
-    (directory / 'mcp.json').write_text('{"mcpServers":{}}')
-    auth = Path(os.environ.get('CURSOR_CONFIG_DIR') or Path.home() / '.config/cursor') / 'auth.json'
-    if auth.is_file():
-        (directory / 'auth.json').symlink_to(auth)
-    env['CURSOR_CONFIG_DIR'] = str(directory)
-    project = workspace / '.cursor'
-    project.mkdir(mode=0o700)
-    (project / 'cli.json').write_text(json.dumps({'permissions': {'allow': [], 'deny': denied}}))
-    return ['cursor-agent', '-p', '--mode', 'ask', '--trust', '--model', analyst.model,
-            '--output-format', 'stream-json']
-
-
-def parse_analyst_result(raw, events_fn, code_re, final_message_fn):
-    text = raw.decode(errors='replace')
-    rows = [obj for _, obj in events_fn(text) if isinstance(obj, dict)]
-    result = next((r for r in reversed(rows) if r.get('type') == 'result'), {})
-    actual = 'unknown'
-    if code_re.fullmatch(str(result.get('actual_model', ''))):
-        actual = result['actual_model']
-    reply = final_message_fn(text) or result.get('result', '')
-    valid = bool(result) and not result.get('is_error') and result.get('subtype') == 'success'
-    tool_use = any(r.get('type') in ('tool_call', 'tool_use') or
-                   (isinstance(r.get('item'), dict) and r['item'].get('type') in
-                    ('command_execution', 'file_change', 'mcp_tool_call', 'web_search')) for r in rows)
-    return rows, reply, valid, actual, [], tool_use

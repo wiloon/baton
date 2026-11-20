@@ -34,7 +34,7 @@ def log(env):
 
 def test_a_pool_pick_probes_stale_quota_and_logs_the_change(env):
     assert pick.choose(env, "v", "pool", "pool", ["claude", "codex"]) == "claude"
-    assert env["probes"] == ["claude"]
+    assert env["probes"] == ["claude", "codex"]
     assert log(env)[-1] == "pool: v -> claude (was pool; claude=+0.00 codex=+0.00)"
     assert log(env)[0].startswith("selection: chosen=claude role=v")
 
@@ -71,3 +71,27 @@ def test_a_codex_pr_may_be_reviewed_by_codex_on_a_proven_model(env, monkeypatch)
     assert pick.choose(env, "reviewer", "agent", "review", ["claude", "codex", "cursor"], pr="15") == "codex"
     assert vendors.review_allowed(env["STATE"], 15, "codex", "gpt-6.1-sol")
     assert not vendors.review_allowed(env["STATE"], 15, "codex", "unknown")
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_stale_cursor_uses_api_refresh_only_when_declared(tmp_path, monkeypatch, enabled):
+    from dataclasses import replace
+    from baton import config, session
+    from conftest import FULL
+
+    cfg = config.load(FULL, home=tmp_path)
+    if not enabled:
+        cfg = replace(cfg, vendors=tuple(v for v in cfg.vendors if v.id != "cursor"))
+    sess = session.create(cfg, repo=cfg.repos[0])
+    monkeypatch.setattr(session, "resolve", lambda value=None: sess if value is None else value)
+    cfg.paths.logs.mkdir(parents=True)
+    before = sorted(cfg.paths.state.rglob("*"))
+    refreshed = []
+    monkeypatch.setattr(pick.settle, "refresh_cursor", lambda state: refreshed.append(state))
+    if enabled:
+        assert pick.choose(sess, "dev", "cursor", "contrib", ["cursor"]) == "cursor"
+        assert refreshed == [str(cfg.paths.state)]
+    else:
+        with pytest.raises(Deferred, match="no vendor can run now"):
+            pick.choose(sess, "dev", "cursor", "contrib", ["cursor"])
+        assert refreshed == []
+        assert sorted(cfg.paths.state.rglob("*")) == before

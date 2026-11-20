@@ -1025,3 +1025,46 @@ cursor = { model = "cursor_analyst" }
     assert calls == expected_models
     if repair:
         assert loop.merged == [PR]
+
+
+def test_saved_cursor_reviewer_at_weekly_cap_defers(loop):
+    from types import SimpleNamespace
+    from baton import quota
+
+    loop.gh.set(headRefName="owner/issue-1", author={"login": "owner"})
+    loop.reviews[:] = ["defer"]
+    with pytest.raises(Deferred):
+        loop.run(reviewer="cursor")
+    assert loop.checkpoint()["reviewer"] == "cursor"
+    now = int(time.time())
+    for vendor in ("claude", "codex"):
+        Path(loop.env["STATE"], f"{vendor}-cooldown-until").write_text(str(now + 3600))
+    quota.record(loop.env["STATE"], "cursor", {"seven_day": {"used": 0.99, "resets_at": now + 3600}}, now)
+    loop.reviews[:] = ["pass"]
+    args = SimpleNamespace(pr=PR, wt=str(loop.wt), issue="297", fixed_by="", fixer="agent", reviewer="pool")
+    result = review.run(args, env=loop.env)
+    assert result["rc"] == 75 and result["defer_vendor"] == "pool"
+    assert "week 99% >= cap 95%" in result["defer"]
+    assert loop.checkpoint()["step"] == "review"
+    assert [run["vendor"] for run in loop.agents] == ["cursor"]
+
+
+def test_screenshot_exhaustion_hands_off_once(loop, monkeypatch):
+    from baton.common import Exhausted
+
+    loop.reviews[:] = ["pass"]
+    notices, handoffs = [], []
+
+    def exhausted(self):
+        raise Exhausted("screenshot_reviewer", "all screenshot reviewers are PR authors")
+
+    monkeypatch.setattr(review.Review, "screenshot_vendor", exhausted)
+    monkeypatch.setattr(review.notify, "notify", lambda title, text: notices.append((title, text)))
+    monkeypatch.setattr(review.telemetry.Telemetry, "task",
+                        lambda self, kind, key, *args: handoffs.append(key) if kind == "handoff" else None)
+    assert screen_run(loop) == 0
+    assert [run["role"] for run in loop.agents] == ["review"]
+    assert handoffs == ["review_failed"]
+    assert len(notices) == 1 and "all screenshot reviewers are PR authors" in notices[0][1]
+    assert sum(c[:2] == ["pr", "edit"] and "--add-label" in c and "ready-for-human" in c
+               for c in loop.gh.calls()) == 1

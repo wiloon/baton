@@ -76,13 +76,10 @@ def test_unsupported_role_grant_raises(tmp_path):
 
 
 def test_missing_required_role_coverage_raises(tmp_path):
-    text = re.sub(r"\n\[vendors\.codex\].*?(?=\n\[vendors\.cursor\])", "\n", three_vendor_text(), flags=re.S)
-    text = text.replace(
-        'roles = ["dev", "fixer", "reviewer", "screenshot_reviewer", "spec_reviewer", "reviser", "retrospective", "scan"]',
-        'roles = ["scan"]',
-        1,
-    )
-    with pytest.raises(config.ConfigError, match="dev"):
+    text = three_vendor_text().replace('roles = ["dev", ', 'roles = [')
+    text = re.sub(r"(?ms)^\[models\.routes\.dev(?:_followup)?\]\n.*?(?=^\[|\Z)", "", text)
+    text = text.replace('dev = ["cursor", "codex", "claude"]\n', "")
+    with pytest.raises(config.ConfigError, match="no eligible vendor for role dev"):
         config.load(write(tmp_path, text), home=tmp_path)
 
 
@@ -110,11 +107,12 @@ def test_route_for_role_vendor_cannot_run_raises(tmp_path):
 
 
 def test_valid_followup_inheritance_unchanged(tmp_path):
-    c = config.load(write(tmp_path, three_vendor_text()), home=tmp_path)
+    text = re.sub(r"(\[models\.routes\.review_followup\][^[]*?\n)codex = [^\n]+\n",
+                  r"\1", three_vendor_text())
+    c = config.load(write(tmp_path, text), home=tmp_path)
     base = c.models.route("review", "codex")
     follow = c.models.route("review", "codex", followup=True)
-    assert follow.model != base.model
-    assert follow.effort == "low"
+    assert follow == base
 
 
 def test_allows_and_for_role_pool_only(tmp_path):
@@ -123,3 +121,54 @@ def test_allows_and_for_role_pool_only(tmp_path):
     assert c.allows("cursor", "reviser") is False
     assert c.for_role("reviser", pool_only=True) == ("claude", "codex")
     assert set(c.for_role("dev")) == {"claude", "codex", "cursor"}
+
+@pytest.mark.parametrize("replacement", [None, "[]", '[""]'])
+def test_codex_cache_paths_are_required(tmp_path, replacement):
+    text = re.sub(r"^cache_dirs = .*\n", f"cache_dirs = {replacement}\n" if replacement else "",
+                  three_vendor_text(), flags=re.M)
+    with pytest.raises(config.ConfigError, match=r"vendors\.codex\.cache_dirs"):
+        config.load(write(tmp_path, text), home=tmp_path)
+
+
+def test_other_vendors_cannot_configure_codex_cache_paths(tmp_path):
+    text = three_vendor_text()
+    cache_line = next(line for line in text.splitlines() if line.startswith("cache_dirs = "))
+    text = text.replace("[vendors.cursor]", f"[vendors.cursor]\n{cache_line}")
+    with pytest.raises(config.ConfigError, match=r"vendors\.cursor\.cache_dirs: unsupported by cursor"):
+        config.load(write(tmp_path, text), home=tmp_path)
+
+
+@pytest.mark.parametrize("replacement", ["", 'quota_probe_model = ""'])
+def test_claude_probe_model_is_required(tmp_path, replacement):
+    text = three_vendor_text().replace('quota_probe_model = "claude_probe"', replacement)
+    with pytest.raises(config.ConfigError, match=r"vendors\.claude\.quota_probe_model"):
+        config.load(write(tmp_path, text), home=tmp_path)
+
+
+def test_nested_preference_has_a_validation_diagnostic(tmp_path, capsys):
+    text = three_vendor_text().replace('dev = ["cursor", "codex", "claude"]', 'dev = [["claude"]]')
+    from baton import bootstrap
+
+    assert bootstrap.main(["--config", str(write(tmp_path, text)), "--validate"]) == 2
+    assert "nonempty list of distinct vendors" in capsys.readouterr().err
+
+
+def test_probe_run_vendor_can_use_extra_lane(tmp_path, monkeypatch):
+    import time
+    from baton import pick, quota, session
+
+    text = three_vendor_text().replace('quota = "pool"', 'quota = "extra"', 1)
+    cfg = config.load(write(tmp_path, text), home=tmp_path)
+    assert cfg.pool() == ("codex",)
+    assert cfg.extra() == ("claude", "cursor")
+    sess = session.create(cfg, repo=cfg.repos[0])
+    monkeypatch.setattr(session, "resolve", lambda value=None: sess if value is None else value)
+    state = cfg.paths.state
+    cfg.paths.logs.mkdir(parents=True)
+    now = time.time()
+    monkeypatch.setattr(pick.settle, "probe", lambda *a: None)
+    assert pick.choose(sess, "dev", "agent", "contrib", ["claude"]) == "claude"
+    quota.record(state, "claude", {"seven_day": {"used": 0.95, "resets_at": now + 3600}}, now)
+    with pytest.raises(pick.Deferred, match="quota"):
+        pick.choose(sess, "dev", "agent", "contrib", ["claude"])
+    assert pick.choose(sess, "reviser", "claude", "pool", ["claude", "codex"]) == "codex"

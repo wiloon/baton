@@ -122,7 +122,12 @@ cp config.example.toml config.toml
 # 2. Point it at a repository: edit the [[repos]] entry in config.toml
 #    (gh_repo, owner, ci_command, ...).
 #    Declare each CLI under [vendors.<id>] with adapter, roles, quota ("pool" or
-#    "extra") and cap. Cursor is optional: omit [vendors.cursor] to disable it.
+#    "extra"), cap (a weekly fraction) and max_minutes (a positive integer).
+#    To disable Cursor in the example, remove [vendors.cursor] and its fields,
+#    delete each cursor entry under [models.routes.*], remove "cursor" from
+#    [preferences].dev, and delete [retrospectives].model_cursor.
+#    In a customized config, remove Cursor from any other preference orders
+#    and remove a preference key if deleting Cursor leaves its order empty.
 #    Both [scheduling] and the [[repos]] entry must allow auto-merge.
 #    For a first run, set [scheduling].auto_merge = false to inspect the PR yourself.
 #    Set auto_merge = false in a [[repos]] entry to merge that repository's PRs yourself.
@@ -212,7 +217,7 @@ The units assume the checkout is at `~/baton` and uv at `/usr/bin/uv`; adjust `E
 
 `config.example.toml` documents every key. Base model routes are required. Follow-up routes,
 quota probe retry settings, and `[[repos]]` `auto_merge` are optional. The repository's `auto_merge` defaults to `true`. Set it to `false` to keep
-that repository's PRs for manual merging. Edit the `[[repos]]` entry, choose your installed vendors in `[quota]`, and
+that repository's PRs for manual merging. Edit the `[[repos]]` entry, declare your installed vendors under `[vendors.<id>]`, and
 choose whether `[scheduling].auto_merge` should be enabled. The optional
 `[linear]` and `[telegram]` tables are at the end of the file.
 

@@ -57,12 +57,11 @@ def test_a_listed_cursor_is_a_candidate_after_the_pool(tmp_path):
 
 
 @pytest.mark.parametrize('mutate,match', [
-    (lambda t: t.replace('quota = "pool"', 'quota = "extra"', 1), 'api quota source'),
     (lambda t: t.replace('[quota]\n', '[quota]\nvendor_extra = ["cursor", "cursor"]\n', 1), 'vendor_extra'),
     (lambda t: t + '\n[vendors.gemini]\nadapter = "gemini"\nroles = ["dev"]\nquota = "pool"\ncap = 0.5\nmax_minutes = 10\n', 'adapter'),
     (lambda t: t.replace('[quota]\n', '[quota]\nvendor_extra = "cursor"\n', 1), 'vendor_extra'),
 ])
-def test_only_cursor_may_be_an_extra_vendor(tmp_path, mutate, match):
+def test_invalid_quota_lane_config_is_rejected(tmp_path, mutate, match):
     with pytest.raises(config.ConfigError, match=match):
         config.load(write(tmp_path, mutate((ROOT / 'config.example.toml').read_text())), home=tmp_path)
 

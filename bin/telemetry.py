@@ -687,13 +687,6 @@ def _runner_config(config):
     return load(config)
 
 
-def _declared(config):
-    try:
-        return _runner_config(config).declared()
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return None
-
-
 def _declared_from_runner_config():
     if CONFIG_PATH is None:
         return None
@@ -707,29 +700,18 @@ def settings(config):
     return [int(_runner_config(config).scheduling.paused), None, None, None]
 
 
-def quota_settings(config):
-    cfg = _runner_config(config)
-    quota = cfg.quota
-    caps = {vendor: cfg.cap(vendor) for vendor in cfg.declared()}
-    return [caps.get('claude', math.nan), caps.get('codex', math.nan), caps.get('cursor', math.nan),
-            quota.quota_five_hour_max, quota.quota_stale_minutes]
-
-
-def quota_metrics(state, config, emit, now, declared=None):
+def quota_metrics(state, config, emit, now):
     """Account quota, never inferred from token counts or successful probes.
 
     Window state: 0 unknown, 1 fresh, 2 stale, 3 reset pending, 4 unsupported,
     5 invalid. Gate: 0 unknown, 1 within quota, 2 5h limit, 3 weekly limit,
     4 cooldown. This is a quota gate, not a prediction of role/PR selection.
     """
-    if declared is None:
+    if config is None:
         return
-    try:
-        claude_cap, codex_cap, cursor_cap, five_cap, stale_minutes = quota_settings(config)
-        caps = {'claude': claude_cap, 'codex': codex_cap, 'cursor': cursor_cap}
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return
-    for vendor in declared:
+    five_cap = config.quota.quota_five_hour_max
+    stale_minutes = config.quota.quota_stale_minutes
+    for vendor in config.declared():
         labels = '{agent="' + vendor + '"}'
         gate, blocked, states = 0, 0, []
         try:
@@ -752,7 +734,7 @@ def quota_metrics(state, config, emit, now, declared=None):
             elif raw is None:
                 status = 0
             used = reset = observed = math.nan
-            cap = five_cap if window == 'five_hour' else caps.get(vendor, math.nan)
+            cap = five_cap if window == 'five_hour' else config.cap(vendor)
             if raw is not None:
                 try:
                     values = (raw['used'], raw['resets_at'], raw.get('observed_at', 0))
@@ -779,9 +761,8 @@ def quota_metrics(state, config, emit, now, declared=None):
             emit('quota_runner_headroom_ratio', max(0, cap - used) if status in (1, 2) else math.nan, wl)
             emit('quota_resets_at_seconds', reset, wl)
             emit('quota_observed_at_seconds', observed if observed > 0 else math.nan, wl)
-        if vendor in caps and math.isfinite(stale_minutes):
-            known = [s for s in states if s != 4]
-            gate = blocked or (1 if known and set(known) == {1} else 0)
+        known = [s for s in states if s != 4]
+        gate = blocked or (1 if known and set(known) == {1} else 0)
         try:
             if count(state / (vendor + '-cooldown-until')) > now:
                 gate = 4
@@ -871,14 +852,14 @@ def retrospective_activity(state, now):
     return running, active
 
 
-def interval_activity(records, previous, now, emit):
+def interval_activity(records, previous, now, emit, declared=VENDORS):
     """Any invocation overlap, including runs completed between observations.
 
     A long/failed observation gap cannot establish idle for the entire interval.
     Do not silently extend a sampling bucket across an outage.
     """
     known = records is not None and math.isfinite(previous) and 0 < now - previous <= 150
-    for vendor in VENDORS:
+    for vendor in declared:
         active = any(r['agent'] == vendor and r['started'] < now and
                      (r['status'] == 'running' or r['ended'] > previous)
                      for r in (records or [])) if known else False
@@ -887,13 +868,15 @@ def interval_activity(records, previous, now, emit):
     emit('activity_interval_start_seconds', previous if known else math.nan)
 
 
-def activity_metrics(records, emit, now, state=None):
+def activity_metrics(records, emit, now, state=None, declared=VENDORS):
     """Stable per-vendor state plus metadata only for reconciled live invocations."""
     running = [r for r in (records or []) if r['status'] == 'running']
-    for vendor in VENDORS:
+    for vendor in declared:
         emit('running_by_agent', sum(r['agent'] == vendor for r in running)
              if records is not None else math.nan, '{agent="' + vendor + '"}')
     for record in running:
+        if record['agent'] not in declared:
+            continue
         # JSON quoting also escapes quotes, backslashes and newlines in Prom labels.
         labels = {key: str(record.get(key, '')) for key in
                   ('agent', 'role', 'stage', 'repo', 'issue', 'pr', 'run_id')}
@@ -912,7 +895,7 @@ def activity_metrics(records, emit, now, state=None):
         source = path if path.exists() else path.with_name('last-success')
         with contextlib.suppress(OSError, ValueError):
             previous = float(source.read_text())
-    interval_activity(records, previous, now, emit)
+    interval_activity(records, previous, now, emit, declared)
     if state is not None and records is not None:
         atomic(path, str(now))
 
@@ -939,7 +922,7 @@ def author_of(task, runs):
     return 'owner', 'unknown'
 
 
-def contribution_metrics(state, emit, now):
+def contribution_metrics(state, emit, now, declared=VENDORS):
     """Per-vendor contribution over the last CONTRIB_DAYS days (#227). Collect and
     display only: nothing in scheduling reads these. Every counter has its own n."""
     root = Path(state) / 'telemetry'
@@ -957,6 +940,9 @@ def contribution_metrics(state, emit, now):
     counts = {}
 
     def add(name, labels, value=1):
+        if any(vendor in VENDORS and vendor not in declared for dimension, vendor in labels.items()
+               if dimension in ('agent', 'author', 'reviewer')):
+            return
         key = (name, label(**labels))
         counts[key] = counts.get(key, 0) + value
 
@@ -1048,18 +1034,11 @@ def collect(ledger, config, output):
     emit('timer_enabled', enabled)
     emit('timer_active', active)
     emit('timer_active_since_seconds', entered)
-    cfg = attempt(lambda: settings(config), [None] * 4)
-    emit('paused', cfg[0] if cfg[0] is not None else 'NaN')
+    cfg_obj = attempt(lambda: _runner_config(config), None)
+    declared = cfg_obj.declared() if cfg_obj else ()
+    emit('paused', int(cfg_obj.scheduling.paused) if cfg_obj else math.nan)
     date = dt.datetime.now().strftime('%Y-%m-%d')  # the host's local timezone, every collect
-    def load_declared():
-        found = _declared(config)
-        if not found:
-            raise ValueError('no declared vendors')
-        return tuple(found)
-
-    declared = attempt(load_declared, None)
-    if declared is not None:
-        cfg_obj = _runner_config(config)
+    if cfg_obj:
         quota_by_id = {v.id: v.quota for v in cfg_obj.vendors}
         for vendor in declared:
             adapter = agents.ADAPTERS[vendor]
@@ -1067,15 +1046,14 @@ def collect(ledger, config, output):
                     f'quota="{quota_by_id[vendor]}"}}')
             emit('vendor_info', 1, info)
             labels = '{agent="' + vendor + '"}'
-            cap = cfg_obj.cap(vendor)
-            emit('cap_configured', int(cap is not None), labels)
-            emit('daily_cap', cap, labels)
+            emit('cap_configured', 0, labels)
+            emit('daily_cap', math.nan, labels)
             emit('runs_today', attempt(lambda v=vendor, a=adapter: count(ledger.state / f'{a.RUNS_STEM}-{date}'), math.nan), labels)
             emit('cooldown_until_seconds', attempt(lambda v=vendor: count(ledger.state / f'{v}-cooldown-until'), math.nan), labels)
 
-    quota_metrics(ledger.state, config, emit, now, declared)
+    quota_metrics(ledger.state, cfg_obj, emit, now)
     credential_metrics(ledger.state, emit, now, declared)
-    attempt(lambda: contribution_metrics(ledger.state, emit, now), None)
+    attempt(lambda: contribution_metrics(ledger.state, emit, now, declared) if declared else None, None)
 
     def lock_held():
         with maintenance.admission(ledger.state), (ledger.state / 'lock').open('a') as stream:
@@ -1097,7 +1075,7 @@ def collect(ledger, config, output):
     emit('retrospective_activity_in_interval', retrospective_interval)
     emit('retrospective_observed_at_seconds', now if math.isfinite(retrospective) else math.nan)
     records = attempt(ledger.reconcile, None)
-    activity_metrics(records, emit, now, ledger.state)
+    activity_metrics(records, emit, now, ledger.state, declared)
     running = [r for r in (records or []) if r['status'] == 'running']
     emit('running', len(running) if records is not None else math.nan)
     emit('execution_healthy', int(held == 1 and any(health(r) == 'running' for r in running)) if records is not None and not math.isnan(held) else math.nan)
@@ -1177,8 +1155,13 @@ def main():
     CONFIG_PATH = args.runner_config
     ledger = Ledger(args.state)
     if args.action == 'begin':
-        record = ledger.begin(args.vendor, args.role, args.pid, args.minutes, args.issue, args.pr, args.round,
-                              repo=args.repo, requested_model=args.requested_model)
+        if args.runner_config is None:
+            parser.error('begin requires --runner-config')
+        try:
+            record = ledger.begin(args.vendor, args.role, args.pid, args.minutes, args.issue, args.pr, args.round,
+                                  repo=args.repo, requested_model=args.requested_model)
+        except ValueError as error:
+            parser.error(str(error))
         print(record['run_id'], record['trace_id'], record['span_id'], record.get('pipeline_id', ''))
         subprocess.Popen([sys.executable, __file__, '--state', str(args.state), 'heartbeat', record['run_id']],
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,

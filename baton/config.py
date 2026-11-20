@@ -126,7 +126,6 @@ BUILTIN_ALIASES = {
     "codex_fast": "gpt-6.2-sol",
     "cursor_analyst": "grok-4.7-high",
 }
-ANALYST_ALIASES = {"claude": "claude_strong", "codex": "codex_fast", "cursor": "cursor_analyst"}
 
 
 @dataclass(frozen=True)
@@ -242,9 +241,9 @@ class Retrospectives:
     # Legacy opt-in when enabled is absent: never used as a requested model.
     model: str = ""
     enabled: bool = False
-    model_claude: str = BUILTIN_ALIASES[ANALYST_ALIASES["claude"]]
-    model_codex: str = BUILTIN_ALIASES[ANALYST_ALIASES["codex"]]
-    model_cursor: str = BUILTIN_ALIASES[ANALYST_ALIASES["cursor"]]
+    model_claude: str = BUILTIN_ALIASES[agents.ADAPTERS["claude"].ANALYST_ALIAS]
+    model_codex: str = BUILTIN_ALIASES[agents.ADAPTERS["codex"].ANALYST_ALIAS]
+    model_cursor: str = BUILTIN_ALIASES[agents.ADAPTERS["cursor"].ANALYST_ALIAS]
     effort: str = "high"
     paused: bool = False
     settle_seconds: int = 300
@@ -302,6 +301,17 @@ class Config:
             return role in self.vendor(vendor_id).roles
         except ConfigError:
             return False
+
+    def admission_error(self, vendor_id, route=None):
+        if vendor_id not in self.declared():
+            return f"vendor {vendor_id} is not declared"
+        if route is not None:
+            role = ROUTE_ROLE.get(route)
+            if role is None:
+                return f"unknown agent role {route}"
+            if vendor_id not in self.for_role(role, pool_only=role == "reviser"):
+                return f"vendor {vendor_id} cannot run {role}"
+        return ""
 
     def cap(self, vendor_id):
         return self.vendor(vendor_id).cap
@@ -435,8 +445,6 @@ def _load_vendors(raw, directory, home, aliases):
         quota = entry.get("quota")
         if quota not in ("pool", "extra"):
             raise ConfigError(f"{label}.quota: expected pool or extra")
-        if quota == "extra" and agents.ADAPTERS[adapter].QUOTA_SOURCE != "api":
-            raise ConfigError(f"{label}.quota: extra quota requires an api quota source")
         cap = entry.get("cap")
         if type(cap) not in (int, float) or not math.isfinite(cap) or cap <= 0 or cap > 1:
             raise ConfigError(f"{label}.cap: expected a fraction at most 1")
@@ -453,16 +461,25 @@ def _load_vendors(raw, directory, home, aliases):
                               "fallback_models", "cache_dirs", "quota_probe_model"}
         if extra:
             raise ConfigError(f"{label}: unknown fields: {', '.join(sorted(extra))}")
+        cli = agents.ADAPTERS[adapter]
+        adapter_fields = {
+            "fallback_models": adapter in ("claude", "codex"),
+            "cache_dirs": adapter == "codex",
+            "quota_probe_model": cli.PROBE_SENDS_MODEL,
+        }
+        for field, supported in adapter_fields.items():
+            if field in entry and not supported:
+                raise ConfigError(f"{label}.{field}: unsupported by {adapter}")
         fallback = entry.get("fallback_models", [])
         if not isinstance(fallback, list) or any(type(v) is not str or not v.strip() for v in fallback):
             raise ConfigError(f"{label}.fallback_models: expected an array of strings")
         fallback = tuple(_model_alias(alias, aliases, f"{label}.fallback_models") for alias in fallback)
         cache = entry.get("cache_dirs", [])
-        if not isinstance(cache, list) or any(type(v) is not str for v in cache):
+        if not isinstance(cache, list) or any(type(v) is not str or not v.strip() for v in cache):
             raise ConfigError(f"{label}.cache_dirs: expected an array of strings")
         cache = tuple(_path(v, directory, home) for v in cache)
         probe = entry.get("quota_probe_model", "")
-        if probe != "":
+        if cli.PROBE_SENDS_MODEL:
             probe = _model_alias(probe, aliases, f"{label}.quota_probe_model")
         vendors.append(Vendor(vendor_id, adapter, tuple(roles), quota, float(cap), max_minutes,
                               fallback, cache, probe))
@@ -575,16 +592,17 @@ def load(path: str | Path, *, home: Path | None = None) -> Config:
     raw_retro = data.get("retrospectives", {}) or {}
     if not isinstance(raw_retro, dict):
         raise ConfigError("retrospectives: expected a table")
-    for vendor in VENDORS:
+    analyst_vendors = {v.id for v in vendors if "retrospective" in v.roles}
+    retro_models = {}
+    for vendor, adapter in agents.ADAPTERS.items():
         key = f"model_{vendor}"
         if key in raw_retro and vendor not in declared:
             raise ConfigError(f"retrospectives.{key}: undeclared vendor")
-    retro_models = {}
-    for vendor in declared:
-        if "retrospective" in next(v for v in vendors if v.id == vendor).roles:
-            retro_models[f"model_{vendor}"] = _model_alias(
-                raw_retro.get(f"model_{vendor}", ANALYST_ALIASES[vendor]), aliases,
-                f"retrospectives.model_{vendor}")
+        if key in raw_retro and vendor not in analyst_vendors:
+            raise ConfigError(f"retrospectives.{key}: vendor cannot run retrospective")
+        if vendor in analyst_vendors:
+            retro_models[key] = _model_alias(raw_retro.get(key, adapter.ANALYST_ALIAS), aliases,
+                                            f"retrospectives.{key}")
     sections["retrospectives"] = replace(sections.get("retrospectives", Retrospectives()), **retro_models)
     pool, extra = tuple(v.id for v in vendors if v.quota == "pool"), tuple(v.id for v in vendors if v.quota == "extra")
     caps = tuple((v.id, v.cap) for v in vendors)
@@ -615,7 +633,8 @@ def load(path: str | Path, *, home: Path | None = None) -> Config:
             raise ConfigError("preferences: scan has no preference entries")
         if role not in ROLES or (key not in ROLES and area not in areas):
             raise ConfigError("preferences: unknown role or area")
-        if not isinstance(order, list) or not order or len(set(order)) != len(order):
+        if (not isinstance(order, list) or not order or any(type(v) is not str for v in order)
+                or len(set(order)) != len(order)):
             raise ConfigError("preferences: expected a nonempty list of distinct vendors")
         for vendor in order:
             if vendor not in declared:
@@ -643,7 +662,7 @@ def load(path: str | Path, *, home: Path | None = None) -> Config:
         except re.error:
             raise ConfigError(f'scheduling.{key}: invalid regular expression') from None
     for vendor in vendors:
-        if vendor.cache_dirs:
+        if vendor.adapter == "codex":
             for cache in (config.environment.gocache, config.environment.gomodcache,
                           config.environment.gotmpdir, config.environment.node_compile_cache):
                 if cache not in vendor.cache_dirs:

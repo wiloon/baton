@@ -832,3 +832,10 @@ def test_analyst_requests_the_resolved_alias_identifier(host):
     assert host.run()[0]['state'] == 'success'
     args = host.calls()[0]['args']
     assert args[args.index('--model') + 1] == 'claude-opus-5-5'
+
+@pytest.mark.parametrize("event", ["tool_use", "tool_result"])
+def test_nested_claude_tool_events_invalidate_analysis(event):
+    from baton import retrospective_analyst
+
+    raw = json.dumps({"type": "assistant", "message": {"content": [{"type": event}]}}).encode()
+    assert retrospective_analyst.parse_response("claude", raw)[-1] is True

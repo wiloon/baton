@@ -5,7 +5,7 @@ Checks the vendor can run, counts the run, opens its telemetry record, runs the 
 (baton.agents) with the exporters set on that child only, and settles how it ended
 (baton.settle). Prints JSON for the bash caller, which keeps `defer_vendor` (it
 exits the item's subshell):
-    status   how it ended; "deferred" when the vendor cannot run now; "" for an unknown vendor
+    status   how it ended; "deferred" when the vendor cannot run now; "" for rejected requests
     outcome  the RESULT:/REVIEW:/SPEC:/... line
     reply    the agent's final message (untrusted: callers strip markers)
     model    the actual Claude or Codex model when reported
@@ -24,6 +24,13 @@ import time
 from . import agents, capacity, hooks as telemetry, notify, settle, vendors
 from .common import Request
 
+# Claude Code writes its prompt cache with a one-hour lifetime by default, at 2x the input price
+# against 1.25x for five minutes. These roles finish in minutes with no long wait between model calls
+# (all 11 Claude fix runs up to 2026-11-01 idled 22 s or less). dev runs long test suites between
+# calls, and a five-minute cache would expire and be written again.
+FIVE_MINUTE_CACHE_ROLES = ("spec_review", "spec", "review", "screenshot_review", "fix")
+
+
 SECRET_ROLES = ("dev", "fix")
 
 
@@ -31,7 +38,6 @@ SECRET_ROLES = ("dev", "fix")
 def configure(vendor, role, env):
     """(model, minutes, suffix, Request options) from the runner's configuration."""
     env = session.resolve(env)
-    adapter = agents.ADAPTERS[vendor]
     runtime = env.runtime
     models = env.config.models
     followup = (
@@ -41,7 +47,18 @@ def configure(vendor, role, env):
     )
     route = models.route(role, vendor, followup=followup)
     settings = env.config.vendor(vendor)
-    return route.model, settings.max_minutes, adapter.LOG_SUFFIX, adapter.dispatch_options(env, role, route, settings)
+    if vendor == "claude":
+        return route.model, settings.max_minutes, "", {
+            "fallback_models": " ".join(settings.fallback_models),
+            "budget": str(getattr(models, "budget_" + role)),
+            "repo": str(env.dirs.clone), "subagent_model": route.subagent_model,
+            "context_dir": str(env.dirs.ctx), "effort": route.effort}
+    if vendor == "cursor":
+        return route.model, settings.max_minutes, "", {}
+    return route.model, settings.max_minutes, "-codex", {
+        "effort": route.effort, "fallback_models": " ".join(settings.fallback_models),
+        "add_dirs": list(map(str, env.caches)), "shots_dir": runtime.shots_dir,
+        "skills_dir": env.skills}
 
 
 def secret_overrides(env, role):
@@ -65,8 +82,13 @@ def secret_overrides(env, role):
 @session.scoped
 def dispatch(vendor, role, prompt, tag, cwd, settings="", output="", env=None, hooks=None):
     env = session.resolve(env)
-    if vendor not in agents.ADAPTERS:
-        return _dispatch(vendor, role, prompt, tag, cwd, settings, output, env, hooks)
+    why = (f"unknown vendor {vendor}" if vendor not in agents.ADAPTERS
+           else env.config.admission_error(vendor, role))
+    if why:
+        outcome = f"RESULT: failed {why}"
+        print(outcome, file=sys.stderr)
+        return {"rc": 1, "status": "", "outcome": outcome, "reply": None,
+                "model": "", "defer": "", "log": ""}
     with capacity.lease(env.config.paths.state, vendor) as available:
         if not available:
             return {"rc": 75, "status": "deferred", "outcome": "", "reply": None,
@@ -78,23 +100,17 @@ def _dispatch(vendor, role, prompt, tag, cwd, settings, output, env, hooks):
     # Cooldowns and run counts are the machine's; the run's log is its repository's.
     state, logs = str(env.config.paths.state), str(env.dirs.logs)
     cooldown_hours = int(env.config.scheduling.cooldown_hours or agents.COOLDOWN_HOURS)
-    adapter = agents.ADAPTERS.get(vendor)
 
     def result(rc, status, outcome, reply=None, model="", defer="", log=""):
         return {"rc": rc, "status": status, "outcome": outcome, "reply": reply, "model": model, "defer": defer, "log": log}
 
-    if adapter is None:
-        outcome = f"RESULT: failed unknown vendor {vendor}"
-        notify.log(outcome)
-        print(outcome, file=sys.stderr)
-        return result(1, "", outcome)
     if why := vendors.vendor_blocked(state, vendor):
         return result(75, "deferred", "", defer=why)
     settle.count_run(state, vendor)
     model, minutes, suffix, options = configure(vendor, role, env)
-    if adapter.DISPATCH_SETTINGS:
+    if vendor == "claude":
         options["settings"] = settings
-    if adapter.DISPATCH_OUTPUT:
+    elif vendor == "codex":
         options["output"] = output
     if outcome := agents.preflight(vendor):
         deadline = str(int(time.time()) + cooldown_hours * 3600)
@@ -105,11 +121,11 @@ def _dispatch(vendor, role, prompt, tag, cwd, settings, output, env, hooks):
     hooks = hooks or telemetry.from_env(env, issue=env.runtime.issue, pr=env.runtime.pr, round=env.runtime.round)
     run = hooks.begin(vendor, role, minutes, requested_model=model)
     child_overrides = hooks.child_env(vendor, role, run)
-    if adapter.FIVE_MINUTE_CACHE and role in getattr(adapter, "FIVE_MINUTE_CACHE_ROLES", ()):
+    if vendor == "claude" and role in FIVE_MINUTE_CACHE_ROLES:
         child_overrides["FORCE_PROMPT_CACHING_5M"] = "1"
     child_overrides.update(secret_overrides(env, role))
     request = Request(vendor=vendor, role=role, prompt=prompt, cwd=Path(cwd), log=run_log, minutes=minutes,
-                      model=model, otel=adapter.OTEL and bool(run), env=child_overrides, **options)
+                      model=model, otel=vendor == "codex" and bool(run), env=child_overrides, **options)
     try:
         ran = agents.run(request, cooldown_hours)
     except Exception as error:
@@ -122,8 +138,7 @@ def _dispatch(vendor, role, prompt, tag, cwd, settings, output, env, hooks):
         ran.cooldown_until = int(time.time()) + env.config.models.busy_minutes * 60
     if ran.killed:
         notify.log(f"killed {tag} after {minutes} min")
-    label = adapter.MODEL_LOG_LABEL
-    identity = f"{label}={ran.model or 'unknown'} " if label else ""
+    identity = f"claude_model={ran.model or 'unknown'} " if vendor == "claude" else ""
     notify.log(f"end {tag} rc={ran.rc} {identity}{ran.summary}")
     rc, outcome, defer = settle.settle(state, vendor, ran.status, ran.rc, str(run_log), tag,
                                        "" if ran.cooldown_until is None else str(ran.cooldown_until),

@@ -284,7 +284,8 @@ class SummaryContractTest(unittest.TestCase):
                 patch.object(t, 'CONFIG_PATH', None):
             ledger = t.Ledger(state)
             for role in ROUTE_ROLES:
-                args = ['telemetry.py', '--state', state, 'begin', 'codex', role, '123', '60',
+                args = ['telemetry.py', '--runner-config', str(root / 'config.example.toml'),
+                        '--state', state, 'begin', 'codex', role, '123', '60',
                         '7', '8', '1', '--repo', 'test/repo']
                 with patch.object(sys, 'argv', args), patch('builtins.print') as printed:
                     t.main()
