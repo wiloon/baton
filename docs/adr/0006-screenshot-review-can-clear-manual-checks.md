@@ -72,3 +72,8 @@ verified is not "every check verified". `none` and `defer` are separate paths an
   replaces it before merging (written after usable verdicts, removed otherwise) and removes it
   when the merge fails, so a file left by a failed attempt cannot hide a retry's checks from the
   tracking issue.
+- Issue #94: the saved remainder also records the checks it was computed from. The tracker uses
+  it only when the merged PR's body has one well-formed checks section with exactly those checks;
+  otherwise it sends every current check. Under `defer` the merge goes ahead even when the checks
+  changed between the merge step's two reads of the body, so a remainder computed from the
+  earlier read could otherwise hide a check added in between.
