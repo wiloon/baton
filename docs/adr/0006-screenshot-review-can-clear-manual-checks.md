@@ -19,8 +19,11 @@ screenshot review comment, ## Checks (numbered as the prompt numbered the PR's c
   1. verified                 the screenshots show it and it looks right
   2. broken — <why>           they show it is wrong (also a Must fix)
   3. owner — <why>            no screenshot can show it, or the reviewer is not sure
+                              (or a design disagreement the fixer and reviewer could not settle, #96)
+## Design findings (#96): open findings, each naming the checks it blocks
 
 merge gate (manual_checks = "gate"), after review passed and CI is green
+  a check named by an open design finding counts as not verified
   every check verified          -> merge; the screenshots still go to Telegram
   any check not verified        -> ready-for-human, listing only those checks
   no usable verdicts            -> ready-for-human, as before
@@ -83,3 +86,10 @@ verified is not "every check verified". `none` and `defer` are separate paths an
   written before the rename keep working; the runner writes only the new name. One module
   (`baton/checks.py`) reads and writes the section, and shared prompt rules live in
   `bin/partials/`.
+- Issue #96: `verified` also requires that no open design finding names the check. The
+  screenshot reviewer now reviews as a UI/UX designer too, and the owner decided design findings
+  are settled between the reviewer and the fixer rather than merged unseen as Nits. The gate
+  enforces this from the comment's `## Design findings` section, not from the reviewer's
+  `## Checks` line alone: a named check is not verified whatever its line says, and a missing
+  section or a finding without a valid check number reads as no usable verdicts. A check left for
+  an open finding is handed off with the finding and the fixer's answer, when there is one.

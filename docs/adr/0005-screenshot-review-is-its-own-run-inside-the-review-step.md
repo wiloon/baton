@@ -16,8 +16,9 @@ so the existing fix loop consumes them unchanged.
 review round N  (repo.screenshot_review, manual checks, and eligible PR/reviewer)
   code review run         role=review              -> PR review comment
   screenshot review run   role=screenshot_review   -> PR comment with "## Screenshots" verdicts
-  after both succeed: round verdict = changes if either run reports a Must fix
-fix                        reads both, re-shoots every manual-check item
+  after both succeed: round verdict = changes if either run reports a Must fix,
+                      or the screenshot review lists an open design finding (#96)
+fix                        reads both, answers Must fix and design findings, re-shoots every manual-check item
 ```
 
 ## Considered options
@@ -50,6 +51,13 @@ fix                        reads both, re-shoots every manual-check item
 - After a successful code review (`pass` or `changes`), checkpoint its result before starting
   screenshot review. A deferral resumes that step using the saved code verdict. A failed review
   hands off the PR via `review_failed`.
+- Design findings (#96) are settled between the screenshot reviewer and the fixer. The runner,
+  not the reviewer's `REVIEW:` line, decides that an open `## Design findings` item keeps the
+  loop going; `REVIEW: pass` still means "no Must fix". The fixer answers each finding under
+  its own `## Design findings` reply section, and the next screenshot review judges the answers.
+  When the rounds run out with only design findings open, the PR goes to the merge gate (ADR
+  0006), which leaves the blocked checks to the owner, instead of a `review_limit` hand-off.
+  When feedback is cut, the design findings survive with the Must fix section.
 
 ## Revision record
 
@@ -57,3 +65,5 @@ fix                        reads both, re-shoots every manual-check item
   exclusions, and how a split review round resumes and hands off.
 - Issue #103: express candidate and skip rules through role eligibility and adapter capabilities
   so the existing review workflow applies to the configured registry.
+- Issue #96: open design findings also make the round's verdict `changes` and reach the fixer,
+  so a design problem the owner decided the pipeline settles cannot end the loop as `pass`.
