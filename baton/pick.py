@@ -27,7 +27,7 @@ def choose(env, role, current, mode, candidates, *, pr="", exclude="", issue="",
     area = vendors.task_area(env.repo.gh_repo, pr, issue) if vendors.area_keys(role, env) else ""
     result, rc = vendors.pick(state, pool, role, candidates, current, pr, exclude.split(), area=area, **kwargs)
     if rc == 75:
-        raise Deferred("pool", result["reason"])
+        raise Deferred("pool", result["reason"], lends_slot=result["lends_slot"])
     vendor = result["vendor"]
     try:
         notify.log("selection: " + vendors.selection_details(state, pool, candidates, vendor, role, area=area))

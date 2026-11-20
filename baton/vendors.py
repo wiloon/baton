@@ -273,16 +273,17 @@ def _quota_horizon(state, vendor, now):
                          config.quota_five_hour_max, now) or vendor_policy.SHORT
 
 
-def _waiting_for_cross_vendor(fallback, runnable, blocked, horizons):
+def _waiting_for_cross_vendor(fallback, runnable, blocked, horizons, slot_blockers):
     """ADR 0002: when only the same-vendor FALLBACK could run, but another vendor is blocked
-    just for a short while, the reason to wait for it; "" when the fallback may run."""
+    just for a short while, return its wait reason and whether the wait can lend a slot."""
     if not fallback or list(runnable) != [fallback]:
-        return ""
-    short = [f"{vendor} ({why})" for vendor, why in blocked.items()
-             if vendor != fallback and horizons.get(vendor) == vendor_policy.SHORT]
+        return "", False
+    short = {vendor: why for vendor, why in blocked.items()
+             if vendor != fallback and horizons.get(vendor) == vendor_policy.SHORT}
     if not short:
-        return ""
-    return f"waiting for {', '.join(short)} instead of same-vendor {fallback}"
+        return "", False
+    details = ", ".join(f"{vendor} ({why})" for vendor, why in short.items())
+    return f"waiting for {details} instead of same-vendor {fallback}", bool(slot_blockers.intersection(short))
 
 
 def _quota_pick(state, vendors, now, current=None, prefer=()):
@@ -361,6 +362,7 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
     ordered = ([current, *candidates] if by == "pool" else candidates)
     ready, blocked, probe = [], {}, []
     horizons = {}   # blocked vendor -> vendor_policy.SHORT or LONG
+    slot_blockers = set()
     for vendor in ordered:
         if vendor in ready or vendor in blocked or vendor in excluded:
             continue
@@ -371,6 +373,8 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
         if why:
             blocked[vendor] = why
             horizons[vendor] = status.horizon
+            if status.reason in ("vendor_cooldown", "quota_stale"):
+                slot_blockers.add(vendor)
             continue
         if vendor in (*pool, "cursor") and quota.stale(state, vendor, now,
                                                        int(session.resolve().config.quota.quota_stale_minutes)):
@@ -381,6 +385,8 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
         why = status.detail
         if why:
             blocked[fallback] = why
+            if status.reason in ("vendor_cooldown", "quota_stale"):
+                slot_blockers.add(fallback)
         else:
             ready.append(fallback)
             if quota.stale(state, fallback, now, int(session.resolve().config.quota.quota_stale_minutes)):
@@ -388,12 +394,13 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
     if probe_only:
         return {"vendor": "", "reason": "", "probe": probe, "blocked": blocked}, 0
     if by == "pool":
-        if waiting := _waiting_for_cross_vendor(fallback, ready, blocked, horizons):
-            return {"vendor": "", "reason": waiting, "probe": [], "blocked": blocked}, 75
+        waiting, lends_slot = _waiting_for_cross_vendor(fallback, ready, blocked, horizons, slot_blockers)
+        if waiting:
+            return {"vendor": "", "reason": waiting, "probe": [], "blocked": blocked, "lends_slot": lends_slot}, 75
         if not ready:
             details = "".join(f"; {v}: {why}" for v, why in blocked.items())
             return {"vendor": "", "reason": f"no vendor can run now{details}",
-                    "probe": [], "blocked": blocked}, 75
+                    "probe": [], "blocked": blocked, "lends_slot": bool(slot_blockers)}, 75
         try:
             chosen, summary = _quota_pick(state, ready, now, current, prefer)
         except Exception:
@@ -401,7 +408,7 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
                     "quota_error": True}, 0
         if not chosen:
             return {"vendor": "", "reason": f"quota limits: {summary}",
-                    "probe": [], "blocked": blocked}, 75
+                    "probe": [], "blocked": blocked, "lends_slot": True}, 75
         if chosen == current or len(ready) < 2:
             preferred = ""
         return {"vendor": chosen, "reason": preferred + summary, "probe": [], "blocked": blocked}, 0
@@ -419,15 +426,17 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
             if not chosen:
                 blocked[vendor] = f"quota {summary}"
                 horizons[vendor] = _quota_horizon(state, vendor, now)
+                slot_blockers.add(vendor)
                 continue
         eligible.append(vendor)
     blocked = {vendor: blocked[vendor] for vendor in ordered if vendor in blocked}
-    if waiting := _waiting_for_cross_vendor(fallback, eligible, blocked, horizons):
-        return {"vendor": "", "reason": waiting, "probe": [], "blocked": blocked}, 75
+    waiting, lends_slot = _waiting_for_cross_vendor(fallback, eligible, blocked, horizons, slot_blockers)
+    if waiting:
+        return {"vendor": "", "reason": waiting, "probe": [], "blocked": blocked, "lends_slot": lends_slot}, 75
     if not eligible:
         details = "".join(f"; {v}: {why}" for v, why in blocked.items())
         return {"vendor": "", "reason": f"no vendor can run now{details}",
-                "probe": [], "blocked": blocked}, 75
+                "probe": [], "blocked": blocked, "lends_slot": bool(slot_blockers)}, 75
     if fallback in eligible and any(v != fallback for v in eligible):
         eligible.remove(fallback)
     counts = {v: contrib_of(pr_state, pr, v) for v in eligible}
