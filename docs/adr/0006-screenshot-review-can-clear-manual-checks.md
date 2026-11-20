@@ -28,6 +28,10 @@ merge gate (manual_checks = "gate"), after review passed and CI is green
   any check not verified        -> ready-for-human, listing only those checks
   no usable verdicts            -> ready-for-human, as before
 manual_checks = "defer"         -> merge; only the unverified checks go to "Checks to try"
+                                   (a check blocked by a design finding goes there with the finding)
+any round's open design finding or disagreement that no current check carries
+                                -> ready-for-human, whatever manual_checks says, even when
+                                   the checks section is `none` (#96)
 ```
 
 "No usable verdicts" covers every case where the runner can't be sure: no screenshot review in
@@ -35,7 +39,8 @@ the last round (setting off, owner-authored PR, Cursor review), a `## Checks` se
 exactly one valid verdict per check, a PR description whose checks changed after the review,
 a description whose checks section is missing, repeated or empty (no item to verify), and one
 that carries both the old and the new heading. Missing information never merges: zero items
-verified is not "every check verified". `none` and `defer` are separate paths and are unchanged.
+verified is not "every check verified". `none` and `defer` are separate paths and are unchanged, except
+that an unsettled design finding with no current check to carry it goes to the owner (#96).
 
 ## Considered options
 
@@ -93,3 +98,11 @@ verified is not "every check verified". `none` and `defer` are separate paths an
   `## Checks` line alone: a named check is not verified whatever its line says, and a missing
   section or a finding without a valid check number reads as no usable verdicts. A check left for
   an open finding is handed off with the finding and the fixer's answer, when there is one.
+- Issue #96, round 2: the gate reads the open findings and disagreements the review loop
+  carried across all its rounds (ADR 0005), not only the last comment, matched to the current
+  checks by text. Under `defer` a blocked check is an unverified check like any other: the merge
+  goes ahead and the check reaches "Checks to try" with the finding, so the owner still sees it;
+  `defer` keeps its meaning. A finding or disagreement that no current check carries (the checks
+  changed, or the section became `none`, after the review that raised it) has no check to defer
+  or hand off, so it sends the PR to ready-for-human in every mode, per "missing information never
+  merges".

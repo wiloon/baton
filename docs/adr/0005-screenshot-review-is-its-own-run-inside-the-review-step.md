@@ -58,6 +58,22 @@ fix                        reads both, answers Must fix and design findings, re-
   When the rounds run out with only design findings open, the PR goes to the merge gate (ADR
   0006), which leaves the blocked checks to the owner, instead of a `review_limit` hand-off.
   When feedback is cut, the design findings survive with the Must fix section.
+- The runner tracks the design exchange itself and does not trust a later review to repeat it.
+  A fix comment carries its round (`<!-- baton-fix by=<vendor> round=<n> -->`), so the next
+  screenshot review is given the answers to its own previous findings. That review must judge
+  every previous finding exactly once under `## Design answers`. A finding with no valid,
+  single answer stays open. A held finding the fixer adopted stays open. A held finding the
+  fixer rejected is a disagreement for the owner. The loop's checkpoint carries open findings
+  and disagreements (with the text of the checks they block) across rounds and a deferred
+  resume, so a later review that omits them, or a later round with no screenshot review, cannot
+  drop them.
+- A fix run that commits nothing is not a `no_commit` hand-off when its reply answers every
+  design finding (all `rejected`) and the feedback had no Must fix item: the next round's
+  screenshot review judges the rejections. The fixer still re-shoots as the fix rules say.
+- Design findings, and the fixer's answers given to the next screenshot review, are complete
+  numbered records: they are never cut inside an item. If they do not fit
+  `review_context_max_chars` whole, the PR goes to the owner (`review_failed`) instead of the
+  loop sending a partial exchange.
 
 ## Revision record
 
@@ -67,3 +83,7 @@ fix                        reads both, answers Must fix and design findings, re-
   so the existing review workflow applies to the configured registry.
 - Issue #96: open design findings also make the round's verdict `changes` and reach the fixer,
   so a design problem the owner decided the pipeline settles cannot end the loop as `pass`.
+- Issue #96, round 2: a rejection-only fix round is a valid outcome, the runner validates the
+  design answers and carries open findings and disagreements across rounds, and an exchange
+  that does not fit the context budget is handed off whole instead of cut, so an incomplete
+  exchange can never clear a check.
