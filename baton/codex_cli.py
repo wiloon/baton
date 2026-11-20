@@ -10,6 +10,28 @@ from pathlib import Path
 
 from .common import Run, changed, child_env, events, git, read, restore, run_cli, strip_markers
 
+ID = "codex"
+DISPLAY_NAME = "Codex"
+ANALYST_ALIAS = "codex_fast"
+SUPPORTED_ROLES = frozenset({
+    "dev", "fixer", "reviewer", "screenshot_reviewer", "spec_reviewer", "reviser",
+    "retrospective",
+})
+QUOTA_SOURCE = "probe-run"
+QUOTA_WINDOWS = frozenset({"five_hour", "seven_day"})
+IMAGES = True
+SCAN = False
+SKIP_SCREENSHOT_AFTER_REVIEW = False
+ROUTE_FIELDS = frozenset({"model", "effort"})
+EMPTY_MODEL_OK = True
+RECORDS_AUTHOR_MODEL = True
+DEFAULT_MAX_MINUTES = 60
+PREFLIGHT_CHECKS = (("codex", "--version"), ("codex", "login", "status"))
+VERSION_EXECUTABLE = "codex"
+PROBE_SENDS_MODEL = False
+RUNS_STEM = "codex-runs"
+OTEL = "http://127.0.0.1:4318/v1/"
+
 # The terminal verdict each role may end with (its final message's last line).
 VERDICTS = {
     "review": ("REVIEW: pass", "REVIEW: changes"),
@@ -19,7 +41,6 @@ VERDICTS = {
     "spec_review": ("SPEC: accept", "SPEC: changes", "SPEC: reject"),
     "dev": ("RESULT: ready",),
 }
-OTEL = "http://127.0.0.1:4318/v1/"
 # Fixed context the runner's agents never use (measured with codex-cli 0.163.0: a "reply
 # ok" run in a mid-sized repository goes from 17.2K to 14.8K input tokens). The Matt skills reach Codex
 # as plain paths in the prompt, so the skills listing only names Codex's own.

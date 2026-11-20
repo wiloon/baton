@@ -31,7 +31,7 @@ import subprocess
 import sys
 import time
 
-from . import checks as check_section, claude_cli, dispatch, e2e_gate, fix, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, review, vendors
+from . import agents, checks as check_section, claude_cli, dispatch, e2e_gate, fix, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, review, vendors
 from .common import Deferred, changed, git, permission_denials, push, restore, strip_markers
 
 REPLY_CAP = 60000
@@ -82,6 +82,10 @@ def spec_state(env, issue):
         return "none", 0
     last = found[-1]
     return last["k"] + ("-human" if last["h"] else ""), int(last["r"])
+
+
+def pending_role(kind):
+    return "reviser" if kind in ("review", "reply-human") else "spec_reviewer"
 
 
 @session.scoped
@@ -253,7 +257,7 @@ class Spec:
     def record(self, vendor, model):
         if not self.pr:
             return
-        if vendor == "codex":
+        if agents.ADAPTERS[vendor].RECORDS_AUTHOR_MODEL:
             vendors.record_author_model(self.state, self.pr, vendor, model or "unknown")
         vendors.record_author(self.state, self.pr, vendor)
 
@@ -385,7 +389,7 @@ class Spec:
         reviser = self.pick("reviser", list(env.config.quota.vendor_pool), last_vendor, other_model,
                             spec_followup=claude_followup)
         self.mark_base(round)
-        template = self.self_dir / (f"codex-spec-prompt.md" if reviser == "codex" else "spec-prompt.md")
+        template = self.self_dir / ("codex-spec-prompt.md" if reviser == "codex" else "spec-prompt.md")
         prompt = self.render(
             template, ISSUE=n, GH_REPO=self.repo, WORKTREE=str(wt), BRANCH=self.branch, ROUND=str(round),
             CONTEXT_FILE=str(context), OUT=out_base)
@@ -469,7 +473,7 @@ class Spec:
         False when the owner or a failure took over. Deferred when a vendor cannot run now."""
         n, env = self.issue, self.env
         kind, round = spec_state(env, n)
-        if kind in ("review", "reply-human"):
+        if pending_role(kind) == "reviser":
             step = "revise"   # the reviewer asked for changes, or the owner answered
         elif kind == "reply":
             step, round = "review", round + 1   # a reviser revised; the spec is reviewed again

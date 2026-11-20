@@ -4,6 +4,26 @@ import re
 
 from .common import Run, child_env, events, last_result, outcome_line, read, run_cli
 
+ID = "claude"
+DISPLAY_NAME = "Claude"
+ANALYST_ALIAS = "claude_strong"
+SUPPORTED_ROLES = frozenset({
+    "dev", "fixer", "reviewer", "screenshot_reviewer", "spec_reviewer", "reviser",
+    "retrospective", "scan",
+})
+QUOTA_SOURCE = "probe-run"
+QUOTA_WINDOWS = frozenset({"five_hour", "seven_day"})
+IMAGES = True
+SCAN = True
+SKIP_SCREENSHOT_AFTER_REVIEW = False
+ROUTE_FIELDS = frozenset({"model", "effort", "subagent_model"})
+EMPTY_MODEL_OK = False
+RECORDS_AUTHOR_MODEL = False
+DEFAULT_MAX_MINUTES = 150
+PREFLIGHT_CHECKS = (("claude", "--version"),)
+VERSION_EXECUTABLE = "claude"
+PROBE_SENDS_MODEL = True
+RUNS_STEM = "runs"
 KINDS = ("RESULT", "REVIEW", "VERDICT", "SCAN", "SPEC")
 MODEL = re.compile(
     r"(?P<prefix>claude-)?(?P<family>opus|sonnet|haiku)(?P<version>(?:-[0-9]+)*?)(?:-(?P<snapshot>[0-9]{8}))?"

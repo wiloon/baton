@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 import time
 
-from . import quota, session, settle, vendor_policy
+from . import agents, quota, session, settle, vendor_policy
 from .config import ConfigError, load
 
 
@@ -43,8 +43,8 @@ def run(config):
                 return True
 
             try:
-                attempted = settle.probe(str(state), str(config.paths.logs), vendor,
-                                         settings.quota_probe_model_claude, needed=needed)
+                model = config.probe_model(vendor) if agents.ADAPTERS[vendor].PROBE_SENDS_MODEL else ""
+                attempted = settle.probe(str(state), str(config.paths.logs), vendor, model, needed=needed)
                 now = time.time()
                 fresh = (quota.fresh(state, vendor, now, settings.quota_stale_minutes)
                          and quota.credential_current(state, vendor, now))

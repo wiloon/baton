@@ -65,7 +65,7 @@ def availability(state, settings, vendor, now, *, strict=False, leased=False):
         return Availability('quota_stale', 'quota observations invalid', True, SHORT)
     if not quota.fresh(state, vendor, now, settings.quota_stale_minutes):
         return Availability('quota_stale', 'quota observations stale or unavailable', True, SHORT)
-    cap = getattr(settings, f'quota_cap_{vendor}')
+    cap = settings.cap_of(vendor)
     _, blocked = quota.assess(snap, cap, settings.quota_five_hour_max, now)
     if not blocked:
         return Availability()
@@ -80,7 +80,7 @@ def choose(state, settings, pool, candidates, now, *, prefer=(), current='', ext
     """
     candidates = list(dict.fromkeys(candidates))
     snapshots = {v: quota.load(state, v) for v in candidates}
-    caps = {v: getattr(settings, f'quota_cap_{v}') for v in candidates}
+    caps = {v: settings.cap_of(v) for v in candidates}
     if not extras:
         return quota.pick(candidates, snapshots, caps, settings.quota_five_hour_max, now, current, prefer)
     pooled = [v for v in candidates if v in pool]

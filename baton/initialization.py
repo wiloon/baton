@@ -39,7 +39,8 @@ def skills_directory(root: Path) -> Path | None:
 
 def cache_directories(config: Config, ambient: Mapping[str, str], uid: int) -> tuple[Path, ...]:
     runtime = Path(ambient.get('XDG_RUNTIME_DIR') or '/tmp')
-    return (*config.models.codex_cache_dirs, runtime / f'pnpm-store-operation-locks-{uid}')
+    caches = config.vendor("codex").cache_dirs if "codex" in config.declared() else ()
+    return (*caches, runtime / f'pnpm-store-operation-locks-{uid}')
 
 
 def child_environment(config: Config, ambient: Mapping[str, str], repo=None) -> dict[str, str]:
@@ -58,7 +59,8 @@ def child_environment(config: Config, ambient: Mapping[str, str], repo=None) -> 
     env = {key: value for key, value in ambient.items()
            if key not in internal and not key.startswith(('PREFER_', 'MODEL_CODEX_', 'EFFORT_CODEX_',
                                                         'SUBAGENT_MODEL_', 'MAX_RUNS_PER_DAY', 'MAX_CODEX_RUNS_PER_DAY',
-                                                        'MAX_CURSOR_RUNS_PER_DAY'))}
+                                                        'MAX_CURSOR_RUNS_PER_DAY', 'QUOTA_CAP_', 'MAX_MINUTES',
+                                                        'CURSOR_MAX_MINUTES', 'CODEX_MAX_MINUTES'))}
     for key in ('VIRTUAL_ENV', 'PYTHONPATH', 'PYTHONHOME', 'UV_RUN_RECURSION_DEPTH', *RUNNER_KEYS, *(k for r in config.repos for k in r.secret_env_keys)):
         env.pop(key, None)
     inherited_path = ambient.get('PATH') or os.defpath

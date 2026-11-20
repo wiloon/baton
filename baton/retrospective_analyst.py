@@ -240,7 +240,18 @@ def parse_response(vendor, raw):
                    (isinstance(r.get('item'), dict) and r['item'].get('type') in
                     ('command_execution', 'file_change', 'mcp_tool_call', 'web_search'))
                    for r in rows)
+    if vendor == 'claude':
+        tool_use = tool_use or any(_claude_tool_event(row) for row in rows)
     return rows, reply, valid, actual, sorted(models) if isinstance(models, dict) else [], tool_use
+
+
+def _claude_tool_event(node):
+    if isinstance(node, dict):
+        return node.get('type') in ('tool_call', 'tool_use', 'tool_result') or any(
+            _claude_tool_event(value) for value in node.values())
+    if isinstance(node, list):
+        return any(_claude_tool_event(value) for value in node)
+    return False
 
 
 def approved_actual(vendor, model):
