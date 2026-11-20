@@ -33,3 +33,11 @@ Claude just as Codex out of its 5-hour window makes Claude's work wait for Codex
   blocked turns into a long block (weekly cap or long cooldown) that then allows the fallback.
 - Applies to every role that has a same-vendor fallback: code review, spec review and spec
   revision.
+- The wait applies to the deferred item. An agent PR waiting on quota or cooldown can lend its
+  `max_pending_prs` slot to another issue in the same repository. The repository can admit at
+  most one extra issue above the cap. Existing PR work keeps priority over new issues.
+
+## Revision record
+
+- Issue #99: let a quota-deferred PR lend its slot so work eligible for a free vendor can start
+  while the PR waits for independent review.
