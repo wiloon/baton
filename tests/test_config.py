@@ -36,7 +36,7 @@ def test_loading_is_typed_immutable_and_does_not_initialize(tmp_path, monkeypatc
     assert c.repos[0].secret_env_file == home / '.config/baton/env-files/acme/app/.secrets'
     with pytest.raises(FrozenInstanceError):
         c.scheduling.scan = True
-    assert isinstance(c.models.fallback_models_codex, tuple)
+    assert isinstance(c.vendor("codex").fallback_models, tuple)
 
 
 def test_repository_auto_merge_defaults_on_and_turns_off_per_repository(tmp_path):
@@ -53,11 +53,12 @@ def test_repository_auto_merge_defaults_on_and_turns_off_per_repository(tmp_path
     ('chain_max = 5', 'chain_max = true'),
     ('chain_max = 5', 'chain_max = 0'),
     ('chain_max = 5', 'chain_max = "secret-value"'),
-    ('quota_cap_claude = 0.9', 'quota_cap_claude = 1.1'),
-    ('quota_cap_claude = 0.9', 'quota_cap_claude = nan'),
-    ('quota_cap_claude = 0.9', 'quota_cap_claude = true'),
-    ('vendor_pool = ["claude", "codex"]', 'vendor_pool = ["cursor"]'),
-    ('vendor_pool = ["claude", "codex"]', 'vendor_pool = ["codex", "codex"]'),
+    ('cap = 0.90', 'cap = 1.1'),
+    ('cap = 0.90', 'cap = nan'),
+    ('quota = "pool"', 'quota = true'),
+    ('roles = ["dev", "fixer", "reviewer", "screenshot_reviewer", "spec_reviewer", "reviser", "retrospective", "scan"]',
+     'roles = ["bogus"]'),
+    ('quota = "pool"', 'quota = "both"'),
     ('effort = "medium" }', 'effort = "secret-value" }'),
     ('reviewer = ["claude", "codex"]', 'reviewer = ["unknown"]'),
     ('reviewer = ["claude", "codex"]', 'reviewer = []'),
@@ -98,12 +99,11 @@ def test_preferences_support_roles_and_areas(tmp_path):
     assert ('spec_reviewer_ui', ('codex', 'claude')) in c.preferences
 
 
-def test_the_shipped_config_routes_the_screenshot_review_for_all_three_vendors():
+def test_the_shipped_config_routes_the_screenshot_review_for_pool_vendors():
     c = config.load(ROOT / 'config.example.toml', home=Path('/nonexistent'))
-    routes = {vendor: c.models.route('screenshot_review', vendor) for vendor in ('claude', 'codex', 'cursor')}
+    routes = {vendor: c.models.route('screenshot_review', vendor) for vendor in ('claude', 'codex')}
     assert routes['codex'] == config.ModelRoute('gpt-6.1-terra', 'low')
     assert routes['claude'] == config.ModelRoute('opus', 'low')
-    assert routes['cursor'] == config.ModelRoute('auto')
     assert c.models.budget_screenshot_review == c.models.budget_review
     # The base route serves every round: a follow-up table is rejected, so none can replace it.
     assert c.models.route('screenshot_review', 'codex', followup=True) == routes['codex']
@@ -154,8 +154,9 @@ def test_cache_directories_must_be_writable_by_codex(tmp_path):
 
 def test_fractional_budget_and_integer_quota_are_supported(tmp_path):
     c = config.load(write(tmp_path, TEXT.replace('budget_review = 4', 'budget_review = 0.5')
-                          .replace('quota_cap_codex = 0.95', 'quota_cap_codex = 1')))
-    assert c.models.budget_review == 0.5 and c.quota.quota_cap_codex == 1.0
+                          .replace('cap = 0.95\nmax_minutes = 60\nfallback_models = ["codex_prev"',
+                                   'cap = 1\nmax_minutes = 60\nfallback_models = ["codex_prev"', 1)))
+    assert c.models.budget_review == 0.5 and c.cap("codex") == 1.0
 
 
 @pytest.mark.parametrize('old,new', [
@@ -175,8 +176,9 @@ def test_invalid_preference_suffix_and_empty_paths(tmp_path, old, new):
     ('codex = { model = "codex_fast", effort = "medium" }', 'codex = {}', 'models.routes.dev.codex.model'),
     ('codex = { model = "codex_fast", effort = "medium" }', 'codex = { model = "codex_fast", effort = "medium", typo = "" }', 'models.routes.dev.codex'),
     ('cursor = { model = "cursor_auto" }', 'cursor = { model = "cursor_auto", effort = "" }', 'models.routes.dev.cursor'),
-    ('fallback_models_codex = [', 'fallback_models_codex = ["missing", ', 'models.fallback_models_codex'),
-    ('quota_probe_model_claude = "claude_probe"', 'quota_probe_model_claude = "missing"', 'quota.quota_probe_model_claude'),
+    ('fallback_models = ["codex_prev", "codex_strong"]', 'fallback_models = ["missing", "codex_strong"]',
+     'vendors.codex.fallback_models'),
+    ('quota_probe_model = "claude_probe"', 'quota_probe_model = "missing"', 'vendors.claude.quota_probe_model'),
     ('model_codex = "codex_fast"', 'model_codex = "missing"', 'retrospectives.model_codex'),
     ('[models]', '[models]\ncodex_model = ""', r'models.aliases.*models.routes'),
 ])
@@ -200,7 +202,7 @@ def test_retrospective_aliases_default_and_preserve_legacy_opt_in(tmp_path):
 def test_alloy_model_filters_match_shipped_codex_config():
     cfg = config.load(ROOT / 'config.example.toml')
     identifiers = {route.model for _, vendor, route in cfg.models.routes if vendor == 'codex' and route.model}
-    identifiers.update(cfg.models.fallback_models_codex)
+    identifiers.update(cfg.vendor("codex").fallback_models)
     identifiers.add(cfg.retrospectives.model_codex)
     filters = re.findall(r'IsMatch\(attributes\["model"\], "\^\(([^"]+)\)\$"\)',
                          (ROOT / 'telemetry/codex.alloy').read_text())

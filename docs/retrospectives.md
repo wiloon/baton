@@ -65,11 +65,13 @@ output_chars = 20000
 budget_usd = 1.0
 ```
 
-The three model fields reference `[models.aliases]`. The example uses the built-in aliases,
-which default to `opus`, `gpt-6.2-sol`, and `grok-4.7-high` respectively. Omitting any model
-field uses its built-in alias. Family validation applies even when analysis is disabled.
+The model fields reference `[models.aliases]`. A vendor needs a `[vendors.<id>]` table
+with the `retrospective` role to use its model field. Without an explicit field, an eligible
+vendor uses its adapter's built-in alias, which defaults to `opus`, `gpt-6.2-sol`, or
+`grok-4.7-high` for Claude, Codex, or Cursor respectively. Family and role validation
+apply even when analysis is disabled.
 
-The machine-wide `quota.vendor_pool` / `quota.vendor_extra` still enables vendors. The new
+The `quota` field in each vendor table assigns its lane. The
 `preferences.retrospective` order overrides `preferences.reviewer`; when absent the reviewer
 order is reused. The shared `baton.vendor_policy` module supplies cooldown/capacity checks,
 quota pacing, close-tie preferences and the review policy for extras. Workload review retains its

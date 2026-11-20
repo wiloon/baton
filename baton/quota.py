@@ -15,7 +15,7 @@ Cursor's output carries none: refresh_cursor asks the dashboard API its IDE uses
                                print the vendor to use and a one-line summary; exit 1 if none
 """
 
-from . import session
+from . import agents, session
 import glob
 import json
 from contextlib import contextmanager
@@ -23,6 +23,7 @@ import fcntl
 import math
 import os
 from pathlib import Path
+import subprocess
 import sys
 import time
 import tempfile
@@ -31,6 +32,8 @@ import urllib.request
 WINDOW_SECONDS = {"five_hour": 5 * 3600, "seven_day": 7 * 24 * 3600}
 TIE = 0.05   # scores this close count as equal: preference, then pool order decides
 CURSOR_USAGE = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage"
+# Where cursor-agent >= 2026.11.19 keeps its login on Linux (secret-tool attributes).
+CURSOR_SECRET = ("service", "cursor-credentials", "account", "cursor-user")
 
 
 def _json_lines(lines):
@@ -107,11 +110,58 @@ def _fetch_cursor(token):
         return json.load(response)
 
 
-def refresh_cursor(state, now, auth=None, fetch=_fetch_cursor):
-    """Record Cursor's usage; {} when it isn't logged in here. Raises when the API fails."""
+class CursorLoginUnreadable(ValueError):
+    """auth.json records a Cursor login, but its access token can't be read."""
+
+
+def _secret_lookup():
+    """The credential cursor-agent keeps in the Secret Service (Linux), or None."""
     try:
-        token = json.loads(Path(auth or Path.home() / ".config/cursor/auth.json").read_text())["accessToken"]
-    except (OSError, ValueError, KeyError):
+        found = subprocess.run(["secret-tool", "lookup", *CURSOR_SECRET], capture_output=True, text=True,
+                               timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return found.stdout if found.returncode == 0 else None
+
+
+def cursor_token(auth, lookup=_secret_lookup):
+    """Cursor's access token; None when this machine has no Cursor login.
+
+    cursor-agent 2026.11.19 moved the login into the OS secret store and left only
+    {"storedIn": "os-secret-store"} in auth.json; older versions keep accessToken there.
+    Raises CursorLoginUnreadable when a login is recorded but no token comes back, so the
+    snapshot can't silently freeze at its last value."""
+    try:
+        stored = json.loads(Path(auth).read_text())
+    except OSError:
+        return None
+    except ValueError as error:
+        raise CursorLoginUnreadable(f"cursor auth.json is not JSON: {error}") from None
+    if not isinstance(stored, dict) or stored.get("signedOut") is True:
+        return None
+    if token := stored.get("accessToken"):
+        return token
+    if stored.get("storedIn") == "os-secret-store":
+        try:
+            token = json.loads(lookup() or "")["accessToken"]
+        except (ValueError, TypeError, KeyError):
+            token = None
+        if not token:
+            raise CursorLoginUnreadable("cursor login is in the OS secret store, but secret-tool returned no "
+                                        f"access token ({' '.join(CURSOR_SECRET)})")
+        return token
+    raise CursorLoginUnreadable("cursor auth.json has neither accessToken nor storedIn")
+
+
+def refresh_cursor(state, now, auth=None, fetch=_fetch_cursor, lookup=_secret_lookup):
+    """Record Cursor's usage; {} when it isn't logged in here. Raises when the login can't be
+    read (recording probe_failed) or the API fails."""
+    try:
+        token = cursor_token(auth or Path.home() / ".config/cursor/auth.json", lookup)
+    except CursorLoginUnreadable:
+        credential(state, 'cursor', 'probe_failed', now)
+        raise
+    if token is None:
         return {}
     windows = parse_cursor(fetch(token))
     if windows:
@@ -178,7 +228,7 @@ def record(state, vendor, windows, now):
 def fresh(state, vendor, now, minutes):
     """A probe attempt or a successful call without quota data is not an observation."""
     snap = load(state, vendor) or {}
-    required = {'seven_day'} if vendor == 'cursor' else {'five_hour', 'seven_day'}
+    required = set(agents.ADAPTERS[vendor].QUOTA_WINDOWS)
     try:
         windows = snap.get('windows') or {}
         return required <= windows.keys() and all(
@@ -308,7 +358,8 @@ def pick(vendors, snapshots, caps, five_hour_max, now, current=None, prefer=()):
 
 
 def main(argv):
-    state = str(session.resolve().config.paths.state)
+    cfg = session.resolve().config
+    state = str(cfg.paths.state)
     now = time.time()
     command, args = argv[0], argv[1:]
     if command == "record":
@@ -318,6 +369,9 @@ def main(argv):
         mark_probed(state, args[0], now)
         return 0
     if command == "refresh":
+        if reason := cfg.admission_error("cursor"):
+            print(reason, file=sys.stderr)
+            return 1
         print(json.dumps(refresh_cursor(state, now)))
         return 0
     if command == "credential":
@@ -333,9 +387,9 @@ def main(argv):
             else:
                 prefer = args[1].split()
             args = args[2:]
-        caps = {v: getattr(session.resolve().config.quota, f"quota_cap_{v}") for v in args}
+        caps = {v: cfg.cap(v) for v in args}
         chosen, summary = pick(args, {v: load(state, v) for v in args}, caps,
-                               float(session.resolve().config.quota.quota_five_hour_max), now, current,
+                               float(cfg.quota.quota_five_hour_max), now, current,
                                prefer)
         print(chosen or "")
         print(summary)

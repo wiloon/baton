@@ -71,7 +71,7 @@ def telegram(gh, monkeypatch, tmp_path):
     fake = Telegram()
     monkeypatch.setattr(notify.urllib.request, "urlopen", fake.urlopen)
     monkeypatch.setattr(notify.time, "sleep", lambda seconds: None)
-    gh.set(body="## Manual checks\n- Check the theme\n## Follow-ups\nnone\n")
+    gh.set(body="## Checks to verify\n- Check the theme\n## Follow-ups\nnone\n")
     return fake
 
 
@@ -128,11 +128,18 @@ def test_an_album_with_the_checks_on_the_first_shot(telegram, tmp_path):
     form = telegram.form(0)
     media = json.loads(form["media"])
     assert media[0] == {"type": "photo", "media": "attach://photo0", "caption":
-                        "PR #7: manual checks\nhttps://github.com/owner/app/pull/7\n01-theme-light.png\n- Check the theme"}
+                        "PR #7: checks left for you\nhttps://github.com/owner/app/pull/7\n01-theme-light.png\n- Check the theme"}
     assert media[1] == {"type": "photo", "media": "attach://photo1", "caption": "02-theme-dark.png"}
     assert form["chat_id"] == "42"
     assert form["photo0"] == ("01-theme-light.png", PNG) and form["photo1"][0] == "02-theme-dark.png"
     assert telegram.requests[0][3] == 120
+
+
+def test_the_caption_lists_only_the_checks_the_caller_says_are_left(telegram, tmp_path):
+    shot(tmp_path, "01-theme-light.png")
+    notify.send_shots(7, left=["Sign up", "Open a book"])
+    assert telegram.form(0)["caption"].endswith("01-theme-light.png\n- Sign up\n- Open a book")
+    assert "Check the theme" not in telegram.form(0)["caption"]
 
 
 def test_shots_sent_after_a_merge_say_so_in_the_caption(telegram, tmp_path):
@@ -181,7 +188,7 @@ def test_a_lone_shot_uses_send_photo(telegram, tmp_path):
     notify.send_shots(7)
     assert telegram.method(0) == "sendPhoto"
     form = telegram.form(0)
-    assert form["photo"][0] == "01-theme-light.png" and form["caption"].startswith("PR #7: manual checks\n")
+    assert form["photo"][0] == "01-theme-light.png" and form["caption"].startswith("PR #7: checks left for you\n")
 
 
 def test_caption_length_oversize_files_and_the_photo_cap(gh, telegram, tmp_path):
@@ -190,7 +197,7 @@ def test_caption_length_oversize_files_and_the_photo_cap(gh, telegram, tmp_path)
     large = shot(tmp_path, "00-large.png")
     with open(large, "r+b") as file:
         file.truncate(10 * 1024 * 1024 + 1)
-    gh.set(body="## Manual checks\n" + "主题" * 2000)
+    gh.set(body="## Checks to verify\n" + "主题" * 2000)
     notify.send_shots(7)
     media = [json.loads(telegram.form(i)["media"]) for i in range(len(telegram.requests))]
     assert [len(m) for m in media] == [10, 10]

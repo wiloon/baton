@@ -700,11 +700,14 @@ class Tick:
                 continue   # already has a PR
             # These issues can be at different steps: one whose next step no vendor can run now must
             # not block another (revision needs a pool vendor).
-            next_vendors = self.all_vendors()
-            if not spec.cursor_plan(self.env, str(n)) and spec.spec_state(self.env, str(n))[0] in ("review", "reply-human"):
-                next_vendors = list(self.env.config.quota.vendor_pool)
+            issue = str(n)
+            if spec.cursor_plan(self.env, issue):
+                role = "dev"
+            else:
+                role = spec.pending_role(spec.spec_state(self.env, issue)[0])
+            candidates = list(self.env.config.pool()) if role == "reviser" else self.all_vendors()
             try:
-                self.pick_vendor("next_vendor", "contrib", next_vendors)
+                self.pick_vendor(role, "contrib", candidates, issue=issue)
             except Deferred as deferred:
                 self.defer(deferred.vendor, deferred.reason)
                 continue
@@ -760,13 +763,27 @@ class Tick:
         if waiting >= max_waiting:
             self.log(f"no scan; {waiting} claude-found issue(s) still wait for Cursor")
             return None
+        if not self.env.config.for_role("scan"):
+            self.log("scan skipped: no vendor with scan role")
+            return None
         self.item(self.scan_item)
         return 0
 
     def scan_item(self):
-        why = vendors.vendor_blocked(str(self.runner_state), "claude")
-        if why:
-            return self.defer("claude", why)
+        scanners = self.env.config.for_role("scan")
+        if not scanners:
+            self.log("scan skipped: no vendor with scan role")
+            return None
+        vendor = ""
+        blocked = ""
+        for candidate in scanners:
+            status = vendors.vendor_blocked(str(self.runner_state), candidate)
+            if not status:
+                vendor = candidate
+                break
+            blocked = status
+        if not vendor:
+            return self.defer(scanners[0], blocked or f"{scanners[0]} blocked")
         path = self.state / "scan-area"
         try:
             index = int(path.read_text().strip()) % len(self.scan_areas)

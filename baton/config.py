@@ -13,6 +13,7 @@ import sys
 import tomllib
 from typing import get_type_hints
 
+from . import agents
 from .analyst_models import approved_model
 
 
@@ -83,7 +84,7 @@ class Repo:
     prompt_notes: Pairs
     # Agent commits get a Signed-off-by for their author before they are pushed (DCO, #44).
     signoff: bool = False
-    # "gate": a PR whose `## Manual checks` is not none waits for the owner. "defer": it merges,
+    # "gate": a PR whose checks section is not none waits for the owner. "defer": it merges,
     # and its checks go to one tracking issue for a later trial of the whole app (#48).
     manual_checks: str = "gate"
     # A second model reviews the manual-check screenshots, and fixers re-shoot them (#50).
@@ -109,12 +110,22 @@ def repo_dirs(paths, repo):
 
 
 ROUTE_ROLES = ("dev", "fix", "review", "screenshot_review", "spec_review", "spec", "scan")
+ROLE_ROUTE = {
+    "dev": "dev",
+    "fixer": "fix",
+    "reviewer": "review",
+    "screenshot_reviewer": "screenshot_review",
+    "spec_reviewer": "spec_review",
+    "reviser": "spec",
+    "scan": "scan",
+}
+ROUTE_ROLE = {route: role for role, route in ROLE_ROUTE.items()}
+COVERAGE_ROLES = ("dev", "fixer", "reviewer", "spec_reviewer", "reviser")
 BUILTIN_ALIASES = {
     "claude_strong": "opus",
     "codex_fast": "gpt-6.2-sol",
     "cursor_analyst": "grok-4.7-high",
 }
-ANALYST_ALIASES = {"claude": "claude_strong", "codex": "codex_fast", "cursor": "cursor_analyst"}
 
 
 @dataclass(frozen=True)
@@ -122,6 +133,19 @@ class ModelRoute:
     model: str
     effort: str = ""
     subagent_model: str = ""
+
+
+@dataclass(frozen=True)
+class Vendor:
+    id: str
+    adapter: str
+    roles: tuple[str, ...]
+    quota: str  # pool|extra
+    cap: float
+    max_minutes: int
+    fallback_models: tuple[str, ...] = ()
+    cache_dirs: tuple[Path, ...] = ()
+    quota_probe_model: str = ""
 
 
 @dataclass(frozen=True)
@@ -133,12 +157,6 @@ class ModelSettings:
     budget_spec_review: float
     budget_spec: float
     budget_scan: float
-    max_minutes: int
-    cursor_max_minutes: int
-    fallback_models_claude: tuple[str, ...]
-    fallback_models_codex: tuple[str, ...]
-    codex_max_minutes: int
-    codex_cache_dirs: tuple[Path, ...]
     busy_minutes: int
 
 
@@ -155,19 +173,30 @@ class Models(ModelSettings):
 
 
 @dataclass(frozen=True)
-class Quota:
-    vendor_pool: tuple[str, ...]
-    vendor_extra: tuple[str, ...]
-    quota_cap_claude: float
-    quota_cap_codex: float
-    quota_cap_cursor: float
+class QuotaSettings:
     quota_five_hour_max: float
     quota_stale_minutes: int
-    quota_probe_model_claude: str
     quota_probe_retry_minutes: int = 5
     quota_probe_max_retry_minutes: int = 60
-    # Same-vendor review waits for a vendor whose cooldown ends within this (ADR 0002).
     same_vendor_wait_max_minutes: int = 360
+
+
+@dataclass(frozen=True)
+class Quota:
+    quota_five_hour_max: float
+    quota_stale_minutes: int
+    caps: tuple[tuple[str, float], ...]
+    vendor_pool: tuple[str, ...]
+    vendor_extra: tuple[str, ...]
+    quota_probe_retry_minutes: int = 5
+    quota_probe_max_retry_minutes: int = 60
+    same_vendor_wait_max_minutes: int = 360
+
+    def cap_of(self, vendor):
+        caps = dict(self.caps)
+        if vendor not in caps:
+            raise ConfigError(f"quota: no cap configured for vendor {vendor}")
+        return caps[vendor]
 
 
 @dataclass(frozen=True)
@@ -212,9 +241,9 @@ class Retrospectives:
     # Legacy opt-in when enabled is absent: never used as a requested model.
     model: str = ""
     enabled: bool = False
-    model_claude: str = BUILTIN_ALIASES[ANALYST_ALIASES["claude"]]
-    model_codex: str = BUILTIN_ALIASES[ANALYST_ALIASES["codex"]]
-    model_cursor: str = BUILTIN_ALIASES[ANALYST_ALIASES["cursor"]]
+    model_claude: str = BUILTIN_ALIASES[agents.ADAPTERS["claude"].ANALYST_ALIAS]
+    model_codex: str = BUILTIN_ALIASES[agents.ADAPTERS["codex"].ANALYST_ALIAS]
+    model_cursor: str = BUILTIN_ALIASES[agents.ADAPTERS["cursor"].ANALYST_ALIAS]
     effort: str = "high"
     paused: bool = False
     settle_seconds: int = 300
@@ -231,6 +260,7 @@ class Config:
     paths: Paths
     scheduling: Scheduling
     repos: tuple[Repo, ...]
+    vendors: tuple[Vendor, ...]
     models: Models
     quota: Quota
     environment: Environment
@@ -247,13 +277,71 @@ class Config:
                 return repo
         raise ConfigError('repos: no such repository configured')
 
+    def vendor(self, vendor_id):
+        for vendor in self.vendors:
+            if vendor.id == vendor_id:
+                return vendor
+        raise ConfigError(f"vendors: no vendor {vendor_id}")
+
+    def declared(self):
+        return tuple(v.id for v in self.vendors)
+
+    def pool(self):
+        return tuple(v.id for v in self.vendors if v.quota == "pool")
+
+    def extra(self):
+        return tuple(v.id for v in self.vendors if v.quota == "extra")
+
+    def for_role(self, role, *, pool_only=False):
+        ids = tuple(v.id for v in self.vendors if role in v.roles and (not pool_only or v.quota == "pool"))
+        return ids
+
+    def allows(self, vendor_id, role):
+        try:
+            return role in self.vendor(vendor_id).roles
+        except ConfigError:
+            return False
+
+    def admission_error(self, vendor_id, route=None):
+        if vendor_id not in self.declared():
+            return f"vendor {vendor_id} is not declared"
+        if route is not None:
+            role = ROUTE_ROLE.get(route)
+            if role is None:
+                return f"unknown agent role {route}"
+            if vendor_id not in self.for_role(role, pool_only=role == "reviser"):
+                return f"vendor {vendor_id} cannot run {role}"
+        return ""
+
+    def cap(self, vendor_id):
+        return self.vendor(vendor_id).cap
+
+    def probe_model(self, vendor_id):
+        return self.vendor(vendor_id).quota_probe_model
+
 
 SECTIONS = {"paths": Paths, "scheduling": Scheduling, "models": ModelSettings,
-            "quota": Quota, "environment": Environment}
+            "quota": QuotaSettings, "environment": Environment}
 # Integrations a runner may go without (#328): no section, no integration.
 OPTIONAL = {"linear": Linear, "telegram": Telegram, "retrospectives": Retrospectives}
-VENDORS = {"claude", "codex", "cursor"}
-ROLES = {"dev", "reviewer", "fixer", "screenshot_reviewer", "spec_reviewer", "reviser", "retrospective"}
+VENDORS = frozenset(agents.ADAPTERS)
+ROLES = {"dev", "reviewer", "fixer", "screenshot_reviewer", "spec_reviewer", "reviser", "retrospective", "scan"}
+MOVED_QUOTA = {
+    "vendor_pool": 'declare vendors in [vendors] with quota = "pool"',
+    "vendor_extra": 'declare vendors in [vendors] with quota = "extra"',
+    "quota_cap_claude": "vendors.claude.cap",
+    "quota_cap_codex": "vendors.codex.cap",
+    "quota_cap_cursor": "vendors.cursor.cap",
+    "quota_probe_model_claude": "vendors.claude.quota_probe_model",
+}
+MOVED_MODELS = {
+    "max_minutes": "vendors.<id>.max_minutes",
+    "cursor_max_minutes": "vendors.cursor.max_minutes",
+    "codex_max_minutes": "vendors.codex.max_minutes",
+    "fallback_models_claude": "vendors.claude.fallback_models",
+    "fallback_models_codex": "vendors.codex.fallback_models",
+    "codex_cache_dirs": "vendors.codex.cache_dirs",
+}
 OTHER_AREA = "other"
 ENV_NAME = re.compile(r'[A-Z_][A-Z0-9_]*')
 # Variables the runner itself builds for the tools; a repository must not replace them.
@@ -321,7 +409,88 @@ def _model_alias(value, aliases, field):
     return aliases[value]
 
 
-def _model_routes(raw, aliases):
+def _reject_moved(data):
+    quota = data.get("quota")
+    if isinstance(quota, dict):
+        for key, hint in MOVED_QUOTA.items():
+            if key in quota:
+                raise ConfigError(f"quota.{key} moved to {hint}")
+    models = data.get("models")
+    if isinstance(models, dict):
+        for key, hint in MOVED_MODELS.items():
+            if key in models:
+                raise ConfigError(f"models.{key} moved to {hint}")
+
+
+def _load_vendors(raw, directory, home, aliases):
+    if not isinstance(raw, dict) or not raw:
+        raise ConfigError("vendors: expected at least one [vendors.ID] table")
+    known = set(VENDORS)
+    vendors = []
+    for vendor_id in sorted(raw):
+        entry = raw[vendor_id]
+        label = f"vendors.{vendor_id}"
+        if not isinstance(entry, dict):
+            raise ConfigError(f"{label}: expected a table")
+        adapter = entry.get("adapter", vendor_id)
+        if adapter != vendor_id:
+            raise ConfigError(f"{label}: table key must equal adapter")
+        if adapter not in known:
+            raise ConfigError(f"{label}.adapter: expected a registered adapter")
+        roles = entry.get("roles")
+        if not isinstance(roles, list) or not roles or any(type(r) is not str for r in roles):
+            raise ConfigError(f"{label}.roles: expected a nonempty array of role names")
+        if unknown := set(roles) - ROLES:
+            raise ConfigError(f"{label}.roles: unknown roles: {', '.join(sorted(unknown))}")
+        quota = entry.get("quota")
+        if quota not in ("pool", "extra"):
+            raise ConfigError(f"{label}.quota: expected pool or extra")
+        cap = entry.get("cap")
+        if type(cap) not in (int, float) or not math.isfinite(cap) or cap <= 0 or cap > 1:
+            raise ConfigError(f"{label}.cap: expected a fraction at most 1")
+        max_minutes = entry.get("max_minutes")
+        if type(max_minutes) is not int or max_minutes <= 0:
+            raise ConfigError(f"{label}.max_minutes: expected a positive integer")
+        supported = agents.ADAPTERS[adapter].SUPPORTED_ROLES
+        if unsupported := set(roles) - supported:
+            raise ConfigError(f"{label}.roles: adapter {adapter} does not support "
+                              f"{', '.join(sorted(unsupported))}")
+        if quota == "pool" and "seven_day" not in agents.ADAPTERS[adapter].QUOTA_WINDOWS:
+            raise ConfigError(f"{label}.quota: pool vendors need a weekly quota window")
+        extra = set(entry) - {"adapter", "roles", "quota", "cap", "max_minutes",
+                              "fallback_models", "cache_dirs", "quota_probe_model"}
+        if extra:
+            raise ConfigError(f"{label}: unknown fields: {', '.join(sorted(extra))}")
+        cli = agents.ADAPTERS[adapter]
+        adapter_fields = {
+            "fallback_models": adapter in ("claude", "codex"),
+            "cache_dirs": adapter == "codex",
+            "quota_probe_model": cli.PROBE_SENDS_MODEL,
+        }
+        for field, supported in adapter_fields.items():
+            if field in entry and not supported:
+                raise ConfigError(f"{label}.{field}: unsupported by {adapter}")
+        fallback = entry.get("fallback_models", [])
+        if not isinstance(fallback, list) or any(type(v) is not str or not v.strip() for v in fallback):
+            raise ConfigError(f"{label}.fallback_models: expected an array of strings")
+        fallback = tuple(_model_alias(alias, aliases, f"{label}.fallback_models") for alias in fallback)
+        cache = entry.get("cache_dirs", [])
+        if not isinstance(cache, list) or any(type(v) is not str or not v.strip() for v in cache):
+            raise ConfigError(f"{label}.cache_dirs: expected an array of strings")
+        cache = tuple(_path(v, directory, home) for v in cache)
+        probe = entry.get("quota_probe_model", "")
+        if cli.PROBE_SENDS_MODEL:
+            probe = _model_alias(probe, aliases, f"{label}.quota_probe_model")
+        vendors.append(Vendor(vendor_id, adapter, tuple(roles), quota, float(cap), max_minutes,
+                              fallback, cache, probe))
+    if len({v.id for v in vendors}) != len(vendors):
+        raise ConfigError("vendors: each vendor id may be configured once")
+    return tuple(vendors)
+
+
+def _model_routes(raw, aliases, vendors):
+    by_id = {v.id: v for v in vendors}
+    declared = set(by_id)
     names = set(ROUTE_ROLES) | {f"{role}_followup" for role in ROUTE_ROLES if role != "screenshot_review"}
     if not isinstance(raw, dict) or raw.keys() - names:
         raise ConfigError("models.routes: expected tables for known roles")
@@ -331,22 +500,27 @@ def _model_routes(raw, aliases):
         table = raw.get(name, {})
         if not isinstance(table, dict) or table.keys() - set(VENDORS):
             raise ConfigError(f"models.routes.{name}: expected entries for known vendors")
-        for vendor in sorted(VENDORS):
+        role = ROUTE_ROLE.get(name.rsplit("_followup", 1)[0])
+        for vendor in sorted(table):
+            if vendor not in declared:
+                raise ConfigError(f"models.routes.{name}.{vendor}: undeclared vendor")
+            if role and role not in by_id[vendor].roles:
+                raise ConfigError(f"models.routes.{name}.{vendor}: vendor cannot run {role}")
+        for vendor in sorted(declared):
             field = f"models.routes.{name}.{vendor}"
-            if vendor not in table:
-                if required:
+            if role and role in by_id[vendor].roles:
+                if vendor not in table and required:
                     raise ConfigError(f"{field}: missing base route")
+            if vendor not in table:
                 continue
             entry = table[vendor]
-            allowed = {"model"}
-            if vendor != "cursor":
-                allowed.add("effort")
-            if vendor == "claude":
-                allowed.add("subagent_model")
+            allowed = set(agents.ADAPTERS[vendor].ROUTE_FIELDS)
             if not isinstance(entry, dict) or entry.keys() - allowed:
                 raise ConfigError(f"{field}: unsupported route fields")
-            model = entry.get("model")
-            if model != "" or vendor != "codex":
+            if "model" not in entry:
+                raise ConfigError(f"{field}.model: missing model")
+            model = entry.get("model", "")
+            if model != "" or not agents.ADAPTERS[vendor].EMPTY_MODEL_OK:
                 model = _model_alias(model, aliases, f"{field}.model")
             effort = entry.get("effort", "")
             if effort not in ("", "low", "medium", "high", "xhigh", "max"):
@@ -356,6 +530,22 @@ def _model_routes(raw, aliases):
                 subagent = _model_alias(subagent, aliases, f"{field}.subagent_model")
             routes.append((name, vendor, ModelRoute(model, effort, subagent)))
     return tuple(routes)
+
+
+def _validate_coverage(config):
+    if not config.pool():
+        raise ConfigError("vendors: at least one vendor with quota = pool is required")
+    for role in COVERAGE_ROLES:
+        pool_only = role == "reviser"
+        if not config.for_role(role, pool_only=pool_only):
+            raise ConfigError(f"vendors: no eligible vendor for role {role}")
+    if any(repo.screenshot_review for repo in config.repos):
+        if not any(config.allows(v, "screenshot_reviewer") and agents.ADAPTERS[v].IMAGES
+                   for v in config.declared()):
+            raise ConfigError("vendors: screenshot_review needs a declared vendor with screenshot_reviewer and images")
+    if config.retrospectives.enabled:
+        if not any(config.allows(v, "retrospective") for v in config.declared()):
+            raise ConfigError("vendors: retrospectives.enabled needs a retrospective-capable vendor")
 
 
 def load(path: str | Path, *, home: Path | None = None) -> Config:
@@ -370,10 +560,11 @@ def load(path: str | Path, *, home: Path | None = None) -> Config:
         raise ConfigError("configuration file cannot be read") from None
     except tomllib.TOMLDecodeError:
         raise ConfigError("invalid TOML syntax") from None
-    required = set(SECTIONS) | {"repos", "preferences"}
+    _reject_moved(data)
+    required = set(SECTIONS) | {"repos", "preferences", "vendors"}
     if not required <= data.keys() or data.keys() - required - OPTIONAL.keys():
-        raise ConfigError("configuration sections do not match the schema (paths, scheduling, repos, models, quota, "
-                          "environment, preferences; optional: linear, telegram, retrospectives)")
+        raise ConfigError("configuration sections do not match the schema (paths, scheduling, repos, vendors, models, "
+                          "quota, environment, preferences; optional: linear, telegram, retrospectives)")
     models = data["models"]
     if not isinstance(models, dict):
         raise ConfigError("models: expected a table")
@@ -386,32 +577,42 @@ def load(path: str | Path, *, home: Path | None = None) -> Config:
             for key, value in catalog.items()):
         raise ConfigError("models.aliases: expected a table of model identifiers")
     aliases = BUILTIN_ALIASES | catalog
-    routes = _model_routes(models.pop("routes", None), aliases)
-    sections = {name: _section(name, cls, data[name], source.parent, home or Path.home())
+    home = home or Path.home()
+    vendors = _load_vendors(data["vendors"], source.parent, home, aliases)
+    routes = _model_routes(models.pop("routes", None), aliases, vendors)
+    sections = {name: _section(name, cls, data[name], source.parent, home)
                 for name, cls in SECTIONS.items()}
-    sections.update({name: _section(name, cls, data[name], source.parent, home or Path.home())
+    sections.update({name: _section(name, cls, data[name], source.parent, home)
                      for name, cls in OPTIONAL.items() if name in data})
     if 'retrospectives' in data and 'enabled' not in data['retrospectives']:
         legacy = sections['retrospectives']
         sections['retrospectives'] = replace(legacy, enabled=bool(legacy.model))
-    settings = sections["models"]
-    fallback = {
-        key: tuple(_model_alias(alias, aliases, f"models.{key}") for alias in getattr(settings, key))
-        for key in ("fallback_models_claude", "fallback_models_codex")
-    }
-    sections["models"] = Models(**(vars(settings) | fallback), routes=routes)
-    quota = sections["quota"]
-    sections["quota"] = replace(quota, quota_probe_model_claude=_model_alias(
-        quota.quota_probe_model_claude, aliases, "quota.quota_probe_model_claude"))
-    raw_retro = data.get("retrospectives", {})
-    sections["retrospectives"] = replace(sections.get("retrospectives", Retrospectives()), **{
-        f"model_{vendor}": _model_alias(raw_retro.get(f"model_{vendor}", alias), aliases,
-                                       f"retrospectives.model_{vendor}")
-        for vendor, alias in ANALYST_ALIASES.items()
-    })
+    sections["models"] = Models(**vars(sections["models"]), routes=routes)
+    declared = {v.id for v in vendors}
+    raw_retro = data.get("retrospectives", {}) or {}
+    if not isinstance(raw_retro, dict):
+        raise ConfigError("retrospectives: expected a table")
+    analyst_vendors = {v.id for v in vendors if "retrospective" in v.roles}
+    retro_models = {}
+    for vendor, adapter in agents.ADAPTERS.items():
+        key = f"model_{vendor}"
+        if key in raw_retro and vendor not in declared:
+            raise ConfigError(f"retrospectives.{key}: undeclared vendor")
+        if key in raw_retro and vendor not in analyst_vendors:
+            raise ConfigError(f"retrospectives.{key}: vendor cannot run retrospective")
+        if vendor in analyst_vendors:
+            retro_models[key] = _model_alias(raw_retro.get(key, adapter.ANALYST_ALIAS), aliases,
+                                            f"retrospectives.{key}")
+    sections["retrospectives"] = replace(sections.get("retrospectives", Retrospectives()), **retro_models)
+    pool, extra = tuple(v.id for v in vendors if v.quota == "pool"), tuple(v.id for v in vendors if v.quota == "extra")
+    caps = tuple((v.id, v.cap) for v in vendors)
+    q = sections["quota"]
+    sections["quota"] = Quota(q.quota_five_hour_max, q.quota_stale_minutes, caps, pool, extra,
+                              q.quota_probe_retry_minutes, q.quota_probe_max_retry_minutes,
+                              q.same_vendor_wait_max_minutes)
     if not isinstance(data['repos'], list) or not data['repos']:
         raise ConfigError("repos: expected at least one [[repos]] entry")
-    repos = tuple(_section("repos", Repo, entry, source.parent, home or Path.home()) for entry in data['repos'])
+    repos = tuple(_section("repos", Repo, entry, source.parent, home) for entry in data['repos'])
     for repo in repos:
         _check_repo(repo)
     if len({repo.gh_repo.lower() for repo in repos}) != len(repos):
@@ -422,40 +623,51 @@ def load(path: str | Path, *, home: Path | None = None) -> Config:
     preferences = data['preferences']
     if not isinstance(preferences, dict):
         raise ConfigError("preferences: expected a table")
+    vendor_roles = {v.id: set(v.roles) for v in vendors}
     for key, order in preferences.items():
         role, _, area = key.partition('_') if key not in ROLES else (key, '', '')
-        # spec_reviewer and screenshot_reviewer may also carry an area suffix.
         for named in ('spec_reviewer', 'screenshot_reviewer'):
             if key.startswith(named + '_'):
                 role, area = named, key[len(named) + 1:]
+        if role == "scan":
+            raise ConfigError("preferences: scan has no preference entries")
         if role not in ROLES or (key not in ROLES and area not in areas):
             raise ConfigError("preferences: unknown role or area")
-        if not isinstance(order, list) or not order or any(type(v) is not str or v not in VENDORS for v in order) or len(set(order)) != len(order):
-            raise ConfigError("preferences: expected a nonempty list of distinct known vendors")
-    config = Config(**sections, repos=repos, preferences=tuple((k, tuple(v)) for k, v in sorted(preferences.items())), source=source)
+        if (not isinstance(order, list) or not order or any(type(v) is not str for v in order)
+                or len(set(order)) != len(order)):
+            raise ConfigError("preferences: expected a nonempty list of distinct vendors")
+        for vendor in order:
+            if vendor not in declared:
+                raise ConfigError(f"preferences.{key}: undeclared vendor {vendor}")
+            if role not in vendor_roles[vendor]:
+                raise ConfigError(f"preferences.{key}: vendor {vendor} cannot run {role}")
+    config = Config(**sections, vendors=vendors, repos=repos,
+                    preferences=tuple((k, tuple(v)) for k, v in sorted(preferences.items())), source=source)
     retro = config.retrospectives
     if retro.model and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,63}', retro.model):
         raise ConfigError('retrospectives.model: expected a model identifier')
-    for vendor in ('claude', 'codex', 'cursor'):
-        if not approved_model(vendor, getattr(retro, f'model_{vendor}'), requested=True):
-            raise ConfigError(f'retrospectives.model_{vendor}: requires the approved Opus/Sol/Grok 4.7 family')
+    for vendor in config.declared():
+        if "retrospective" in config.vendor(vendor).roles:
+            model = getattr(retro, f"model_{vendor}", "")
+            if model and not approved_model(vendor, model, requested=True):
+                raise ConfigError(f'retrospectives.model_{vendor}: requires the approved Opus/Sol/Grok 4.7 family')
     if retro.effort not in ('high', 'xhigh'):
         raise ConfigError('retrospectives.effort: expected high or xhigh')
     if retro.timeout_seconds > 600 or retro.input_chars > 20000 or retro.output_chars > 20000:
         raise ConfigError('retrospectives: deadline/character limits exceed Stage 1 bounds')
-    schedule, quota = config.scheduling, config.quota
+    schedule = config.scheduling
     for key in ('cursor_login_re', 'cursor_branch_re'):
         try:
             re.compile(getattr(schedule, key))
         except re.error:
             raise ConfigError(f'scheduling.{key}: invalid regular expression') from None
-    if not quota.vendor_pool or any(v not in ('claude', 'codex') for v in quota.vendor_pool) or len(set(quota.vendor_pool)) != len(quota.vendor_pool):
-        raise ConfigError('quota.vendor_pool: expected distinct claude/codex vendors')
-    if any(v != 'cursor' for v in quota.vendor_extra) or len(set(quota.vendor_extra)) != len(quota.vendor_extra):
-        raise ConfigError('quota.vendor_extra: expected [] or ["cursor"]')
-    for cache in (config.environment.gocache, config.environment.gomodcache, config.environment.gotmpdir, config.environment.node_compile_cache):
-        if cache not in config.models.codex_cache_dirs:
-            raise ConfigError("models.codex_cache_dirs: must include the configured Go and Node caches")
+    for vendor in vendors:
+        if vendor.adapter == "codex":
+            for cache in (config.environment.gocache, config.environment.gomodcache,
+                          config.environment.gotmpdir, config.environment.node_compile_cache):
+                if cache not in vendor.cache_dirs:
+                    raise ConfigError(f"vendors.{vendor.id}.cache_dirs: must include the configured Go and Node caches")
+    _validate_coverage(config)
     return config
 
 

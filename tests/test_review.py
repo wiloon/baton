@@ -471,7 +471,7 @@ def test_a_big_diff_runs_the_review_skill_only_when_matt_skills_are_installed(lo
 
 # --- screenshot review (#50) ----------------------------------------------------------------
 
-CHECKS_BODY = "Refs #297\n\n## Manual checks\n- The library at 390 px and 1280 px.\n"
+CHECKS_BODY = "Refs #297\n\n## Checks to verify\n- The library at 390 px and 1280 px.\n"
 
 
 def shoot(loop, *names):
@@ -524,6 +524,30 @@ def test_a_resumed_screenshot_review_preserves_checks_when_the_body_is_unavailab
     assert not loop.checkpoint()
 
 
+@pytest.mark.parametrize("section", ["", "## Checks to verify\n", "## Checks to verify\n- old\n## Manual checks\n- new"])
+@pytest.mark.parametrize("resume", ["fresh", "legacy checkpoint", "saved checks"])
+def test_no_eligible_checks_preserve_the_code_verdict(loop, section, resume):
+    loop.reviews, loop.screens = ["pass"], ["defer", "pass"]
+    if resume != "fresh":
+        with pytest.raises(Deferred):
+            screen_run(loop)
+        if resume == "legacy checkpoint":
+            pending = Path(loop.env["STATE"], f"review-pending-{PR}")
+            pending.write_text("".join(line for line in pending.read_text().splitlines(keepends=True)
+                                       if not line.startswith("screenshot_checks=")))
+    loop.gh.set(body=f"Refs #297\n\n{section}")
+    if resume == "fresh":
+        assert loop.run(fixer="cursor", SCREENSHOT_REVIEW="1") == 0
+        assert roles(loop) == ["review"]
+        assert loop.merged == [PR]
+    else:
+        assert resume_split_review(loop) == 80
+        assert roles(loop) == ["review", "screenshot_review"]
+        assert loop.merged == [str(PR)]
+    assert loop.merge_screenshots == [None] and not screenshot_comments(loop)
+    assert not loop.labelled("ready-for-human") and not loop.checkpoint()
+
+
 def test_a_qualifying_round_runs_the_code_review_then_its_own_screenshot_review(loop):
     shoot(loop, "01-library-390.png")
     loop.reviews, loop.screens = ["pass"], ["pass"]
@@ -538,10 +562,13 @@ def test_a_qualifying_round_runs_the_code_review_then_its_own_screenshot_review(
     assert loop.merged == [PR] and not loop.fixes
 
 
-def test_the_merge_step_gets_the_reviewed_checks_and_the_screenshot_comment(loop):
+@pytest.mark.parametrize("heading", ["Manual checks", "Checks to verify"])
+def test_the_merge_step_gets_the_reviewed_checks_and_the_screenshot_comment(loop, heading):
     loop.reviews, loop.screens = ["pass"], ["pass"]
     loop.screen_text = "## Must fix\nnone\n\n## Checks\n1. verified\n\n## Screenshots\n- a.png — ok"
-    assert screen_run(loop) == 0
+    loop.gh.set(body=CHECKS_BODY.replace("Checks to verify", heading))
+    assert loop.run(fixer="cursor", SCREENSHOT_REVIEW="1") == 0
+    assert "1. The library at 390 px and 1280 px." in loop.agents[1]["prompt"]
     [given] = loop.merge_screenshots
     assert given["checks"] == "- The library at 390 px and 1280 px."
     assert given["comment"].startswith("<!-- baton-screenshot-review round=1 by=") and "1. verified" in given["comment"]
@@ -615,7 +642,7 @@ def test_screenshot_review_is_skipped_and_the_code_review_keeps_its_outcome(loop
     if case == "setting off":
         overrides = {}
     elif case == "checks none":
-        body = "Refs #297\n\n## Manual checks\nnone\n"
+        body = "Refs #297\n\n## Checks to verify\nnone\n"
     elif case == "owner pr in the pool":
         loop.gh.set(headRefName="owner/issue-1", author={"login": "owner"})
     else:
@@ -699,7 +726,7 @@ def test_the_code_prompts_leave_the_screenshots_to_their_own_run(loop, monkeypat
         screen_run(loop)
         prompt = loop.agents[0]["prompt"]
         assert loop.agents[0]["vendor"] == vendor
-        assert "01-library-390.png" not in prompt and "screenshot" not in prompt.lower()
+        assert "01-library-390.png" not in prompt and "Look at every one of the screenshots" not in prompt
 
 
 def test_the_screenshot_prompt_lists_every_eligible_png_and_asks_for_a_line_each(loop):
@@ -1025,3 +1052,46 @@ cursor = { model = "cursor_analyst" }
     assert calls == expected_models
     if repair:
         assert loop.merged == [PR]
+
+
+def test_saved_cursor_reviewer_at_weekly_cap_defers(loop):
+    from types import SimpleNamespace
+    from baton import quota
+
+    loop.gh.set(headRefName="owner/issue-1", author={"login": "owner"})
+    loop.reviews[:] = ["defer"]
+    with pytest.raises(Deferred):
+        loop.run(reviewer="cursor")
+    assert loop.checkpoint()["reviewer"] == "cursor"
+    now = int(time.time())
+    for vendor in ("claude", "codex"):
+        Path(loop.env["STATE"], f"{vendor}-cooldown-until").write_text(str(now + 3600))
+    quota.record(loop.env["STATE"], "cursor", {"seven_day": {"used": 0.99, "resets_at": now + 3600}}, now)
+    loop.reviews[:] = ["pass"]
+    args = SimpleNamespace(pr=PR, wt=str(loop.wt), issue="297", fixed_by="", fixer="agent", reviewer="pool")
+    result = review.run(args, env=loop.env)
+    assert result["rc"] == 75 and result["defer_vendor"] == "pool"
+    assert "week 99% >= cap 95%" in result["defer"]
+    assert loop.checkpoint()["step"] == "review"
+    assert [run["vendor"] for run in loop.agents] == ["cursor"]
+
+
+def test_screenshot_exhaustion_hands_off_once(loop, monkeypatch):
+    from baton.common import Exhausted
+
+    loop.reviews[:] = ["pass"]
+    notices, handoffs = [], []
+
+    def exhausted(self):
+        raise Exhausted("screenshot_reviewer", "all screenshot reviewers are PR authors")
+
+    monkeypatch.setattr(review.Review, "screenshot_vendor", exhausted)
+    monkeypatch.setattr(review.notify, "notify", lambda title, text: notices.append((title, text)))
+    monkeypatch.setattr(review.telemetry.Telemetry, "task",
+                        lambda self, kind, key, *args: handoffs.append(key) if kind == "handoff" else None)
+    assert screen_run(loop) == 0
+    assert [run["role"] for run in loop.agents] == ["review"]
+    assert handoffs == ["review_failed"]
+    assert len(notices) == 1 and "all screenshot reviewers are PR authors" in notices[0][1]
+    assert sum(c[:2] == ["pr", "edit"] and "--add-label" in c and "ready-for-human" in c
+               for c in loop.gh.calls()) == 1

@@ -25,8 +25,8 @@ issue labelled ready-for-agent
   review        a vendor that wrote none of the PR reviews it
   fix           answer the review or a failing CI check (up to max_review_rounds)
   merge         [scheduling].auto_merge and the repository's [[repos]] auto_merge both true,
-                CI green, "## Manual checks" none -> merge; else ready-for-human
-                (manual_checks = "defer": the checks go to a "Manual checks to try" issue instead)
+                CI green, "## Checks to verify" none, or every check verified by the screenshot review -> merge; else ready-for-human
+                (manual_checks = "defer": the checks go to a "Checks to try" issue instead)
                 (screenshot_review = true: a second, separate run checks the manual-check screenshots after the code review;
                  every check verified -> merge; otherwise only the unverified ones go to the owner, ADR 0006)
 ```
@@ -111,7 +111,7 @@ existing alternatives, replacement criteria and the proposed boundary for model-
 - at least one agent CLI, logged in with its subscription:
   - Claude Code (`claude`)
   - Codex (`codex`)
-  - Cursor (`cursor-agent`) as an optional extra vendor (`vendor_extra = ["cursor"]`)
+  - Cursor (`cursor-agent`) as an optional extra vendor (`[vendors.cursor]` with `quota = "extra"`)
 - whatever the watched repository's own checks need (its toolchain; `mise.toml` here pins one
   for everything under `~/baton`, edit it to suit)
 
@@ -128,8 +128,13 @@ cp config.example.toml config.toml
 
 # 2. Point it at a repository: edit the [[repos]] entry in config.toml
 #    (gh_repo, owner, ci_command, ...).
-#    Set [quota].vendor_pool to the CLIs you installed, e.g. ["codex"] or ["claude"].
-#    Cursor is optional: vendor_extra = ["cursor"] enables it.
+#    Declare each CLI under [vendors.<id>] with adapter, roles, quota ("pool" or
+#    "extra"), cap (a weekly fraction) and max_minutes (a positive integer).
+#    To disable Cursor in the example, remove [vendors.cursor] and its fields,
+#    delete each cursor entry under [models.routes.*], remove "cursor" from
+#    [preferences].dev, and delete [retrospectives].model_cursor.
+#    In a customized config, remove Cursor from any other preference orders
+#    and remove a preference key if deleting Cursor leaves its order empty.
 #    Both [scheduling] and the [[repos]] entry must allow auto-merge.
 #    For a first run, set [scheduling].auto_merge = false to inspect the PR yourself.
 #    Set auto_merge = false in a [[repos]] entry to merge that repository's PRs yourself.
@@ -219,7 +224,7 @@ The units assume the checkout is at `~/baton` and uv at `/usr/bin/uv`; adjust `E
 
 `config.example.toml` documents every key. Base model routes are required. Follow-up routes,
 quota probe retry settings, and `[[repos]]` `auto_merge` are optional. The repository's `auto_merge` defaults to `true`. Set it to `false` to keep
-that repository's PRs for manual merging. Edit the `[[repos]]` entry, choose your installed vendors in `[quota]`, and
+that repository's PRs for manual merging. Edit the `[[repos]]` entry, declare your installed vendors under `[vendors.<id>]`, and
 choose whether `[scheduling].auto_merge` should be enabled. The optional
 `[linear]` and `[telegram]` tables are at the end of the file.
 

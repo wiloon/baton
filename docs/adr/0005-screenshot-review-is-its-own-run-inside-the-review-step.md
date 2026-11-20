@@ -38,14 +38,15 @@ fix                        reads both, re-shoots every manual-check item
   telemetry run and verdict records. The vendor preference role is `screenshot_reviewer`.
 - The code review prompt no longer carries the screenshot instructions (`Review.shots_step`
   moves to the new run).
-- The screenshot reviewer uses the code reviewer's author/fixer exclusions. If Codex is
-  excluded, it can review only as a last resort under ADR 0002, with a known model distinct from
-  every recorded Codex writer model. Check the screenshot route at selection and preflight and
-  verify the reported model before publishing. This role requires distinct models even in a
+- The screenshot reviewer uses the code reviewer's author/fixer exclusions. An excluded vendor
+  with a screenshot fallback policy (Codex) can review only as a last resort under ADR 0002,
+  with a known model distinct from every recorded writer model for that vendor. Check the
+  screenshot route at selection and preflight, and verify the reported model before
+  publishing. This role requires distinct models even in a
   fresh session.
-- Skip screenshot review on owner-authored PRs and whenever Cursor performed the code review.
-  The screenshot reviewer is selected from Claude and Codex. The setting remains per repository
-  and off by default.
+- Skip screenshot review on owner-authored PRs and when the code review adapter has the
+  screenshot-skip policy (Cursor). Select from declared, role-allowed vendors with image input
+  support (Claude and Codex). The setting remains per repository and off by default.
 - After a successful code review (`pass` or `changes`), checkpoint its result before starting
   screenshot review. A deferral resumes that step using the saved code verdict. A failed review
   hands off the PR via `review_failed`.
@@ -54,3 +55,5 @@ fix                        reads both, re-shoots every manual-check item
 
 - Issue #67, round 1: specify read-only access, distinct-model verification, the owner and Cursor
   exclusions, and how a split review round resumes and hands off.
+- Issue #103: express candidate and skip rules through role eligibility and adapter capabilities
+  so the existing review workflow applies to the configured registry.

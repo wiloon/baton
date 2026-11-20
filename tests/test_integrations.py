@@ -1,6 +1,7 @@
 """Linear and Telegram are optional, and the runner's credentials come from its environment or a
 private env file (#328). Real Sessions on a minimal config, no legacy test adapter."""
 import json
+import re
 from pathlib import Path
 import subprocess
 
@@ -12,8 +13,11 @@ from conftest import sh
 ROOT = Path(__file__).resolve().parents[1]
 TEXT = (ROOT / "config.example.toml").read_text()
 # GitHub and one vendor: no [linear], no [telegram], no vendor preferences.
-MINIMAL = (TEXT.replace('vendor_pool = ["claude", "codex"]', 'vendor_pool = ["claude"]')
-           .replace('dev = ["cursor", "codex", "claude"]\nreviewer = ["claude", "codex"]\n', ""))
+MINIMAL = re.sub(r"\n\[vendors\.(codex|cursor)\].*?(?=\n\[)", "\n", TEXT, flags=re.S)
+MINIMAL = re.sub(r'(?m)^(?:codex|cursor) = \{[^\n]+\}\n', "", MINIMAL)
+MINIMAL = MINIMAL.replace('dev = ["cursor", "codex", "claude"]\nreviewer = ["claude", "codex"]\n', "")
+MINIMAL = MINIMAL.replace('model_codex = "codex_fast"\n', "")
+MINIMAL = MINIMAL.replace('model_cursor = "cursor_analyst"\n', "")
 LINEAR = '''
 [linear]
 env_file = "~/.config/baton/linear.env"

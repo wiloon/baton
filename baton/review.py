@@ -21,8 +21,8 @@ import re
 import sys
 import time
 
-from . import check_verdicts, checkpoint, dispatch, fix, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, vendors
-from .common import Deferred, changed, git, restore, strip_markers
+from . import agents, check_verdicts, checkpoint, checks as check_section, dispatch, fix, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, vendors
+from .common import Deferred, Exhausted, changed, git, restore, strip_markers
 
 REPLY_CAP = 60000
 REVIEWED = ("REVIEW: pass", "REVIEW: changes")
@@ -194,17 +194,6 @@ def combined_feedback(code, screenshot, limit):
     return f"{fit(code, code_parts, first)}\n\n{fit(screenshot, shot_parts, second)}"
 
 
-def manual_checks(body):
-    """The text under the PR's `## Manual checks` heading."""
-    on, lines = False, []
-    for line in (body or "").split("\n"):
-        if line.startswith("## "):
-            on = line.startswith("## Manual checks")
-        elif on:
-            lines.append(line)
-    return "\n".join(lines).strip()
-
-
 def human_feedback(repo, owner, pr):
     """The owner's reviews, comments and inline comments since the last agent fix. Public
     repo: only the owner's words reach an agent as instructions."""
@@ -274,14 +263,21 @@ class Review:
         return pick.all_vendors(self.env)
 
     def review_vendor(self, current):
-        """The reviewer with the fewest lines in the PR. When every vendor is excluded it stays
-        as it is, so review_allowed hands the PR to the owner."""
+        """The reviewer with the fewest lines in the PR. When every vendor is excluded, Exhausted
+        ends the step with a ready-for-human handoff."""
         return pick.choose(self.env, "reviewer", current, "review", self.vendors(), pr=str(self.pr),
-                           issue=self.issue, fixed_by=self.fixed_by)
+                           issue=self.issue, fixed_by=self.fixed_by, pinned=current == "cursor")
 
     def review_allowed(self, vendor, model=""):
         """Persisted authors survive restarts and role changes: a vendor that wrote the PR does
         not review it. The PR goes to the owner otherwise."""
+        cfg = self.env.config
+        if vendor not in cfg.declared() or not cfg.allows(vendor, "reviewer"):
+            self.label("--add-label", "ready-for-human")
+            self.hooks.task("handoff", "review_failed", "--pr", str(self.pr), "--reason", "review_failed")
+            notify.notify(f"PR #{self.pr} needs you",
+                          f"Reviewer {vendor} is not configured for code review.")
+            return False
         if vendors.review_allowed(self.state, self.pr, vendor, model, self.fixed_by):
             return True
         self.label("--add-label", "ready-for-human")
@@ -397,7 +393,8 @@ class Review:
     # --- the screenshot review (#67): its own run after a successful code review ---
     def screenshot_enabled(self, reviewer):
         """Whether to check the PR body for screenshot review after this code review."""
-        return (self.env.repo.screenshot_review and reviewer != "cursor"
+        return (self.env.repo.screenshot_review
+                and not agents.ADAPTERS[reviewer].SKIP_SCREENSHOT_AFTER_REVIEW
                 and "owner" not in vendors.review_excluded(self.state, self.pr))
 
     def screenshot_vendor(self):
@@ -409,7 +406,7 @@ class Review:
         """The screenshot reviewer's look at the manual-check screenshots (#50): every valid PNG,
         or one Must fix when there are none."""
         if not shots:
-            return ("This PR has `## Manual checks` but there are no screenshots: report one Must fix asking the "
+            return (f"This PR has `## {check_section.HEADING}` but there are no screenshots: report one Must fix asking the "
                     "author to shoot every manual-check item the way the repository's agent docs describe.")
         listed = "".join(f"\n   - `{path}`" for path in shots)
         return ("Look at every one of the screenshots of this PR's manual checks (Claude: the Read tool; "
@@ -423,6 +420,9 @@ class Review:
         self.hooks.round = round
         head = git(wt, "rev-parse", "HEAD") or ""
         vendor = self.screenshot_vendor()
+        cfg = self.env.config
+        if vendor not in cfg.declared() or not cfg.allows(vendor, "screenshot_reviewer"):
+            return "RESULT: failed screenshot reviewer not role-allowed"
         route = self.env.config.models.route("screenshot_review", vendor)
         if not vendors.screenshot_allowed(self.state, pr, vendor, route.model, self.fixed_by):
             return "RESULT: failed screenshot reviewer model may be a PR author"
@@ -484,6 +484,9 @@ class Review:
             code_verdict, screenshot = saved.get("code_verdict", ""), saved.get("screenshot", "")
             checks = saved.get("screenshot_checks", "")
             self.fixed_by, self.issue = saved.get("fixed_by", ""), saved.get("ISSUE", "")
+        cfg = self.env.config
+        if reviewer not in ("pool",) and (reviewer not in cfg.declared() or not cfg.allows(reviewer, "reviewer")):
+            reviewer = "pool"
         if self.seed():
             self.seed_contrib()
         self.label("--remove-label", "ready-for-human")
@@ -505,32 +508,38 @@ class Review:
             if step in ("review", "screenshot"):
                 verdict = code_verdict
                 if step == "review":
-                    # A disabled or resting Cursor is re-picked like any pool vendor.
-                    if (reviewer != "cursor" or reviewer not in self.vendors()
-                            or vendors.vendor_blocked(str(self.env.config.paths.state), "cursor")):
+                    try:
                         reviewer = self.review_vendor(reviewer)
-                        self.values["reviewer"] = reviewer
-                        self.save()
+                    except Exhausted as exhausted:
+                        self.handoff("review_failed", f"PR #{pr} needs you",
+                                     exhausted.reason or "No eligible reviewer for this PR.")
+                        self.drop()
+                        return 0
+                    self.values["reviewer"] = reviewer
+                    self.save()
                     outcome = self.run_review(round, rnote, reviewer)
                     if not outcome.startswith(REVIEWED):
                         self.handoff("review_failed", f"PR #{pr} review failed ({reviewer})", f"{outcome} {self.url}")
                         self.drop()
                         return 0
                     verdict = "pass" if outcome.startswith("REVIEW: pass") else "changes"
-                    body = pr_helpers.body(pr) if self.screenshot_enabled(reviewer) else None
-                    if body is not None and not pr_helpers.checks_none(body):
-                        step = "screenshot"
-                        code_verdict = verdict
-                        checks = manual_checks(body)
-                        self.values.update(step=step, code_verdict=code_verdict, screenshot_checks=checks)
-                        self.save()
-                elif not checks:   # a split checkpoint written before the manual checks were saved
+                if step == "screenshot" or self.screenshot_enabled(reviewer):
                     body = pr_helpers.body(pr)
-                    if body is not None and not pr_helpers.checks_none(body):
-                        checks = manual_checks(body)
-                if step == "screenshot":
-                    outcome = (self.run_screenshot_review(round, checks) if checks
-                               else "RESULT: failed reading PR manual checks")
+                    # If the body read fails on resume, keep the checks saved with the code verdict.
+                    if body is not None:
+                        if check_section.items(body):
+                            checks = check_section.read(body)
+                        else:
+                            checks = ""
+                if checks:
+                    step = "screenshot"
+                    code_verdict = verdict
+                    self.values.update(step=step, code_verdict=code_verdict, screenshot_checks=checks)
+                    self.save()
+                    try:
+                        outcome = self.run_screenshot_review(round, checks)
+                    except Exhausted as exhausted:
+                        outcome = exhausted.reason or "No screenshot reviewer available."
                     if not outcome.startswith(REVIEWED):
                         self.handoff("review_failed", f"PR #{pr} screenshot review failed", f"{outcome} {self.url}")
                         self.drop()

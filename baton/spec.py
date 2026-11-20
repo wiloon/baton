@@ -31,7 +31,7 @@ import subprocess
 import sys
 import time
 
-from . import claude_cli, dispatch, e2e_gate, fix, hooks as telemetry, md, merge, notify, pick, pr as pr_helpers, prompts, review, vendors
+from . import agents, checks as check_section, claude_cli, dispatch, e2e_gate, fix, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, review, vendors
 from .common import Deferred, changed, git, permission_denials, push, restore, strip_markers
 
 REPLY_CAP = 60000
@@ -82,6 +82,10 @@ def spec_state(env, issue):
         return "none", 0
     last = found[-1]
     return last["k"] + ("-human" if last["h"] else ""), int(last["r"])
+
+
+def pending_role(kind):
+    return "reviser" if kind in ("review", "reply-human") else "spec_reviewer"
 
 
 @session.scoped
@@ -253,7 +257,7 @@ class Spec:
     def record(self, vendor, model):
         if not self.pr:
             return
-        if vendor == "codex":
+        if agents.ADAPTERS[vendor].RECORDS_AUTHOR_MODEL:
             vendors.record_author_model(self.state, self.pr, vendor, model or "unknown")
         vendors.record_author(self.state, self.pr, vendor)
 
@@ -284,11 +288,10 @@ class Spec:
             owner = self.path("spec-owner-body").read_text()
         except OSError:
             owner = ""
-        kept = {line.strip() for line in md.section("Manual checks", body.stdout).splitlines()}
-        lost = [line.strip() for line in md.section("Manual checks", owner).splitlines()
-                if line.strip() and line.strip() not in kept]
+        kept = set(check_section.lines(body.stdout))
+        lost = [line for line in check_section.lines(owner) if line not in kept]
         if lost:
-            problems.append("`## Manual checks` must keep every check the owner wrote, word for word; these are "
+            problems.append(f"`## {check_section.HEADING}` must keep every check the owner wrote, word for word; these are "
                             "missing (never move them to `## Before release`):\n" + "\n".join(f"   {line}" for line in lost))
         return problems
 
@@ -386,7 +389,7 @@ class Spec:
         reviser = self.pick("reviser", list(env.config.quota.vendor_pool), last_vendor, other_model,
                             spec_followup=claude_followup)
         self.mark_base(round)
-        template = self.self_dir / (f"codex-spec-prompt.md" if reviser == "codex" else "spec-prompt.md")
+        template = self.self_dir / ("codex-spec-prompt.md" if reviser == "codex" else "spec-prompt.md")
         prompt = self.render(
             template, ISSUE=n, GH_REPO=self.repo, WORKTREE=str(wt), BRANCH=self.branch, ROUND=str(round),
             CONTEXT_FILE=str(context), OUT=out_base)
@@ -422,7 +425,7 @@ class Spec:
             self.handoff(f"{reviser} spec run failed: {outcome}{why}")
             return "stop"
         if body.is_file() and body.stat().st_size:
-            body.write_text(strip_markers(body.read_text()).rstrip("\n") + "\n")
+            body.write_text(check_section.canonicalize(strip_markers(body.read_text())).rstrip("\n") + "\n")
             edited = self.gh("issue", "edit", n, "--body-file", str(body))
             if edited.returncode != 0:
                 self.handoff(f"Applying {reviser} revised issue body failed ({body}).{pr_helpers.why(edited)}")
@@ -441,7 +444,7 @@ class Spec:
                                   "--title", f"docs(adr): spec revisions for #{n}", "--body",
                                   f"ADR revisions from the spec review of #{n} ({reviser} revises). The runner merges this "
                                   "once a spec reviewer accepts the spec; the issue stays open for implementation.\n\n"
-                                  "## Manual checks\nnone")
+                                  f"## {check_section.HEADING}\nnone")
                 if created.returncode != 0:
                     self.handoff(f"Opening the ADR PR for {self.branch} failed.{pr_helpers.why(created)}")
                     return "stop"
@@ -470,7 +473,7 @@ class Spec:
         False when the owner or a failure took over. Deferred when a vendor cannot run now."""
         n, env = self.issue, self.env
         kind, round = spec_state(env, n)
-        if kind in ("review", "reply-human"):
+        if pending_role(kind) == "reviser":
             step = "revise"   # the reviewer asked for changes, or the owner answered
         elif kind == "reply":
             step, round = "review", round + 1   # a reviser revised; the spec is reviewed again

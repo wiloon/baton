@@ -5,7 +5,7 @@ Checks the vendor can run, counts the run, opens its telemetry record, runs the 
 (baton.agents) with the exporters set on that child only, and settles how it ended
 (baton.settle). Prints JSON for the bash caller, which keeps `defer_vendor` (it
 exits the item's subshell):
-    status   how it ended; "deferred" when the vendor cannot run now; "" for an unknown vendor
+    status   how it ended; "deferred" when the vendor cannot run now; "" for rejected requests
     outcome  the RESULT:/REVIEW:/SPEC:/... line
     reply    the agent's final message (untrusted: callers strip markers)
     model    the actual Claude or Codex model when reported
@@ -31,6 +31,9 @@ from .common import LEASE_REASON, Request
 FIVE_MINUTE_CACHE_ROLES = ("spec_review", "spec", "review", "screenshot_review", "fix")
 
 
+SECRET_ROLES = ("dev", "fix")
+
+
 @session.scoped
 def configure(vendor, role, env):
     """(model, minutes, suffix, Request options) from the runner's configuration."""
@@ -43,21 +46,19 @@ def configure(vendor, role, env):
         or (role == "fix" and runtime.fix_followup)
     )
     route = models.route(role, vendor, followup=followup)
+    settings = env.config.vendor(vendor)
     if vendor == "claude":
-        return route.model, models.max_minutes, "", {
-            "fallback_models": " ".join(models.fallback_models_claude),
+        return route.model, settings.max_minutes, "", {
+            "fallback_models": " ".join(settings.fallback_models),
             "budget": str(getattr(models, "budget_" + role)),
             "repo": str(env.dirs.clone), "subagent_model": route.subagent_model,
             "context_dir": str(env.dirs.ctx), "effort": route.effort}
     if vendor == "cursor":
-        return route.model, models.cursor_max_minutes, "", {}
-    return route.model, models.codex_max_minutes, "-codex", {
-        "effort": route.effort, "fallback_models": " ".join(models.fallback_models_codex),
+        return route.model, settings.max_minutes, "", {}
+    return route.model, settings.max_minutes, "-codex", {
+        "effort": route.effort, "fallback_models": " ".join(settings.fallback_models),
         "add_dirs": list(map(str, env.caches)), "shots_dir": runtime.shots_dir,
         "skills_dir": env.skills}
-
-
-SECRET_ROLES = ("dev", "fix")
 
 
 def secret_overrides(env, role):
@@ -81,8 +82,13 @@ def secret_overrides(env, role):
 @session.scoped
 def dispatch(vendor, role, prompt, tag, cwd, settings="", output="", env=None, hooks=None):
     env = session.resolve(env)
-    if vendor not in agents.ADAPTERS:
-        return _dispatch(vendor, role, prompt, tag, cwd, settings, output, env, hooks)
+    why = (f"unknown vendor {vendor}" if vendor not in agents.ADAPTERS
+           else env.config.admission_error(vendor, role))
+    if why:
+        outcome = f"RESULT: failed {why}"
+        print(outcome, file=sys.stderr)
+        return {"rc": 1, "status": "", "outcome": outcome, "reply": None,
+                "model": "", "defer": "", "log": ""}
     with capacity.lease(env.config.paths.state, vendor) as available:
         if not available:
             return {"rc": 75, "status": "deferred", "outcome": "", "reply": None,
@@ -98,11 +104,6 @@ def _dispatch(vendor, role, prompt, tag, cwd, settings, output, env, hooks):
     def result(rc, status, outcome, reply=None, model="", defer="", log=""):
         return {"rc": rc, "status": status, "outcome": outcome, "reply": reply, "model": model, "defer": defer, "log": log}
 
-    if vendor not in agents.ADAPTERS:
-        outcome = f"RESULT: failed unknown vendor {vendor}"
-        notify.log(outcome)
-        print(outcome, file=sys.stderr)
-        return result(1, "", outcome)
     if why := vendors.vendor_blocked(state, vendor):
         return result(75, "deferred", "", defer=why)
     settle.count_run(state, vendor)

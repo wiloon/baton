@@ -10,7 +10,7 @@ agent_run): run counts, cooldown files, quota snapshots, Telegram, telemetry, lo
 CLI (JSON on stdout):
     run --vendor V --role R --cwd DIR --log FILE --minutes N [...] < prompt
         exit 0 success, 1 failure/timeout, 75 quota/busy/auth
-    preflight --vendor V            exit 1 with the failed outcome when V cannot run
+    preflight --vendor V [--role R] exit 1 with the failed outcome when V cannot run
     classify --vendor V --rc N --log FILE [--outcome O]
     deadline TEXT                   the epoch a quota error says it resets
 """
@@ -27,20 +27,21 @@ from zoneinfo import ZoneInfo
 from . import claude_cli, codex_cli, cursor_cli
 from .common import Request, events, read
 
-ADAPTERS = {"claude": claude_cli, "cursor": cursor_cli, "codex": codex_cli}
+ADAPTERS = {mod.ID: mod for mod in (claude_cli, cursor_cli, codex_cli)}
+CATALOG = frozenset(ADAPTERS)
+
+
 STATUSES = ("success", "failure", "timeout", "quota", "busy", "auth")
 
 # Match explicit quota messages, never bare 429/rate-limit/overloaded errors (those are
-# BUSY below). Claude
-# phrases come from the previous runner. Cursor phrases are conservative guesses until
-# captured on the runner host; Codex usage_limit_reached/usage-limit text is present in the local
-# CLI binary. Authentication is classified before quota. An auth failure is handled
+# BUSY below). Phrases live with each adapter so a disabled vendor still classifies
+# historical logs. Authentication is classified before quota. An auth failure is handled
 # like an exhausted quota: the vendor rests COOLDOWN_HOURS (no reset time to read) and
 # the item waits for another vendor or the owner's new login.
 QUOTA = {
-    "claude": r"usage limit|session limit|hit your .*limit|limit reached|out of (extra )?usage|rate_limit_error",
-    "cursor": r"usage limit (reached|exceeded)|(monthly|weekly|daily) (usage |request )?limit (reached|exceeded)|(insufficient|exhausted) quota",
-    "codex": r"usage_limit_reached|hit your usage limit|usage limit (reached|exceeded)|insufficient_quota",
+    claude_cli.ID: r"usage limit|session limit|hit your .*limit|limit reached|out of (extra )?usage|rate_limit_error",
+    cursor_cli.ID: r"usage limit (reached|exceeded)|(monthly|weekly|daily) (usage |request )?limit (reached|exceeded)|(insufficient|exhausted) quota",
+    codex_cli.ID: r"usage_limit_reached|hit your usage limit|usage limit (reached|exceeded)|insufficient_quota",
 }
 AUTH = (r"authentication (failed|required)|failed to authenticate|unauthorized|invalid[_ ]api[_ ]key|invalid[_ ]token"
         r"|(token|session) (has )?expired|please (log|sign) in|login required|not (logged|signed) in")
@@ -202,6 +203,7 @@ def main(argv=None):
     r.add_argument("--cooldown-hours", type=int, default=COOLDOWN_HOURS)
     f = sub.add_parser("preflight")
     f.add_argument("--vendor", required=True, choices=ADAPTERS)
+    f.add_argument("--role")
     c = sub.add_parser("classify")
     c.add_argument("--vendor", required=True, choices=ADAPTERS)
     c.add_argument("--rc", required=True, type=int)
@@ -220,6 +222,16 @@ def main(argv=None):
         status, until = classify(a.vendor, a.rc, read(a.log), a.outcome, a.cooldown_hours)
         print(json.dumps({"status": status, "cooldown_until": until}))
         return 0
+    from . import session
+    from .config import ConfigError
+
+    try:
+        reason = session.resolve().config.admission_error(a.vendor, a.role)
+    except ConfigError as error:
+        reason = str(error)
+    if reason:
+        print(json.dumps({"status": "failure", "outcome": f"RESULT: failed {reason}"}))
+        return 1
     if a.command == "preflight":
         outcome = preflight(a.vendor)
         print(json.dumps({"status": "auth" if outcome else "success", "outcome": outcome or ""}))

@@ -14,8 +14,10 @@ identifiers appear once, as **aliases**. Dispatch takes its model and effort fro
 the same alias catalog. Updating a model identifier means changing its alias definition.
 
 ```toml
-[models]                      # non-routing settings stay here: budgets, minutes, cache dirs
-fallback_models_codex = ["codex_prev", "codex_strong"]
+[models]                      # shared model settings and per-role budgets
+
+[vendors.codex]               # excerpt: other required vendor settings omitted
+fallback_models = ["codex_prev", "codex_strong"]
 
 [models.aliases]              # the only place a model identifier is written
 codex_strong = "gpt-6.2-astra"
@@ -34,27 +36,29 @@ codex  = { model = "codex_fast", effort = "low" }
 
 ## Rules
 
-- Route model and subagent fields, fallback lists, the Claude quota probe setting and per-vendor
+- Route model and subagent fields, adapter fallback lists, configured quota probe models and per-vendor
   retrospective model fields reference aliases. Unknown alias references are a `ConfigError`.
-- Config validation requires a base vendor entry for each of `dev`, `fix`, `review`,
-  `screenshot_review`, `spec_review`, `spec` and `scan` for Claude, Codex and Cursor.
-  The Cursor screenshot route satisfies the base schema. Screenshot review selects Claude or Codex.
-  Unknown roles, vendors and route fields are errors. Each entry requires a `model` field.
-  Codex alone accepts `model = ""` to request its CLI default and omit `-m`. Cursor's
-  `auto` is an alias value passed to its CLI.
+- Each declared vendor needs a base entry for each route mapped from its allowed roles (ADR 0007).
+  The mappings are `dev` to `dev`, `fixer` to `fix`, `reviewer` to `review`,
+  `screenshot_reviewer` to `screenshot_review`, `spec_reviewer` to `spec_review`,
+  `reviser` to `spec`, and `scan` to `scan`. Retrospectives have a dedicated model field.
+  Reject unknown routes and fields, undeclared vendors and routes for roles the vendor cannot run.
+  Each entry requires a `model` field. An adapter may accept `model = ""` for its CLI default
+  (Codex omits `-m`). Cursor's `auto` is an alias value passed to its CLI.
 - When the caller selects follow-up, use that role's `ROLE_followup` entry for that vendor.
   If the entry or table is absent, inherit the complete base entry for that vendor, including
   effort and subagent model. A present entry replaces the complete base entry. An omitted or
   empty effort or subagent field uses the CLI default for that field.
-- Codex receives effort via `-c model_reasoning_effort` and Claude Code via `--effort`.
-  Any effort field on a Cursor route is a `ConfigError` because the model identifier carries
-  the effort level. Only Claude routes support a subagent model.
+- The adapter declares whether effort and subagent fields are supported. Codex receives effort
+  via `-c model_reasoning_effort` and Claude Code via `--effort`. A Cursor model identifier
+  carries the effort level. Claude supports subagent models.
 - Retrospectives keep the Opus / Sol / Grok 4.7 family checks and analyst effort policy.
   Each omitted per-vendor field defaults to a documented built-in alias for that vendor's
   current default identifier. Supply those definitions once as built-ins in the alias catalog
   and overlay user definitions by name. This applies to an omitted section and to individual
-  omissions, including when retrospectives are disabled. Validate all three resolved
-  identifiers at load and pass the resolved identifier to the analyst. The deprecated
+  omissions, including when retrospectives are disabled. Validate resolved identifiers at load
+  for declared vendors allowed to be analysts. An explicit per-vendor field requires the
+  retrospective role. Pass the resolved identifier to the analyst. The deprecated
   `retrospectives.model` keeps its existing validation and opt-in semantics when `enabled`
   is absent. It supplies no model to the analyst.
 
@@ -65,20 +69,20 @@ and dispatch where applicable. An absent follow-up entry preserves the base assi
 
 | Role | When to select follow-up |
 | --- | --- |
-| `review` | Review round greater than one, including Cursor, except Codex reviewing Codex-authored work under the existing PR/fixer exclusion rules. |
-| `spec_review` | Spec-review round greater than one, except Codex reviewing a preceding Codex revision. |
-| `spec` | Round-one Claude revision of a Claude review. Later Claude revisions after Claude review use the base entry, as do other revisions. A retry uses the original phase. |
+| `review` | Review round greater than one. The writer-model fallback policy keeps the base route for a reviewer excluded by the existing PR/fixer rules (Codex reviewing Codex-authored work). |
+| `spec_review` | Spec-review round greater than one. The known-distinct-model spec policy keeps the base route after a revision by that same vendor (Codex). |
+| `spec` | Round-one same-vendor revision for the alternating-phase policy (Claude). Later same-vendor revisions for that policy and other revisions use the base entry. A retry uses the original phase. |
 | `fix` | Fixing agent review feedback from review round greater than one. Fixes from round-one review, owner feedback, CI and verification repairs use the base entry. |
 | `screenshot_review` | Always use the base entry. Validation rejects `screenshot_review_followup`. |
 | `dev`, `scan` | Always use the base entry. |
 
 Quota probes and retrospective analysts use their dedicated alias settings and have no
-follow-up phase. The same-vendor Claude spec paths keep the baseline's alternating
-assignments: the first review uses the base review route, later Claude reviews use the
-follow-up review route, and Claude revisions after Claude reviews use the opposite assignment.
-The picker resolves the Claude revision route for that round before admitting the fallback.
+follow-up phase. The alternating-phase policy keeps the baseline assignments: the first
+review uses the base review route, later reviews use the follow-up route, and same-vendor
+revisions use the opposite assignment. The picker resolves the revision route for that
+round before admitting the fallback.
 If an inherited entry or another route resolves to the preceding review's model, or the
-comparison cannot establish two known, distinct models, Claude is ineligible for that revision.
+comparison cannot establish two known, distinct models, that vendor is ineligible for the revision.
 The config remains valid and normal cross-vendor selection applies.
 
 ## Considered options
@@ -102,17 +106,17 @@ The config remains valid and normal cross-vendor selection applies.
   `config.toml`. A test checks every model filter against the identifiers resolved from the
   shipped Codex routes, fallback list and retrospective setting.
 - Vendor selection and preflight use the same resolved model and phase that dispatch
-  requests. Code review retains the known different-model Codex fallback and the known
-  same-model fallback in a fresh session. Spec review and revision after Codex require
-  two known, different Codex models. Screenshot review's Codex fallback requires a known
-  model distinct from every recorded Codex writer model (ADR 0005). Same-vendor fallbacks
-  retain ADR 0002's wait for short cross-vendor quota blocks. Post-run eligibility and review
+  requests. The writer-model policy (Codex) allows code review with a known different model
+  or a known same model in a fresh session. Its screenshot fallback requires a known
+  model distinct from every recorded writer model (ADR 0005). The known-distinct-model spec
+  policy (Codex) requires two known, different models for same-vendor review and revision.
+  Same-vendor fallbacks retain ADR 0002's wait for short cross-vendor quota blocks. Post-run eligibility and review
   mode use the actual model reported by the run, which may differ after a capacity fallback.
-- Carry the actual Claude main-session model from CLI output through dispatch and the runner's
-  round record so revision selection can use the preceding review's reported model. Compare
-  model identities, accounting for Claude CLI shorthand and concrete IDs for the same model.
-  Missing or ambiguous main-session evidence counts as unknown. Before publishing a Claude
-  revision after a Claude review, verify that both reported main-session models are known and
+- For alternating-phase revision (Claude), carry the actual main-session model from CLI output
+  through dispatch and the runner's round record so selection can use the preceding review's
+  reported model. Use the adapter's model identity comparison to account for shorthand and
+  concrete IDs. Missing or ambiguous main-session evidence counts as unknown. Before publishing
+  a same-vendor revision, verify that both reported main-session models are known and
   different. If verification fails, use the existing unverified-spec handoff and publish no
   revision or `same-vendor-different-model` note.
 
@@ -125,3 +129,5 @@ The config remains valid and normal cross-vendor selection applies.
   inherited routes and CLI fallbacks cannot turn a spec revision into same-model review.
 - Issue #67, round 1: define the base-only screenshot review route and its eligibility rules
   so selection, validation and dispatch use the screenshot model consistently.
+- Issue #103: require routes only for declared, allowed roles and express phase and model
+  evidence rules through adapter policies to keep existing assignments and safeguards.
