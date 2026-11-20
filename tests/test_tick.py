@@ -487,7 +487,267 @@ def test_an_issue_with_a_pr_is_skipped(ctx, monkeypatch, branch):
 
 def test_new_work_waits_while_an_issue_awaits_review(ctx):
     issues(ctx, ready=[issue(12)], pending=1)
-    assert ctx.make().next_issue() == "" and "1 issue(s) still waiting on review (agent-wip), cap 1" in ctx.log()
+    assert ctx.make().next_issue() == ""
+    assert "1 issue(s) still waiting on review (agent-wip), cap 1, 0 deferred, 1 not deferred" in ctx.log()
+    assert "#0: no open PR" in ctx.log()
+
+
+# --- a PR deferred on quota lends its slot (#99) --------------------------------------------------------------
+ORIGINAL_REVIEW_LOOP = tick.Tick.review_loop
+QUOTA = "quota claude=blocked(5h 94% >= 90%)"
+
+
+def flight(ctx, wip, ready=(), prs=None, labels=None, cap=None):
+    """WIP issues are in flight; PRS maps an issue to its open PR number, LABELS a PR to its labels."""
+    prs, labels = prs or {}, labels or {}
+    ctx.gh.answers["issue list"] = lambda args: [{"number": n} for n in wip] if "agent-wip" in args else \
+        ([] if "claude-found" in args else list(ready))
+    open_prs = [{"number": pr, "headRefName": f"agent/issue-{n}", "labels": [{"name": x} for x in labels.get(pr, ())]}
+                for n, pr in prs.items()]
+    ctx.gh.answers["pr list"] = lambda args: [] if "--label" in args else open_prs
+    for item in ready:
+        label_history(ctx, item["number"], [label_event(1, "owner")])
+    ctx.cap = cap
+
+
+def pr_state(ctx, state="OPEN", branch="agent/issue-5"):
+    def answer(args):
+        return f"{state}\n" if "--jq" in args else {"state": state, "headRefName": branch, "labels": []}
+    ctx.gh.answers["pr view"] = answer
+    ctx.gh.answers["issue view"] = {"labels": [{"name": "agent-wip"}]}
+
+
+def defer_loop(monkeypatch, reason=QUOTA, vendor="pool"):
+    def loop(self, *a, **k):
+        raise Deferred(vendor, reason)
+    monkeypatch.setattr(tick.Tick, "review_loop", loop)
+
+
+def deferred_review(ctx, prs, **extra):
+    """Checkpoints for PRS, each yields on quota in the review loop: one pass of pending_reviews."""
+    for pr in prs:
+        checkpoint(ctx, pr=str(pr))
+    ctx.make(**extra).pending_reviews()
+
+
+def no_vendor_blocked(monkeypatch, seen=None):
+    monkeypatch.setattr(spec, "cursor_plan", lambda env, n: "plan")
+    monkeypatch.setattr(tick.Tick, "pick_vendor", lambda self, *a, **k: "codex")
+
+
+def test_a_review_deferred_on_quota_lends_its_slot(ctx, monkeypatch):
+    pr_state(ctx)
+    flight(ctx, wip=[5], ready=[issue(12)], prs={5: 11})
+    defer_loop(monkeypatch)
+    deferred_review(ctx, [11])
+    assert ctx.path("slot-deferred-11").exists()
+    assert ctx.log().count("lends its agent-wip slot") == 1
+    no_vendor_blocked(monkeypatch)
+    assert ctx.make().next_issue() == "12"
+    deferred_review(ctx, [11])   # a repeat deferral keeps the marker and does not log again
+    assert ctx.path("slot-deferred-11").exists()
+    assert ctx.log().count("lends its agent-wip slot") == 1
+    assert ctx.make().next_issue() == "12"
+
+
+def test_a_lent_slot_starts_nothing_when_every_vendor_is_blocked(ctx, monkeypatch):
+    pr_state(ctx)
+    flight(ctx, wip=[5], ready=[issue(12)], prs={5: 11})
+    defer_loop(monkeypatch)
+    deferred_review(ctx, [11])
+    monkeypatch.setattr(spec, "cursor_plan", lambda env, n: "plan")
+    monkeypatch.setattr(tick.Tick, "pick_vendor", lambda self, *a, **k: (_ for _ in ()).throw(Deferred("pool", QUOTA)))
+    assert ctx.make().next_issue() == ""
+    assert not ctx.path("slot-deferred-12").exists()   # the candidate's own deferral records nothing
+
+
+def test_the_tick_hands_the_candidate_to_dev_run_while_a_review_is_deferred(ctx, monkeypatch):
+    pr_state(ctx)
+    flight(ctx, wip=[5], ready=[issue(12)], prs={5: 11})
+    no_vendor_blocked(monkeypatch)
+    defer_loop(monkeypatch)
+    checkpoint(ctx, pr="11")
+    started = []
+    monkeypatch.setattr(dev, "run", lambda t, n: started.append(n) or 80)
+    monkeypatch.setattr(tick.session, "run_process", lambda *a, **k: subprocess.CompletedProcess(a, 0, "", ""))
+    monkeypatch.setattr(tick.Tick, "cleanup", lambda self: None)
+    monkeypatch.setattr(tick.Tick, "file_merged_follow_ups", lambda self: None)
+    assert ctx.make().work() == 0
+    assert started == ["12"]
+
+
+@pytest.mark.parametrize("cap, wip, deferred, started", [
+    (1, [5, 6], [5, 6], False),        # two deferred issues fill cap + 1
+    (2, [5, 6], [5], True),            # one deferred of two lets a third start
+    (2, [5, 6, 7], [5, 6, 7], False),  # three in flight block even when all are deferred
+    (1, [5], [], False),               # no deferral: the slot is held
+])
+def test_the_slots_lent_are_bounded(ctx, monkeypatch, cap, wip, deferred, started):
+    pr_state(ctx)
+    prs = {n: 10 + n for n in wip}
+    flight(ctx, wip=wip, ready=[issue(12)], prs=prs)
+    no_vendor_blocked(monkeypatch)
+    defer_loop(monkeypatch)
+
+    def view(args):
+        if "--jq" in args:
+            return "OPEN\n"
+        return {"state": "OPEN", "headRefName": f"agent/issue-{int(args[2]) - 10}", "labels": []}
+    ctx.gh.answers["pr view"] = view
+    for n in deferred:
+        checkpoint(ctx, pr=str(10 + n))
+    ctx.make(MAX_PENDING_PRS=str(cap)).pending_reviews()
+    assert {p.name for p in ctx.path(".").glob("slot-deferred-*")} == {f"slot-deferred-{10 + n}" for n in deferred}
+    assert (ctx.make(MAX_PENDING_PRS=str(cap)).next_issue() == "12") is started
+
+
+def test_the_cap_log_names_issues_prs_states_and_reasons(ctx, monkeypatch):
+    pr_state(ctx)
+    flight(ctx, wip=[5, 6], ready=[issue(12)], prs={5: 11})
+    defer_loop(monkeypatch)
+    deferred_review(ctx, [11])
+    assert ctx.make().next_issue() == ""
+    log = ctx.log()
+    assert "2 issue(s) still waiting on review (agent-wip), cap 1, 1 deferred, total limit 2 reached" in log
+    assert f"#5: PR #11 deferred (pool {QUOTA})" in log and "#6: no open PR" in log
+
+
+def test_a_resumed_review_that_completes_returns_the_slot(ctx, monkeypatch):
+    pr_state(ctx)
+    flight(ctx, wip=[5], ready=[issue(12)], prs={5: 11})
+    no_vendor_blocked(monkeypatch)
+    defer_loop(monkeypatch)
+    deferred_review(ctx, [11])
+    assert ctx.path("slot-deferred-11").exists()
+    monkeypatch.setattr(tick.Tick, "review_loop", lambda self, *a, **k: 0)
+    ctx.make().pending_reviews()
+    assert not ctx.path("slot-deferred-11").exists()
+    assert ctx.make().next_issue() == ""   # the PR still counts, and is no longer deferred
+
+
+def test_a_handoff_returns_the_slot(ctx, monkeypatch):
+    pr_state(ctx)
+    flight(ctx, wip=[5], ready=[issue(12)], prs={5: 11})
+    no_vendor_blocked(monkeypatch)
+    defer_loop(monkeypatch)
+    deferred_review(ctx, [11])
+    t = ctx.make()
+
+    def handoff():
+        t.active["pr"] = "11"
+        return 80
+    assert t.item(handoff) == 80
+    assert not ctx.path("slot-deferred-11").exists()
+    assert ctx.make().next_issue() == ""
+
+
+@pytest.mark.parametrize("state", ["MERGED", "CLOSED"])
+def test_a_checkpoint_of_a_finished_pr_returns_the_slot(ctx, monkeypatch, state):
+    pr_state(ctx)
+    flight(ctx, wip=[5], ready=[issue(12)], prs={5: 11})
+    defer_loop(monkeypatch)
+    deferred_review(ctx, [11])
+    pr_state(ctx, state)
+    ctx.make().pending_reviews()
+    assert not ctx.path("slot-deferred-11").exists() and not ctx.path("review-pending-11").exists()
+
+
+def test_an_agent_fix_deferred_in_vendor_selection_lends_its_slot(ctx, monkeypatch):
+    pr_state(ctx)
+    flight(ctx, wip=[5], ready=[issue(12)], prs={5: 11})
+    ctx.gh.answers["pr list"] = lambda args: [{"number": 11, "headRefName": "agent/issue-5", "labels": []}]
+    Path(ctx.env["WT_ROOT"], "agent-5").mkdir(parents=True)
+    monkeypatch.setattr(tick.session, "run_process", lambda *a, **k: subprocess.CompletedProcess(a, 0, "", ""))
+    monkeypatch.setattr(tick.review, "human_feedback", lambda *a: "please fix")
+    monkeypatch.setattr(tick.vendors, "seed_authors", lambda *a: 0)
+    monkeypatch.setattr(tick.vendors, "seed_contrib", lambda *a: [])
+    calls = []
+
+    def pick_vendor(self, role, mode, cands, **k):
+        calls.append(role)
+        if role == "fixer":
+            raise Deferred("pool", QUOTA)
+        return "codex"
+    monkeypatch.setattr(tick.Tick, "pick_vendor", pick_vendor)
+    monkeypatch.setattr(spec, "cursor_plan", lambda env, n: "plan")
+    t = ctx.make()
+    assert t.item(lambda: t.fix_item("11", "agent/issue-5")) == 75
+    assert ctx.path("slot-deferred-11").exists()
+    assert ctx.make().next_issue() == "12"
+    # closure of the PR with no review checkpoint: the next admission discards the marker
+    flight(ctx, wip=[5], ready=[issue(12)], prs={})
+    assert ctx.make().next_issue() == ""
+    assert not ctx.path("slot-deferred-11").exists()
+
+
+def test_a_handoff_clears_an_agent_fix_marker(ctx, monkeypatch):
+    pr_state(ctx)
+    t = ctx.make()
+    t.active = {"pr": ""}
+    ctx.path("slot-deferred-11").write_text(json.dumps({"vendor": "pool", "reason": QUOTA}))
+    assert t.item(lambda: t.active.update(pr="11") or 80) == 80
+    assert not ctx.path("slot-deferred-11").exists()
+
+
+def test_the_first_review_after_opening_a_pr_can_lend_the_slot(ctx, monkeypatch):
+    pr_state(ctx)
+    flight(ctx, wip=[5], ready=[issue(12)], prs={5: 11})
+    no_vendor_blocked(monkeypatch)
+    monkeypatch.setattr(tick.Tick, "review_loop", ORIGINAL_REVIEW_LOOP)
+
+    class Loop:
+        def __init__(self, *a, **k):
+            pass
+
+        def loop(self, *a):
+            raise Deferred("codex", QUOTA)
+    monkeypatch.setattr(tick.review, "Review", Loop)
+    t = ctx.make()
+    assert t.item(lambda: t.review_loop("11", "/wt", "n", issue="5")) == 75
+    assert ctx.path("slot-deferred-11").exists()
+    assert ctx.make().next_issue() == "12"
+
+
+@pytest.mark.parametrize("how", ["lease", "returned-75", "candidate", "closed", "no-wip"])
+def test_other_deferrals_leave_no_marker(ctx, monkeypatch, how):
+    pr_state(ctx)
+    t = ctx.make()
+    if how == "lease":
+        defer_loop(monkeypatch, "vendor capacity reserved", "codex")
+        checkpoint(ctx, pr="11")
+        ctx.make().pending_reviews()
+    elif how == "returned-75":
+        assert t.item(lambda: t.active.update(pr="11") or 75) == 75
+    elif how == "candidate":
+        flight(ctx, wip=[], ready=[issue(12)])
+        monkeypatch.setattr(spec, "cursor_plan", lambda env, n: "plan")
+        monkeypatch.setattr(tick.Tick, "pick_vendor", lambda self, *a, **k: (_ for _ in ()).throw(Deferred("pool", QUOTA)))
+        assert t.next_issue() == ""
+    elif how == "closed":
+        pr_state(ctx, "CLOSED")
+        defer_loop(monkeypatch)
+        t = ctx.make()
+        assert t.item(lambda: t.review_loop("11", "/wt", "n")) == 75
+    else:
+        ctx.gh.answers["issue view"] = {"labels": []}
+        defer_loop(monkeypatch)
+        checkpoint(ctx, pr="11")
+        ctx.make().pending_reviews()
+    assert not list(ctx.path(".").glob("slot-deferred-*"))
+
+
+def test_a_relabelled_pr_cannot_use_an_old_marker(ctx, monkeypatch):
+    pr_state(ctx)
+    flight(ctx, wip=[5], ready=[issue(12)], prs={5: 11})
+    defer_loop(monkeypatch)
+    deferred_review(ctx, [11])
+    flight(ctx, wip=[5], ready=[issue(12)], prs={5: 11}, labels={11: ["ready-for-human"]})
+    no_vendor_blocked(monkeypatch)
+    assert ctx.make().next_issue() == "12"
+    assert not ctx.path("slot-deferred-11").exists()
+    flight(ctx, wip=[5], ready=[issue(12)], prs={5: 11})   # back in the agents' hands, no deferral on record
+    assert ctx.make().next_issue() == ""
+    assert "deferred (" not in ctx.log().rsplit("not starting new work", 1)[1]
 
 
 def test_a_pr_waiting_for_the_owner_does_not_hold_up_new_work(ctx, monkeypatch):

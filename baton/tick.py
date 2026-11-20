@@ -40,6 +40,7 @@ import time
 from . import after_merge, checkpoint, dev, fix, hooks as telemetry, maintenance, merge, names, notify, pick, pr as pr_helpers, pr_contract, review, scan, spec, tmp_sweep, vendors
 from .common import Deferred, git
 
+LEASE_REASON = "vendor capacity reserved"   # dispatch.dispatch: a temporary lease, not quota or cooldown
 AGENT_REVIEW_NOTE = ("The PR description{issue} give the problem, its cause and the fix. Check the diagnosis first: does the "
                      "stated cause hold, and does the change fix it rather than a symptom? Then review the code.")
 CURSOR_REVIEW_NOTE = ("Review this Cursor-authored PR, including its current description. Previous metadata fixes may have "
@@ -129,7 +130,7 @@ class Tick:
 
     # --- one item: begin_item / finish_item of roles.sh -----------------------------------
     def begin_item(self):
-        self.active = {"review": "", "spec": "", "issue": "", "cursor_fix": ""}
+        self.active = {"review": "", "spec": "", "issue": "", "cursor_fix": "", "pr": ""}
         if not self.manual:   # the next tick starts with the repository after this one
             (self.runner_state / "last-repo").write_text(f"{self.gh_repo}\n")
         fd, path = tempfile.mkstemp(prefix="baton-telemetry-item.", dir=self.env.tools.get("TMPDIR", "/tmp") or "/tmp")
@@ -145,6 +146,8 @@ class Tick:
             Path(item).unlink(missing_ok=True)
         a, state = self.active, self.state
         if rc != 75:
+            if a.get("pr"):   # a non-deferred attempt ends the PR's slot loan
+                (state / f"slot-deferred-{a['pr']}").unlink(missing_ok=True)
             if a["review"]:
                 (state / f"review-pending-{a['review']}").unlink(missing_ok=True)
             if a["spec"]:
@@ -175,12 +178,45 @@ class Tick:
             rc = stop.rc
         except Deferred as deferred:
             rc = self.defer(deferred.vendor, deferred.reason)
+            self.lend_slot(deferred)
         except Exception as exc:
             self.log(f"item failed: {type(exc).__name__}: {exc}")
             rc = 1
         finally:
             self.finish_item(rc)
         return rc
+
+    def lend_slot(self, deferred):
+        """An open PR of a counted agent-wip issue whose next step yields on vendor quota or
+        cooldown lends its max_pending_prs slot (state file slot-deferred-<pr>). A lease-only
+        deferral (the vendor's capacity is reserved for a moment) does not."""
+        pr = self.active.get("pr")
+        if not pr or deferred.reason == LEASE_REASON:
+            return
+        info = self.gh_json("pr", "view", str(pr), "-R", self.gh_repo, "--json", "state,headRefName,labels")
+        if not isinstance(info, dict) or info.get("state") != "OPEN" \
+                or any(label.get("name") == "ready-for-human" for label in info.get("labels") or []):
+            return
+        issue = names.issue_of(info.get("headRefName") or "")
+        labels = self.gh_json("issue", "view", issue, "-R", self.gh_repo, "--json", "labels") if issue else None
+        if not isinstance(labels, dict) or not any(label.get("name") == "agent-wip" for label in labels.get("labels") or []):
+            return
+        marker = self.state / f"slot-deferred-{pr}"
+        new = not marker.exists()
+        marker.write_text(json.dumps({"vendor": deferred.vendor, "reason": deferred.reason}))
+        if new:
+            self.log(f"PR #{pr} (issue #{issue}) lends its agent-wip slot while deferred: {deferred.vendor} {deferred.reason}")
+
+    def slot_markers(self):
+        """{PR number: "vendor reason"} of the PRs that lend their slots."""
+        found = {}
+        for path in self.state.glob("slot-deferred-*"):
+            try:
+                data = json.loads(path.read_text())
+                found[path.name.removeprefix("slot-deferred-")] = f"{data['vendor']} {data['reason']}"
+            except (OSError, ValueError, KeyError, TypeError):
+                path.unlink(missing_ok=True)
+        return found
 
     def after_item(self, rc):
         """What the tick does with an item's exit code: None to go on, else the exit code."""
@@ -213,7 +249,7 @@ class Tick:
     # --- agent steps that touch the item's markers ---------------------------------------
     def review_loop(self, pr, wt, note, fixer="agent", reviewer="pool", fixed_by="", issue=""):
         """The review rounds, then the merge or handoff (baton.review)."""
-        self.active["review"] = self.active["cursor_fix"] = str(pr)
+        self.active["review"] = self.active["cursor_fix"] = self.active["pr"] = str(pr)
         loop = review.Review(self.env.with_runtime(issue=issue), self.hooks(issue, pr), pr, wt, issue, fixed_by)
         return loop.loop(note, fixer, reviewer)
 
@@ -419,6 +455,7 @@ class Tick:
         if self.force_issue or self.scan_cmd or saved is None:
             return 0
         pr = saved.get("pr", "")
+        self.active["pr"] = str(pr)
         if (self.force_pr or self.force_review) and pr != self.force_pr + self.force_review:
             return 0
         state = self.state_of("pr", pr)
@@ -499,6 +536,7 @@ class Tick:
         return self.after_item(self.item(lambda: self.fix_item(pr, head_ref)))
 
     def fix_item(self, pr, head_ref):
+        self.active["pr"] = str(pr)
         issue = names.issue_of(head_ref)
         wt = str(names.worktree_for(self.wt_root, head_ref))
         url = f"https://github.com/{self.gh_repo}/pull/{pr}"
@@ -605,18 +643,38 @@ class Tick:
                     and ((latest.get("actor") or {}).get("login") or "").casefold() == self.owner.casefold())
 
     def next_issue(self):
-        pending = self.gh_json("issue", "list", "-R", self.gh_repo, "--state", "open", "--label", "agent-wip", "--limit", "100",
-                               "--json", "number") or []
+        listed = self.gh_json("issue", "list", "-R", self.gh_repo, "--state", "open", "--label", "agent-wip", "--limit", "100",
+                              "--json", "number")
         cap = int(self.env.config.scheduling.max_pending_prs or 1)
-        prs = self.gh_json("pr", "list", "-R", self.gh_repo, "--state", "open", "--limit", "100",
-                           "--json", "headRefName,labels") or []
+        open_prs = self.gh_json("pr", "list", "-R", self.gh_repo, "--state", "open", "--limit", "100",
+                                "--json", "number,headRefName,labels")
+        prs = open_prs or []
         branches = {p["headRefName"] for p in prs}
         # A PR waiting for the owner uses no agent capacity; it must not hold up the queue.
         with_owner = {names.issue_of(p["headRefName"]) for p in prs
                       if any(label.get("name") == "ready-for-human" for label in p.get("labels") or [])}
-        pending = [p for p in pending if str(p["number"]) not in with_owner]
-        if len(pending) >= cap:
-            self.log(f"{len(pending)} issue(s) still waiting on review (agent-wip), cap {cap}; not starting new work")
+        pending = [p for p in listed or [] if str(p["number"]) not in with_owner]
+        pr_of = {names.issue_of(p["headRefName"]): str(p.get("number", "")) for p in prs
+                 if names.issue_of(p["headRefName"]) not in with_owner}
+        markers = self.slot_markers()
+        held = {str(p["number"]): pr_of.get(str(p["number"])) for p in pending}
+        deferred = {n for n, pr in held.items() if pr and pr in markers}
+        if listed is not None and open_prs is not None:   # a marker of a closed, merged or relabelled PR goes
+            for pr in set(markers) - {held[n] for n in deferred}:
+                (self.state / f"slot-deferred-{pr}").unlink(missing_ok=True)
+        if len(pending) - len(deferred) >= cap or len(pending) >= cap + 1:
+            why = []
+            for p in pending:
+                n = str(p["number"])
+                if not held[n]:
+                    why.append(f"#{n}: no open PR")
+                elif n in deferred:
+                    why.append(f"#{n}: PR #{held[n]} deferred ({markers[held[n]]})")
+                else:
+                    why.append(f"#{n}: PR #{held[n]} in review")
+            limit = f"total limit {cap + 1} reached" if len(pending) >= cap + 1 else f"{len(pending) - len(deferred)} not deferred"
+            self.log(f"{len(pending)} issue(s) still waiting on review (agent-wip), cap {cap}, {len(deferred)} deferred, "
+                     f"{limit}; not starting new work: " + "; ".join(why))
             return ""
         for n in self.candidates():
             if any(names.issue_of(b) == str(n) for b in branches):
