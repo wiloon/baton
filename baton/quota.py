@@ -23,6 +23,7 @@ import fcntl
 import math
 import os
 from pathlib import Path
+import subprocess
 import sys
 import time
 import tempfile
@@ -31,6 +32,8 @@ import urllib.request
 WINDOW_SECONDS = {"five_hour": 5 * 3600, "seven_day": 7 * 24 * 3600}
 TIE = 0.05   # scores this close count as equal: preference, then pool order decides
 CURSOR_USAGE = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage"
+# Where cursor-agent >= 2026.11.19 keeps its login on Linux (secret-tool attributes).
+CURSOR_SECRET = ("service", "cursor-credentials", "account", "cursor-user")
 
 
 def _json_lines(lines):
@@ -107,11 +110,58 @@ def _fetch_cursor(token):
         return json.load(response)
 
 
-def refresh_cursor(state, now, auth=None, fetch=_fetch_cursor):
-    """Record Cursor's usage; {} when it isn't logged in here. Raises when the API fails."""
+class CursorLoginUnreadable(ValueError):
+    """auth.json records a Cursor login, but its access token can't be read."""
+
+
+def _secret_lookup():
+    """The credential cursor-agent keeps in the Secret Service (Linux), or None."""
     try:
-        token = json.loads(Path(auth or Path.home() / ".config/cursor/auth.json").read_text())["accessToken"]
-    except (OSError, ValueError, KeyError):
+        found = subprocess.run(["secret-tool", "lookup", *CURSOR_SECRET], capture_output=True, text=True,
+                               timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return found.stdout if found.returncode == 0 else None
+
+
+def cursor_token(auth, lookup=_secret_lookup):
+    """Cursor's access token; None when this machine has no Cursor login.
+
+    cursor-agent 2026.11.19 moved the login into the OS secret store and left only
+    {"storedIn": "os-secret-store"} in auth.json; older versions keep accessToken there.
+    Raises CursorLoginUnreadable when a login is recorded but no token comes back, so the
+    snapshot can't silently freeze at its last value."""
+    try:
+        stored = json.loads(Path(auth).read_text())
+    except OSError:
+        return None
+    except ValueError as error:
+        raise CursorLoginUnreadable(f"cursor auth.json is not JSON: {error}") from None
+    if not isinstance(stored, dict) or stored.get("signedOut") is True:
+        return None
+    if token := stored.get("accessToken"):
+        return token
+    if stored.get("storedIn") == "os-secret-store":
+        try:
+            token = json.loads(lookup() or "")["accessToken"]
+        except (ValueError, TypeError, KeyError):
+            token = None
+        if not token:
+            raise CursorLoginUnreadable("cursor login is in the OS secret store, but secret-tool returned no "
+                                        f"access token ({' '.join(CURSOR_SECRET)})")
+        return token
+    raise CursorLoginUnreadable("cursor auth.json has neither accessToken nor storedIn")
+
+
+def refresh_cursor(state, now, auth=None, fetch=_fetch_cursor, lookup=_secret_lookup):
+    """Record Cursor's usage; {} when it isn't logged in here. Raises when the login can't be
+    read (recording probe_failed) or the API fails."""
+    try:
+        token = cursor_token(auth or Path.home() / ".config/cursor/auth.json", lookup)
+    except CursorLoginUnreadable:
+        credential(state, 'cursor', 'probe_failed', now)
+        raise
+    if token is None:
         return {}
     windows = parse_cursor(fetch(token))
     if windows:
