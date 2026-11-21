@@ -220,7 +220,7 @@ class Runner:
         self.comment(
             pr,
             f"<!-- baton-description-discarded by={fixer} -->\n"
-            f"Description request from {fixer} not applied: {detail}. The live description is unchanged.",
+            f"Discarded the PR description request from {fixer}.\n\n{detail}",
         )
 
     # --- a Claude or Codex fixer ---
