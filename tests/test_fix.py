@@ -231,15 +231,15 @@ def test_cursor_recheck_comes_from_its_reply(run):
     assert "Checks to verify" not in run.comments()[0] and run.comments()[0].startswith("<!-- baton-fix by=cursor -->")
 
 
-def test_a_description_request_github_refuses_defers_and_resumes_without_an_agent(run, gh):
+def test_a_description_request_github_refuses_hands_off_without_a_later_write(run, gh, monkeypatch):
+    seen = _codes(monkeypatch)
     request = BODY.replace("## Checks to verify\nnone", "## Checks to verify\n- /billing: badge")
     run.agent(cursor_plan("## Checks to verify\n- /billing: badge\n\nRESULT: fixed", request=request))
-    gh.fail("edit")
-    assert run.fix("cursor")["rc"] == 75
-    assert len(run.agent_calls) == 1 and not run.labelled()
-    gh.fail("edit", False)
-    assert run.fix("cursor")["rc"] == 0 and len(run.agent_calls) == 1   # resumed: no second run
-    assert section(run.body(), "Checks to verify") == "- /billing: badge"
+    gh.fail("edit-before-write")
+    assert run.fix("cursor")["rc"] == 1 and run.labelled() and seen == ["fix_description_write_failed"]
+    assert len(run.agent_calls) == 1
+    assert section(run.body(), "Checks to verify") == "none"
+    assert not Path(run.root / "ctx" / f"pr-{PR}-body.md").exists()
 
 
 def test_a_description_only_cursor_fix_pushes_nothing_and_keeps_the_evidence(run, gh):
@@ -469,15 +469,16 @@ def _codes(monkeypatch):
 @pytest.mark.parametrize("rc", [1, 2])
 @pytest.mark.parametrize("fixer", ["claude", "cursor"])
 def test_a_description_failure_is_discarded_not_handed_off(run, monkeypatch, fixer, rc):
-    """#141: a rejected or failed description request never hands off by itself. The Claude/Codex
-    path continues (its checks refresh counts as a change); Cursor's no-commit run stops as fix_no_commit."""
-    if fixer == "cursor" and rc == 1:
-        pytest.skip("a GitHub failure defers the Cursor path before any handoff")
+    """#141: a rejected description never hands off by itself. Claude/Codex also discard a GitHub
+    description failure and continue; Cursor hands a GitHub description failure off directly (#125)."""
     seen = _codes(monkeypatch)
     monkeypatch.setattr(fix.pr_helpers, "apply_body", lambda *a, **k: (rc, False, "something", False))
     run.agent(cursor_plan("Adopted.\n\nRESULT: fixed", commit=False) if fixer == "cursor" else {**CHECKED, "commit": False})
     run.fix(fixer)
-    assert seen == ([] if fixer == "claude" else ["fix_no_commit"])
+    if fixer == "cursor" and rc == 1:
+        assert seen == ["fix_description_write_failed"]
+    else:
+        assert seen == ([] if fixer == "claude" else ["fix_no_commit"])
 
 
 @pytest.mark.parametrize("rc, code", [(1, "fix_task_write_failed"), (2, "fix_task_invalid"), (3, "fix_task_invalid")])
@@ -727,47 +728,45 @@ def test_cursor_verify_failure_beats_a_description_handoff(run, gh):
     assert "description request not applied" not in "\n".join(run.runner_log())
 
 
-def test_cursor_defers_body_and_task_then_resumes_without_an_agent(run, gh):
-    # Acceptance 4: matching partial body + TASK on live complete; GitHub edit fails, then resumes.
+def test_cursor_hands_off_a_failed_body_and_task_write_without_a_later_write(run, gh, monkeypatch):
+    # Category-1 writes hand off directly: one handoff, request cleared, no later write.
+    seen = _codes(monkeypatch)
     gh.set(body=COMPLETE, headRefName="cursor/issue-419")
     text = "Task completion: partial\n\n## What changed\nFixed all items.\n\n## Checks to verify\nnone\n"
     run.agent(cursor_plan("## Checks to verify\nnone\n\nTASK: partial\nRESULT: fixed", request=text))
     gh.fail("edit-before-write")
-    assert run.fix("cursor")["rc"] == 75 and len(run.agent_calls) == 1 and not run.labelled()
-    assert run.body() == COMPLETE
-    gh.fail("edit-before-write", False)
-    assert run.fix("cursor")["rc"] == 0 and len(run.agent_calls) == 1 and run.pushed()
-    assert "completion=partial" in run.body() and "Refs #419" in run.body()
-    assert "Fixed all items." in run.body()
+    assert run.fix("cursor")["rc"] == 1 and len(run.agent_calls) == 1 and run.labelled()
+    assert run.body() == COMPLETE and "Fixed all items." not in run.body()
+    assert seen == ["fix_description_write_failed"]
+    assert not Path(run.root / "ctx" / f"pr-{PR}-body.md").exists()
+    assert not Path(run.root / "state" / f"cursor-fix-task-{PR}").exists()
 
 
 @pytest.mark.parametrize("failure", ["edit", "edit-before-write"])
-def test_cursor_resumes_a_task_only_edit_after_github_failure(run, gh, failure):
+def test_cursor_hands_off_a_task_only_edit_github_failure(run, gh, monkeypatch, failure):
+    seen = _codes(monkeypatch)
     initial = COMPLETE.replace("## Checks to verify\nnone", "## Checks to verify\n- /billing: badge")
     gh.set(body=initial, headRefName="cursor/issue-419")
     run.agent(cursor_plan("Agreed.\nTASK: partial\nRESULT: fixed", commit=False))
     gh.fail(failure)
-    assert run.fix("cursor")["rc"] == 75 and len(run.agent_calls) == 1 and not run.labelled()
+    assert run.fix("cursor")["rc"] == 1 and len(run.agent_calls) == 1 and run.labelled()
+    assert seen == ["fix_task_write_failed"]
     if failure == "edit-before-write":
         assert run.body() == initial
-    gh.fail(failure, False)
-    assert run.fix("cursor")["rc"] == 0 and len(run.agent_calls) == 1 and not run.pushed_new
-    assert "completion=partial" in run.body() and "Refs #419" in run.body()
-    assert section(run.body(), "Checks to verify") == "- /billing: badge"
 
 
-def test_cursor_retries_a_failed_read_then_hands_off_an_unchanged_request(run, gh):
+def test_cursor_hands_off_a_failed_description_read_without_retrying(run, gh, monkeypatch):
+    seen = _codes(monkeypatch)
     run.agent(cursor_plan("RESULT: fixed", request=BODY, commit=False))
     gh.fail("view")
-    assert run.fix("cursor")["rc"] == 75 and not run.labelled()
-    gh.fail("view", False)
-    assert run.fix("cursor")["rc"] == 1 and len(run.agent_calls) == 1 and run.labelled()
+    assert run.fix("cursor")["rc"] == 1 and run.labelled()
     assert run.body() == BODY
-    assert any("made no commit" in line for line in run.runner_log())
+    assert seen == ["fix_description_write_failed"]
+    assert len(run.agent_calls) == 1
 
 
 @pytest.mark.parametrize("request_kind", ["replacement", "task-only", "rejected"])
-def test_a_deferred_task_change_preserves_the_owners_issue_correction(run, gh, request_kind):
+def test_a_failed_cursor_write_hands_off_before_an_owner_issue_correction(run, gh, request_kind):
     gh.set(body=COMPLETE, headRefName="owner-branch")
     request = {
         "replacement": COMPLETE.replace("Disabled buttons.", "Revised description."),
@@ -777,14 +776,9 @@ def test_a_deferred_task_change_preserves_the_owners_issue_correction(run, gh, r
     reply = "## Checks to verify\nnone\n\nTASK: partial\nRESULT: fixed"
     run.agent(cursor_plan(reply, request=request, commit=False))
     gh.fail("edit-before-write")
-    assert run.fix("cursor")["rc"] == 75
-
-    corrected = COMPLETE.replace("419", "420").replace("## Checks to verify\nnone", "## Checks to verify\n- Owner check")
-    gh.set(body=corrected)
-    gh.fail("edit-before-write", False)
     assert run.fix("cursor")["rc"] == 1 and run.labelled()
-    assert run.body() == corrected
     assert len(run.agent_calls) == 1
+    assert run.body() == COMPLETE
 
 
 @pytest.mark.parametrize("outcome", ["RESULT: failed boom", "RESULT: needs-info", "RESULT: fixed"])
@@ -806,30 +800,30 @@ def test_cursor_does_not_resume_a_run_interrupted_before_checks_are_saved(run, g
     assert "Stale description." not in run.body()
 
 
-def test_cursor_resumes_task_after_a_rejected_body_when_github_fails(run, gh):
+def test_cursor_hands_off_task_after_a_rejected_body_when_github_fails(run, gh, monkeypatch):
+    seen = _codes(monkeypatch)
     gh.set(body=COMPLETE, headRefName="cursor/issue-419")
     bad = "Task completion: partial\nTask completion: complete\n\n## What changed\nNope.\n"
     run.agent(cursor_plan("TASK: partial\nRESULT: fixed", request=bad, commit=False))
     gh.fail("edit")
-    # Body is invalid (no edit); task edit is attempted and GitHub refuses → defer.
-    assert run.fix("cursor")["rc"] == 75 and len(run.agent_calls) == 1
-    gh.fail("edit", False)
-    assert run.fix("cursor")["rc"] == 0 and len(run.agent_calls) == 1 and not run.labelled()
-    assert "Nope." not in run.body() and "completion=partial" in run.body() and "Refs #419" in run.body()
+    # Body is invalid (no edit); task edit is attempted and GitHub refuses → hand off.
+    assert run.fix("cursor")["rc"] == 1 and len(run.agent_calls) == 1 and run.labelled()
+    assert seen == ["fix_task_write_failed"]
+    assert "Nope." not in run.body()
     assert any("description request not applied" in line for line in run.runner_log())
 
 
-def test_cursor_lost_body_response_still_counts_on_resume(run, gh):
-    # Lost success response: fake gh writes then fails; retry sees the landed body vs baseline.
+def test_cursor_hands_off_when_a_body_write_response_is_lost(run, gh, monkeypatch):
+    # Lost success response: fake gh writes then fails; category-1 writes still hand off once.
+    seen = _codes(monkeypatch)
     gh.set(body=COMPLETE, headRefName="cursor/issue-419")
     text = COMPLETE.replace("Disabled buttons.", "Fixed all items.")
     run.agent(cursor_plan("## Checks to verify\nnone\n\nTASK: partial\nRESULT: fixed",
                           request=text, commit=False))
     gh.fail("edit")
-    assert run.fix("cursor")["rc"] == 75
+    assert run.fix("cursor")["rc"] == 1 and run.labelled() and seen == ["fix_description_write_failed"]
     assert "Fixed all items." in run.body() and "completion=partial" in run.body()
-    # Keep the edit failure active. The retry can finish using the already-landed body.
-    assert run.fix("cursor")["rc"] == 0 and len(run.agent_calls) == 1
+    assert len(run.agent_calls) == 1
     assert len([c for c in gh.calls() if c[:2] == ["pr", "edit"] and "--body-file" in c]) == 1
 
 

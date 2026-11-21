@@ -959,11 +959,25 @@ def test_a_failed_spec_comment_hands_off_after_gh_backoff(loop, marker, script):
     assert not list(Path(loop.env["STATE"]).glob("handoff-retry-*"))
 
 
+def _ready_handoffs(loop):
+    found = []
+    for c in loop.gh.calls:
+        if c[:2] != ["issue", "edit"]:
+            continue
+        for i, arg in enumerate(c):
+            if arg == "--add-label" and i + 1 < len(c) and c[i + 1] == "ready-for-human":
+                found.append(c)
+                break
+    return found
+
+
 @pytest.mark.parametrize("stderr", ["", "HTTP 401: Bad credentials", "GraphQL: could not resolve issue"])
 def test_an_unclassified_spec_read_failure_hands_off_without_a_retry(loop, stderr):
+    loop.gh.labels = {"needs-triage"}   # start without ready-for-human so a silent return cannot pass
     loop.gh.flaky["issue view"] = [(stderr, False)]
     assert loop.run() is False
-    assert loop.runs == [] and "ready-for-human" in loop.gh.labels
+    assert loop.runs == [] and len(_ready_handoffs(loop)) == 1
+    assert "ready-for-human" in loop.gh.labels
     assert not list(Path(loop.env["STATE"]).glob("handoff-retry-*"))
 
 
@@ -981,7 +995,7 @@ def test_a_spec_read_that_keeps_failing_replays_twice_then_hands_off_once(loop, 
         loop.run()
     clock["now"] = 1_360
     assert loop.run() is False
-    assert "ready-for-human" in loop.gh.labels and loop.runs == []
+    assert len(_ready_handoffs(loop)) == 1 and loop.runs == []
 
 
 def test_a_recovered_spec_read_clears_its_saved_retry(loop, monkeypatch):
@@ -992,7 +1006,10 @@ def test_a_recovered_spec_read_clears_its_saved_retry(loop, monkeypatch):
         loop.run()
     loop.gh.fails.discard("issue view")
     clock["now"] = 1_060
-    loop.run()
+    assert loop.run() is True
+    assert loop.runs and loop.runs[0]["role"] == "spec_review"
+    assert loop.gh.posted("<!-- baton-verdict: accept")
+    assert "ready-for-human" not in loop.gh.labels and not _ready_handoffs(loop)
     assert not list(Path(loop.env["STATE"]).glob("handoff-retry-*spec_comments_read_failed*"))
 
 
@@ -1305,3 +1322,40 @@ def test_an_advised_spec_handoff_keeps_todays_handoff(advised):
     advised.advice = [{"action": "handoff", "reason": "needs a product decision", "evidence": []}]
     assert advised.run() is False
     assert len(advised.runs) == 5 and "ready-for-human" in advised.gh.labels
+
+
+@pytest.mark.parametrize("change", ["body", "verdict", "head"])
+def test_a_pending_adr_input_change_during_deferral_blocks_merge_and_acceptance(loop, monkeypatch, change):
+    """A deferred ADR resume is bound to issue body, verdict and ADR head (#125)."""
+    from baton import handoff
+    clock = _spec_clock(monkeypatch)
+    resume_pending(loop, monkeypatch)
+    # Ensure a stable ADR head snapshot via the local branch tip.
+    branch = f"docs/spec-issue-{N}"
+    sh(loop.repo, "git", "branch", branch, "HEAD")
+    sh(loop.repo, "git", "push", "-q", "origin", branch)
+    tip = sh(loop.repo, "git", "rev-parse", f"origin/{branch}")
+    loop.gh.head_oid = tip
+    loop.gh.fails.add("pr view")
+    with pytest.raises(Deferred, match="spec_pending_adr_read_failed"):
+        loop.run()
+    saved = handoff.load_retry(session.resolve(loop.env), N, "spec_pending_adr_read_failed")
+    assert saved["continuation"]["adr_head"] == tip
+    assert saved["continuation"]["verdict"]
+    if change == "body":
+        loop.gh.body = loop.gh.body + "\nChanged after deferral.\n"
+    elif change == "verdict":
+        # Replace the pending comment with a different saved verdict text.
+        other = VERDICT_BODY.replace("round 1: accept", "round 2: accept")
+        loop.gh.comments = [{"author": {"login": "owner"},
+                             "body": f"<!-- baton-spec-accept-pending pr=77 -->\n{other}"}]
+    else:
+        loop.gh.head_oid = "b" * 40
+        sh(loop.repo, "git", "commit", "-q", "--allow-empty", "-m", "moved")
+        sh(loop.repo, "git", "push", "-q", "origin", f"HEAD:{branch}")
+    loop.gh.fails.discard("pr view")
+    clock["now"] = 1_060
+    assert loop.run() is False
+    assert merges(loop) == []
+    assert not loop.gh.posted(ACCEPTED)
+    assert "ready-for-human" in loop.gh.labels

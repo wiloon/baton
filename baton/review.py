@@ -266,6 +266,30 @@ class Review:
             snapshot=snapshot, revalidate=revalidate, close_outcomes=("review_limit",),
             transient=transient, continuation=continuation, resume=resume)
 
+    def reviewed_revision(self):
+        """(headRefOid, baseRefOid) of the open PR, or (None, None) when unreadable."""
+        data = pr_helpers.view(self.pr, "headRefOid,baseRefOid,state")
+        if not data or data.get("state") != "OPEN":
+            return None, None
+        head, base = data.get("headRefOid") or "", data.get("baseRefOid") or ""
+        return (head, base) if head and base else (None, None)
+
+    def revision_matches(self, saved):
+        """True when SAVED continuation still names this PR's current head and base."""
+        head, base = self.reviewed_revision()
+        return bool(head and base and saved.get("head") == head and saved.get("base") == base)
+
+    def stop_stale_fix(self, reason, title):
+        """Clear a bound retry whose revision moved and hand the PR to the owner."""
+        pr = self.pr
+        episode = self.issue or pr
+        owner_handoff.clear_retry(self.env, episode, reason)
+        result = self.handoff(
+            reason, title,
+            f"PR #{pr} head or base changed (or became unreadable) while waiting for review feedback; "
+            f"not applying the saved fix. {self.url}")
+        return "", 0 if result.handed_off else 75
+
     def fixer_feedback(self, round, screenshot):
         """Read the expected trusted feedback, consuming a saved retry before any lookup."""
         pr = self.pr
@@ -273,17 +297,26 @@ class Review:
         reason = "review_comment_missing"
         title = f"PR #{pr} review comment missing"
         text = f"A review comment of round {round} is unavailable. {self.url}"
-        continuation = {"pr": str(pr), "round": round}
-        pending = owner_handoff.load_retry(self.env, episode, reason)
+        try:
+            pending = owner_handoff.load_retry(self.env, episode, reason)
+        except owner_handoff.RetryUnreadable as exc:
+            notify.log(f"PR #{pr}: review feedback retry unreadable: {exc}")
+            result = self.handoff(reason, title, text)
+            return "", 0 if result.handed_off else 75
         if pending is not None:
             saved = pending.get("continuation") or {}
-            if saved.get("pr") != continuation["pr"] or saved.get("round") != continuation["round"]:
+            if saved.get("pr") != str(pr) or saved.get("round") != round:
                 owner_handoff.clear_retry(self.env, episode, reason)
                 pending = None
+            elif not self.revision_matches(saved):
+                return self.stop_stale_fix(reason, title)
         if pending is not None:
             result = self.handoff(reason, title, text, resume=True)
             if result.action != owner_handoff.RETRY:
                 return "", 75 if result.action == owner_handoff.DEFER else 0
+            saved = result.continuation or pending.get("continuation") or {}
+            if not self.revision_matches(saved):
+                return self.stop_stale_fix(reason, title)
 
         code, retryable = read_agent_comment(self.repo, self.owner, pr, "baton-review", round)
         feedback = code
@@ -295,6 +328,11 @@ class Review:
             owner_handoff.clear_retry(self.env, episode, reason)
             return feedback, None
 
+        head, base = self.reviewed_revision()
+        if not head or not base:
+            result = self.handoff(reason, title, text, transient=False)
+            return "", 75 if result.action == owner_handoff.DEFER else 0
+        continuation = {"pr": str(pr), "round": round, "head": head, "base": base}
         result = self.handoff(reason, title, text, transient=retryable, continuation=continuation)
         return "", 75 if result.action == owner_handoff.DEFER else 0
 

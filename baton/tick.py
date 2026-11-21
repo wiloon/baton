@@ -37,7 +37,7 @@ import sys
 import tempfile
 import time
 
-from . import advisor, after_merge, checkpoint, dev, fix, hooks as telemetry, maintenance, merge, names, notify, pick, pr as pr_helpers, pr_contract, review, scan, spec, tmp_sweep, vendors
+from . import advisor, after_merge, checkpoint, dev, fix, handoff as owner_handoff, hooks as telemetry, maintenance, merge, names, notify, pick, pr as pr_helpers, pr_contract, review, scan, spec, tmp_sweep, vendors
 from .common import Deferred, git
 
 AGENT_REVIEW_NOTE = ("The PR description{issue} give the problem, its cause and the fix. Check the diagnosis first: does the "
@@ -714,10 +714,31 @@ class Tick:
             # These issues can be at different steps: one whose next step no vendor can run now must
             # not block another (revision needs a pool vendor).
             issue = str(n)
-            # Pending ADR acceptance needs a later tick to finish the merge; treat it as
-            # ready for the implementation role's vendor pool so it is not blocked when
-            # only a spec reviewer/reviser is unavailable (#122).
-            if spec.accept_pending(self.env, issue) or spec.cursor_plan(self.env, issue):
+            # A pending comments retry must not be bypassed by accept_pending / cursor_plan /
+            # spec_state (each would read again during the 60s/300s wait). When due, one gated
+            # read selects plan, role and round from the same payload Spec.loop will use.
+            try:
+                pending = owner_handoff.load_retry(self.env, issue, "spec_comments_read_failed")
+            except owner_handoff.RetryUnreadable:
+                spec.Spec(self.env, self.hooks(issue), issue).handoff(
+                    "Could not read the saved comments retry.", "spec_comments_read_failed")
+                continue
+            if pending is not None:
+                try:
+                    listed = spec.Spec(self.env, self.hooks(issue), issue).retry_read(
+                        lambda: spec.read_comments(self.env, issue),
+                        "Could not read issue comments to select the next step.",
+                        "spec_comments_read_failed")
+                except Deferred as deferred:
+                    self.defer(deferred.vendor, deferred.reason)
+                    continue
+                if listed is None:
+                    continue
+                role = spec.role_from(listed, self.env)
+            elif spec.accept_pending(self.env, issue) or spec.cursor_plan(self.env, issue):
+                # Pending ADR acceptance needs a later tick to finish the merge; treat it as
+                # ready for the implementation role's vendor pool so it is not blocked when
+                # only a spec reviewer/reviser is unavailable (#122).
                 role = "dev"
             else:
                 role = spec.pending_role(spec.spec_state(self.env, issue)[0])

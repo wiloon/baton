@@ -80,6 +80,7 @@ REASONS = {
     "spec_pending_accept_post_failed": Reason(1, "rule"),
     "spec_accept_post_failed": Reason(1, "rule"),
     "fix_checks_refresh_failed": Reason(1, "rule"),
+    "fix_description_write_failed": Reason(1, "rule"),
     "fix_task_write_failed": Reason(1, "rule"),
     "spec_body_edit_failed": Reason(1, "rule"),
     "spec_adr_open_failed": Reason(1, "rule"),
@@ -130,14 +131,21 @@ def retry_path(env, episode, reason):
     return Path(str(env.dirs.state)) / f"handoff-retry-{episode}-{reason}.json"
 
 
+class RetryUnreadable(Exception):
+    """A retry record exists but cannot be read or parsed; callers must fail closed."""
+
+
 def load_retry(env, episode, reason):
+    """Return the saved retry dict, None when absent, or raise RetryUnreadable when corrupt."""
     path = retry_path(env, episode, reason)
+    if not path.is_file():
+        return None
     try:
         data = json.loads(path.read_text())
-    except (OSError, ValueError):
-        return None
+    except (OSError, ValueError) as exc:
+        raise RetryUnreadable(f"unreadable retry record {path.name}") from exc
     if not isinstance(data, dict):
-        return None
+        raise RetryUnreadable(f"invalid retry record {path.name}")
     return data
 
 
@@ -185,13 +193,18 @@ def _category1(env, reason, entry, *, kind, number, title, text, hooks, remove, 
                close_outcomes, after_labels, transient, continuation, resume):
     """Rule-decided recovery: schedule, consume a due attempt, or hand off (#125)."""
     now = int(clock())
-    pending = load_retry(env, episode, reason)
-    attempts = int(pending.get("attempts") or 0) if pending else 0
 
     def finish():
         return _finish(env, reason, entry, kind=kind, number=number, title=title, text=text, hooks=hooks,
                        remove=remove, item=item, episode=episode, close_outcomes=close_outcomes,
                        after_labels=after_labels)
+
+    try:
+        pending = load_retry(env, episode, reason)
+    except RetryUnreadable as exc:
+        notify.log(f"handoff-retry {reason} unreadable episode={episode}: {exc}")
+        return finish()
+    attempts = int(pending.get("attempts") or 0) if pending else 0
 
     if resume:
         if pending is None or attempts >= MAX_ATTEMPTS:

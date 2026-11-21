@@ -284,3 +284,29 @@ def test_each_category_1_reason_defers_then_hands_off_through_perform(env, monke
                            hooks=hooks, item="1", episode="ep", transient=True,
                            continuation={"op": reason})
     assert done.handed_off and labelled == [1] and calls == []
+
+
+def test_a_damaged_retry_record_hands_off_without_replaying(env, monkeypatch):
+    """An unreadable retry must fail closed: no fresh budget, no lookup replay."""
+    labelled = []
+    hooks, events = _hooks()
+    monkeypatch.setattr(handoff, "clock", lambda: 1_000)
+    monkeypatch.setattr(handoff, "label_ready",
+                        lambda *a, **k: labelled.append(1) or MagicMock(returncode=0))
+    monkeypatch.setattr(handoff.notify, "notify", lambda *a, **k: None)
+    path = handoff.retry_path(env, "7", "spec_comments_read_failed")
+    path.write_text("{not-json")
+    with pytest.raises(handoff.RetryUnreadable):
+        handoff.load_retry(env, "7", "spec_comments_read_failed")
+    # Resume after a restart that finds the damaged record: hand off, never RETRY.
+    done = handoff.perform(env, "spec_comments_read_failed", kind="issue", number="7", title="t", text="x",
+                           hooks=hooks, item="7", episode="7", resume=True)
+    assert done.action == handoff.HANDOFF and done.handed_off and labelled == [1]
+    assert events[-1][0] == "handoff"
+    assert handoff.load_retry(env, "7", "spec_comments_read_failed") is None
+
+    path.write_text('["not", "a", "dict"]')
+    scheduled = handoff.perform(env, "spec_comments_read_failed", kind="issue", number="7", title="t", text="x",
+                                hooks=hooks, item="7", episode="7", transient=True, continuation={})
+    assert scheduled.action == handoff.HANDOFF
+    assert handoff.load_retry(env, "7", "spec_comments_read_failed") is None

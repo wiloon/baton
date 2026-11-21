@@ -374,8 +374,10 @@ class Runner:
         description_rc, body_changed, description_reason, task_changed = pr_helpers.apply_body(
             pr, str(request), self.state, self.ctx, completion=want or None)
         if description_rc == 1:
-            notify.log(f"PR #{pr}: description update deferred after GitHub failure")
-            return 75
+            self.clear_cursor_request(pr)
+            return self.handoff(pr, "fix_description_write_failed",
+                               f"PR #{pr}: description update failed (cursor)",
+                               f"{description_reason or 'GitHub could not update the PR description'} {url}")
         discarded = description_rc == 2
         if discarded:
             pr_helpers.remove_body_request(request)
@@ -384,12 +386,11 @@ class Runner:
             rc, task_changed, log = pr_helpers.apply_task(pr, want, self.ctx, baseline_file)
             if log:
                 notify.log(log)
-            if rc == 1:
+            if rc != 0 and (rc != 2 or description_rc != 2):
                 if discarded:
                     self.description_discarded(pr, "cursor", description_reason)
-                notify.log(f"PR #{pr}: description update deferred after GitHub failure")
-                return 75
-            if rc != 0 and (rc != 2 or description_rc != 2):
+                if rc == 1:
+                    self.clear_cursor_request(pr)
                 return self.handoff(pr, "fix_task_write_failed" if rc == 1 else "fix_task_invalid",
                                     f"PR #{pr}: task completion change failed (cursor)", url)
         moved = self.head(wt) != head

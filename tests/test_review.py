@@ -29,7 +29,10 @@ def loop(gh, worktree, tmp_path, monkeypatch):
            "CURSOR_LOGIN_RE": "^cursor$", "MAX_REVIEW_ROUNDS": "2", "REVIEW_SKILL_MIN_LINES": "300",
            "REVIEW_CONTEXT_MAX_CHARS": "20000", "AUTO_MERGE": "1", "WT_ROOT": str(tmp_path / "worktrees"),
            "REPO_DIR": str(worktree.repo), "MAX_VERIFY_FIXES": "2", "ISSUE": "297"}
-    gh.set(headRefName="cursor/issue-297", author={"login": "cursor"}, title="T", body="Refs #297", comments=[], reviews=[])
+    head = sh(worktree.wt, "git", "rev-parse", "HEAD")
+    base = sh(worktree.repo, "git", "rev-parse", "origin/main")
+    gh.set(headRefName="cursor/issue-297", author={"login": "cursor"}, title="T", body="Refs #297",
+           comments=[], reviews=[], state="OPEN", headRefOid=head, baseRefOid=base)
     monkeypatch.setenv("CURSOR_BRANCH_RE", "^cursor/")
     monkeypatch.setenv("CURSOR_LOGIN_RE", "^cursor$")
     monkeypatch.setattr(pick.settle, "probe", lambda *args: None)   # never call a real CLI for quota
@@ -1155,9 +1158,16 @@ def advised(loop, monkeypatch):
         return loop.advice.pop(0), {}
     monkeypatch.setattr(advisor, "call_deepseek", call)
     real_view = review.pr_helpers.view
-    monkeypatch.setattr(review.pr_helpers, "view", lambda pr, fields: (
-        {"state": "OPEN", "headRefOid": sh(loop.wt, "git", "rev-parse", "HEAD")} if "headRefOid" in fields
-        else real_view(pr, fields)))
+
+    def view(pr, fields):
+        if "headRefOid" in fields:
+            data = {"state": "OPEN", "headRefOid": sh(loop.wt, "git", "rev-parse", "HEAD")}
+            if "baseRefOid" in fields:
+                data["baseRefOid"] = loop.gh.pr.get("baseRefOid") or sh(loop.repo, "git", "rev-parse", "origin/main")
+            return data
+        return real_view(pr, fields)
+
+    monkeypatch.setattr(review.pr_helpers, "view", view)
     return loop
 
 
@@ -1376,3 +1386,42 @@ def test_an_agent_screenshot_failure_that_mentions_a_comment_stays_a_run_failure
     loop.screens = ["RESULT: failed the comment was unavailable"]
     assert screen_run(loop) == 0
     _one_handoff(loop, seen, "screenshot_run_failed")
+
+
+@pytest.mark.parametrize("change", ["head", "base", "unreadable"])
+def test_a_head_or_base_change_during_feedback_deferral_stops_the_saved_fix(loop, monkeypatch, change):
+    """A review_comment_missing retry is bound to the reviewed revision (#125)."""
+    from baton import handoff
+
+    clock = {"now": 1_000}
+    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
+    loop.reviews = ["changes", "pass"]
+    head = loop.gh.pr["headRefOid"]
+    base = loop.gh.pr["baseRefOid"]
+    call = review.pr_helpers.call
+    marker = "<!-- baton-review round=1 "
+
+    def hide_comment(*args, **kwargs):
+        result = call(*args, **kwargs)
+        if args[:2] != ("pr", "view") or "comments" not in args or loop.fixes:
+            return result
+        data = __import__("json").loads(result.stdout)
+        data["comments"] = [c for c in data["comments"] if not c["body"].startswith(marker)]
+        from subprocess import CompletedProcess
+        return CompletedProcess(result.args, result.returncode, __import__("json").dumps(data), result.stderr)
+
+    monkeypatch.setattr(review.pr_helpers, "call", hide_comment)
+    assert loop.run(fixer="cursor", reviewer="claude") == 75
+    assert not loop.fixes
+    saved = handoff.load_retry(session.resolve(loop.env), "297", "review_comment_missing")
+    assert saved["continuation"]["head"] == head and saved["continuation"]["base"] == base
+    if change == "head":
+        loop.gh.set(headRefOid="f" * 40)
+    elif change == "base":
+        loop.gh.set(baseRefOid="e" * 40)
+    else:
+        loop.gh.set(state="CLOSED")
+    clock["now"] = 1_060
+    assert loop.run(fixer="cursor", reviewer="claude") == 0
+    assert not loop.fixes and loop.labelled("ready-for-human")
+    assert not list(Path(loop.env["STATE"]).glob("handoff-retry-*"))
