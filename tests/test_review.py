@@ -1095,3 +1095,52 @@ def test_screenshot_exhaustion_hands_off_once(loop, monkeypatch):
     assert len(notices) == 1 and "all screenshot reviewers are PR authors" in notices[0][1]
     assert sum(c[:2] == ["pr", "edit"] and "--add-label" in c and "ready-for-human" in c
                for c in loop.gh.calls()) == 1
+
+
+# --- the advisor at the review round limit (#17) -----------------------------------------------
+
+@pytest.fixture
+def advised(loop, monkeypatch):
+    """A live DeepSeek advisor with scripted replies; the PR's live head is the worktree's."""
+    from baton import advisor
+    from baton.config import Advisor
+    monkeypatch.setenv(advisor.KEY, "sk-" + "t" * 24)   # built, so no scanner reads a key
+    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="live"))
+    loop.advice, loop.advice_calls = [], []
+
+    def call(cfg, key, snapshot, actions):
+        loop.advice_calls.append(snapshot)
+        return loop.advice.pop(0), {}
+    monkeypatch.setattr(advisor, "call_deepseek", call)
+    real_view = review.pr_helpers.view
+    monkeypatch.setattr(review.pr_helpers, "view", lambda pr, fields: (
+        {"state": "OPEN", "headRefOid": sh(loop.wt, "git", "rev-parse", "HEAD")} if "headRefOid" in fields
+        else real_view(pr, fields)))
+    return loop
+
+
+def test_the_advisor_grants_one_more_round_and_the_pr_merges(advised):
+    advised.reviews[:] = ["changes", "changes", "pass"]
+    advised.advice = [{"action": "extra_round", "reason": "only a test is missing", "evidence": []}]
+    assert advised.run(fixer="cursor") == 0
+    assert len(advised.fixes) == 2 and advised.merged == [PR] and not advised.labelled("ready-for-human")
+    assert len(advised.advice_calls) == 1 and "review round limit" in advised.advice_calls[0]
+    assert any("advisor granted one more round" in line for line in advised.log())
+
+
+def test_a_second_limit_hands_off_without_asking_again(advised):
+    advised.reviews[:] = ["changes", "changes", "changes"]
+    advised.advice = [{"action": "extra_round", "reason": "fixable", "evidence": []}]
+    assert advised.run(fixer="cursor") == 0
+    assert len(advised.fixes) == 2 and advised.merged == [] and advised.labelled("ready-for-human")
+    assert len(advised.advice_calls) == 1
+    assert any("after 3 review rounds" in line for line in advised.log())
+
+
+def test_an_advised_handoff_says_why(advised):
+    advised.reviews[:] = ["changes", "changes"]
+    advised.advice = [{"action": "handoff", "reason": "the same design disagreement repeats", "evidence": []}]
+    assert advised.run(fixer="cursor") == 0
+    assert len(advised.fixes) == 1 and advised.labelled("ready-for-human")
+    assert any("Advisor (DeepSeek) chose handoff: the same design disagreement repeats" in line
+               for line in advised.log())

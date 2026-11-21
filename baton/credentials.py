@@ -7,7 +7,7 @@ read (mode 0600). The config names the file, never a value. No tool inherits the
 import os
 import stat
 
-RUNNER_KEYS = ("LINEAR_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID")
+RUNNER_KEYS = ("LINEAR_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "DEEPSEEK_API_KEY")
 
 
 class CredentialError(Exception):
