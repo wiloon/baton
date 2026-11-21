@@ -19,11 +19,16 @@ screenshot review comment, ## Checks (numbered as the prompt numbered the PR's c
   1. verified                 the screenshots show it and it looks right
   2. broken — <why>           they show it is wrong (also a Must fix)
   3. owner — <why>            no screenshot can show it, or the reviewer is not sure
+                              (or a design disagreement the fixer and reviewer could not settle, #96)
+## Design findings (#96): open findings, each naming the checks it blocks
 
 merge gate (every repository), after review passed and CI is green
+  a check named by an open design finding counts as not verified (#96)
   every check verified          -> merge; the screenshots still go to Telegram
   any check not verified        -> ready-for-human, listing only those checks
   no usable verdicts            -> ready-for-human, as before
+any open design finding or disagreement of the review loop that no current check carries
+                                -> ready-for-human, even when the checks section is `none` (#96)
 ```
 
 "No usable verdicts" covers every case where the runner can't be sure: no screenshot review in
@@ -31,8 +36,9 @@ the last round (setting off, owner-authored PR, Cursor review), a `## Checks` se
 exactly one valid verdict per check, a PR description whose checks changed after the review,
 a description whose checks section is missing, repeated or empty (no item to verify), and one
 that carries both the old and the new heading. Missing information never merges: zero items
-verified is not "every check verified". `none` is a separate path and is unchanged. There is no
-per-repository way around this gate (issue #95).
+verified is not "every check verified". `none` is a separate path and is unchanged, except
+that an unsettled design finding with no current check to carry it goes to the owner (#96).
+There is no per-repository way around this gate (issue #95).
 
 ## Considered options
 
@@ -93,3 +99,22 @@ per-repository way around this gate (issue #95).
   CI wait, before attempting the merge. The PR description may have changed during the wait,
   so the runner rechecks screenshot clearance against the live checks and reruns metadata
   preflight before merging.
+- Issue #96: `verified` also requires that no open design finding names the check. The
+  screenshot reviewer now reviews as a UI/UX designer too, and the owner decided design findings
+  are settled between the reviewer and the fixer rather than merged unseen as Nits. The gate
+  enforces this from the comment's `## Design findings` section, not from the reviewer's
+  `## Checks` line alone: a named check is not verified whatever its line says, and a missing
+  section or a finding without a valid check number reads as no usable verdicts. A check left for
+  an open finding is handed off with the finding and the fixer's answer, when there is one.
+- Issue #96, round 2: the gate reads the open findings and disagreements the review loop
+  carried across all its rounds (ADR 0005), not only the last comment, matched to the current
+  checks by text. A finding or disagreement that no current check carries (the checks changed,
+  or the section became `none`, after the review that raised it) has no check to hand off, so it
+  sends the PR to ready-for-human, per "missing information never merges".
+- Issue #96, round 3: the unmatched-finding guard runs inside `pr.gate`, on the same live body
+  read that decides `none` or `verified`, because the merge step reads the body once before the
+  gate and the checks can change between the reads.
+- Issue #96, after #95: the `defer` parts of rounds 2 to 5 (blocked checks and unmatched
+  findings carried to "Checks to try", the saved remainder computed from the gate's body, the
+  tracker never dropping a recorded finding) are withdrawn with the `defer` path itself. With
+  one gate, a check blocked by a design finding always goes to the owner before the merge.
