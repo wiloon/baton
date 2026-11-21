@@ -249,7 +249,8 @@ def apply_body(pr, request, state, ctx, completion=None):
 
 def apply_task(pr, want, ctx, baseline=None):
     """Apply a parsed task completion. A saved baseline distinguishes an earlier
-    landed write from a no-op. Returns (rc, changed, log): 1 GitHub failed, 2 invalid relation."""
+    landed write from a no-op. Returns (rc, changed, log): 1 GitHub failed, 2 unusable relation,
+    3 the retarget itself failed (e.g. a closing keyword in a partial PR)."""
     if not want:
         return 0, False, ""
     current = view(pr, "headRefName,body")
@@ -266,7 +267,10 @@ def apply_task(pr, want, ctx, baseline=None):
                 return 0, False, ""
             _, original_completion = pr_contract.relation({**current, "body": original})
             return 0, original_completion != want, ""
-        prepared = pr_contract.retarget(before + "\n", issue, want)
+        try:
+            prepared = pr_contract.retarget(before + "\n", issue, want)
+        except ValueError:
+            return 3, False, ""
     except ValueError:
         return 2, False, ""
     if not edit_body(pr, prepared, ctx, f"pr-{pr}-task."):

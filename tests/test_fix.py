@@ -518,6 +518,22 @@ def test_a_rejected_body_with_task_partial_still_pushes_and_retargets(run, gh, m
 
 
 @pytest.mark.parametrize("fixer", ["cursor", "codex"])
+def test_a_rejected_body_does_not_hide_a_failed_task_retarget(run, gh, fixer):
+    # Live body has a closing keyword in prose, so retarget to partial fails; the rejected
+    # body must not swallow that failure.
+    gh.set(body=COMPLETE.replace("Disabled buttons.", "Disabled buttons. Fixes #419 too."),
+           headRefName="cursor/issue-419")
+    bad = "Task completion: partial\nTask completion: complete\n\n## What changed\nNope.\n"
+    if fixer == "cursor":
+        run.agent(cursor_plan("## Checks to verify\nnone\n\nTASK: partial\nRESULT: fixed", request=bad))
+    else:
+        run.agent({**CHECKED, "description": bad, "reply": "TASK: partial\nRESULT: fixed\n"})
+    run.fix(fixer)
+    assert any("task completion change failed" in line for line in run.runner_log())
+    assert "completion=complete" in run.body()
+
+
+@pytest.mark.parametrize("fixer", ["cursor", "codex"])
 def test_a_rejected_body_with_no_commit_hands_off_without_pushing(run, gh, fixer):
     gh.set(body=COMPLETE, headRefName="cursor/issue-419")
     bad = "Task completion: partial\n\n## What changed\nNope.\n"   # no TASK line
