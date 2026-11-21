@@ -209,9 +209,10 @@ class Runner:
         if session.run_process(["git", "-C", str(wt), "fetch", "-q", "origin", "main"]).returncode:
             notify.log(f"fetching origin/main for {wt} failed; the fixer uses the local copy")
 
-    def description_not_applied(self, pr, fixer, url):
+    def description_not_applied(self, pr, fixer, url, reason=""):
+        detail = reason or "It was invalid or GitHub refused it"
         return self.handoff(pr, "", f"PR #{pr}: description request not applied ({fixer})",
-                            f"It was invalid or GitHub refused it; the commits, if any, are pushed. {url}")
+                            f"{detail}; the commits, if any, are pushed. {url}")
 
     # --- a Claude or Codex fixer ---
     def fix_pr(self, pr, wt, fixer, source, feedback, head=""):
@@ -251,11 +252,14 @@ class Runner:
                     rest = strip_markers(fix_file.read_text())
                 self.comment(pr, f"<!-- baton-fix by={fixer} -->\n{rest.rstrip(chr(10))}")
             self.hooks.fix(fixer, self.round or 0, out["reply"], str(fix_file))
-        task_changed, description_rc, description_changed = False, 0, False
+        task_changed, description_rc, description_changed, description_reason = False, 0, False, ""
         if outcome.startswith("RESULT: fixed"):
-            description_rc, description_changed = pr_helpers.apply_body(pr, str(description_request), self.state, self.ctx)
+            want = pr_helpers.task_wanted(out["reply"])
+            description_rc, description_changed, description_reason = pr_helpers.apply_body(
+                pr, str(description_request), self.state, self.ctx, completion=want or None)
             Path(self.state, f"pr-body-base-{pr}").unlink(missing_ok=True)
             description_request.unlink(missing_ok=True)
+            # A rejected body keeps the prior text; still apply a valid TASK: request.
             rc, task_changed, log = pr_helpers.apply_task(pr, out["reply"], self.ctx)
             if log:
                 notify.log(log)
@@ -277,7 +281,7 @@ class Runner:
             if rc != 0:
                 return rc
             if description_rc != 0:
-                return self.description_not_applied(pr, fixer, url)
+                return self.description_not_applied(pr, fixer, url, description_reason)
             if not task_changed and not checks_changed and not description_changed:
                 return self.handoff(pr, "no_commit", f"PR #{pr} needs you", f"The fix run made no commit; stopping the loop. {url}")
         if self.head(wt) != head:
@@ -293,7 +297,7 @@ class Runner:
             if rc != 0:
                 return rc
             if description_rc != 0:
-                return self.description_not_applied(pr, fixer, url)
+                return self.description_not_applied(pr, fixer, url, description_reason)
         return 0
 
     # --- a Cursor fixer ---
@@ -301,6 +305,8 @@ class Runner:
         url = f"https://github.com/{self.repo}/pull/{pr}"
         branch = git(wt, "branch", "--show-current") or ""
         base_file = Path(self.state, f"cursor-fix-base-{pr}")
+        baseline_file = Path(self.state, f"pr-body-base-{pr}")
+        task_file = Path(self.state, f"cursor-fix-task-{pr}")
         if base_file.is_file():
             head = base_file.read_text().split("\n")[0]
         else:
@@ -310,15 +316,20 @@ class Runner:
         feedback_file.write_text(f"{feedback}\n\n<pr-description>\n{pr_helpers.body(pr) or ''}\n</pr-description>\n")
         request = Path(self.ctx, f"pr-{pr}-body.md")
         reply_raw = ""
-        if request.is_file() and Path(self.state, f"pr-body-base-{pr}").is_file():
-            # Resume a validated request after a transient GitHub failure without another agent run.
+        # Resume when a prior attempt saved the baseline plus a body request and/or task intent.
+        # Legacy pending body requests with no task file stay under the current-completion rule.
+        resuming = baseline_file.is_file() and (request.is_file() or task_file.is_file())
+        if resuming:
             outcome = "RESULT: fixed"
+            want = task_file.read_text().split("\n")[0] if task_file.is_file() else ""
+            reply_raw = f"TASK: {want}\n" if want else ""
         else:
             self.fetch_main(wt)
             shots = Path(self.ctx, f"pr-{pr}-shots")
             session.run_process(["rm", "-rf", str(shots)])
             shots.mkdir(parents=True)
             request.unlink(missing_ok=True)
+            task_file.unlink(missing_ok=True)
             Path(self.ctx, f"pr-{pr}-fix-checks.json").unlink(missing_ok=True)
             out = self.agent("cursor", "fix", self.render(
                 "cursor-fix-prompt.md", PR=str(pr), ISSUE=self.env.runtime.issue or "unknown", GH_REPO=self.repo,
@@ -326,36 +337,57 @@ class Runner:
                 SHOTS_DIR=str(shots), PR_BODY_FILE=str(request)), f"pr-{pr}-cursor-fix", wt)
             outcome, reply_raw = out["outcome"], out["reply"]
             self.reply = reply_raw
+            want = pr_helpers.task_wanted(reply_raw)
+            if request.is_file() or want:
+                # Persist intent and baseline before edits so a transient failure can resume.
+                task_file.write_text(want + "\n")
+                if not baseline_file.exists():
+                    baseline_file.write_text((pr_helpers.body(pr) or "") + "\n")
         reply = "\n".join(line for line in strip_markers(reply_raw).split("\n") if not line.startswith("RESULT: ")).rstrip("\n")
-        # A resumed fix has no reply; its re-check was kept on the first pass.
-        if reply_raw:
+        # A resumed fix has no agent reply; its re-check was kept on the first pass.
+        if reply_raw and not resuming:
             try:
                 reply = pr_helpers.split_checks(pr, reply, self.ctx).rstrip("\n")
             except Exception:
                 pass
-        if reply.strip():
+        if reply.strip() and not resuming:
             self.comment(pr, f"<!-- baton-fix by=cursor -->\n{reply[:REPLY_CAP]}", f"PR #{pr}: posting Cursor's reply failed")
         if not outcome.startswith("RESULT: fixed"):
             if outcome.startswith("RESULT: needs-info"):
                 return self.handoff(pr, "needs_info", f"Cursor PR #{pr} has questions", url)
             return self.handoff(pr, "fix_failed", f"Cursor PR #{pr} fix failed", f"{outcome} {url}")
-        rc, body_changed = pr_helpers.apply_body(pr, str(request), self.state, self.ctx)
+        description_rc, body_changed, description_reason = pr_helpers.apply_body(
+            pr, str(request), self.state, self.ctx, completion=want or None)
         task_changed = False
-        if rc == 0:
-            rc, task_changed, log = pr_helpers.apply_task(pr, reply_raw, self.ctx)
-            if log:
-                notify.log(log)
+        if description_rc == 1:
+            notify.log(f"PR #{pr}: description update deferred after GitHub failure")
+            return 75
+        # A rejected body keeps the prior text; still apply a valid TASK: request.
+        rc, task_changed, log = pr_helpers.apply_task(pr, f"TASK: {want}\n" if want else "", self.ctx)
+        if log:
+            notify.log(log)
         if rc == 1:
             notify.log(f"PR #{pr}: description update deferred after GitHub failure")
             return 75
         if rc != 0:
-            return self.handoff(pr, "", f"Cursor PR #{pr}: invalid description request", url)
+            return self.handoff(pr, "", f"PR #{pr}: task completion change failed (cursor)", url)
+        # A lost write response still lands on GitHub; count it against the saved baseline.
+        if baseline_file.is_file():
+            current = (pr_helpers.body(pr) or "").rstrip("\n")
+            if current != baseline_file.read_text().rstrip("\n"):
+                body_changed = True
         moved = self.head(wt) != head
         if not moved:
-            rc, checks_changed = self.recheck_without_commit(pr, "Cursor ", url)
+            rc, checks_changed = self.recheck_without_commit(pr, "Cursor ", url, body_changed)
             if rc != 0:
                 return rc
+            if description_rc != 0:
+                for path in (base_file, baseline_file, task_file, request):
+                    path.unlink(missing_ok=True)
+                return self.description_not_applied(pr, "cursor", url, description_reason)
             if not body_changed and not task_changed and not checks_changed:
+                for path in (base_file, baseline_file, task_file, request):
+                    path.unlink(missing_ok=True)
                 return self.handoff(pr, "no_commit", f"Cursor PR #{pr} needs you", f"Cursor's fix run made no commit. {url}")
         if moved:
             rc, failure, rounds = self.verify(wt, "origin/main", "cursor", "pr", pr)
@@ -372,7 +404,11 @@ class Runner:
                 return self.handoff(pr, "push_failed", f"Cursor PR #{pr}: push failed", url)
             if self.refresh_checks(pr, "Cursor ", url):
                 return 1
-        for path in (base_file, Path(self.state, f"pr-body-base-{pr}"), request):
+            if description_rc != 0:
+                for path in (base_file, baseline_file, task_file, request):
+                    path.unlink(missing_ok=True)
+                return self.description_not_applied(pr, "cursor", url, description_reason)
+        for path in (base_file, baseline_file, task_file, request):
             path.unlink(missing_ok=True)
         return 0
 

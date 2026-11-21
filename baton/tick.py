@@ -153,7 +153,8 @@ class Tick:
                 (state / f"spec-paused-{a['spec']}").unlink(missing_ok=True)
             if a["cursor_fix"]:
                 n = a["cursor_fix"]
-                for path in (state / f"cursor-fix-base-{n}", state / f"pr-body-base-{n}", self.ctx / f"pr-{n}-body.md",
+                for path in (state / f"cursor-fix-base-{n}", state / f"pr-body-base-{n}",
+                             state / f"cursor-fix-task-{n}", self.ctx / f"pr-{n}-body.md",
                              self.ctx / f"pr-{n}-fix-checks.json"):
                     path.unlink(missing_ok=True)
         elif a["issue"]:

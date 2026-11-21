@@ -21,6 +21,12 @@ from . import pr_contract
 TASK_LINE = re.compile(r"TASK: (partial|complete)")
 
 
+def task_wanted(reply):
+    """The fixer's last full-line `TASK: partial|complete`, or '' when absent."""
+    wanted = [m[1] for line in reply.split("\n") if (m := TASK_LINE.fullmatch(line))]
+    return wanted[-1] if wanted else ""
+
+
 # A gh failure worth another try: the network or GitHub's edge, not the request (#46).
 TRANSIENT = re.compile(r"TLS handshake timeout|connection reset|connection refused|i/o timeout|unexpected EOF"
                        r"|timeout awaiting response headers|Client\.Timeout exceeded|error connecting to"
@@ -175,43 +181,59 @@ def preflight(pr):
     pr_contract.preflight(data)
 
 
-def apply_body(pr, request, state, ctx):
+def _prepare_request(text, issue, live, wanted):
+    """Canonical body for a description request. WANTED from `TASK:` may authorize a
+    change: the text may carry the live completion or the requested one; the result
+    uses WANTED. With no WANTED (or when it matches LIVE), the text must match LIVE."""
+    if not wanted or wanted == live:
+        return pr_contract.prepare(text, issue, live)
+    try:
+        prepared = pr_contract.prepare(text, issue, live)
+    except ValueError as error:
+        if str(error) != "a body edit cannot change task completion; request owner review":
+            raise
+        return pr_contract.prepare(text, issue, wanted)
+    return pr_contract.retarget(prepared, issue, wanted)
+
+
+def apply_body(pr, request, state, ctx, completion=None):
     """Apply an agent's PR description request (file REQUEST) with the runner-owned task
-    relation. Returns (rc, changed): rc 0 done or no request, 1 GitHub failed (retry),
+    relation. COMPLETION is the fixer's `TASK:` value when the fix path parsed one; the
+    standalone apply-body CLI leaves it None so the body must match the live completion.
+    Returns (rc, changed, reason): rc 0 done or no request, 1 GitHub failed (retry),
     2 invalid request. changed: the body differs from the one before the first attempt,
     so a retry after a write whose response was lost still counts the change."""
     path = Path(request)
     if not path.exists() and not path.is_symlink():
-        return 0, False
+        return 0, False, ""
     if path.is_symlink() or not path.is_file() or path.stat().st_size == 0:
-        return 2, False
+        return 2, False, "description request must be a non-empty regular file and cannot be a symlink"
     current = view(pr, "headRefName,body")
     if current is None:
-        return 1, False
+        return 1, False, "GitHub could not read the current PR description"
     try:
-        issue, completion = pr_contract.relation(current)
-        if not re.fullmatch(r"\d+", issue) or completion not in ("partial", "complete"):
-            return 2, False
-        prepared = pr_contract.prepare(path.read_text(), issue, completion)
-    except ValueError:
-        return 2, False
+        issue, live = pr_contract.relation(current)
+        if not re.fullmatch(r"\d+", issue) or live not in ("partial", "complete"):
+            return 2, False, "cannot determine the PR's issue and task completion"
+        prepared = _prepare_request(path.read_text(), issue, live, completion)
+    except ValueError as error:
+        return 2, False, str(error)
     before = (current.get("body") or "").rstrip("\n")
     baseline = Path(state, f"pr-body-base-{pr}")
     if not baseline.exists():
         baseline.write_text(before + "\n")
     if prepared.rstrip("\n") != before and not edit_body(pr, prepared, ctx, f"pr-{pr}-body-prepared."):
-        return 1, False
-    return 0, prepared.rstrip("\n") != baseline.read_text().rstrip("\n")
+        return 1, False, "GitHub could not update the PR description"
+    return 0, prepared.rstrip("\n") != baseline.read_text().rstrip("\n"), ""
 
 
 def apply_task(pr, reply, ctx):
     """A fixer that agrees with a reviewer about the task completion ends its reply with
     a `TASK: partial|complete` line of its own; rewrite the PR's task relation (Refs/
     Closes) to match. Returns (rc, changed, log): rc 1 GitHub failed, 2 invalid relation."""
-    wanted = [m[1] for line in reply.split("\n") if (m := TASK_LINE.fullmatch(line))]
-    if not wanted:
+    want = task_wanted(reply)
+    if not want:
         return 0, False, ""
-    want = wanted[-1]
     current = view(pr, "headRefName,body")
     if current is None:
         return 1, False, ""
@@ -322,7 +344,7 @@ def main(argv=None):
             print(error, file=sys.stderr)
             return 1
     elif args.command == "apply-body":
-        rc, changed = apply_body(args.pr, args.request, str(env.dirs.state), str(env.dirs.ctx))
+        rc, changed, _reason = apply_body(args.pr, args.request, str(env.dirs.state), str(env.dirs.ctx))
         print(json.dumps({"changed": changed}))
         return rc
     elif args.command in ("apply-task", "apply-checks"):
