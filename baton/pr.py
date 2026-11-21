@@ -191,7 +191,7 @@ def _prepare_request(text, issue, live, wanted):
     try:
         prepared = pr_contract.prepare(text, issue, live)
     except ValueError as error:
-        if str(error) != "a body edit cannot change task completion; request owner review":
+        if str(error) != "a body edit cannot change task completion; a fix needs a matching TASK: line":
             raise
         return pr_contract.prepare(text, issue, wanted)
     return pr_contract.retarget(prepared, issue, wanted)

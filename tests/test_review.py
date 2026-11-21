@@ -372,6 +372,18 @@ def test_the_checkpoint_the_loop_writes_is_what_bash_sources(loop, tmp_path):
 
 # --- what the reviewer reads ----------------------------------------------------------------
 
+def test_a_preflight_invalid_body_is_must_fix_in_the_review_context(loop):
+    # After a rejected description request the live body can stay preflight-invalid; the next
+    # review must see the exact runner reason under <runner-preflight>.
+    reason = "partial PR body has no `## Acceptance advanced` item; a slice must meet at least one acceptance item of its issue"
+    loop.gh.set(body="Refs #297\n\n## Checks to verify\nnone\n", commits=[], closingIssuesReferences=[])
+    loop.reviews = ["pass"]
+    assert loop.run(fixer="cursor") == 0
+    contexts = sorted(Path(loop.env["CTX"]).glob(f"pr-{PR}-review-*.md"))
+    assert contexts and f"<runner-preflight>\n{reason}\n" in contexts[0].read_text()
+    assert "Report this as Must fix" in contexts[0].read_text()
+
+
 def test_the_review_context_keeps_only_the_comments_that_count_and_cuts_long_ones(gh):
     env = {"OWNER": "owner", "GH_REPO": "owner/app", "REVIEW_CONTEXT_MAX_CHARS": "20", "CURSOR_LOGIN_RE": "^cursor$"}
     gh.set(title="Title", body="b" * 25, comments=[

@@ -375,6 +375,14 @@ def test_a_description_closing_the_wrong_issue_queues_a_metadata_review(run):
     assert any("merge preflight blocked" in line for line in run.log())
 
 
+def test_a_preflight_invalid_live_body_queues_review_instead_of_merge(run):
+    # Same live defect a rejected description request can leave: partial with no Acceptance advanced.
+    run.gh.set(body="Refs #297\n\n## Checks to verify\nnone\n", commits=[], closingIssuesReferences=[])
+    run.go()
+    assert not run.merged() and run.labelled("agent-review") and not run.labelled("ready-for-human")
+    assert any("Acceptance advanced" in line for line in run.log())
+
+
 def test_the_gate_reads_the_live_description_after_ci(run, monkeypatch):
     run.gh.set(body=PARTIAL, closingIssuesReferences=[])
     def unsafe_after_ci(self, minutes):

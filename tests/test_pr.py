@@ -249,7 +249,7 @@ def test_body_request(gh, dirs, tmp_path):
     request.write_text("Closes #297\n\nCorrected description")   # live partial cannot become complete
     rc, changed, reason, task_changed = pr.apply_body(335, request, state, ctx)
     assert (rc, changed, task_changed) == (2, False, False)
-    assert reason == "a body edit cannot change task completion; request owner review"
+    assert reason == "a body edit cannot change task completion; a fix needs a matching TASK: line"
     request.write_text("Refs #297\n\nCorrected description")
     assert pr.apply_body(335, request, state, ctx) == (0, True, "", False)
     assert gh.pr["body"].endswith("Refs #297\n\nCorrected description\n")
@@ -278,7 +278,7 @@ def test_body_without_task_validates_against_the_current_completion(gh, dirs, tm
     assert pr.apply_body(420, request, state, ctx) == (0, True, "", False)
     assert pr.apply_task(420, "complete", ctx)[:2] == (0, True)
     assert pr.apply_body(420, request, state, ctx) == (
-        2, False, "a body edit cannot change task completion; request owner review", False)
+        2, False, "a body edit cannot change task completion; a fix needs a matching TASK: line", False)
 
 
 def test_task_wanted_takes_the_last_full_line(gh, dirs, tmp_path):
@@ -309,7 +309,7 @@ def test_body_without_task_still_requires_live_completion(gh, dirs, tmp_path):
     request.write_text("Task completion: partial\n\n## What changed\nFixed.\n")
     rc, changed, reason, task_changed = pr.apply_body(420, request, state, ctx)
     assert (rc, changed, task_changed) == (2, False, False)
-    assert reason == "a body edit cannot change task completion; request owner review"
+    assert reason == "a body edit cannot change task completion; a fix needs a matching TASK: line"
     assert edits(gh) == []
 
 
