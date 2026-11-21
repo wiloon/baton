@@ -833,7 +833,8 @@ def test_unknown_codex_writer_provenance_cannot_fall_back_to_codex_for_screensho
 
 
 @pytest.mark.parametrize("reported, posts", [("gpt-6.2-astra", False), ("gpt-6.1-sol", True)])
-def test_the_model_dispatch_reports_decides_whether_the_screenshot_comment_is_posted(loop, reported, posts):
+def test_the_model_dispatch_reports_decides_whether_the_screenshot_comment_is_posted(loop, monkeypatch, reported, posts):
+    seen = _watch(monkeypatch)
     write_codex(loop, "gpt-6.2-astra")
     loop.after["review"] = lambda: rest(loop, "claude", 86400)   # only the Codex fallback is left
     loop.reviews, loop.screens = ["pass"], ["pass"]
@@ -841,9 +842,23 @@ def test_the_model_dispatch_reports_decides_whether_the_screenshot_comment_is_po
     assert screen_run(loop) == 0
     assert roles(loop) == ["review", "screenshot_review"]
     assert bool(screenshot_comments(loop)) == posts and bool(loop.merged) == posts
-    assert loop.labelled("ready-for-human") != posts
     if posts:
+        assert not loop.labelled("ready-for-human")
         assert "same-vendor-different-model (codex/gpt-6.1-sol)" in screenshot_comments(loop)[0]
+    else:
+        _one_handoff(loop, seen, "screenshot_independence_denied")
+
+
+def test_a_denied_screenshot_reviewer_role_hands_off_once_with_its_reason(loop, monkeypatch):
+    seen = _watch(monkeypatch)
+    allows = config.Config.allows
+    monkeypatch.setattr(config.Config, "allows",
+                        lambda self, vendor, role: role != "screenshot_reviewer" and allows(self, vendor, role))
+    loop.reviews = ["pass"]
+    assert screen_run(loop) == 0
+    assert roles(loop) == ["review"] and not screenshot_comments(loop)
+    assert not loop.fixes and not loop.merged
+    _one_handoff(loop, seen, "screenshot_reviewer_role_denied")
 
 
 def test_a_short_block_on_the_other_vendor_defers_the_screenshot_fallback_and_resumes_after_it(loop):
@@ -1179,12 +1194,12 @@ def _watch(monkeypatch):
     seen = {"reasons": [], "notices": []}
     monkeypatch.setattr(review.notify, "notify", lambda title, text: seen["notices"].append((title, text)))
     monkeypatch.setattr(review.telemetry.Telemetry, "task",
-                        lambda self, kind, key, *args: seen["reasons"].append(key) if kind == "handoff" else None)
+                        lambda self, kind, *args: seen["reasons"].append(args) if kind == "handoff" else None)
     return seen
 
 
 def _one_handoff(loop, seen, reason):
-    assert seen["reasons"] == [reason]
+    assert seen["reasons"] == [(reason, "--reason", reason)]
     assert len(seen["notices"]) == 1
     assert sum(c[:2] == ["pr", "edit"] and "--add-label" in c and "ready-for-human" in c
                for c in loop.gh.calls()) == 1

@@ -327,14 +327,29 @@ def test_the_round_limit_hands_the_spec_to_the_owner(loop):
     assert len(loop.runs) == 5
 
 
-def test_a_reject_is_a_note_and_a_handoff(loop, monkeypatch):
-    reasons, notes = [], []
+@pytest.fixture
+def spec_handoffs(loop, monkeypatch):
+    events, notices = [], []
     monkeypatch.setattr(spec.telemetry.Telemetry, "task",
-                        lambda self, kind, key, *args: reasons.append(key) if kind == "handoff" else None)
-    monkeypatch.setattr(spec.notify, "notify", lambda title, text="": notes.append(title))
+                        lambda self, kind, *args: events.append(args) if kind == "handoff" else None)
+    monkeypatch.setattr(spec.notify, "notify", lambda title, text="": notices.append(title))
+
+    def assert_handoffs(reason=None):
+        edits = [c for c in loop.gh.calls if c[:3] == ["issue", "edit", N]
+                 and ("--add-label", "ready-for-human") in zip(c, c[1:])]
+        assert edits == ([["issue", "edit", N, "-R", "owner/app", "--remove-label", "agent-wip",
+                           "--add-label", "ready-for-human"]] if reason else [])
+        assert events == ([(reason, "--reason", reason)] if reason else [])
+        owner_notices = [title for title in notices if not title.startswith(f"#{N}: spec review (round ")]
+        assert owner_notices == ([f"#{N}: spec needs you"] if reason else [])
+
+    return assert_handoffs
+
+
+def test_a_reject_is_a_note_and_a_handoff(loop, spec_handoffs):
     loop.script = [{"rc": 0, "status": "success", "outcome": "SPEC: reject", "reply": "no\nSPEC: reject", "model": "", "defer": ""}]
     assert loop.run() is False
-    assert reasons == ["spec_rejected"] and notes.count("#516: spec needs you") == 1
+    spec_handoffs("spec_rejected")
     [note] = loop.gh.posted("<!-- baton-note by=")
     assert note.endswith("round 1: reject\n\nno") and "ready-for-human" in loop.gh.labels
 
@@ -594,12 +609,9 @@ def test_same_vendor_denial_retry_publishes_only_the_verified_attempt(loop, monk
     (1, "fallback"), (1, "unknown"), (1, "ambiguous"), (1, "short block"), (1, "unknown review"),
     (1, "weekly quota"), (1, "five-hour quota"), (1, "fallback snapshot"),
 ])
-def test_claude_spec_revision_verifies_main_session_models(loop, monkeypatch, round, scenario):
+def test_claude_spec_revision_verifies_main_session_models(loop, monkeypatch, spec_handoffs, round, scenario):
     from baton import claude_cli
 
-    reasons = []
-    monkeypatch.setattr(spec.telemetry.Telemetry, "task",
-                        lambda self, kind, key, *args: reasons.append(key) if kind == "handoff" else None)
     source = session.resolve(loop.env).config.source.read_text()
     if scenario == "shared":
         source = source.replace('[models.routes.spec_followup]\nclaude = { model = "claude_fast", effort = "low" }',
@@ -666,23 +678,18 @@ def test_claude_spec_revision_verifies_main_session_models(loop, monkeypatch, ro
     else:
         assert not replies
         assert loop.gh.body == "Goal\nOld step\n"
-        swapped = any(c[:3] == ["issue", "edit", N] and "--remove-label" in c and "agent-wip" in c
-                      for c in loop.gh.calls)
-        assert swapped == (scenario in ("fallback", "fallback snapshot", "unknown", "ambiguous"))
-        assert reasons == (["spec_reviser_model_unverified"] if swapped else [])
         for artifact in Path("/tmp").glob(f"baton-spec-{N}-{round}.*"):
             artifact.unlink()
+    refused = scenario in ("fallback", "fallback snapshot", "unknown", "ambiguous")
+    spec_handoffs("spec_reviser_model_unverified" if refused else None)
 
 
 @pytest.mark.parametrize("role,base", [("review", "gpt-6.2-astra"), ("revision", "gpt-6.2-sol")])
 @pytest.mark.parametrize("scenario", ["different", "prior unknown", "prior identical", "reported unknown",
                                       "fallback identical", "short block"])
-def test_codex_spec_fallback_verifies_actual_model_at_cli(loop, monkeypatch, tmp_path, role, base, scenario):
+def test_codex_spec_fallback_verifies_actual_model_at_cli(loop, monkeypatch, spec_handoffs, tmp_path, role, base, scenario):
     from baton import codex_cli
 
-    reasons = []
-    monkeypatch.setattr(spec.telemetry.Telemetry, "task",
-                        lambda self, kind, key, *args: reasons.append(key) if kind == "handoff" else None)
     source = session.resolve(loop.env).config.source.read_text().replace(
         '[models.routes.spec_followup]', '[models.routes.spec_followup]\ncodex = { model = "codex_strong" }')
     s, path = live_spec(loop, monkeypatch, source)
@@ -737,13 +744,11 @@ def test_codex_spec_fallback_verifies_actual_model_at_cli(loop, monkeypatch, tmp
         assert f"same-vendor-different-model (codex/{base} after codex/{other})" in posted[0]
     else:
         assert not posted
-        swapped = any(c[:3] == ["issue", "edit", N] and "--remove-label" in c and "agent-wip" in c
-                      for c in loop.gh.calls)
-        assert swapped == (scenario in ("reported unknown", "fallback identical"))
-        unverified = "spec_reviser_model_unverified" if revision else "spec_reviewer_model_unverified"
-        assert reasons == ([unverified] if swapped else [])
         for artifact in Path("/tmp").glob(f"baton-spec-{N}-2.*"):
             artifact.unlink()
+    refused = scenario in ("reported unknown", "fallback identical")
+    unverified = "spec_reviser_model_unverified" if revision else "spec_reviewer_model_unverified"
+    spec_handoffs(unverified if refused else None)
 
 
 # --- what an accept may not break (#25) ------------------------------------------------------

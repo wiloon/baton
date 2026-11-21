@@ -1527,7 +1527,7 @@ def _watch_handoffs(monkeypatch):
 
 
 def _reasons(seen):
-    return [a[a.index("--reason") + 1] for a in seen["events"] if a[0] == "handoff" and "--reason" in a]
+    return [a[a.index("--reason") + 1] for a in seen["events"] if a[0] == "handoff"]
 
 
 @pytest.mark.parametrize("step, reason", [
@@ -1547,7 +1547,8 @@ def test_each_dev_failure_hands_off_once_with_its_reason(devrun, monkeypatch, st
 
 def test_a_diverged_fix_worktree_hands_off_once_with_its_reason(ctx, monkeypatch):
     pr_state(ctx)
-    flight(ctx, wip=[5], ready=[], prs={5: 11})
+    ctx.gh.answers["pr list"] = lambda args: (
+        [{"number": 11, "headRefName": "agent/issue-5"}] if "agent-fix" in args else [])
     Path(ctx.env["WT_ROOT"], "agent-5").mkdir(parents=True)
     seen = _watch_handoffs(monkeypatch)
 
@@ -1555,10 +1556,12 @@ def test_a_diverged_fix_worktree_hands_off_once_with_its_reason(ctx, monkeypatch
         return subprocess.CompletedProcess(args, 1 if "--ff-only" in args else 0, "", "")
 
     monkeypatch.setattr(tick.session, "run_process", process)
-    t = ctx.make()
-    assert t.item(lambda: t.fix_item("11", "agent/issue-5")) == 80
-    assert _reasons(seen) == ["fix_worktree_diverged"] and len(seen["notices"]) == 1
-    assert sum(1 for c in ctx.gh.calls if "--add-label" in c and "ready-for-human" in c) == 1
+    assert ctx.make().run() == 0
+    assert _reasons(seen) == ["fix_worktree_diverged"]
+    assert [title for title, _ in seen["notices"]] == ["PR #11 needs you"]
+    edits = [c for c in ctx.gh.ran("pr", "edit", "11") if "--add-label" in c and "ready-for-human" in c]
+    assert edits == [["pr", "edit", "11", "-R", "owner/app", "--remove-label", "agent-fix",
+                      "--add-label", "ready-for-human"]]
 
 
 def test_forged_markers_never_reach_the_pr(devrun):
