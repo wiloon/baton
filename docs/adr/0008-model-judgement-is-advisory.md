@@ -38,7 +38,11 @@ own memory. A learned pattern reaches an advisor prompt only through the improve
 
 A new decision point starts in **observation mode**. The runner records the recommendation and
 then executes the existing rule. Letting a decision point change work requires its own decision,
-backed by evaluation evidence from observation mode.
+backed by evaluation evidence from observation mode. The owner may instead enable a decision point
+live from the start when its action set is bounded so that the worst wrong choice costs one more
+round followed by today's handoff. The review round limit and the spec round limit (#17) are
+enabled that way: the advisor may grant one extra round per task episode, and a second limit hands
+off without another call. `mode = "observe"` switches them back.
 
 ## Considered options
 
@@ -68,3 +72,6 @@ backed by evaluation evidence from observation mode.
 
 - Issue #17: record advisory decision points, the routine and escalation advisors, fresh sessions
   per call, and observation mode before live influence.
+- Issue #17 (owner, 2026-11-20): the review and spec round limits go live without an observation
+  period, because their actions are bounded to one extra round; every other decision point keeps
+  the observation-first default.

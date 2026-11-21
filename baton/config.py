@@ -91,6 +91,13 @@ class Repo:
     screenshot_review: bool = False
     # false: every PR of this repository waits for the owner, whatever scheduling.auto_merge says.
     auto_merge: bool = True
+    # Globs relative to the repository root (fnmatch: * also matches /). A PR whose diff touches
+    # one, under its old or new name, never auto-merges: it goes to the owner after review and
+    # CI pass, and no advisor may release it (#131).
+    owner_review_paths: tuple[str, ...] = ()
+    # false: the advisor (#17) is never called for this repository: its issue and PR text stays
+    # on the host, and its decision points use the rules.
+    advisor: bool = True
 
 
 @dataclass(frozen=True)
@@ -218,6 +225,19 @@ class Telegram:
 
 
 @dataclass(frozen=True)
+class Advisor:
+    """Optional (#17, ADR 0008): the routine advisor. "off" makes no call; "observe" records the
+    recommendation and runs the rule; "live" executes a revalidated recommendation. DEEPSEEK_API_KEY
+    comes from the environment or env_file (baton.credentials)."""
+    env_file: Path | None
+    mode: str = "off"
+    model: str = "deepseek-flash"
+    base_url: str = "https://api.deepseek.com"
+    timeout_seconds: int = 60
+    snapshot_chars: int = 24000
+
+
+@dataclass(frozen=True)
 class Environment:
     path_prefix: tuple[Path, ...]
     # Host settings: "" leaves the tools whatever the runner's own environment has.
@@ -269,6 +289,7 @@ class Config:
     linear: Linear | None = None
     telegram: Telegram | None = None
     retrospectives: Retrospectives = Retrospectives()
+    advisor: Advisor = Advisor(env_file=None)
 
     def repo(self, gh_repo):
         """The configured repository named owner/name; ConfigError for any other."""
@@ -323,7 +344,7 @@ class Config:
 SECTIONS = {"paths": Paths, "scheduling": Scheduling, "models": ModelSettings,
             "quota": QuotaSettings, "environment": Environment}
 # Integrations a runner may go without (#328): no section, no integration.
-OPTIONAL = {"linear": Linear, "telegram": Telegram, "retrospectives": Retrospectives}
+OPTIONAL = {"linear": Linear, "telegram": Telegram, "retrospectives": Retrospectives, "advisor": Advisor}
 VENDORS = frozenset(agents.ADAPTERS)
 ROLES = {"dev", "reviewer", "fixer", "screenshot_reviewer", "spec_reviewer", "reviser", "retrospective", "scan"}
 MOVED_QUOTA = {
@@ -370,7 +391,7 @@ def _section(name, cls, data, directory, home):
     for key, typ in hints.items():
         value, label = data.get(key, defaults.get(key)), f"{name}.{key}"
         if typ in (tuple[str, ...], tuple[Path, ...]):
-            if not isinstance(value, list) or any(type(v) is not str for v in value):
+            if not isinstance(value, (list, tuple)) or any(type(v) is not str for v in value):
                 raise ConfigError(f"{label}: expected an array of strings")
             if any(not v.strip() for v in value):
                 raise ConfigError(f"{label}: entries must be nonempty")
@@ -564,7 +585,7 @@ def load(path: str | Path, *, home: Path | None = None) -> Config:
     required = set(SECTIONS) | {"repos", "preferences", "vendors"}
     if not required <= data.keys() or data.keys() - required - OPTIONAL.keys():
         raise ConfigError("configuration sections do not match the schema (paths, scheduling, repos, vendors, models, "
-                          "quota, environment, preferences; optional: linear, telegram, retrospectives)")
+                          "quota, environment, preferences; optional: linear, telegram, retrospectives, advisor)")
     models = data["models"]
     if not isinstance(models, dict):
         raise ConfigError("models: expected a table")
@@ -643,6 +664,15 @@ def load(path: str | Path, *, home: Path | None = None) -> Config:
                 raise ConfigError(f"preferences.{key}: vendor {vendor} cannot run {role}")
     config = Config(**sections, vendors=vendors, repos=repos,
                     preferences=tuple((k, tuple(v)) for k, v in sorted(preferences.items())), source=source)
+    adv = config.advisor
+    if adv.mode not in ('off', 'observe', 'live'):
+        raise ConfigError('advisor.mode: expected "off", "observe" or "live"')
+    if not adv.base_url.startswith('https://'):
+        raise ConfigError('advisor.base_url: expected an https:// URL')
+    if not adv.model.strip() or any(c.isspace() for c in adv.model):
+        raise ConfigError('advisor.model: expected a model identifier')
+    if adv.timeout_seconds <= 0 or adv.snapshot_chars < 1000:
+        raise ConfigError('advisor: timeout_seconds must be positive and snapshot_chars at least 1000')
     retro = config.retrospectives
     if retro.model and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,63}', retro.model):
         raise ConfigError('retrospectives.model: expected a model identifier')
@@ -703,6 +733,8 @@ def _check_repo(repo):
         raise ConfigError('repos.secret_env_keys: expected UPPER_CASE names')
     if any(not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.]*', p) for p in repo.tmp_prefixes):
         raise ConfigError('repos.tmp_prefixes: expected plain names such as myapp')
+    if any(p.startswith('/') or '..' in p.split('/') for p in repo.owner_review_paths):
+        raise ConfigError('repos.owner_review_paths: expected globs relative to the repository root')
 
 
 def main(argv=None):

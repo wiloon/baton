@@ -209,3 +209,29 @@ def test_alloy_model_filters_match_shipped_codex_config():
     assert filters
     for pattern in filters:
         assert set(pattern.replace('[.]', '.').split('|')) == identifiers
+
+
+def test_owner_review_paths_default_empty_and_reject_absolute_paths(tmp_path):
+    head, repo = TEXT.split('\n[[repos]]\n', 1)
+    plain = write(tmp_path, head + '\n[[repos]]\n' + repo)
+    assert config.load(plain, home=tmp_path).repos[0].owner_review_paths == ()
+    def with_paths(value):
+        return write(tmp_path, head + '\n[[repos]]\n' + repo.replace('\nowner_review_paths = []\n', f'\nowner_review_paths = {value}\n', 1))
+    listed = with_paths('["bin/guard.sh", "baton/advisor*.py"]')
+    assert config.load(listed, home=tmp_path).repos[0].owner_review_paths == ("bin/guard.sh", "baton/advisor*.py")
+    for bad in ('"/etc/passwd"', '"../x"'):
+        broken = with_paths(f'[{bad}]')
+        with pytest.raises(config.ConfigError):
+            config.load(broken, home=tmp_path)
+
+
+def test_the_advisor_section_is_optional_and_validated(tmp_path):
+    plain = write(tmp_path, TEXT)
+    assert config.load(plain, home=tmp_path).advisor.mode == "off"
+    without = write(tmp_path, TEXT.split('\n[advisor]\n', 1)[0] + '\n')
+    c = config.load(without, home=tmp_path)
+    assert c.advisor.mode == "off" and c.advisor.env_file is None
+    for old, new in (('mode = "off"', 'mode = "always"'), ('base_url = "https://api.deepseek.com"', 'base_url = "http://x"')):
+        broken = write(tmp_path, TEXT.replace(old, new, 1))
+        with pytest.raises(config.ConfigError):
+            config.load(broken, home=tmp_path)

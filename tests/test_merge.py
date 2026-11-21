@@ -662,3 +662,38 @@ def test_a_failed_merge_with_unavailable_status_hands_off_without_updating(run, 
     assert not any(c[:2] == ["pr", "update-branch"] for c in run.gh.calls())
     assert len([c for c in run.gh.calls() if c[:2] == ["pr", "merge"]]) == 1
     assert "notify PR #335 merge failed" in run.events
+
+
+# --- owner-review paths (#131) -----------------------------------------------------------------
+
+def test_a_pr_touching_an_owner_review_path_goes_to_the_owner_after_ci(run):
+    run.gh.set(files_api=[{"filename": "bin/guard.sh"}, {"filename": "README.md"}])
+    run.go(OWNER_REVIEW_PATHS="bin/guard.sh baton/advisor*.py")
+    assert not run.merged() and run.labelled("ready-for-human")
+    assert run.events[-1] == "notify PR #335 review and CI passed" and "ci" in run.events
+    assert "bin/guard.sh" in run.texts["PR #335 review and CI passed"]
+    assert "README.md" not in run.texts["PR #335 review and CI passed"]
+
+
+def test_a_pr_touching_no_owner_review_path_merges(run):
+    run.gh.set(files_api=[{"filename": "baton/spec.py"}])
+    run.go(OWNER_REVIEW_PATHS="bin/guard.sh baton/advisor*.py")
+    assert run.merged()
+
+
+def test_a_rename_out_of_an_owner_review_path_counts(run):
+    run.gh.set(files_api=[{"filename": "baton/limits.py", "previous_filename": "baton/quota.py"}])
+    run.go(OWNER_REVIEW_PATHS="baton/quota.py")
+    assert not run.merged() and "baton/quota.py" in run.texts["PR #335 review and CI passed"]
+
+
+def test_an_unreadable_file_list_is_not_merged(run):
+    run.gh.fail("files")
+    run.go(OWNER_REVIEW_PATHS="bin/guard.sh")
+    assert not run.merged() and "could not be read" in run.texts["PR #335 review and CI passed"]
+
+
+def test_without_owner_review_paths_the_file_list_is_not_read(run):
+    run.go()
+    assert run.merged()
+    assert not any(c[:1] == ["api"] and c[-3].endswith("/files") for c in run.gh.calls() if len(c) > 3)
