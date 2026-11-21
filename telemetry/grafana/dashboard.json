@@ -219,7 +219,7 @@
         "w": 24,
         "h": 8
       },
-      "description": "X: time; Y: Agent. Green Active = an agent invocation overlapped the preceding observed collection interval, including short runs completed between polls. Gray Idle = no invocation overlapped that observed interval. Orange Unknown = failed/stale collection or a gap over 150 seconds. This is interval activity, not exact run boundaries or current process state; see Current executions for what is running now. About one-minute collection resolution; range aggregation preserves active buckets when zooming out, which can widen visible activity blocks. Existing missed instantaneous samples are not backfilled. All Agents remain visible regardless of Agent/Role filters. Before interval rollout, available legacy instantaneous observations are retained and may omit short runs.",
+      "description": "X: time; Y: Agent. Green Active = an agent invocation overlapped the preceding observed collection interval, including short runs completed between polls. Gray Idle = no invocation overlapped that observed interval. Orange Unknown = failed/stale collection or a gap over 150 seconds. This is interval activity, not exact run boundaries or current process state; see Current executions for what is running now. About one-minute collection resolution, so a 5 s run and a busy minute look the same here; see Agent busy fraction below for how much of each bucket was busy; range aggregation preserves active buckets when zooming out, which can widen visible activity blocks. Existing missed instantaneous samples are not backfilled. All Agents remain visible regardless of Agent/Role filters. Before interval rollout, available legacy instantaneous observations are retained and may omit short runs.",
       "targets": [
         {
           "refId": "A",
@@ -298,6 +298,75 @@
       }
     },
     {
+      "id": 114,
+      "type": "timeseries",
+      "title": "Agent busy fraction",
+      "description": "Share of each bucket during which at least one invocation of the agent was running: rate of baton_active_seconds_total. 100% = busy the whole bucket; a 5 s run in a one-minute bucket shows about 8%. Overlapping invocations of one agent count once. An average, so it stays correct when zooming out, unlike the Active/Idle timeline above, which keeps any activity. Unknown intervals (failed reads, gaps over 150 s) add no time, so check the timeline for Unknown before reading a dip as idle. \"Running\" includes waiting for the model, tools and the network. All Agents remain visible regardless of Agent/Role filters. No data before the counter rollout.",
+      "gridPos": {
+        "x": 0,
+        "y": 9,
+        "w": 24,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus}"
+          },
+          "expr": "clamp(max by (agent) (rate(baton_active_seconds_total{hostname=\"$host\"}[$__rate_interval])), 0, 1) * on(agent) group_left(display_name) (max by (agent, display_name) (baton_vendor_info{hostname=\"$host\"}) or on() max by (agent, display_name) (last_over_time(baton_vendor_info{hostname=\"$host\"}[5m])))",
+          "legendFormat": "{{display_name}}",
+          "instant": false,
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "interval": "1m",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "decimals": 0,
+          "noValue": "N/A",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 1,
+            "fillOpacity": 20,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "pointSize": 4
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
       "id": 113,
       "type": "state-timeline",
       "title": "Retrospective activity",
@@ -307,7 +376,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 9,
+        "y": 16,
         "w": 24,
         "h": 5
       },
@@ -395,7 +464,7 @@
       "title": "Quota balances by provider",
       "gridPos": {
         "x": 0,
-        "y": 14,
+        "y": 21,
         "w": 24,
         "h": 8
       },
@@ -979,7 +1048,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 22,
+        "y": 29,
         "w": 24,
         "h": 7
       },
@@ -1224,7 +1293,7 @@
       "title": "Quota history & scheduling",
       "gridPos": {
         "x": 0,
-        "y": 29,
+        "y": 36,
         "w": 24,
         "h": 1
       },
@@ -1237,7 +1306,7 @@
       "title": "Quota interpretation",
       "gridPos": {
         "x": 0,
-        "y": 30,
+        "y": 37,
         "w": 24,
         "h": 4
       },
@@ -1253,7 +1322,7 @@
       "description": "Last observed quota remaining. Stale values retain their last observation; reset-pending and unknown values leave gaps. No extrapolation or calendar-week aggregation. History starts at deployment.",
       "gridPos": {
         "x": 0,
-        "y": 34,
+        "y": 41,
         "w": 12,
         "h": 8
       },
@@ -1321,7 +1390,7 @@
       "description": "Last observed quota remaining. Stale values retain their last observation; reset-pending and unknown values leave gaps. No extrapolation or calendar-week aggregation. History starts at deployment.",
       "gridPos": {
         "x": 12,
-        "y": 34,
+        "y": 41,
         "w": 12,
         "h": 8
       },
@@ -1389,7 +1458,7 @@
       "description": "",
       "gridPos": {
         "x": 0,
-        "y": 42,
+        "y": 49,
         "w": 24,
         "h": 1
       },
@@ -1403,7 +1472,7 @@
       "description": "",
       "gridPos": {
         "x": 0,
-        "y": 43,
+        "y": 50,
         "w": 3,
         "h": 4
       },
@@ -1481,7 +1550,7 @@
       "description": "",
       "gridPos": {
         "x": 3,
-        "y": 43,
+        "y": 50,
         "w": 3,
         "h": 4
       },
@@ -1559,7 +1628,7 @@
       "description": "",
       "gridPos": {
         "x": 6,
-        "y": 43,
+        "y": 50,
         "w": 3,
         "h": 4
       },
@@ -1637,7 +1706,7 @@
       "description": "",
       "gridPos": {
         "x": 9,
-        "y": 43,
+        "y": 50,
         "w": 3,
         "h": 4
       },
@@ -1715,7 +1784,7 @@
       "description": "A held lock can represent CLI work, CI waits, dispatch or a runner started before instrumentation. It does not by itself prove a healthy agent invocation.",
       "gridPos": {
         "x": 12,
-        "y": 43,
+        "y": 50,
         "w": 3,
         "h": 4
       },
@@ -1793,7 +1862,7 @@
       "description": "Known instrumented CLI invocations only. Zero does not mean the runner is idle; check the lock. Interrupted invocations are reconciled by the independent collector.",
       "gridPos": {
         "x": 15,
-        "y": 43,
+        "y": 50,
         "w": 3,
         "h": 4
       },
@@ -1856,7 +1925,7 @@
       "description": "Age since the last successful independent state read. Unknown if it has never succeeded.",
       "gridPos": {
         "x": 18,
-        "y": 43,
+        "y": 50,
         "w": 3,
         "h": 4
       },
@@ -1919,7 +1988,7 @@
       "description": "Last received independent self-scrape value. Check sample age below; a stale Up sample is not current health.",
       "gridPos": {
         "x": 21,
-        "y": 43,
+        "y": 50,
         "w": 3,
         "h": 4
       },
@@ -1997,7 +2066,7 @@
       "description": "",
       "gridPos": {
         "x": 0,
-        "y": 47,
+        "y": 54,
         "w": 6,
         "h": 4
       },
@@ -2075,7 +2144,7 @@
       "description": "",
       "gridPos": {
         "x": 6,
-        "y": 47,
+        "y": 54,
         "w": 6,
         "h": 4
       },
@@ -2138,7 +2207,7 @@
       "description": "Local collector acceptance, not a guarantee of durable backend storage. Stable event IDs support deduplication.",
       "gridPos": {
         "x": 12,
-        "y": 47,
+        "y": 54,
         "w": 6,
         "h": 4
       },
@@ -2216,7 +2285,7 @@
       "description": "Unknown before the first instrumented scheduled tick. Paused and lock-busy ticks still record their start. No NoTick alert is enabled.",
       "gridPos": {
         "x": 18,
-        "y": 47,
+        "y": 54,
         "w": 6,
         "h": 4
       },
@@ -2279,7 +2348,7 @@
       "description": "The host's /tmp is a tmpfs (half the RAM) with a per-user quota; when it fills, runs and deploys fail with \"Disk quota exceeded\" (#248). The agent user writes nearly all of it, so the mount total stands in for that user's quota use. node_exporter filesystem collector; display only, no alert.",
       "gridPos": {
         "x": 0,
-        "y": 51,
+        "y": 58,
         "w": 6,
         "h": 4
       },
@@ -2351,7 +2420,7 @@
       "description": "The host's /tmp is a tmpfs (half the RAM) with a per-user quota; when it fills, runs and deploys fail with \"Disk quota exceeded\" (#248). The agent user writes nearly all of it, so the mount total stands in for that user's quota use. node_exporter filesystem collector; display only, no alert.",
       "gridPos": {
         "x": 6,
-        "y": 51,
+        "y": 58,
         "w": 18,
         "h": 4
       },
@@ -2425,7 +2494,7 @@
       "description": "",
       "gridPos": {
         "x": 0,
-        "y": 55,
+        "y": 62,
         "w": 24,
         "h": 1
       },
@@ -2439,7 +2508,7 @@
       "description": "Actual runner daily counters, including manual invocations and CLI launches that fail before producing usage. These are distinct from completed summaries.",
       "gridPos": {
         "x": 0,
-        "y": 56,
+        "y": 63,
         "w": 8,
         "h": 4
       },
@@ -2502,7 +2571,7 @@
       "description": "Read from current runner configuration; manual invocations bypass the scheduled cap. No quota is changed by monitoring.",
       "gridPos": {
         "x": 8,
-        "y": 56,
+        "y": 63,
         "w": 8,
         "h": 4
       },
@@ -2565,7 +2634,7 @@
       "description": "Zero means no remaining cooldown. Unknown means a state read failed.",
       "gridPos": {
         "x": 16,
-        "y": 56,
+        "y": 63,
         "w": 8,
         "h": 4
       },
@@ -2628,7 +2697,7 @@
       "description": "Local-date counters reset at the host's midnight, including idle periods.",
       "gridPos": {
         "x": 0,
-        "y": 60,
+        "y": 67,
         "w": 12,
         "h": 7
       },
@@ -2692,7 +2761,7 @@
       "description": "May exceed 100% because manual invocations bypass the cap. A missing/zero cap is unavailable, not unlimited.",
       "gridPos": {
         "x": 12,
-        "y": 60,
+        "y": 67,
         "w": 12,
         "h": 7
       },
@@ -2756,7 +2825,7 @@
       "description": "",
       "gridPos": {
         "x": 0,
-        "y": 67,
+        "y": 74,
         "w": 24,
         "h": 1
       },
@@ -2770,7 +2839,7 @@
       "description": "",
       "gridPos": {
         "x": 0,
-        "y": 68,
+        "y": 75,
         "w": 24,
         "h": 3
       },
@@ -2786,7 +2855,7 @@
       "description": "",
       "gridPos": {
         "x": 16,
-        "y": 71,
+        "y": 78,
         "w": 8,
         "h": 4
       },
@@ -2849,7 +2918,7 @@
       "description": "",
       "gridPos": {
         "x": 0,
-        "y": 71,
+        "y": 78,
         "w": 16,
         "h": 4
       },
@@ -2945,10 +3014,10 @@
       "id": 25,
       "type": "table",
       "title": "Recent runs \u00b7 select a trace to explore",
-      "description": "One row per CLI invocation, deduplicated by event ID within the latest 500 records. CLI outcome is not task success. Task ID opens Loki; Trace ID opens Tempo. Configuration fingerprints contain no config contents. Unknown actual model stays unavailable. Requested model is configuration; actual model stays unknown when Auto does not disclose it. Quota probes have Role=probe and no task.",
+      "description": "One row per CLI invocation, deduplicated by event ID within the latest 500 records. CLI outcome is not task success. Task ID opens Loki; Trace ID opens Tempo; runs of one task share a trace. Configuration fingerprints contain no config contents. Unknown actual model stays unavailable. Requested model is configuration; actual model stays unknown when Auto does not disclose it. Quota probes have Role=probe and no task.",
       "gridPos": {
         "x": 0,
-        "y": 75,
+        "y": 82,
         "w": 24,
         "h": 11
       },
@@ -3343,7 +3412,7 @@
       "description": "",
       "gridPos": {
         "x": 0,
-        "y": 86,
+        "y": 93,
         "w": 24,
         "h": 1
       },
@@ -3357,7 +3426,7 @@
       "description": "",
       "gridPos": {
         "x": 0,
-        "y": 87,
+        "y": 94,
         "w": 24,
         "h": 3
       },
@@ -3373,7 +3442,7 @@
       "description": "Codex only. Empty intervals mean no valid rate sample, not zero consumption. Native metrics have no role/issue labels, so the role filter does not apply.",
       "gridPos": {
         "x": 0,
-        "y": 90,
+        "y": 97,
         "w": 12,
         "h": 7
       },
@@ -3437,7 +3506,7 @@
       "description": "Codex only. Empty intervals mean no valid rate sample, not zero consumption. Native metrics have no role/issue labels, so the role filter does not apply.",
       "gridPos": {
         "x": 12,
-        "y": 90,
+        "y": 97,
         "w": 12,
         "h": 7
       },
@@ -3501,7 +3570,7 @@
       "description": "Native Codex tool counters only. Role filtering is unavailable on bounded native metrics.",
       "gridPos": {
         "x": 0,
-        "y": 97,
+        "y": 104,
         "w": 12,
         "h": 7
       },
@@ -3565,7 +3634,7 @@
       "description": "Native histogram sum/count, excluding idle intervals without observations.",
       "gridPos": {
         "x": 12,
-        "y": 97,
+        "y": 104,
         "w": 12,
         "h": 7
       },
@@ -3629,7 +3698,7 @@
       "description": "",
       "gridPos": {
         "x": 0,
-        "y": 104,
+        "y": 111,
         "w": 24,
         "h": 1
       },
@@ -3643,7 +3712,7 @@
       "description": "Native claude_code.token.usage from run_claude (metrics only; session/user ids dropped on the host). type: input, output, cacheRead, cacheCreation; query_source: main, subagent, auxiliary.",
       "gridPos": {
         "x": 0,
-        "y": 105,
+        "y": 112,
         "w": 12,
         "h": 7
       },
@@ -3707,7 +3776,7 @@
       "description": "Native claude_code.cost.usage: Claude Code's own USD estimate at API prices. Under a subscription it is a relative measure, not a bill.",
       "gridPos": {
         "x": 12,
-        "y": 105,
+        "y": 112,
         "w": 12,
         "h": 7
       },
@@ -3771,7 +3840,7 @@
       "description": "",
       "gridPos": {
         "x": 0,
-        "y": 112,
+        "y": 119,
         "w": 24,
         "h": 1
       },
@@ -3782,10 +3851,10 @@
       "id": 33,
       "type": "table",
       "title": "Task history \u00b7 select a task to inspect events",
-      "description": "Latest snapshot per task episode within the latest 500 matching records. Active means no terminal event has been observed, not that a CLI is running. Task totals span all vendors and ignore Agent/Role filters. A token category is N/A if any completed invocation lacks complete usage. Duration ends at the last observed event; it does not keep increasing while idle. Elapsed includes idle time. Recorded active spans completed attempts; timing coverage is partial for mixed old/new history. Model, local checks and CI wait are measured separately; absent history stays unavailable.",
+      "description": "Latest snapshot per task episode within the latest 500 matching records. Active means no terminal event has been observed, not that a CLI is running. Task totals span all vendors and ignore Agent/Role filters. A token category is N/A if any completed invocation lacks complete usage. Duration ends at the last observed event; it does not keep increasing while idle. Elapsed includes idle time. Recorded active spans completed attempts; timing coverage is partial for mixed old/new history. Model, local checks and CI wait are measured separately; absent history stays unavailable. Trace opens the task's Tempo trace: one span per run, with exact gaps between runs and Codex native spans nested under each run. Tasks whose runs predate shared task traces open an empty trace; use Recent runs for those.",
       "gridPos": {
         "x": 0,
-        "y": 113,
+        "y": 120,
         "w": 24,
         "h": 10
       },
@@ -3800,7 +3869,7 @@
             "type": "loki",
             "uid": "${loki}"
           },
-          "expr": "{source=\"runner\",host=\"$host\"} |= \"baton.task_summary\" | json pipeline_id=\"attributes.pipeline_id\", repo=\"attributes.repo\", issue=\"attributes.issue\", pr=\"attributes.pr\", task_status=\"attributes.task_status\", reason=\"attributes.reason\", duration_ms=\"attributes.duration_ms\", review_rounds=\"attributes.review_rounds\", spec_rounds=\"attributes.spec_rounds\", runs=\"attributes.runs\", incomplete_runs=\"attributes.incomplete_runs\", input_tokens=\"attributes.input_tokens\", cache_read_tokens=\"attributes.cache_read_tokens\", cache_write_tokens=\"attributes.cache_write_tokens\", output_tokens=\"attributes.output_tokens\", workflow_version=\"attributes.workflow_version\", config_version=\"attributes.config_version\", sequence=\"attributes.sequence\", event_id=\"attributes.event_id\", active_ms=\"attributes.active_ms\", last_attempt_ms=\"attributes.last_attempt_ms\", model_ms=\"attributes.model_ms\", verify_ms=\"attributes.verify_ms\", ci_wait_ms=\"attributes.ci_wait_ms\", deferred_wait_ms=\"attributes.deferred_wait_ms\", timing_state=\"attributes.timing_state\" | __error__=\"\" | line_format `{\"pipeline_id\":\"{{.pipeline_id}}\",\"repo\":\"{{.repo}}\",\"issue\":\"{{ if and (ne .issue \"0\") (ne .issue \"\") }}[{{.issue}}](https://github.com/{{.repo}}/issues/{{.issue}}){{ else }}N/A{{ end }}\",\"pr\":\"{{ if and (ne .pr \"0\") (ne .pr \"\") }}[{{.pr}}](https://github.com/{{.repo}}/pull/{{.pr}}){{ else }}N/A{{ end }}\",\"task_status\":\"{{.task_status}}\",\"reason\":\"{{.reason}}\",\"duration_ms\":\"{{.duration_ms}}\",\"review_rounds\":\"{{.review_rounds}}\",\"spec_rounds\":\"{{.spec_rounds}}\",\"runs\":\"{{.runs}}\",\"incomplete_runs\":\"{{.incomplete_runs}}\",\"input_tokens\":\"{{.input_tokens}}\",\"cache_read_tokens\":\"{{.cache_read_tokens}}\",\"cache_write_tokens\":\"{{.cache_write_tokens}}\",\"output_tokens\":\"{{.output_tokens}}\",\"workflow_version\":\"{{.workflow_version}}\",\"config_version\":\"{{.config_version}}\",\"sequence\":\"{{.sequence}}\",\"event_id\":\"{{.event_id}}\",\"active_ms\":\"{{.active_ms}}\",\"last_attempt_ms\":\"{{.last_attempt_ms}}\",\"model_ms\":\"{{.model_ms}}\",\"verify_ms\":\"{{.verify_ms}}\",\"ci_wait_ms\":\"{{.ci_wait_ms}}\",\"deferred_wait_ms\":\"{{.deferred_wait_ms}}\",\"timing_state\":\"{{.timing_state}}\"}`",
+          "expr": "{source=\"runner\",host=\"$host\"} |= \"baton.task_summary\" | json pipeline_id=\"attributes.pipeline_id\", repo=\"attributes.repo\", issue=\"attributes.issue\", pr=\"attributes.pr\", task_status=\"attributes.task_status\", reason=\"attributes.reason\", duration_ms=\"attributes.duration_ms\", review_rounds=\"attributes.review_rounds\", spec_rounds=\"attributes.spec_rounds\", runs=\"attributes.runs\", incomplete_runs=\"attributes.incomplete_runs\", input_tokens=\"attributes.input_tokens\", cache_read_tokens=\"attributes.cache_read_tokens\", cache_write_tokens=\"attributes.cache_write_tokens\", output_tokens=\"attributes.output_tokens\", workflow_version=\"attributes.workflow_version\", config_version=\"attributes.config_version\", sequence=\"attributes.sequence\", event_id=\"attributes.event_id\", active_ms=\"attributes.active_ms\", last_attempt_ms=\"attributes.last_attempt_ms\", model_ms=\"attributes.model_ms\", verify_ms=\"attributes.verify_ms\", ci_wait_ms=\"attributes.ci_wait_ms\", deferred_wait_ms=\"attributes.deferred_wait_ms\", timing_state=\"attributes.timing_state\" | __error__=\"\" | line_format `{\"pipeline_id\":\"{{.pipeline_id}}\",\"trace_id\":\"{{ .pipeline_id | replace \"-\" \"\" }}\",\"repo\":\"{{.repo}}\",\"issue\":\"{{ if and (ne .issue \"0\") (ne .issue \"\") }}[{{.issue}}](https://github.com/{{.repo}}/issues/{{.issue}}){{ else }}N/A{{ end }}\",\"pr\":\"{{ if and (ne .pr \"0\") (ne .pr \"\") }}[{{.pr}}](https://github.com/{{.repo}}/pull/{{.pr}}){{ else }}N/A{{ end }}\",\"task_status\":\"{{.task_status}}\",\"reason\":\"{{.reason}}\",\"duration_ms\":\"{{.duration_ms}}\",\"review_rounds\":\"{{.review_rounds}}\",\"spec_rounds\":\"{{.spec_rounds}}\",\"runs\":\"{{.runs}}\",\"incomplete_runs\":\"{{.incomplete_runs}}\",\"input_tokens\":\"{{.input_tokens}}\",\"cache_read_tokens\":\"{{.cache_read_tokens}}\",\"cache_write_tokens\":\"{{.cache_write_tokens}}\",\"output_tokens\":\"{{.output_tokens}}\",\"workflow_version\":\"{{.workflow_version}}\",\"config_version\":\"{{.config_version}}\",\"sequence\":\"{{.sequence}}\",\"event_id\":\"{{.event_id}}\",\"active_ms\":\"{{.active_ms}}\",\"last_attempt_ms\":\"{{.last_attempt_ms}}\",\"model_ms\":\"{{.model_ms}}\",\"verify_ms\":\"{{.verify_ms}}\",\"ci_wait_ms\":\"{{.ci_wait_ms}}\",\"deferred_wait_ms\":\"{{.deferred_wait_ms}}\",\"timing_state\":\"{{.timing_state}}\"}`",
           "queryType": "range",
           "editorMode": "code",
           "maxLines": 500,
@@ -4005,6 +4074,12 @@
                 "aggregations": [
                   "firstNotNull"
                 ]
+              },
+              "trace_id": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "firstNotNull"
+                ]
               }
             }
           }
@@ -4017,30 +4092,31 @@
               "Time (firstNotNull)": 0,
               "event_id (firstNotNull)": 1,
               "pipeline_id": 2,
-              "repo (firstNotNull)": 3,
-              "issue (firstNotNull)": 4,
-              "pr (firstNotNull)": 5,
-              "task_status (firstNotNull)": 6,
-              "reason (firstNotNull)": 7,
-              "duration_ms (firstNotNull)": 8,
-              "review_rounds (firstNotNull)": 9,
-              "spec_rounds (firstNotNull)": 10,
-              "runs (firstNotNull)": 11,
-              "incomplete_runs (firstNotNull)": 12,
-              "input_tokens (firstNotNull)": 13,
-              "cache_read_tokens (firstNotNull)": 14,
-              "cache_write_tokens (firstNotNull)": 15,
-              "output_tokens (firstNotNull)": 16,
-              "workflow_version (firstNotNull)": 17,
-              "config_version (firstNotNull)": 18,
-              "sequence (firstNotNull)": 19,
-              "active_ms (firstNotNull)": 20,
-              "last_attempt_ms (firstNotNull)": 21,
-              "model_ms (firstNotNull)": 22,
-              "verify_ms (firstNotNull)": 23,
-              "ci_wait_ms (firstNotNull)": 24,
-              "deferred_wait_ms (firstNotNull)": 25,
-              "timing_state (firstNotNull)": 26
+              "repo (firstNotNull)": 4,
+              "issue (firstNotNull)": 5,
+              "pr (firstNotNull)": 6,
+              "task_status (firstNotNull)": 7,
+              "reason (firstNotNull)": 8,
+              "duration_ms (firstNotNull)": 9,
+              "review_rounds (firstNotNull)": 10,
+              "spec_rounds (firstNotNull)": 11,
+              "runs (firstNotNull)": 12,
+              "incomplete_runs (firstNotNull)": 13,
+              "input_tokens (firstNotNull)": 14,
+              "cache_read_tokens (firstNotNull)": 15,
+              "cache_write_tokens (firstNotNull)": 16,
+              "output_tokens (firstNotNull)": 17,
+              "workflow_version (firstNotNull)": 18,
+              "config_version (firstNotNull)": 19,
+              "sequence (firstNotNull)": 20,
+              "active_ms (firstNotNull)": 21,
+              "last_attempt_ms (firstNotNull)": 22,
+              "model_ms (firstNotNull)": 23,
+              "verify_ms (firstNotNull)": 24,
+              "ci_wait_ms (firstNotNull)": 25,
+              "deferred_wait_ms (firstNotNull)": 26,
+              "timing_state (firstNotNull)": 27,
+              "trace_id (firstNotNull)": 3
             },
             "renameByName": {
               "Time (firstNotNull)": "Observed",
@@ -4069,7 +4145,8 @@
               "verify_ms (firstNotNull)": "Local checks",
               "ci_wait_ms (firstNotNull)": "CI wait",
               "deferred_wait_ms (firstNotNull)": "Deferred wait",
-              "timing_state (firstNotNull)": "Timing coverage"
+              "timing_state (firstNotNull)": "Timing coverage",
+              "trace_id (firstNotNull)": "Trace"
             }
           }
         },
@@ -4173,6 +4250,28 @@
               {
                 "id": "custom.width",
                 "value": 160
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Trace"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open task trace in Tempo",
+                    "url": "/explore?schemaVersion=1&panes=%7B%22trace%22%3A%7B%22datasource%22%3A%22tempo%22%2C%22queries%22%3A%5B%7B%22refId%22%3A%22A%22%2C%22datasource%22%3A%7B%22type%22%3A%22tempo%22%2C%22uid%22%3A%22tempo%22%7D%2C%22queryType%22%3A%22traceId%22%2C%22query%22%3A%22${__value.raw}%22%7D%5D%2C%22range%22%3A%7B%22from%22%3A%22${__from}%22%2C%22to%22%3A%22${__to}%22%7D%7D%7D",
+                    "targetBlank": true
+                  }
+                ]
+              },
+              {
+                "id": "custom.width",
+                "value": 120
               }
             ]
           },
@@ -4322,7 +4421,7 @@
       "description": "Deduplicated task events from rollout onward; all vendors, independent of Agent/Role filters. CI no_checks, pending, timeout and infrastructure errors are distinct from pass/failure. Planned approval is separate from abnormal handoff. Click Task ID for the full Loki history.",
       "gridPos": {
         "x": 0,
-        "y": 123,
+        "y": 130,
         "w": 24,
         "h": 10
       },
@@ -4622,7 +4721,7 @@
       "title": "Detailed logs in Loki Explore",
       "gridPos": {
         "x": 0,
-        "y": 133,
+        "y": 140,
         "w": 24,
         "h": 3
       },
@@ -4635,10 +4734,10 @@
       "id": 35,
       "type": "table",
       "title": "Recent run traces",
-      "description": "Run traces only; multi-tick pipeline episodes and CI spans are not yet implemented. Open a trace ID to inspect native Codex child spans and use Tempo trace-to-logs correlation.",
+      "description": "One row per trace. Runs of one task share a trace (trace ID = task ID without dashes), so a task row holds every run span; runs without a task (quota probes) and runs before shared task traces are one trace each. CI spans are not yet implemented. Open a trace ID to inspect native Codex child spans and use Tempo trace-to-logs correlation.",
       "gridPos": {
         "x": 0,
-        "y": 136,
+        "y": 143,
         "w": 24,
         "h": 8
       },
@@ -4672,7 +4771,7 @@
       "description": "",
       "gridPos": {
         "x": 0,
-        "y": 144,
+        "y": 151,
         "w": 24,
         "h": 5
       },
@@ -4688,7 +4787,7 @@
       "description": "",
       "gridPos": {
         "x": 0,
-        "y": 149,
+        "y": 156,
         "w": 24,
         "h": 1
       },
@@ -4702,7 +4801,7 @@
       "description": "",
       "gridPos": {
         "x": 0,
-        "y": 150,
+        "y": 157,
         "w": 24,
         "h": 4
       },
@@ -4718,7 +4817,7 @@
       "description": "One row per implementing vendor and the model its dev run used. n = ended episodes. Merged / handoff rates are shares of n. First-round pass uses the first review verdict of each episode (n shown). Review rounds, time and tokens are per merged episode. Tokens exclude cache reads and cover complete runs only; Incomplete runs counts merged-episode runs without complete usage. Post-merge columns use merged PRs whose 14 days after merge have passed (n shown): a merged revert PR, or a `bug`-labelled issue in the same repository that references the PR. Label a regression `bug` and mention the PR for it to count.",
       "gridPos": {
         "x": 0,
-        "y": 154,
+        "y": 161,
         "w": 24,
         "h": 8
       },
@@ -5105,7 +5204,7 @@
       "description": "Ended episodes handed to the owner, by implementing vendor and runner reason code. auto_merge_off and manual_checks are planned handoffs; the rest are abnormal.",
       "gridPos": {
         "x": 0,
-        "y": 162,
+        "y": 169,
         "w": 24,
         "h": 7
       },
@@ -5193,7 +5292,7 @@
       "description": "PR review verdicts in ended episodes, by reviewing vendor. Must-fix items are the numbered entries under the review's \"## Must fix\" heading, recorded from 2026-10-27; reviews without a count are excluded from Must-fix per review (its n is shown). Adopted / rejected comes from the fixer's `## Must fix` answers to that round's review (recorded from 2026-10-27); owner rejections are not counted.",
       "gridPos": {
         "x": 0,
-        "y": 169,
+        "y": 176,
         "w": 24,
         "h": 6
       },
@@ -5416,7 +5515,7 @@
       "description": "Every run that ended in the last 30 days, task or not. Model is what the run's own log reports (Codex: its session rollout; Claude: stream-json init; Cursor reports only Auto, shown as unknown). Token averages are per run with complete usage (n shown). Use with #245 to compare Codex models per role.",
       "gridPos": {
         "x": 0,
-        "y": 175,
+        "y": 182,
         "w": 24,
         "h": 9
       },

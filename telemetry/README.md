@@ -100,7 +100,15 @@ knows them:
 For Codex, the native exporters and the TRACEPARENT and resource context are set
 on that CLI child only. They use HTTP JSON, port 4318,
 `log_user_prompt=false` and a 1 s metric interval. The finished run span uses
-the same trace and parent identity. A run is instrumented when `bin/telemetry-enabled`
+the same trace and parent identity.
+
+**One trace per task.** A run that belongs to a task episode uses the task's
+pipeline ID (hex, without dashes) as its trace ID, so every run of the task is a
+span in the same trace and the Tempo trace view shows them on one timeline with
+the gaps between them. Each run keeps its own span ID, and Codex's native spans
+nest under their run through TRACEPARENT. Run spans are siblings with no task
+root span. Runs without a task, such as quota probes, keep a random trace ID.
+Runs recorded before this change stay one trace each. A run is instrumented when `bin/telemetry-enabled`
 exists. Removing it stops instrumenting new runs, but records already written are
 still collected and retried.
 
@@ -269,6 +277,16 @@ observations.
 
 **Block edges** are approximate, so use run summaries for exact times.
 
+`baton_active_seconds_total{agent}` is a counter of seconds during which at least
+one invocation of that agent was running. Overlapping invocations of one agent
+count once. `rate()` over it gives the busy fraction per bucket, so a 5 s run and
+a fully busy minute look different, and the value stays an average when zooming
+out. The counter keeps its own boundary in `$STATE/telemetry/active-seconds.json`:
+- a first observation, a failed read or a gap over 150 s adds nothing, so busy
+  time inside an outage is missed rather than guessed;
+- a failed read emits no sample and does not advance the boundary;
+- a corrupt file restarts the counter at zero, which `rate()` treats as a reset.
+
 **What it covers:** "Running" includes waiting for tools or the network. CLI runs
 started outside the runner aren't counted.
 
@@ -303,8 +321,9 @@ and only for an instrumented run (`Telemetry.child_env` in `baton/hooks.py`):
 `grafana/dashboard.json` takes its host and its Prometheus, Loki and Tempo data
 sources from variables.
 
-**Top panels:** Agent activity, Retrospective activity and Quota balances by provider
-precede Current executions. Activity and current executions ignore the Agent and Role
+**Top panels:** Agent activity, Agent busy fraction, Retrospective activity and Quota
+balances by provider precede Current executions. Agent activity shows whether any run
+overlapped each bucket; Agent busy fraction shows how much of the bucket was busy. Activity and current executions ignore the Agent and Role
 filters so a filter cannot hide an active agent. Introductory operational notes live in
 the dashboard JSON description rather than a visible text panel.
 
@@ -323,7 +342,8 @@ locations are outside this host-service view.
 **Task tables:**
 - they span every vendor;
 - they show the latest 500 matching records in Loki;
-- a task ID links to Loki Explore, and a run's trace ID to Tempo.
+- a task ID links to Loki Explore, a task's Trace to its Tempo trace, and a run's
+  trace ID to Tempo.
 
 **Quota overview:** it is per provider and shows:
 - account balance;
