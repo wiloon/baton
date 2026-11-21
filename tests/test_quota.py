@@ -42,6 +42,7 @@ def snapshot(five=None, week=None, week_resets_in=3 * 24 * HOUR, observed=NOW):
 
 
 CAPS = {"claude": 0.70, "codex": 0.95}
+FIVE = {"claude": 0.90, "codex": 0.90}
 
 
 class ParseTests(unittest.TestCase):
@@ -174,7 +175,7 @@ class RecordTests(unittest.TestCase):
 
 class PickTests(unittest.TestCase):
     def pick(self, snapshots, order=("claude", "codex"), current=None, prefer=()):
-        return quota.pick(list(order), snapshots, CAPS, five_hour_max=0.90, now=NOW, current=current,
+        return quota.pick(list(order), snapshots, CAPS, FIVE, now=NOW, current=current,
                           prefer=prefer)[0]
 
     def test_the_vendor_behind_its_weekly_pace_wins(self):
@@ -233,7 +234,7 @@ class PickTests(unittest.TestCase):
 
     def test_the_summary_explains_the_choice(self):
         chosen, summary = quota.pick(["claude", "codex"], {"claude": snapshot(week=0.71)}, CAPS,
-                                     five_hour_max=0.90, now=NOW, current=None)
+                                     FIVE, now=NOW, current=None)
         self.assertEqual(chosen, "codex")
         self.assertIn("claude=blocked(week 71% >= cap 70%)", summary)
         self.assertIn("codex=+0.00", summary)
