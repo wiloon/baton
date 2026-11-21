@@ -502,6 +502,15 @@ def ci_result(checks, rc):
     return ('pass' if 'pass' in buckets else 'no_checks') if rc == 0 else 'unknown'
 
 
+def task_trace_id(pipeline_id):
+    """All runs of one task share a trace; the run span ID stays per run.
+
+    The pipeline UUID is already random and 128-bit, so its hex form is a valid
+    W3C trace ID that dashboards can derive from the task ID alone.
+    """
+    return uuid.UUID(pipeline_id).hex
+
+
 class Ledger:
     def __init__(self, state):
         self.state = Path(state)
@@ -523,15 +532,16 @@ class Ledger:
         stage = {'dev': 'implement', 'screenshot_review': 'review'}.get(role, role)
         if role == 'spec':
             stage = agents.ADAPTERS[vendor].SPEC_STAGE
+        task = Tasks(self.state).ensure(issue, pr, repo=repo)
         record = dict(run_id=run_id, agent=vendor, role=role, stage=stage, repo=repo, status='running',
-                      trace_id=uuid.uuid4().hex, span_id=uuid.uuid4().hex[:16],
+                      trace_id=task_trace_id(task['pipeline_id']) if task else uuid.uuid4().hex,
+                      span_id=uuid.uuid4().hex[:16],
                       started=now, heartbeat=now, deadline=now + minutes * 60 + 60,
                       owner=identity(pid), pr=max(0, pr), round=max(0, round_))
         if issue > 0:
             record['issue'] = issue
         if requested_model and MODEL_RE.fullmatch(requested_model):
             record['requested_model'] = requested_model
-        task = Tasks(self.state).ensure(issue, pr, repo=repo)
         if task:
             record['pipeline_id'] = task['pipeline_id']
         record.update(fingerprints(Path(__file__).parent))
@@ -859,6 +869,46 @@ def interval_activity(records, previous, now, emit, declared=VENDORS):
     emit('activity_interval_start_seconds', previous if known else math.nan)
 
 
+def busy_seconds(records, vendor, previous, now):
+    """Seconds in (previous, now] with at least one invocation of vendor running.
+
+    Overlapping invocations count once, so the value never exceeds the interval.
+    """
+    intervals = []
+    for r in records:
+        if r.get('agent') != vendor or 'started' not in r:
+            continue
+        end = now if r['status'] == 'running' else r.get('ended')
+        if end is not None:
+            intervals.append((max(r['started'], previous), min(end, now)))
+    return timing.milliseconds(intervals) / 1000
+
+
+def active_seconds(records, now, emit, state, declared=VENDORS):
+    """Monotonic busy-seconds counter per vendor, for rate()-based busy fraction.
+
+    The counter keeps its own boundary in one atomic file. An unknown interval
+    (failed read, first observation, gap over 150 s) adds nothing rather than
+    guessing; a corrupt file restarts from zero, which rate() treats as a reset.
+    """
+    path = Path(state) / 'telemetry' / 'active-seconds.json'
+    saved = {}
+    with contextlib.suppress(OSError, ValueError):
+        saved = json.loads(path.read_text())
+    totals = saved.get('seconds') if isinstance(saved, dict) else None
+    totals = {k: float(v) for k, v in totals.items()
+              if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v >= 0} \
+        if isinstance(totals, dict) else {}
+    previous = saved.get('observed', math.nan) if isinstance(saved, dict) else math.nan
+    if isinstance(previous, bool) or not isinstance(previous, (int, float)):
+        previous = math.nan
+    known = math.isfinite(previous) and 0 < now - previous <= 150
+    for vendor in declared:
+        totals[vendor] = totals.get(vendor, 0.0) + (busy_seconds(records, vendor, previous, now) if known else 0.0)
+        emit('active_seconds_total', round(totals[vendor], 3), '{agent="' + vendor + '"}')
+    atomic(path, json.dumps({'observed': now, 'seconds': totals}))
+
+
 def activity_metrics(records, emit, now, state=None, declared=VENDORS):
     """Stable per-vendor state plus metadata only for reconciled live invocations."""
     running = [r for r in (records or []) if r['status'] == 'running']
@@ -889,6 +939,7 @@ def activity_metrics(records, emit, now, state=None, declared=VENDORS):
     interval_activity(records, previous, now, emit, declared)
     if state is not None and records is not None:
         atomic(path, str(now))
+        active_seconds(records, now, emit, state, declared)
 
 
 
