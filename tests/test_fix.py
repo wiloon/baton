@@ -449,15 +449,15 @@ def _codes(monkeypatch):
 @pytest.mark.parametrize("rc", [1, 2])
 @pytest.mark.parametrize("fixer", ["claude", "cursor"])
 def test_a_description_failure_is_discarded_not_handed_off(run, monkeypatch, fixer, rc):
-    """#141: a rejected or failed description request never hands off by itself; with no commit the
-    loop still stops as fix_no_commit."""
+    """#141: a rejected or failed description request never hands off by itself. The Claude/Codex
+    path continues (its checks refresh counts as a change); Cursor's no-commit run stops as fix_no_commit."""
     if fixer == "cursor" and rc == 1:
         pytest.skip("a GitHub failure defers the Cursor path before any handoff")
     seen = _codes(monkeypatch)
     monkeypatch.setattr(fix.pr_helpers, "apply_body", lambda *a, **k: (rc, False, "something", False))
     run.agent(cursor_plan("Adopted.\n\nRESULT: fixed", commit=False) if fixer == "cursor" else {**CHECKED, "commit": False})
     run.fix(fixer)
-    assert seen == ["fix_no_commit"]
+    assert seen == ([] if fixer == "claude" else ["fix_no_commit"])
 
 
 @pytest.mark.parametrize("rc, code", [(1, "fix_task_write_failed"), (2, "fix_task_invalid"), (3, "fix_task_invalid")])
