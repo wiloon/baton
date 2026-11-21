@@ -13,6 +13,22 @@ One continuous period of work on an issue or pull request, ending in completion 
 Resuming work after a handoff starts another episode of the same task.
 _Avoid_: Using issue and episode interchangeably
 
+**Decision point**:
+A named place in the execution loop where a choice needs judgement, offered as a fixed set of
+currently allowed actions with a rule-based default.
+
+**Advisor**:
+A model that recommends one allowed action at a decision point. It does not change anything
+itself.
+_Avoid_: AI scheduler, supervisor
+
+**Decision record**:
+The stored account of one advisor recommendation: what it saw, what it could choose, what it
+chose and why, and later what happened.
+
+**Observation mode**:
+A decision point whose advisor recommendations are recorded but do not change the work.
+
 **Improvement loop**:
 The process that turns execution evidence into optimization hypotheses, evaluates changes
 and retains improvements that preserve task quality.
