@@ -178,8 +178,9 @@ def advise(env, point, item, snapshot, actions, *, episode="", revalidate=None, 
     digest = hashlib.sha256(f"{point}\n{item}\n{text}".encode()).hexdigest()
     for record in reversed(read_records(env)):
         if record.get("snapshot_sha") == digest and record.get("kind") == "decision":
-            # Unchanged snapshot: no second call; the recorded result stands.
-            return Decision(record.get("executed") or rule, record.get("reason", ""), tuple(record.get("evidence") or ()),
+            # Unchanged snapshot: no second call. A recorded handoff stands; a recorded extra round
+            # was already spent, so the rule result stands.
+            return Decision(rule, record.get("reason", ""), tuple(record.get("evidence") or ()),
                             record.get("advised", ""), "duplicate snapshot")
     started = time.monotonic()
     record = {"kind": "decision", "ts": int(time.time()), "point": point, "repo": env.repo.gh_repo, "item": str(item),
@@ -229,12 +230,15 @@ def advise(env, point, item, snapshot, actions, *, episode="", revalidate=None, 
 
 
 def outcome(env, point, item, result):
-    """How an advisor-granted extra round ended: "pass", "accept" or "handoff"."""
+    """How an advisor-granted extra round ended: "pass", "accept" or "handoff". The outcome ends
+    the task episode, so the grant goes too: a later episode on the same PR or issue (owner
+    feedback, a reopened spec) may ask the advisor again."""
     env = session.resolve(env)
     if not granted(env, point, item):
         return
     append(env, {"kind": "outcome", "ts": int(time.time()), "point": point, "repo": env.repo.gh_repo,
                  "item": str(item), "result": result})
+    grant_path(env, point, item).unlink(missing_ok=True)
 
 
 def handoff_note(decision):

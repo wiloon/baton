@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+from dataclasses import replace
 import urllib.error
 
 import pytest
@@ -74,9 +75,27 @@ def test_off_and_a_repository_switch_make_no_call(adv, monkeypatch):
     adv.mode = "off"
     assert advisor.advise(adv.env, "review_limit", 1, "s", ("extra_round",)).action == "handoff"
     adv.mode = "live"
-    monkeypatch.setattr(advisor, "enabled", lambda env: False)
-    assert advisor.advise(adv.env, "review_limit", 1, "s", ("extra_round",)).action == "handoff"
+    off = replace(adv.env, repo=replace(adv.env.repo, advisor=False))   # [[repos]] advisor = false
+    assert advisor.advise(off, "review_limit", 1, "s", ("extra_round",)).action == "handoff"
     assert adv.calls == [] and adv.records() == []
+
+
+def test_a_new_episode_after_the_outcome_may_ask_again(adv):
+    adv.replies = [EXTRA, EXTRA]
+    assert advisor.advise(adv.env, "review_limit", 21, "first", ("extra_round",), revalidate=lambda: True).extra_round
+    advisor.outcome(adv.env, "review_limit", 21, "handoff")
+    assert not advisor.granted(adv.env, "review_limit", 21)
+    again = advisor.advise(adv.env, "review_limit", 21, "owner feedback, a new loop", ("extra_round",),
+                           revalidate=lambda: True)
+    assert again.extra_round and len(adv.calls) == 2
+
+
+def test_a_duplicate_snapshot_never_grants_a_spent_round_again(adv):
+    adv.replies = [EXTRA]
+    assert advisor.advise(adv.env, "review_limit", 22, "same", ("extra_round",), revalidate=lambda: True).extra_round
+    advisor.outcome(adv.env, "review_limit", 22, "handoff")
+    repeat = advisor.advise(adv.env, "review_limit", 22, "same", ("extra_round",), revalidate=lambda: True)
+    assert repeat.action == "handoff" and len(adv.calls) == 1
 
 
 @pytest.mark.parametrize("reply, failure", [
