@@ -28,6 +28,11 @@ actions. For a problem that needs investigation, it may recommend one retry of t
 step or a handoff. The decision records can justify a separate follow-up for a backend with
 read-only tools behind the same interface if these retries frequently fail.
 
+After a fix, a rejected PR description request is a recoverable runner outcome. The runner
+reports why it rejected the request and uses the usual evidence of progress to decide whether
+review can continue. Review and merge preflight still check the live PR. This case needs no
+advisor decision or handoff of its own.
+
 Every advisor call starts a fresh session, and no conversation carries over to the next call.
 Continuity lives in state files, GitHub and the decision record. Each call appends a **decision
 record**: a snapshot reference, the allowed actions, the advisor, model and prompt versions, the
@@ -96,3 +101,5 @@ advisor action per reason and task episode, and a recurrence after that action g
   within existing review gates to reduce handoffs. Keep reversible defaults in observation and
   require separate repository opt-ins for the three excerpt types to preserve the current data
   boundary when only the advisor is enabled.
+- Issue #141: let the normal progress rule and preflight handle rejected description requests
+  after a fix, so a bad replacement does not send a valid fix to the owner.
