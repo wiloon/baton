@@ -261,6 +261,7 @@ class Spec:
     def handoff(self, why, reason="spec_failed"):
         """The owner takes over; the loop resumes once they answer on the issue and remove
         ready-for-human."""
+        advisor.outcome(self.env, "spec_limit", self.issue, "handoff")
         swapped = self.gh("issue", "edit", self.issue, "--remove-label", "agent-wip", "--add-label", "ready-for-human")
         self.hooks.task("handoff", reason, "--reason", reason)
         if swapped.returncode != 0:
@@ -370,8 +371,6 @@ class Spec:
             self.extra = 1
             notify.log(f"#{self.issue}: advisor granted one more spec round: {decision.reason}")
             return True
-        if self.extra:
-            advisor.outcome(self.env, "spec_limit", self.issue, "handoff")
         self.handoff(why + advisor.handoff_note(decision), "spec_limit")
         return False
 

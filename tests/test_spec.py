@@ -1168,6 +1168,21 @@ def test_a_second_spec_limit_hands_off_without_asking_again(advised):
     assert len(advised.advice_calls) == 1
 
 
+def test_a_failed_extra_review_does_not_extend_the_next_spec_episode(advised):
+    failed = {**CHANGES, "rc": 1, "status": "failure", "outcome": "RESULT: failed reviewer crashed"}
+    advised.script = [CHANGES, reviser(), CHANGES, reviser(), CHANGES, reviser(), failed]
+    advised.advice = [{"action": "extra_round", "reason": "fixable", "evidence": []}]
+    assert advised.run() is False
+    assert "ready-for-human" in advised.gh.labels and len(advised.advice_calls) == 1
+
+    advised.gh.labels.remove("ready-for-human")
+    advised.script = [CHANGES, reviser(), CHANGES, reviser(), CHANGES]
+    advised.advice = [{"action": "handoff", "reason": "needs the owner", "evidence": []}]
+    assert advised.run() is False
+    assert len(advised.advice_calls) == 2
+    assert len(advised.runs) == 10 and "ready-for-human" in advised.gh.labels
+
+
 def test_an_advised_spec_handoff_keeps_todays_handoff(advised):
     advised.script = [CHANGES, reviser(), CHANGES, reviser(), CHANGES]
     advised.advice = [{"action": "handoff", "reason": "needs a product decision", "evidence": []}]

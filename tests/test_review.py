@@ -1137,6 +1137,26 @@ def test_a_second_limit_hands_off_without_asking_again(advised):
     assert any("after 3 review rounds" in line for line in advised.log())
 
 
+@pytest.mark.parametrize("failure", ["fix", "review"])
+def test_a_failed_extra_round_does_not_extend_the_next_review_episode(advised, failure):
+    advised.reviews[:] = ["changes", "changes"]
+    if failure == "fix":
+        advised.fix_plans[:] = [0, 1]
+    else:
+        advised.reviews.append("RESULT: failed reviewer crashed")
+    advised.advice = [{"action": "extra_round", "reason": "fixable", "evidence": []}]
+    assert advised.run(fixer="cursor") == 0
+    assert not advised.checkpoint() and not advised.merged
+    assert len(advised.fixes) == 2 and len(advised.advice_calls) == 1
+
+    advised.review_text = "A different issue after the owner resumed review"
+    advised.reviews[:] = ["changes", "changes", "changes"]
+    advised.advice = [{"action": "handoff", "reason": "needs the owner", "evidence": []}]
+    assert advised.run(fixer="cursor") == 0
+    assert len(advised.advice_calls) == 2
+    assert len(advised.fixes) == 3 and advised.labelled("ready-for-human")
+
+
 def test_an_advised_handoff_says_why(advised):
     advised.reviews[:] = ["changes", "changes"]
     advised.advice = [{"action": "handoff", "reason": "the same design disagreement repeats", "evidence": []}]

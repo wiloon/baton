@@ -240,6 +240,7 @@ class Review:
         pr_helpers.gh("pr", "edit", str(self.pr), "-R", self.repo, *options)
 
     def handoff(self, reason, title, text):
+        advisor.outcome(self.env, "review_limit", self.pr, "handoff")
         self.label("--add-label", "ready-for-human")
         self.hooks.task("handoff", reason, "--reason", reason)
         notify.notify(title, text)
@@ -582,8 +583,6 @@ class Review:
                         extra = 1
                         notify.log(f"PR #{pr}: advisor granted one more round: {decision.reason}")
                     else:
-                        if extra:
-                            advisor.outcome(self.env, "review_limit", pr, "handoff")
                         self.handoff("review_limit", f"PR #{pr} needs you",
                                      f"Still has must-fix items after {round} review rounds. {self.url}"
                                      + advisor.handoff_note(decision))
@@ -619,6 +618,7 @@ class Review:
             if rc == 75:
                 return 75
             if rc != 0:
+                advisor.outcome(self.env, "review_limit", pr, "handoff")
                 self.drop()
                 return 0
             self.fixed_by = fixer
