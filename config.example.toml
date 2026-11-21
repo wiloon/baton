@@ -129,6 +129,10 @@ screenshot_review = false
 # false: every PR of this repository waits for the owner (ready-for-human), even when
 # [scheduling].auto_merge is true. Use it for a repository whose changes you merge yourself.
 auto_merge = true
+# Globs relative to the repository root (* also matches /). A PR that touches one, under its old
+# or new name, waits for the owner after review and CI pass, even with auto_merge on; no advisor
+# may release it. List the files that decide what agents may do (guard, quota, merge rules).
+owner_review_paths = []
 
 [repos.areas]
 # Top-level directory -> area, for per-area vendor preferences (`dev_ui = [...]`). Anything else is "other".
