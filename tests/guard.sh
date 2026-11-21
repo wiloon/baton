@@ -49,6 +49,11 @@ for f in "$WT/baton/review.py" "$WT/README.md" /tmp/reply.md /tmp/tests/reply.md
   [[ $(guard_decision dev "$(marker_write "$f")") == deny ]] || fail "guard-marker-non-test $f"
 done
 [[ $(guard_decision dev '{"tool_name":"Bash","tool_input":{"command":"echo by=codex > tests/x"}}') == deny ]] || fail guard-marker-bash
+# #75: the fixer edits the description through /tmp; create/edit go through the runner.
+[[ $(guard_decision fix '{"tool_name":"Bash","tool_input":{"command":"gh pr create --fill"}}') == deny ]] || fail guard-fix-pr-create
+[[ $(guard_decision fix '{"tool_name":"Bash","tool_input":{"command":"gh pr edit 1 --body x"}}') == deny ]] || fail guard-fix-pr-edit
+[[ $(guard_decision fix '{"tool_name":"Bash","tool_input":{"command":"gh pr view 1"}}') == none ]] || fail guard-fix-pr-view
+[[ $(guard_decision fix '{"tool_name":"Write","tool_input":{"file_path":"/tmp/baton-fix-1.md.body","content":"a"}}') == none ]] || fail guard-fix-body-artifact
 # #84: the dev/fix settings run each repo's own checks, Python included.
 dev_allows() {
   local rule pattern
