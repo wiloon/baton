@@ -929,14 +929,16 @@ def test_a_fix_checkpoint_without_screenshot_review_keeps_the_single_comment_pat
 
 @pytest.mark.parametrize("case", ["run failed", "missing artifact", "comment not posted", "comment missing at fix time"])
 def test_a_screenshot_review_that_fails_goes_to_the_owner_with_neither_fix_nor_merge(loop, monkeypatch, case):
+    from baton import handoff as owner_handoff
     loop.reviews = ["changes" if case == "comment missing at fix time" else "pass"]
     loop.screens = ["pass"]
     handoffs = []
     handoff = review.Review.handoff
+    monkeypatch.setattr(owner_handoff, "clock", lambda: 1_000)
 
-    def record_handoff(self, reason, title, text):
+    def record_handoff(self, reason, title, text, **kwargs):
         handoffs.append(reason)
-        handoff(self, reason, title, text)
+        return handoff(self, reason, title, text, **kwargs)
 
     monkeypatch.setattr(review.Review, "handoff", record_handoff)
     if case == "run failed":
@@ -950,18 +952,21 @@ def test_a_screenshot_review_that_fails_goes_to_the_owner_with_neither_fix_nor_m
         real = review.agent_comment
         monkeypatch.setattr(review, "agent_comment", lambda repo, owner, pr, marker, round:
                             "" if "screenshot" in marker else real(repo, owner, pr, marker, round))
-    assert screen_run(loop) == 0
+    rc = screen_run(loop)
     expected = {
         "run failed": "screenshot_run_failed",
         "missing artifact": "screenshot_run_failed",
         "comment not posted": "screenshot_comment_post_failed",
         "comment missing at fix time": "review_comment_missing",
     }[case]
-    assert handoffs == [expected]
-    assert loop.labelled("ready-for-human") and not loop.fixes and not loop.merged
-    assert not loop.checkpoint()
-    assert "stale" not in "".join(loop.comments())
-    if case not in ("comment missing at fix time", "comment not posted"):
+    if case in ("comment not posted", "comment missing at fix time"):
+        assert rc == 75 and handoffs == [expected] and not loop.labelled("ready-for-human")
+        assert loop.checkpoint() and not loop.fixes and not loop.merged
+    else:
+        assert rc == 0 and handoffs == [expected]
+        assert loop.labelled("ready-for-human") and not loop.fixes and not loop.merged
+        assert not loop.checkpoint()
+        assert "stale" not in "".join(loop.comments())
         assert not screenshot_comments(loop)
 
 
@@ -1251,7 +1256,9 @@ def test_a_denied_reviewer_role_hands_off_once_with_its_reason(loop, monkeypatch
     ("seed", "review_author_state_failed"),
 ])
 def test_a_failed_review_is_classified_where_it_fails(loop, monkeypatch, case, reason):
+    from baton import handoff
     seen = _watch(monkeypatch)
+    monkeypatch.setattr(handoff, "clock", lambda: 1_000)
     reviewer = "claude"
     if case == "claude post":
         loop.after["review"] = lambda: loop.gh.fail("comment")
@@ -1267,8 +1274,13 @@ def test_a_failed_review_is_classified_where_it_fails(loop, monkeypatch, case, r
         real, calls = review.vendors.seed_authors, []
         monkeypatch.setattr(review.vendors, "seed_authors",
                             lambda *args: real(*args) if not calls.append(1) and len(calls) == 1 else 1)
-    assert loop.run(fixer="cursor", reviewer=reviewer) == 0
-    _one_handoff(loop, seen, reason)
+    rc = loop.run(fixer="cursor", reviewer=reviewer)
+    if reason == "review_comment_post_failed":
+        assert rc == 75 and not loop.labelled("ready-for-human")
+        assert loop.checkpoint()
+    else:
+        assert rc == 0
+        _one_handoff(loop, seen, reason)
 
 
 def test_an_agent_screenshot_failure_that_mentions_a_comment_stays_a_run_failure(loop, monkeypatch):

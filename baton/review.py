@@ -236,22 +236,98 @@ class Review:
         self.checkpoint = Path(self.state, f"review-pending-{pr}")
         self.values = {}
         self.fail_reason = ""   # the handoff reason of the last failed run; ALREADY when it handed off itself
+        self.fail_transient = False
+        self.retry_continuation = None
 
-    def failed(self, reason, outcome):
+    def failed(self, reason, outcome, *, transient=False, continuation=None):
         """Classify a runner-generated failure where it is produced (#125)."""
         self.fail_reason = reason
+        self.fail_transient = transient
+        self.retry_continuation = continuation
         return outcome
 
     # --- small steps every gate shares ---
     def label(self, *options):
         pr_helpers.gh("pr", "edit", str(self.pr), "-R", self.repo, *options)
 
-    def handoff(self, reason, title, text, *, snapshot="", revalidate=None):
-        """Terminal owner handoff through the shared entry (#125). Returns the entry Result."""
+    def handoff(self, reason, title, text, *, snapshot="", revalidate=None, transient=False,
+                continuation=None, resume=False):
+        """Shared handoff entry (#125). Category-1 may DEFER/RETRY instead of labeling."""
         return owner_handoff.perform(
             self.env, reason, kind="pr", number=self.pr,
-            title=title, text=text, hooks=self.hooks, item=self.pr, episode=self.issue,
-            snapshot=snapshot, revalidate=revalidate, close_outcomes=("review_limit",))
+            title=title, text=text, hooks=self.hooks, item=self.pr, episode=self.issue or self.pr,
+            snapshot=snapshot, revalidate=revalidate, close_outcomes=("review_limit",),
+            transient=transient, continuation=continuation, resume=resume)
+
+    def category1(self, reason, title, text, *, transient, continuation=None):
+        """Apply the category-1 rule; return 75 to keep the checkpoint, 0 after a terminal handoff."""
+        result = self.handoff(reason, title, text, transient=transient, continuation=continuation)
+        if result.action == owner_handoff.DEFER:
+            return 75
+        self.drop()
+        return 0
+
+    def missing_comments(self, round, *, screenshot):
+        """Re-read trusted review comments; defer under the category-1 budget when still missing."""
+        pr = self.pr
+        title = f"PR #{pr} review comment missing"
+        text = f"A review comment of round {round} is unavailable. {self.url}"
+        cont = {"round": round, "screenshot": screenshot}
+        episode = self.issue or pr
+
+        def lookup():
+            if screenshot:
+                code = agent_comment(self.repo, self.owner, pr, "baton-review", round)
+                shots = agent_comment(self.repo, self.owner, pr, "baton-screenshot-review", round)
+                return (code, shots) if code and shots else None
+            body = agent_review(self.repo, self.owner, pr, round)
+            return body or None
+
+        found = lookup()
+        if found is not None:
+            return found, None
+        pending = owner_handoff.load_retry(self.env, episode, "review_comment_missing")
+        if pending is not None:
+            result = self.handoff("review_comment_missing", title, text, resume=True)
+            if result.action == owner_handoff.DEFER:
+                return None, 75
+            if result.action == owner_handoff.RETRY:
+                found = lookup()
+                if found is not None:
+                    owner_handoff.clear_retry(self.env, episode, "review_comment_missing")
+                    return found, None
+                return None, self.category1("review_comment_missing", title, text,
+                                           transient=True, continuation=cont)
+            self.drop()
+            return None, 0
+        return None, self.category1("review_comment_missing", title, text,
+                                    transient=True, continuation=cont)
+
+    def resume_comment_post(self, reason):
+        """Replay a saved review/screenshot comment without re-running the worker (#125).
+
+        Returns (outcome_or_None, rc): outcome continues the loop; rc 75 defers; rc 0 after handoff.
+        """
+        pending = owner_handoff.load_retry(self.env, self.issue or self.pr, reason)
+        if pending is None:
+            return None, None
+        result = self.handoff(reason, f"PR #{self.pr} review comment",
+                              f"Retrying a saved comment post. {self.url}", resume=True)
+        if result.action == owner_handoff.DEFER:
+            return None, 75
+        if result.action != owner_handoff.RETRY:
+            self.drop()
+            return None, 0
+        cont = result.continuation or {}
+        body = cont.get("body") or ""
+        posted = pr_helpers.gh("pr", "comment", str(self.pr), "-R", self.repo, "--body", body)
+        if posted.returncode == 0:
+            owner_handoff.clear_retry(self.env, self.issue or self.pr, reason)
+            return cont.get("outcome") or "REVIEW: pass", None
+        rc = self.category1(reason, f"PR #{self.pr} review comment",
+                            f"RESULT: failed posting review{pr_helpers.why(posted)} {self.url}",
+                            transient=pr_helpers.recoverable(posted), continuation=cont)
+        return None, rc
 
     def render(self, template, **pairs):
         return prompts.render(self.self_dir / template, list(pairs.items()), env=self.env)
@@ -324,10 +400,12 @@ class Review:
         if not outcome.startswith(REVIEWED):
             return outcome, reply
         posted = "\n".join(line for line in strip_markers(reply).split("\n") if not MARKER_LINE.match(line)).rstrip("\n")
-        comment = pr_helpers.gh("pr", "comment", str(pr), "-R", self.repo, "--body",
-                                f"<!-- baton-review round={round} by=cursor -->\n{posted[:REPLY_CAP]}")
+        body = f"<!-- baton-review round={round} by=cursor -->\n{posted[:REPLY_CAP]}"
+        comment = pr_helpers.gh("pr", "comment", str(pr), "-R", self.repo, "--body", body)
         if comment.returncode != 0:
-            return self.failed("review_comment_post_failed", "RESULT: failed posting Cursor's review"), reply
+            return self.failed("review_comment_post_failed", "RESULT: failed posting Cursor's review",
+                               transient=pr_helpers.recoverable(comment),
+                               continuation={"body": body, "outcome": outcome}), reply
         return outcome, reply
 
     def run_review(self, round, note, reviewer=None):
@@ -388,10 +466,12 @@ class Review:
         if outcome.startswith(REVIEWED):
             if review_file.is_file() and review_file.stat().st_size:
                 body = strip_markers(review_file.read_text()).rstrip("\n")
-                posted = pr_helpers.gh("pr", "comment", str(pr), "-R", self.repo, "--body",
-                                       f"<!-- baton-review round={round} by={reviewer} -->\n{review_note}{body}")
+                text = f"<!-- baton-review round={round} by={reviewer} -->\n{review_note}{body}"
+                posted = pr_helpers.gh("pr", "comment", str(pr), "-R", self.repo, "--body", text)
                 if posted.returncode != 0:
-                    outcome = self.failed("review_comment_post_failed", "RESULT: failed posting review")
+                    outcome = self.failed("review_comment_post_failed", "RESULT: failed posting review",
+                                          transient=pr_helpers.recoverable(posted),
+                                          continuation={"body": text, "outcome": outcome})
             else:
                 outcome = self.failed("review_run_failed", "RESULT: failed no review artifact")
         self.hooks.verdict("review", reviewer, head, round, outcome, out["reply"] or "", str(review_file))
@@ -455,10 +535,13 @@ class Review:
                 mode = (vendors.codex_review_mode(self.state, pr, model)
                         if vendor == "codex" and "codex" in vendors.review_excluded(self.state, pr, self.fixed_by) else "")
                 review_note = f"Review mode: {mode} (codex/{model}).\n\n" if mode else ""
-                posted = pr_helpers.gh("pr", "comment", str(pr), "-R", self.repo, "--body",
-                                       f"<!-- baton-screenshot-review round={round} by={vendor} -->\n{review_note}{body}")
+                text = f"<!-- baton-screenshot-review round={round} by={vendor} -->\n{review_note}{body}"
+                posted = pr_helpers.gh("pr", "comment", str(pr), "-R", self.repo, "--body", text)
                 if posted.returncode != 0:
-                    outcome = self.failed("screenshot_comment_post_failed", "RESULT: failed posting screenshot review")
+                    outcome = self.failed("screenshot_comment_post_failed",
+                                          "RESULT: failed posting screenshot review",
+                                          transient=pr_helpers.recoverable(posted),
+                                          continuation={"body": text, "outcome": outcome})
             else:
                 outcome = self.failed("screenshot_run_failed", "RESULT: failed no screenshot review artifact")
         self.hooks.verdict("screenshot_review", vendor, head, round, outcome, out["reply"] or "", str(review_file))
@@ -540,19 +623,30 @@ class Review:
             if step in ("review", "screenshot"):
                 verdict = code_verdict
                 if step == "review":
-                    try:
-                        reviewer = self.review_vendor(reviewer)
-                    except Exhausted as exhausted:
-                        self.handoff("reviewer_unavailable", f"PR #{pr} needs you",
-                                     exhausted.reason or "No eligible reviewer for this PR.")
-                        self.drop()
-                        return 0
-                    self.values["reviewer"] = reviewer
-                    self.save()
-                    self.fail_reason = ""
-                    outcome = self.run_review(round, rnote, reviewer)
+                    resumed, rc = self.resume_comment_post("review_comment_post_failed")
+                    if rc is not None:
+                        return rc
+                    if resumed is not None:
+                        outcome = resumed
+                    else:
+                        try:
+                            reviewer = self.review_vendor(reviewer)
+                        except Exhausted as exhausted:
+                            self.handoff("reviewer_unavailable", f"PR #{pr} needs you",
+                                         exhausted.reason or "No eligible reviewer for this PR.")
+                            self.drop()
+                            return 0
+                        self.values["reviewer"] = reviewer
+                        self.save()
+                        self.fail_reason = ""
+                        outcome = self.run_review(round, rnote, reviewer)
                     if not outcome.startswith(REVIEWED):
                         if self.fail_reason != ALREADY:   # a refusal handed off where it was decided
+                            if self.fail_reason == "review_comment_post_failed":
+                                return self.category1(
+                                    "review_comment_post_failed", f"PR #{pr} review failed ({reviewer})",
+                                    f"{outcome} {self.url}", transient=self.fail_transient,
+                                    continuation=self.retry_continuation)
                             self.handoff(self.fail_reason or "review_run_failed", f"PR #{pr} review failed ({reviewer})",
                                          f"{outcome} {self.url}")
                         self.drop()
@@ -571,13 +665,24 @@ class Review:
                     code_verdict = verdict
                     self.values.update(step=step, code_verdict=code_verdict, screenshot_checks=checks)
                     self.save()
-                    self.fail_reason = ""
-                    try:
-                        outcome = self.run_screenshot_review(round, checks)
-                    except Exhausted as exhausted:
-                        outcome = self.failed("screenshot_reviewer_unavailable",
-                                              exhausted.reason or "No screenshot reviewer available.")
+                    resumed, rc = self.resume_comment_post("screenshot_comment_post_failed")
+                    if rc is not None:
+                        return rc
+                    if resumed is not None:
+                        outcome = resumed
+                    else:
+                        self.fail_reason = ""
+                        try:
+                            outcome = self.run_screenshot_review(round, checks)
+                        except Exhausted as exhausted:
+                            outcome = self.failed("screenshot_reviewer_unavailable",
+                                                  exhausted.reason or "No screenshot reviewer available.")
                     if not outcome.startswith(REVIEWED):
+                        if self.fail_reason == "screenshot_comment_post_failed":
+                            return self.category1(
+                                "screenshot_comment_post_failed", f"PR #{pr} screenshot review failed",
+                                f"{outcome} {self.url}", transient=self.fail_transient,
+                                continuation=self.retry_continuation)
                         self.handoff(self.fail_reason or "screenshot_run_failed", f"PR #{pr} screenshot review failed",
                                      f"{outcome} {self.url}")
                         self.drop()
@@ -600,23 +705,26 @@ class Review:
                     else:
                         self.drop()
                         return 0
-            if step != "fix":
+            entered_fix = step != "fix"
+            if entered_fix:
                 fix_head = git(wt, "rev-parse", "HEAD") or ""
             step = "fix"
             self.values.update(step=step, fix_head=fix_head, code_verdict=code_verdict, screenshot=screenshot,
                                screenshot_checks="")
             self.save()
             if screenshot:
-                # A split review: the fixer reads both comments, or none (an incomplete one is no feedback).
-                code = agent_comment(self.repo, self.owner, pr, "baton-review", round)
-                shots = agent_comment(self.repo, self.owner, pr, "baton-screenshot-review", round)
-                if not (code and shots):
-                    self.handoff("review_comment_missing", f"PR #{pr} review comment missing",
-                                 f"A review comment of round {round} is unavailable. {self.url}")
-                    self.drop()
-                    return 0
-                feedback = combined_feedback(code, shots, int(self.env.config.scheduling.review_context_max_chars or 20000))
+                found, rc = self.missing_comments(round, screenshot=True)
+                if rc is not None:
+                    return rc
+                feedback = combined_feedback(found[0], found[1],
+                                             int(self.env.config.scheduling.review_context_max_chars or 20000))
+            elif entered_fix:
+                found, rc = self.missing_comments(round, screenshot=False)
+                if rc is not None:
+                    return rc
+                feedback = found
             else:
+                # Resuming a mid-fix checkpoint: the comment was already required when fix began.
                 feedback = agent_review(self.repo, self.owner, pr, round)
             # The next round's reviewer must stay free: a fixed reviewer, or a sole pool vendor.
             pool = self.env.config.quota.vendor_pool

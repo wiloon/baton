@@ -22,7 +22,7 @@ import sys
 import time
 
 from . import agents, dispatch, e2e_gate, hooks as telemetry, notify, pr as pr_helpers, pr_contract, prompts, vendors
-from .common import Deferred, child_env, git, push, strip_markers
+from .common import Deferred, child_env, git, push_result, strip_markers
 
 REPLY_CAP = 60000
 # The verify output a repair run gets in its prompt: the tail, where the errors are. The whole
@@ -49,13 +49,22 @@ class Runner:
         self.hooks = hooks or telemetry.from_env(env, issue=env.runtime.issue, pr=pr, round=round)
 
     # --- the owner handoff every gate shares ---
-    def handoff(self, pr, reason, title, text):
-        """Label the PR for the owner, record why, say so on Telegram; always rc 1."""
+    def handoff(self, pr, reason, title, text, *, transient=False, continuation=None, resume=False):
+        """Shared handoff entry (#125). Category-1 may return 75 (defer) instead of 1."""
         from . import handoff as owner_handoff
-        owner_handoff.perform(
+        result = owner_handoff.perform(
             self.env, reason, kind="pr", number=pr,
-            title=title, text=text, hooks=self.hooks, item=pr)
+            title=title, text=text, hooks=self.hooks, item=pr, episode=str(pr),
+            transient=transient, continuation=continuation, resume=resume)
+        if result.action == owner_handoff.DEFER:
+            return 75
+        if result.action == owner_handoff.RETRY:
+            return result
         return 1
+
+    def category1(self, pr, reason, title, text, *, transient, continuation=None):
+        """Schedule or exhaust a category-1 retry; 75 deferred, 1 handed off."""
+        return self.handoff(pr, reason, title, text, transient=transient, continuation=continuation)
 
     def comment(self, pr, body, failed=""):
         posted = pr_helpers.gh("pr", "comment", str(pr), "-R", self.repo, "--body", body)
@@ -180,12 +189,15 @@ class Runner:
         return True
 
     def refresh_checks(self, pr, who, url):
-        rc, _, log = pr_helpers.apply_checks(pr, self.ctx)
+        rc, _, log, was_transient = pr_helpers.apply_checks(pr, self.ctx)
         if log:
             notify.log(log)
         if rc != 0:
-            return self.handoff(pr, "fix_checks_refresh_failed", f"{who}PR #{pr}: Checks not refreshed",
-                                f"The fix is pushed but the description may still list stale checks. {url}")
+            return self.category1(pr, "fix_checks_refresh_failed", f"{who}PR #{pr}: Checks not refreshed",
+                                  f"The fix is pushed but the description may still list stale checks. {url}",
+                                  transient=was_transient, continuation={"op": "apply_checks"})
+        from . import handoff as owner_handoff
+        owner_handoff.clear_retry(self.env, str(pr), "fix_checks_refresh_failed")
         return 0
 
     def recheck_without_commit(self, pr, who, url, description_changed=False):
@@ -194,12 +206,15 @@ class Runner:
         unless the fixer rewrote it: its own checks section must not reach the merge gate."""
         if not description_changed and not pr_helpers.fixer_gave_checks(self.ctx, pr):
             return 0, False
-        rc, changed, log = pr_helpers.apply_checks(pr, self.ctx)
+        rc, changed, log, was_transient = pr_helpers.apply_checks(pr, self.ctx)
         if log:
             notify.log(log)
         if rc != 0:
-            return self.handoff(pr, "fix_checks_refresh_failed", f"{who}PR #{pr}: Checks not refreshed",
-                                f"The description may still list stale checks. {url}"), False
+            return self.category1(pr, "fix_checks_refresh_failed", f"{who}PR #{pr}: Checks not refreshed",
+                                  f"The description may still list stale checks. {url}",
+                                  transient=was_transient, continuation={"op": "apply_checks"}), False
+        from . import handoff as owner_handoff
+        owner_handoff.clear_retry(self.env, str(pr), "fix_checks_refresh_failed")
         return 0, changed
 
     def head(self, wt):
@@ -267,25 +282,35 @@ class Runner:
         if outcome.startswith("RESULT: fixed"):
             want = pr_helpers.task_wanted(out["reply"])
             has_request = description_request.exists() or description_request.is_symlink()
-            description_rc, description_changed, description_reason, task_changed = pr_helpers.apply_body(
-                pr, str(description_request), self.state, self.ctx, completion=want or None)
+            description_rc, description_changed, description_reason, task_changed, _transient = (
+                pr_helpers.apply_body(pr, str(description_request), self.state, self.ctx, completion=want or None))
             Path(self.state, f"pr-body-base-{pr}").unlink(missing_ok=True)
             pr_helpers.remove_body_request(description_request)
-            # A rejected body keeps the prior text; still apply a valid TASK: request.
+            # A rejected or failed body keeps the prior text (#141); still apply a valid TASK: request.
             if not has_request or description_rc:
-                rc, task_changed, log = pr_helpers.apply_task(pr, want, self.ctx)
+                rc, task_changed, log, task_transient = pr_helpers.apply_task(pr, want, self.ctx)
                 if log:
                     notify.log(log)
+                if rc == 1:
+                    return self.category1(pr, "fix_task_write_failed",
+                                          f"PR #{pr}: task completion change failed ({fixer})", url,
+                                          transient=task_transient, continuation={"op": "apply_task", "want": want})
                 if rc != 0 and (rc != 2 or description_rc != 2):
-                    return self.handoff(pr, "fix_task_write_failed" if rc == 1 else "fix_task_invalid",
+                    return self.handoff(pr, "fix_task_invalid",
                                         f"PR #{pr}: task completion change failed ({fixer})", url)
+                from . import handoff as owner_handoff
+                owner_handoff.clear_retry(self.env, str(pr), "fix_task_write_failed")
         elif self.head(wt) != head:
             # Anything but a fix goes to the owner, who must see the partial work ("commit
             # what is done" in the fix prompts): push it unverified. Only a fix is gated below.
             if not self.record(pr, fixer, wt, agent_head, model, cursor_base):
                 return 1
-            if not push(wt, "HEAD", signoff=self.env.repo.signoff):
+            pushed = push_result(wt, "HEAD", signoff=self.env.repo.signoff)
+            if not pushed.ok:
                 outcome = "RESULT: failed pushing fix"
+                if pushed.transient:
+                    return self.category1(pr, "fix_push_failed", f"PR #{pr}: pushing fix failed", url,
+                                          transient=True, continuation={"op": "push", "ref": "HEAD"})
         if not outcome.startswith("RESULT: fixed"):
             if outcome.startswith("RESULT: needs-info"):
                 return self.handoff(pr, "fix_needs_info", f"PR #{pr} has questions", url)
@@ -305,8 +330,12 @@ class Runner:
                 return self.handoff(pr, "fix_verify_failed", f"PR #{pr}: local CI verification failed", url)
             if not self.record(pr, fixer, wt, agent_head, model if rounds == 0 else "unknown", cursor_base):
                 return 1
-            if not push(wt, "HEAD", signoff=self.env.repo.signoff):
-                return self.handoff(pr, "fix_push_failed", f"PR #{pr}: pushing fix failed", url)
+            pushed = push_result(wt, "HEAD", signoff=self.env.repo.signoff)
+            if not pushed.ok:
+                return self.category1(pr, "fix_push_failed", f"PR #{pr}: pushing fix failed", url,
+                                      transient=pushed.transient, continuation={"op": "push", "ref": "HEAD"})
+            from . import handoff as owner_handoff
+            owner_handoff.clear_retry(self.env, str(pr), "fix_push_failed")
             rc = self.refresh_checks(pr, "", url)
             if rc != 0:
                 return rc
@@ -370,28 +399,44 @@ class Runner:
                 temp = task_file.with_suffix(".tmp")
                 temp.write_text(want + "\n")
                 temp.replace(task_file)
+        from . import handoff as owner_handoff
+        for reason in ("fix_description_write_failed", "fix_task_write_failed"):
+            if owner_handoff.load_retry(self.env, str(pr), reason) is None:
+                continue
+            result = self.handoff(pr, reason, f"PR #{pr}: resuming {reason}", url, resume=True)
+            if result == 75:
+                return 75
+            if not isinstance(result, owner_handoff.Result) or result.action != owner_handoff.RETRY:
+                return 1
         has_request = request.exists() or request.is_symlink()
-        description_rc, body_changed, description_reason, task_changed = pr_helpers.apply_body(
-            pr, str(request), self.state, self.ctx, completion=want or None)
+        description_rc, body_changed, description_reason, task_changed, description_transient = (
+            pr_helpers.apply_body(pr, str(request), self.state, self.ctx, completion=want or None))
         if description_rc == 1:
             notify.log(f"PR #{pr}: description update deferred after GitHub failure")
-            return 75
+            return self.category1(pr, "fix_description_write_failed",
+                                  f"PR #{pr}: description update failed (cursor)", url,
+                                  transient=description_transient,
+                                  continuation={"op": "apply_body", "request": str(request), "want": want or ""})
+        owner_handoff.clear_retry(self.env, str(pr), "fix_description_write_failed")
         discarded = description_rc == 2
         if discarded:
             pr_helpers.remove_body_request(request)
             has_request = False
         if not has_request or description_rc:
-            rc, task_changed, log = pr_helpers.apply_task(pr, want, self.ctx, baseline_file)
+            rc, task_changed, log, task_transient = pr_helpers.apply_task(pr, want, self.ctx, baseline_file)
             if log:
                 notify.log(log)
             if rc == 1:
                 if discarded:
                     self.description_discarded(pr, "cursor", description_reason)
                 notify.log(f"PR #{pr}: description update deferred after GitHub failure")
-                return 75
+                return self.category1(pr, "fix_task_write_failed",
+                                      f"PR #{pr}: task completion change failed (cursor)", url,
+                                      transient=task_transient, continuation={"op": "apply_task", "want": want})
             if rc != 0 and (rc != 2 or description_rc != 2):
-                return self.handoff(pr, "fix_task_write_failed" if rc == 1 else "fix_task_invalid",
+                return self.handoff(pr, "fix_task_invalid",
                                     f"PR #{pr}: task completion change failed (cursor)", url)
+            owner_handoff.clear_retry(self.env, str(pr), "fix_task_write_failed")
         moved = self.head(wt) != head
         if not moved:
             rc, checks_changed = self.recheck_without_commit(pr, "Cursor ", url, body_changed)
@@ -413,8 +458,11 @@ class Runner:
             return 1
         vendors.record_contrib(self.state, pr, "cursor", str(wt), head)
         if moved:
-            if not push(wt, branch, signoff=self.env.repo.signoff):
-                return self.handoff(pr, "fix_push_failed", f"Cursor PR #{pr}: push failed", url)
+            pushed = push_result(wt, branch, signoff=self.env.repo.signoff)
+            if not pushed.ok:
+                return self.category1(pr, "fix_push_failed", f"Cursor PR #{pr}: push failed", url,
+                                      transient=pushed.transient, continuation={"op": "push", "ref": branch})
+            owner_handoff.clear_retry(self.env, str(pr), "fix_push_failed")
             if self.refresh_checks(pr, "Cursor ", url):
                 return 1
         if discarded and moved:

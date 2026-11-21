@@ -846,6 +846,9 @@ def test_a_github_description_update_failure_does_not_lend_a_slot(ctx, monkeypat
 
 @pytest.mark.parametrize("route", ["review", "owner", "switch", "switch-no-commit", "switch-review"])
 def test_a_second_tick_finishes_a_deferred_description_edit(ctx, worktree, monkeypatch, request, route):
+    from baton import handoff
+    clock = {"now": 1_000}
+    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
     pr = "11"
     original = ("<!-- baton-task issue=297 completion=complete -->\n\nCloses #297\n\n"
                 "## Summary\nOld.\n\n## Checks to verify\nnone\n")
@@ -943,6 +946,7 @@ def test_a_second_tick_finishes_a_deferred_description_edit(ctx, worktree, monke
 
     fail_edit = False
     switched = route.startswith("switch")
+    clock["now"] = 1_060
     assert ctx.make().run() == 0, ctx.log()
     expected_agents = ["cursor", "codex"] if switched else ["cursor"]
     if route == "switch-review":

@@ -51,6 +51,18 @@ def transient(result):
     return bool(TRANSIENT.search(stderr))
 
 
+def recoverable(result):
+    """True when a category-1 later attempt may still succeed (#125).
+
+    Recognized transient failures qualify. So do inconclusive answers (empty stderr, a write
+    whose response was lost): only a clear permanent 4xx fails closed immediately.
+    """
+    stderr = result.stderr or ""
+    if re.search(r"HTTP 4\d\d", stderr) and not re.search(r"secondary rate limit", stderr, re.IGNORECASE):
+        return False
+    return True
+
+
 def why(result):
     """gh's last stderr lines as ` (gh: ...)` for a runner.log line or a handoff; '' when it printed none."""
     lines = [line.strip() for line in (getattr(result, "stderr", "") or "").splitlines() if line.strip()]
@@ -136,11 +148,12 @@ def body(pr):
 
 
 def edit_body(pr, text, directory, prefix):
-    """Replace the PR description through a file, as the bash helpers did."""
+    """Replace the PR description through a file. Returns (ok, recoverable_on_failure)."""
     with tempfile.NamedTemporaryFile("w", dir=directory, prefix=prefix, delete=False) as file:
         file.write(text)
     try:
-        return gh("pr", "edit", str(pr), "-R", session.resolve().repo.gh_repo, "--body-file", file.name).returncode == 0
+        result = gh("pr", "edit", str(pr), "-R", session.resolve().repo.gh_repo, "--body-file", file.name)
+        return result.returncode == 0, recoverable(result)
     finally:
         os.unlink(file.name)
 
@@ -220,17 +233,17 @@ def apply_body(pr, request, state, ctx, completion=None):
     """Apply an agent's PR description request (file REQUEST) with the runner-owned task
     relation. COMPLETION is the fixer's `TASK:` value when the fix path parsed one; the
     standalone apply-body CLI leaves it None so the body must match the live completion.
-    Returns (rc, text_changed, reason, task_changed): rc 0 done or no request,
-    1 GitHub failed (retry), 2 invalid request. Changes are measured from before
-    the first attempt so a write whose response was lost still counts."""
+    Returns (rc, text_changed, reason, task_changed, transient): rc 0 done or no request,
+    1 GitHub failed (retry), 2 invalid request. TRANSIENT is set when rc is 1 after gh backoff.
+    Changes are measured from before the first attempt so a write whose response was lost still counts."""
     path = Path(request)
     if not path.exists() and not path.is_symlink():
-        return 0, False, "", False
+        return 0, False, "", False, False
     if path.is_symlink() or not path.is_file() or path.stat().st_size == 0:
-        return 2, False, "description request must be a non-empty regular file and cannot be a symlink", False
+        return 2, False, "description request must be a non-empty regular file and cannot be a symlink", False, False
     current = view(pr, "headRefName,body")
     if current is None:
-        return 1, False, "GitHub could not read the current PR description", False
+        return 1, False, "GitHub could not read the current PR description", False, True
     before = (current.get("body") or "").rstrip("\n")
     baseline = Path(state, f"pr-body-base-{pr}")
     original = _original_body(baseline, before)
@@ -238,14 +251,16 @@ def apply_body(pr, request, state, ctx, completion=None):
         relation_source = {**current, "body": original} if completion else current
         issue, original_completion = pr_contract.relation(relation_source)
         if not re.fullmatch(r"\d+", issue) or original_completion not in ("partial", "complete"):
-            return 2, False, "cannot determine the PR's issue and task completion", False
+            return 2, False, "cannot determine the PR's issue and task completion", False, False
         if completion and pr_contract.relation(current)[0] != issue:
-            return 2, False, "the PR's associated issue changed since the fix began", False
+            return 2, False, "the PR's associated issue changed since the fix began", False, False
         prepared = _prepare_request(path.read_text(), issue, original_completion, completion)
     except ValueError as error:
-        return 2, False, str(error), False
-    if prepared.rstrip("\n") != before and not edit_body(pr, prepared, ctx, f"pr-{pr}-body-prepared."):
-        return 1, False, "GitHub could not update the PR description", False
+        return 2, False, str(error), False, False
+    if prepared.rstrip("\n") != before:
+        ok, was_transient = edit_body(pr, prepared, ctx, f"pr-{pr}-body-prepared.")
+        if not ok:
+            return 1, False, "GitHub could not update the PR description", False, was_transient
     task_changed = bool(completion and completion != original_completion)
     if task_changed:
         try:
@@ -253,39 +268,41 @@ def apply_body(pr, request, state, ctx, completion=None):
         except ValueError:
             # The replacement also corrected text that prevented a relation-only edit.
             pass
-    return 0, prepared.rstrip("\n") != original, "", task_changed
+    return 0, prepared.rstrip("\n") != original, "", task_changed, False
 
 
 def apply_task(pr, want, ctx, baseline=None):
     """Apply a parsed task completion. A saved baseline distinguishes an earlier
-    landed write from a no-op. Returns (rc, changed, log): 1 GitHub failed, 2 unusable relation,
-    3 unsafe retarget (e.g. a changed issue or a closing keyword in a partial PR)."""
+    landed write from a no-op. Returns (rc, changed, log, transient): 1 GitHub failed,
+    2 unusable relation, 3 unsafe retarget (e.g. a changed issue or a closing keyword in a
+    partial PR). TRANSIENT is set when rc is 1 after gh backoff."""
     if not want:
-        return 0, False, ""
+        return 0, False, "", False
     current = view(pr, "headRefName,body")
     if current is None:
-        return 1, False, ""
+        return 1, False, "", True
     try:
         issue, completion = pr_contract.relation(current)
         before = (current.get("body") or "").rstrip("\n")
         original = _original_body(baseline, before)
         original_issue, original_completion = pr_contract.relation({**current, "body": original})
         if original_issue != issue:
-            return 3, False, f"PR #{pr}: the associated issue changed since the fix began"
+            return 3, False, f"PR #{pr}: the associated issue changed since the fix began", False
         if not re.fullmatch(r"\d+", issue):
-            return 2, False, ""
+            return 2, False, "", False
         if completion == want:
-            return 0, original_completion != want, ""
+            return 0, original_completion != want, "", False
         try:
             prepared = pr_contract.retarget(before + "\n", issue, want)
         except ValueError:
-            return 3, False, ""
+            return 3, False, "", False
     except ValueError:
-        return 2, False, ""
-    if not edit_body(pr, prepared, ctx, f"pr-{pr}-task."):
-        return 1, False, ""
+        return 2, False, "", False
+    ok, was_transient = edit_body(pr, prepared, ctx, f"pr-{pr}-task.")
+    if not ok:
+        return 1, False, "", was_transient
     return 0, True, (f"PR #{pr}: task completion {completion} -> {want} at the fixer's request; "
-                     "the next review checks it")
+                     "the next review checks it"), False
 
 
 def checks_file(ctx, pr):
@@ -311,7 +328,7 @@ def fixer_gave_checks(ctx, pr):
 def apply_checks(pr, ctx):
     """After a fix, the fixer's re-check of the whole PR replaces the body's
     checks section; none given reads "Not re-checked", which the merge gate hands
-    off. Returns (rc, changed, log): rc 1 while GitHub may still hold the old section."""
+    off. Returns (rc, changed, log, transient): rc 1 while GitHub may still hold the old section."""
     file = checks_file(ctx, pr)
     try:
         checks = json.loads(file.read_text())["checks"]
@@ -319,15 +336,15 @@ def apply_checks(pr, ctx):
         checks = None
     current = body(pr)
     if current is None:
-        return 1, False, ""
+        return 1, False, "", True
     updated = pr_contract.set_checks(current, checks).rstrip("\n")
     changed = updated != current
     if changed:
         result = gh("pr", "edit", str(pr), "-R", session.resolve().repo.gh_repo, "--body-file", "-", input=updated + "\n")
         if result.returncode != 0:
-            return 1, False, ""
+            return 1, False, "", recoverable(result)
     file.unlink(missing_ok=True)
-    return 0, changed, f"PR #{pr}: checks refreshed after the fix" if changed else ""
+    return 0, changed, f"PR #{pr}: checks refreshed after the fix" if changed else "", False
 
 
 def checks_none(text):
@@ -380,16 +397,17 @@ def main(argv=None):
             print(error, file=sys.stderr)
             return 1
     elif args.command == "apply-body":
-        rc, changed, _reason, _task_changed = apply_body(args.pr, args.request, str(env.dirs.state), str(env.dirs.ctx))
+        rc, changed, _reason, _task_changed, _transient = apply_body(
+            args.pr, args.request, str(env.dirs.state), str(env.dirs.ctx))
         print(json.dumps({"changed": changed}))
         return rc
     elif args.command in ("apply-task", "apply-checks"):
         if args.command == "apply-task":
-            rc, changed, log = apply_task(args.pr, task_wanted(sys.stdin.read()), str(env.dirs.ctx))
+            rc, changed, log, _transient = apply_task(args.pr, task_wanted(sys.stdin.read()), str(env.dirs.ctx))
             if rc == 3:
                 rc = 2
         else:
-            rc, changed, log = apply_checks(args.pr, str(env.dirs.ctx))
+            rc, changed, log, _transient = apply_checks(args.pr, str(env.dirs.ctx))
         print(json.dumps({"changed": changed, "log": log}))
         return rc
     elif args.command == "split-checks":

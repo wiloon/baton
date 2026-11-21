@@ -273,13 +273,20 @@ def test_a_comment_that_timed_out_but_landed_is_not_posted_twice(loop):
     assert sum(1 for c in loop.gh.calls if c[:2] == ["issue", "comment"]) == 3   # review, reply, verdict
 
 
-def test_a_gh_failure_that_outlasts_the_retries_is_in_runner_log(loop):
+def test_a_gh_failure_that_outlasts_the_retries_is_in_runner_log(loop, monkeypatch):
+    """After gh backoff, category-1 schedules a later attempt instead of handing off immediately."""
+    from baton import handoff
+    clock = {"now": 1_000}
+    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
     loop.gh.comments = []
     loop.gh.flaky["issue edit --body-file"] = [("HTTP 502: Bad Gateway", False)] * 4
     loop.script = [CHANGES, reviser(body="Goal\nNew step\n")]
-    assert loop.run() is False
+    with pytest.raises(Deferred, match="spec_body_edit_failed"):
+        loop.run()
     log = loop.log()
     assert "gh issue edit failed after 4 tries (gh: HTTP 502: Bad Gateway)" in log
+    assert "handoff-retry spec_body_edit_failed scheduled in 60s" in log
+    assert "ready-for-human" not in loop.gh.labels
 
 
 def test_a_handoff_whose_label_swap_fails_says_so(loop, monkeypatch):
@@ -851,8 +858,9 @@ def test_a_later_matching_verdict_supersedes_pending_acceptance(loop):
 def test_pending_write_failure_skips_ci_and_merge(loop):
     loop.script = [CHANGES, reviser(commit=True), ACCEPT]
     loop.gh.fail_body_substr = "baton-spec-accept-pending"
-    assert loop.run() is False
-    assert "ready-for-human" in loop.gh.labels
+    with pytest.raises(Deferred, match="spec_pending_accept_post_failed"):
+        loop.run()
+    assert "ready-for-human" not in loop.gh.labels
     assert not any(c[:2] == ["pr", "merge"] for c in loop.gh.calls)
     assert not loop.gh.posted("<!-- baton-spec-accept-pending")
 
@@ -906,14 +914,19 @@ def test_a_closed_adr_pr_hands_off_without_a_verdict(loop):
     assert loop.gh.posted("<!-- baton-spec-accept-pending pr=77 -->")  # still pending
 
 
-def test_verdict_write_failure_after_merge_retries_without_another_merge(loop):
+def test_verdict_write_failure_after_merge_retries_without_another_merge(loop, monkeypatch):
+    from baton import handoff
+    clock = {"now": 1_000}
+    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
     loop.gh.comments = [{"author": {"login": "owner"},
                          "body": f"<!-- baton-spec-accept-pending pr=77 -->\n{VERDICT_BODY}"}]
     loop.gh.pr_state = "MERGED"
     loop.gh.fail_body_substr = "<!-- baton-verdict: accept"
-    assert loop.run() is False
+    with pytest.raises(Deferred, match="spec_accept_post_failed"):
+        loop.run()
     assert not loop.gh.posted("<!-- baton-verdict: accept")
     # Retry: pending still there, PR already merged — publish only.
+    clock["now"] = 1_060
     loop.gh.fail_body_substr = ""
     before = sum(1 for c in loop.gh.calls if c[:2] == ["pr", "merge"])
     assert loop.run() is True
@@ -1056,17 +1069,19 @@ def test_red_ci_after_a_confirmed_adr_update_hands_off_without_merging(loop, mon
 def test_an_unreadable_adr_pr_state_hands_off_with_the_pending_comment_kept(loop, monkeypatch):
     resume_pending(loop, monkeypatch)
     loop.gh.fails.add("pr view")
-    assert loop.run() is False
+    with pytest.raises(Deferred, match="spec_pending_adr_read_failed"):
+        loop.run()
     assert merges(loop) == [] and not loop.gh.posted(ACCEPTED)
-    assert loop.gh.posted(PENDING) and "ready-for-human" in loop.gh.labels
+    assert loop.gh.posted(PENDING) and "ready-for-human" not in loop.gh.labels
 
 
 def test_unreadable_issue_comments_hand_off_instead_of_starting_a_review(loop):
-    loop.gh.labels = {"needs-triage"}   # the handoff must add ready-for-human, not find it there
+    loop.gh.labels = {"needs-triage"}   # a recoverable read failure defers under the category-1 budget
     loop.gh.fails.add("issue view")
-    assert loop.run() is False
+    with pytest.raises(Deferred, match="spec_comments_read_failed"):
+        loop.run()
     assert loop.runs == [] and not loop.gh.ran("pr", "create")
-    assert not loop.gh.posted(ACCEPTED) and "ready-for-human" in loop.gh.labels
+    assert not loop.gh.posted(ACCEPTED) and "ready-for-human" not in loop.gh.labels
 
 
 def accept_now(loop, monkeypatch):

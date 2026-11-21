@@ -4,13 +4,27 @@ Every task handoff in review, fix, merge, spec, dev and tick goes through `perfo
 the reason against the code table, applies the rule or advisor action for that reason, and on a
 terminal handoff performs the label change, telemetry and notification. Callers keep their own
 label removals and stop semantics. Cursor triage and after-merge tracker issues stay outside.
+
+Category-1 reasons never call the advisor. After `pr.gh`'s per-call backoff, a recognized
+transient failure schedules at most two later attempts (due after 60s then 300s). The attempt is
+consumed before it runs so a restart cannot reset the budget. Permanent failures and exhaustion
+hand off. Deferrals yield the tick without sleeping.
 """
 from dataclasses import dataclass
+import json
+from pathlib import Path
+import time
 
 from . import advisor, notify, pr as pr_helpers
 
 HANDOFF = advisor.HANDOFF
+DEFER = "defer"
+RETRY = "retry"
 READY = "ready-for-human"
+# After gh backoff: at most two later attempts, due after these delays (seconds).
+DELAYS = (60, 300)
+MAX_ATTEMPTS = len(DELAYS)
+clock = time.time
 
 # Categories: 1 rule-decided, 2 judgement, 3 needs investigation, 4 owner-only.
 RANK = {"off": 0, "observe": 1, "live": 2}
@@ -28,6 +42,7 @@ class Result:
     action: str
     decision: object | None = None
     handed_off: bool = False
+    continuation: dict | None = None
 
 
 class UnknownReason(ValueError):
@@ -62,6 +77,7 @@ REASONS = {
     "spec_pending_accept_post_failed": Reason(1, "rule"),
     "spec_accept_post_failed": Reason(1, "rule"),
     "fix_checks_refresh_failed": Reason(1, "rule"),
+    "fix_description_write_failed": Reason(1, "rule"),
     "fix_task_write_failed": Reason(1, "rule"),
     "spec_body_edit_failed": Reason(1, "rule"),
     "spec_adr_open_failed": Reason(1, "rule"),
@@ -107,6 +123,32 @@ def capped_mode(global_mode, point_mode):
     return point_mode if RANK[point_mode] <= RANK[global_mode] else global_mode
 
 
+def retry_path(env, episode, reason):
+    """Repository state keyed by task episode and reason (#125 category-1 budget)."""
+    return Path(str(env.dirs.state)) / f"handoff-retry-{episode}-{reason}.json"
+
+
+def load_retry(env, episode, reason):
+    path = retry_path(env, episode, reason)
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def save_retry(env, episode, reason, data):
+    path = retry_path(env, episode, reason)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False) + "\n")
+
+
+def clear_retry(env, episode, reason):
+    retry_path(env, episode, reason).unlink(missing_ok=True)
+
+
 def label_ready(env, kind, number, remove=()):
     """Add ready-for-human on a PR or issue; REMOVE labels first. Returns the gh CompletedProcess."""
     opts = []
@@ -117,13 +159,66 @@ def label_ready(env, kind, number, remove=()):
     return pr_helpers.gh(cmd, "edit", str(number), "-R", env.repo.gh_repo, *opts)
 
 
+def _category1(env, reason, entry, *, kind, number, title, text, hooks, remove, item, episode,
+               close_outcomes, after_labels, transient, continuation, resume):
+    """Rule-decided recovery: schedule, consume a due attempt, or hand off (#125)."""
+    episode = str(episode or item or number)
+    now = int(clock())
+    pending = load_retry(env, episode, reason)
+
+    def finish(decision=None):
+        clear_retry(env, episode, reason)
+        for point in close_outcomes:
+            advisor.outcome(env, point, item, "handoff")
+        result = label_ready(env, kind, number, remove=remove)
+        if after_labels:
+            after_labels(result)
+        hooks.task("handoff", reason, "--reason", reason)
+        body = (text() if callable(text) else text) + (advisor.handoff_note(decision) if decision else "")
+        notify.notify(title, body)
+        notify.log(f"handoff {reason} category={entry.category}")
+        return Result(HANDOFF, decision, True)
+
+    if resume:
+        if pending is None:
+            return finish()
+        due = int(pending.get("due") or 0)
+        if now < due:
+            return Result(DEFER, handed_off=False, continuation=pending.get("continuation"))
+        attempts = int(pending.get("attempts") or 0) + 1
+        pending = {**pending, "attempts": attempts}
+        save_retry(env, episode, reason, pending)
+        notify.log(f"handoff-retry {reason} attempt={attempts}/{MAX_ATTEMPTS} episode={episode}")
+        return Result(RETRY, handed_off=False, continuation=pending.get("continuation"))
+
+    if not transient:
+        return finish()
+
+    attempts = int(pending.get("attempts") or 0) if pending else 0
+    if attempts >= MAX_ATTEMPTS:
+        return finish()
+    delay = DELAYS[attempts]
+    save_retry(env, episode, reason, {
+        "attempts": attempts,
+        "due": now + delay,
+        "continuation": continuation or (pending or {}).get("continuation") or {},
+        "reason": reason,
+        "episode": episode,
+    })
+    notify.log(f"handoff-retry {reason} scheduled in {delay}s attempt={attempts}/{MAX_ATTEMPTS} episode={episode}")
+    return Result(DEFER, handed_off=False, continuation=continuation)
+
+
 def perform(env, reason, *, kind, number, title, text, hooks, remove=(), item="", episode="",
-            snapshot="", revalidate=None, close_outcomes=(), after_labels=None):
+            snapshot="", revalidate=None, close_outcomes=(), after_labels=None,
+            transient=False, continuation=None, resume=False):
     """Validate REASON, apply its rule or advisor action, and on handoff run labels/telemetry/notify.
 
     KIND is "pr" or "issue". REMOVE is labels to drop before adding ready-for-human. AFTER_LABELS
     receives the gh result when the caller must react to a failed swap. Recovery actions other
     than handoff are returned for the caller to execute; handoff side effects have already run.
+    Category-1: TRANSIENT schedules a deferred later attempt; RESUME consumes a due attempt
+    (RETRY) or yields again (DEFER) until due; permanent or exhausted failures hand off.
     Raises UnknownReason before any side effect when REASON is not in the table.
     """
     entry = REASONS.get(reason)
@@ -142,10 +237,16 @@ def perform(env, reason, *, kind, number, title, text, hooks, remove=(), item=""
         notify.log(f"handoff {reason} category={entry.category}")
         return Result(HANDOFF, decision, True)
 
-    # Category 1 and 4 never call the advisor. Category 2/3 may, when the effective mode allows
+    if entry.category == 1:
+        return _category1(env, reason, entry, kind=kind, number=number, title=title, text=text,
+                          hooks=hooks, remove=remove, item=item, episode=episode,
+                          close_outcomes=close_outcomes, after_labels=after_labels,
+                          transient=transient, continuation=continuation, resume=resume)
+
+    # Category 4 never calls the advisor. Category 2/3 may, when the effective mode allows
     # and this slice already executes the offered action (extra_round). Other recoveries fall
     # through to the rule (handoff) until a later slice wires them.
-    if entry.category in (1, 4) or not entry.actions:
+    if entry.category == 4 or not entry.actions:
         return finish()
 
     offered = tuple(a for a in entry.actions if a in LIVE_ACTIONS)

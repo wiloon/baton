@@ -14,7 +14,7 @@ import subprocess
 import time
 
 from . import after_merge, agents, checks as check_section, dispatch, fix, md, names, pr as pr_helpers, pr_contract, prompts, spec, vendors
-from .common import Deferred, git, push, strip_markers
+from .common import Deferred, git, push_result, strip_markers
 
 REPLY_CAP = 60000
 RESUME_NOTE = ("This worktree already holds earlier work on this issue (an earlier run stopped early). "
@@ -103,12 +103,15 @@ def is_partial(text, issue):
         return False
 
 
-def stop(tick, issue, reason, title, text):
-    """The handoff every gate shares: ready-for-human, a telemetry handoff, a Telegram message."""
+def stop(tick, issue, reason, title, text, *, transient=False, continuation=None):
+    """The handoff every gate shares. Category-1 may return 75 (defer) instead of 80."""
     from . import handoff as owner_handoff
-    owner_handoff.perform(
+    result = owner_handoff.perform(
         tick.env, reason, kind="issue", number=issue, remove=("agent-wip",),
-        title=title, text=text, hooks=tick.hooks(issue), item=issue, episode=issue)
+        title=title, text=text, hooks=tick.hooks(issue), item=issue, episode=issue,
+        transient=transient, continuation=continuation)
+    if result.action == owner_handoff.DEFER:
+        return 75
     return 80
 
 
@@ -266,10 +269,11 @@ def run(tick, issue):
                       f"<!-- baton-note by={dev_vendor} -->\nLocal CI verification failed before push after {rounds} of "
                       f"{env.config.scheduling.max_verify_fixes or 2} fix rounds. Nothing was pushed.\n\n{failure[:REPLY_CAP]}")
         return stop(tick, issue, "dev_verify_failed", f"#{issue}: local CI verification failed", url)
-    if not push(wt, branch, upstream=True, signoff=tick.env.repo.signoff):
-        stop(tick, issue, "dev_push_failed", f"#{issue}: pushing {dev_vendor}'s branch failed",
-             f"{branch} is committed in {wt}. {url}")
-        return 1
+    pushed = push_result(wt, branch, upstream=True, signoff=tick.env.repo.signoff)
+    if not pushed.ok:
+        return stop(tick, issue, "dev_push_failed", f"#{issue}: pushing {dev_vendor}'s branch failed",
+                    f"{branch} is committed in {wt}. {url}",
+                    transient=pushed.transient, continuation={"op": "push", "ref": branch})
     lines = Path(body).read_text().split("\n")
     try:
         text = pr_body(check_section.canonicalize(Path(body).read_text()), issue)
