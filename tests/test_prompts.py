@@ -53,6 +53,8 @@ def test_fix_prompts_route_description_fixes_through_the_runner():
         assert "make that description inaccurate" in prompt, name
         assert "keeping the task relation" in prompt, name
         assert "`TASK: complete` or `TASK: partial`" in prompt, name
+        assert "allowed only for issue #{{ISSUE}}" in prompt, name
+        assert "Mention any other issue by its number without a keyword" in prompt, name
 
 
 def test_fix_prompts_answer_nits_in_the_form_the_runner_reads():
