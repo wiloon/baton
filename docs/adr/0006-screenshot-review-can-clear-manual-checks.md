@@ -20,11 +20,10 @@ screenshot review comment, ## Checks (numbered as the prompt numbered the PR's c
   2. broken — <why>           they show it is wrong (also a Must fix)
   3. owner — <why>            no screenshot can show it, or the reviewer is not sure
 
-merge gate (manual_checks = "gate"), after review passed and CI is green
+merge gate (every repository), after review passed and CI is green
   every check verified          -> merge; the screenshots still go to Telegram
   any check not verified        -> ready-for-human, listing only those checks
   no usable verdicts            -> ready-for-human, as before
-manual_checks = "defer"         -> merge; only the unverified checks go to "Checks to try"
 ```
 
 "No usable verdicts" covers every case where the runner can't be sure: no screenshot review in
@@ -32,7 +31,8 @@ the last round (setting off, owner-authored PR, Cursor review), a `## Checks` se
 exactly one valid verdict per check, a PR description whose checks changed after the review,
 a description whose checks section is missing, repeated or empty (no item to verify), and one
 that carries both the old and the new heading. Missing information never merges: zero items
-verified is not "every check verified". `none` and `defer` are separate paths and are unchanged.
+verified is not "every check verified". `none` is a separate path and is unchanged. There is no
+per-repository way around this gate (issue #95).
 
 ## Considered options
 
@@ -83,3 +83,9 @@ verified is not "every check verified". `none` and `defer` are separate paths an
   written before the rename keep working; the runner writes only the new name. One module
   (`baton/checks.py`) reads and writes the section, and shared prompt rules live in
   `bin/partials/`.
+- Issue #95: `manual_checks = "defer"` is removed, superseding the `defer` path of #48 and #52
+  and the `defer` revisions above. The owner wants one pipeline for every repository, and after
+  the screenshot review what is left is exactly what the agents could not settle, so it waits
+  for the owner. A config that still sets `manual_checks` (either value) is rejected as an
+  unknown field, and the runner no longer reads or writes the `Checks to try` tracking issue
+  (under either title). Both checks-section headings stay readable.
