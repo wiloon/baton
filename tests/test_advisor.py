@@ -1,13 +1,13 @@
 """baton.advisor (#17, ADR 0008): the DeepSeek routine advisor at the review and spec round limits."""
-import json
 import os
-from pathlib import Path
-from dataclasses import replace
 import urllib.error
+from dataclasses import replace
+from email.message import Message
+from pathlib import Path
 
 import pytest
 
-from baton import advisor, notify, session
+from baton import advisor, session
 from baton.config import Advisor
 
 KEY = "sk-" + "k" * 24   # built at run time: not a key a scanner should report
@@ -71,7 +71,7 @@ def test_observe_records_the_advice_and_runs_the_rule(adv):
     assert adv.records()[0]["executed"] == "handoff" and not advisor.granted(adv.env, "spec_limit", 7)
 
 
-def test_off_and_a_repository_switch_make_no_call(adv, monkeypatch):
+def test_off_and_a_repository_switch_make_no_call(adv):
     adv.mode = "off"
     assert advisor.advise(adv.env, "review_limit", 1, "s", ("extra_round",)).action == "handoff"
     adv.mode = "live"
@@ -80,14 +80,19 @@ def test_off_and_a_repository_switch_make_no_call(adv, monkeypatch):
     assert adv.calls == [] and adv.records() == []
 
 
-def test_a_new_episode_after_the_outcome_may_ask_again(adv):
+@pytest.mark.parametrize(("point", "result"), [
+    ("review_limit", "handoff"),
+    ("review_limit", "pass"),
+    ("spec_limit", "accept"),
+])
+def test_a_new_episode_after_a_terminal_outcome_may_ask_again(adv, point, result):
     adv.replies = [EXTRA, EXTRA]
-    assert advisor.advise(adv.env, "review_limit", 21, "first", ("extra_round",), revalidate=lambda: True).extra_round
-    advisor.outcome(adv.env, "review_limit", 21, "handoff")
-    assert not advisor.granted(adv.env, "review_limit", 21)
-    again = advisor.advise(adv.env, "review_limit", 21, "owner feedback, a new loop", ("extra_round",),
-                           revalidate=lambda: True)
-    assert again.extra_round and len(adv.calls) == 2
+    assert advisor.advise(adv.env, point, 21, "first", ("extra_round",)).extra_round
+    advisor.outcome(adv.env, point, 21, result)
+    again = advisor.advise(adv.env, point, 21, "new episode", ("extra_round",))
+    assert again.extra_round and again.called
+    assert len(adv.calls) == 2
+    assert [record["result"] for record in adv.records() if record["kind"] == "outcome"] == [result]
 
 
 def test_a_duplicate_snapshot_never_grants_a_spent_round_again(adv):
@@ -102,7 +107,7 @@ def test_a_duplicate_snapshot_never_grants_a_spent_round_again(adv):
     ({"action": "merge_now", "reason": "x"}, "outside the allowed set"),
     (urllib.error.URLError("down"), "unavailable"),
     (ValueError("not json"), "malformed reply"),
-    (urllib.error.HTTPError("u", 401, "no", {}, None), "HTTP 401"),
+    (urllib.error.HTTPError("u", 401, "no", Message(), None), "HTTP 401"),
 ])
 def test_a_failure_hands_off_and_is_recorded(adv, reply, failure):
     adv.replies = [reply]
