@@ -22,20 +22,13 @@ screenshot review comment, ## Checks (numbered as the prompt numbered the PR's c
                               (or a design disagreement the fixer and reviewer could not settle, #96)
 ## Design findings (#96): open findings, each naming the checks it blocks
 
-merge gate (manual_checks = "gate"), after review passed and CI is green
-  a check named by an open design finding counts as not verified
+merge gate (every repository), after review passed and CI is green
+  a check named by an open design finding counts as not verified (#96)
   every check verified          -> merge; the screenshots still go to Telegram
   any check not verified        -> ready-for-human, listing only those checks
   no usable verdicts            -> ready-for-human, as before
-manual_checks = "defer"         -> merge; only the unverified checks go to "Checks to try"
-                                   (a check blocked by a design finding goes there with the finding,
-                                   also when the verdicts are unusable; the remainder is computed
-                                   from the body the gate allowed the merge on; a finding whose
-                                   check later leaves the body is still posted, with its
-                                   original check text)
-any round's open design finding or disagreement that no current check carries
-                                -> ready-for-human, whatever manual_checks says, even when
-                                   the checks section is `none` (#96)
+any open design finding or disagreement of the review loop that no current check carries
+                                -> ready-for-human, even when the checks section is `none` (#96)
 ```
 
 "No usable verdicts" covers every case where the runner can't be sure: no screenshot review in
@@ -43,8 +36,9 @@ the last round (setting off, owner-authored PR, Cursor review), a `## Checks` se
 exactly one valid verdict per check, a PR description whose checks changed after the review,
 a description whose checks section is missing, repeated or empty (no item to verify), and one
 that carries both the old and the new heading. Missing information never merges: zero items
-verified is not "every check verified". `none` and `defer` are separate paths and are unchanged, except
+verified is not "every check verified". `none` is a separate path and is unchanged, except
 that an unsettled design finding with no current check to carry it goes to the owner (#96).
+There is no per-repository way around this gate (issue #95).
 
 ## Considered options
 
@@ -95,6 +89,12 @@ that an unsettled design finding with no current check to carry it goes to the o
   written before the rename keep working; the runner writes only the new name. One module
   (`baton/checks.py`) reads and writes the section, and shared prompt rules live in
   `bin/partials/`.
+- Issue #95: `manual_checks = "defer"` is removed, superseding the `defer` path of #48 and #52
+  and the `defer` revisions above. The owner wants one pipeline for every repository, and after
+  the screenshot review what is left is exactly what the agents could not settle, so it waits
+  for the owner. A config that still sets `manual_checks` (either value) is rejected as an
+  unknown field, and the runner no longer reads or writes the `Checks to try` tracking issue
+  (under either title). Both checks-section headings stay readable.
 - Issue #96: `verified` also requires that no open design finding names the check. The
   screenshot reviewer now reviews as a UI/UX designer too, and the owner decided design findings
   are settled between the reviewer and the fixer rather than merged unseen as Nits. The gate
@@ -104,28 +104,13 @@ that an unsettled design finding with no current check to carry it goes to the o
   an open finding is handed off with the finding and the fixer's answer, when there is one.
 - Issue #96, round 2: the gate reads the open findings and disagreements the review loop
   carried across all its rounds (ADR 0005), not only the last comment, matched to the current
-  checks by text. Under `defer` a blocked check is an unverified check like any other: the merge
-  goes ahead and the check reaches "Checks to try" with the finding, so the owner still sees it;
-  `defer` keeps its meaning. A finding or disagreement that no current check carries (the checks
-  changed, or the section became `none`, after the review that raised it) has no check to defer
-  or hand off, so it sends the PR to ready-for-human in every mode, per "missing information never
-  merges".
+  checks by text. A finding or disagreement that no current check carries (the checks changed,
+  or the section became `none`, after the review that raised it) has no check to hand off, so it
+  sends the PR to ready-for-human, per "missing information never merges".
 - Issue #96, round 3: the unmatched-finding guard runs inside `pr.gate`, on the same live body
-  read that decides `none`, `defer` or `verified`, because the merge step reads the body once
-  before the gate and the checks can change between the reads. Under `defer`, a carried finding
-  keeps its text on the way to "Checks to try" even when the verdicts are unusable: the saved
-  remainder is then written with every current check (not removed) and records, per check, the
-  carried finding's text and the fixer's answer, which the tracker adds to that check. Without
-  carried findings, unusable verdicts still remove the remainder, as before.
-- Issue #96, round 4: a gate that allows the merge returns the body it read, and the merge step
-  computes the unverified checks and the saved remainder from that body, not from its own
-  earlier read, so a check added between the reads cannot make the tracker discard the
-  remainder and the finding's text with it. When the tracker still falls back to every current
-  check (the body changed after the merge), it adds the recorded carried text to each current
-  check whose text matches.
-- Issue #96, round 5: the tracker never drops a recorded carried finding. One whose check no
-  current check of the merged body matches (the check was edited out after the gate's read, or
-  the section became `none`) is posted as its own entry, with the check's original text, the
-  finding and the fixer's answer or both positions of a disagreement; a merged body with no
-  checks still gets those entries before tracking is marked done. The guard in the gate can
-  only see the body up to the merge, and a finding the owner never sees would be merged unseen.
+  read that decides `none` or `verified`, because the merge step reads the body once before the
+  gate and the checks can change between the reads.
+- Issue #96, after #95: the `defer` parts of rounds 2 to 5 (blocked checks and unmatched
+  findings carried to "Checks to try", the saved remainder computed from the gate's body, the
+  tracker never dropping a recorded finding) are withdrawn with the `defer` path itself. With
+  one gate, a check blocked by a design finding always goes to the owner before the merge.

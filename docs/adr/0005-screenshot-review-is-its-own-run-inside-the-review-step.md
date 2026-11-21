@@ -66,9 +66,12 @@ fix                        reads both, answers Must fix and design findings, re-
   From the checkpoint the runner renders one `Open design findings` block, by id, into every fix
   feedback (also a round with no screenshot review, whose fixer otherwise sees only the code
   review) and into every screenshot prompt after round 1. The fixer answers and the reviewer
-  judges by id, never by the comment's local number. A fix comment carries its round
-  (`<!-- baton-fix by=<vendor> round=<n> -->`), so a review reads only the answers given since
-  the previous screenshot review. A round's fixer runs with that round's number, after its
+  judges by id, never by the comment's local number. A loop that starts without a checkpoint
+  gets a fresh loop id, kept in the checkpoint across a deferred resume, and a fix comment
+  carries the loop and its round (`<!-- baton-fix by=<vendor> loop=<id> round=<n> -->`), so a
+  review reads only the answers this loop's fixer gave since the previous screenshot review.
+  Round numbers restart at 1 when the same PR starts a new loop (after the owner's feedback,
+  for example), so a comment of another loop, or one with no loop id, is never an answer. A round's fixer runs with that round's number, after its
   screenshot review, so the replies since the previous screenshot review are the fix comments
   with `previous screenshot round <= round < current round` (the fix that answered round 1's
   review is `round=1`; with no previous screenshot review the lower bound is round 1). That review must judge every open id in the block exactly
@@ -120,3 +123,6 @@ fix                        reads both, answers Must fix and design findings, re-
   round`, because the loop runs a round's fixer under the same round number as the screenshot
   review it answers; a window that started after the previous review's round would miss exactly
   the answers that review asked for.
+- Issue #96, round 6: the reply window is also scoped to the active loop by a loop id in the fix
+  comment's marker, because a new review loop on the same PR restarts its rounds at 1 and an
+  earlier loop's `D1.1` answer would otherwise collide with the new loop's `D1.1`.

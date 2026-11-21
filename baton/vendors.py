@@ -89,19 +89,20 @@ def seed_contrib(state, pr, wt):
     if path.exists():
         return []
     authors = set(_lines(state_path(state, pr, "authors")))
-    others = [v for v in ("claude", "codex") if v in authors]
+    others = [v for v in authors if (adapter := agents.ADAPTERS.get(v))
+              and getattr(adapter, "UNMARKED_AUTHOR_INFERENCE", False)]
     _git(wt, "fetch", "-q", "origin", "main")
     commits = _git(wt, "rev-list", "--no-merges", "origin/main..HEAD").stdout.splitlines()
     skipped = []
     with path.open("w") as file:
         for commit in commits:
             lines = _changed_lines(_git(wt, "show", "--numstat", "--format=", commit).stdout)
-            metadata = _git(wt, "show", "-s", "--format=%ae%n%b", commit).stdout
-            if "cursoragent@cursor.com" in metadata.lower():
-                vendor = "cursor"
-            elif len(others) == 1:
+            metadata = _git(wt, "show", "-s", "--format=%ae%n%b", commit).stdout.lower()
+            vendor = next((adapter.ID for adapter in agents.ADAPTERS.values()
+                           if any(marker in metadata for marker in adapter.COMMIT_MARKERS)), None)
+            if vendor is None and len(others) == 1:
                 vendor = others[0]
-            else:
+            if vendor is None:
                 skipped.append(commit[:7])
                 continue
             if lines > 0:
@@ -126,11 +127,13 @@ def record_author(state, pr, vendor):
 def record_author_model(state, pr, vendor, model):
     """Persist the model that actually wrote a PR; unknown is never review eligible."""
     path = state_path(state, pr, "author-models")
-    if (vendor == "codex" and not path.exists() and vendor in _lines(state_path(state, pr, "authors"))
+    adapter = agents.ADAPTERS.get(vendor)
+    if (adapter and adapter.RECORDS_AUTHOR_MODEL and not path.exists()
+            and vendor in _lines(state_path(state, pr, "authors"))
             and state_path(state, pr, "contrib").exists()):
         # A pre-migration contribution has no model proof. A later fix cannot
         # retroactively make the entire PR eligible for same-vendor review.
-        path.write_text("codex unknown\n")
+        path.write_text(f"{vendor} unknown\n")
     row = f"{vendor} {model or 'unknown'}"
     if row not in _lines(path):
         with path.open("a") as file:
@@ -150,11 +153,15 @@ def seed_authors(state, pr, repo, cursor_branch_re, cursor_login_re):
     if not parts:
         return 1
     branch, author = parts[0], parts[1] if len(parts) > 1 else ""
+    # External Cursor identity (branch/login) is an allowed name match; adapter markers
+    # cover commit attribution. Historical Claude attribution rides LEGACY_SEED_WITH_OWNER.
     if re.search(cursor_branch_re, branch) or re.search(cursor_login_re, author):
         record_author(state, pr, "cursor")
     else:
         record_author(state, pr, "owner")
-        record_author(state, pr, "claude")
+        for adapter in agents.ADAPTERS.values():
+            if adapter.LEGACY_SEED_WITH_OWNER:
+                record_author(state, pr, adapter.ID)
     return 0
 
 
