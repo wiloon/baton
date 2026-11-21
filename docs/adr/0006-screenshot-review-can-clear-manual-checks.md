@@ -89,3 +89,7 @@ per-repository way around this gate (issue #95).
   for the owner. A config that still sets `manual_checks` (either value) is rejected as an
   unknown field, and the runner no longer reads or writes the `Checks to try` tracking issue
   (under either title). Both checks-section headings stay readable.
+- Issue #122: rerun the implementation PR's merge gate after each branch update and new-head
+  CI wait, before attempting the merge. The PR description may have changed during the wait,
+  so the runner rechecks screenshot clearance against the live checks and reruns metadata
+  preflight before merging.
