@@ -173,7 +173,15 @@ def advise(env, point, item, snapshot, actions, *, episode="", revalidate=None, 
     cfg = settings(env)
     if granted(env, point, item):
         return Decision(rule, failure="extra round already granted in this episode")
+    started = time.monotonic()
+    try:
+        key = credentials.load(cfg.env_file, (KEY,)).get(KEY, "")
+        failure = "" if key else "no DEEPSEEK_API_KEY"
+    except credentials.CredentialError as error:
+        key, failure = "", str(error)
     values = secret_values(env)
+    if key:
+        values.add(key)
     text = redact(snapshot, values)[: int(cfg.snapshot_chars)]
     digest = hashlib.sha256(f"{point}\n{item}\n{text}".encode()).hexdigest()
     for record in reversed(read_records(env)):
@@ -182,29 +190,28 @@ def advise(env, point, item, snapshot, actions, *, episode="", revalidate=None, 
             # was already spent, so the rule result stands.
             return Decision(rule, record.get("reason", ""), tuple(record.get("evidence") or ()),
                             record.get("advised", ""), "duplicate snapshot")
-    started = time.monotonic()
     record = {"kind": "decision", "ts": int(time.time()), "point": point, "repo": env.repo.gh_repo, "item": str(item),
               "episode": str(episode), "snapshot_sha": digest, "actions": list(actions), "backend": "deepseek",
               "model": cfg.model, "prompt_version": PROMPT_VERSION, "mode": cfg.mode, "rule": rule}
-    advised, reason, evidence, failure, usage = "", "", [], "", {}
+    advised, reason, evidence, usage = "", "", [], {}
     try:
-        key = credentials.load(cfg.env_file, (KEY,)).get(KEY, "")
-        if not key:
-            raise RuntimeError("no DEEPSEEK_API_KEY")
-        reply, usage = call_deepseek(cfg, key, text, actions)
-        advised = str(reply.get("action", ""))
-        reason = redact(str(reply.get("reason", "")), values)[:600]
-        evidence = [redact(str(e), values)[:300] for e in (reply.get("evidence") or [])][:5]
-        if advised not in actions:
-            failure = f"action outside the allowed set: {advised[:60]!r}"
-    except credentials.CredentialError as error:
-        failure = str(error)
+        if key:
+            reply, metadata = call_deepseek(cfg, key, text, actions)
+            advised = str(reply.get("action", ""))
+            if advised not in actions:
+                advised = redact(advised, values)
+                failure = f"action outside the allowed set: {advised[:60]!r}"
+            reason = redact(str(reply.get("reason", "")), values)[:600]
+            evidence = [redact(str(e), values)[:300] for e in (reply.get("evidence") or [])][:5]
+            if isinstance(metadata, dict):
+                usage = {k: count for k, count in metadata.items()
+                         if k in ("prompt_tokens", "completion_tokens", "total_tokens") and isinstance(count, int)}
     except urllib.error.HTTPError as error:
         failure = f"HTTP {error.code}"
     except (urllib.error.URLError, TimeoutError, OSError) as error:
         failure = f"unavailable: {type(error).__name__}"
     except (ValueError, KeyError, IndexError, TypeError, AttributeError, RuntimeError) as error:
-        failure = f"malformed reply: {type(error).__name__}: {str(error)[:120]}"
+        failure = f"malformed reply: {type(error).__name__}: {redact(str(error), values)[:120]}"
     executed = rule
     if not failure and advised != rule and cfg.mode == "live":
         try:
@@ -216,9 +223,7 @@ def advise(env, point, item, snapshot, actions, *, episode="", revalidate=None, 
         else:
             failure = "stale snapshot: the state changed before acting"
     record.update(advised=advised, reason=reason, evidence=evidence, executed=executed, failure=failure,
-                  latency_ms=int((time.monotonic() - started) * 1000),
-                  usage={k: usage.get(k) for k in ("prompt_tokens", "completion_tokens", "total_tokens")
-                         if k in usage})
+                  latency_ms=int((time.monotonic() - started) * 1000), usage=usage)
     append(env, record)
     notify.log(f"advisor {point} #{item}: advised={advised or '-'} executed={executed}"
                + (f" failure={failure}" if failure else ""))

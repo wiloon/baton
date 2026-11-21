@@ -25,20 +25,22 @@ def adv(tmp_path, monkeypatch):
     monkeypatch.setenv(advisor.KEY, KEY)
 
     class State:
+        env_file = None
         mode = "live"
         replies = []
         calls = []
         notes = []
+        usage = {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
     state = State()
     state.replies, state.calls, state.notes = [], [], []
-    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode=state.mode))
+    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=state.env_file, mode=state.mode))
 
     def call(cfg, key, snapshot, actions):
         state.calls.append({"key": key, "snapshot": snapshot, "actions": actions, "model": cfg.model})
         reply = state.replies.pop(0)
         if isinstance(reply, Exception):
             raise reply
-        return reply, {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        return reply, state.usage
     monkeypatch.setattr(advisor, "call_deepseek", call)
     monkeypatch.setattr(advisor.notify, "notify", lambda title, text="": state.notes.append((title, text)))
     state.env = session.resolve({"STATE": str(tmp_path / "state"), "LOGS": str(tmp_path / "logs"),
@@ -151,6 +153,31 @@ def test_secrets_never_reach_the_request_or_the_record(adv, monkeypatch):
     assert KEY not in stored and "planted-env-secret-value" not in stored
     log = Path(os.environ["LOGS"], "runner.log")
     assert not log.exists() or KEY not in log.read_text()
+
+
+@pytest.mark.parametrize("echo_in_action", [False, True])
+def test_advisor_key_from_env_file_is_redacted(adv, tmp_path, monkeypatch, echo_in_action):
+    # Use an opaque value so the token patterns alone cannot redact it.
+    key = "fixture-" + "opaque-value"
+    monkeypatch.delenv(advisor.KEY)
+    adv.env_file = tmp_path / "deepseek.env"
+    adv.env_file.touch(mode=0o600)
+    adv.env_file.write_text(f"{advisor.KEY}={key}\n")
+    adv.replies = [{"action": key if echo_in_action else "handoff", "reason": f"saw {key}", "evidence": [key]}]
+    adv.usage = {"total_tokens": key}
+
+    decision = advisor.advise(adv.env, "review_limit", 8, f"snapshot contains {key}", ("extra_round",))
+
+    [call] = adv.calls
+    assert call["key"] == key
+    assert call["snapshot"] == "snapshot contains [redacted]"
+    assert decision.action == "handoff"
+    assert bool(decision.failure) == echo_in_action
+    assert decision.reason == "saw [redacted]"
+    assert decision.evidence == ("[redacted]",)
+    assert key not in advisor.handoff_note(decision)
+    assert key not in advisor.records_path(adv.env).read_text()
+    assert key not in Path(os.environ["LOGS"], "runner.log").read_text()
 
 
 def test_the_digest_is_sent_once_a_day_with_outcomes(adv):
