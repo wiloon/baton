@@ -10,6 +10,7 @@ import uuid
 import pytest
 
 from baton import checkpoint, merge, pick, review, session, tick, vendors
+from baton import config
 from baton.config import load
 from baton.dispatch import dispatch as dispatch_run
 from baton.fix import fix_pr as fix_pr_run
@@ -1170,3 +1171,82 @@ def test_an_advised_handoff_says_why(advised):
     assert len(advised.fixes) == 1 and advised.labelled("ready-for-human")
     assert any("Advisor (DeepSeek) chose handoff: the same design disagreement repeats" in line
                for line in advised.log())
+
+
+# --- one handoff per terminal review failure, classified where it is produced (#125) ------------
+
+def _watch(monkeypatch):
+    seen = {"reasons": [], "notices": []}
+    monkeypatch.setattr(review.notify, "notify", lambda title, text: seen["notices"].append((title, text)))
+    monkeypatch.setattr(review.telemetry.Telemetry, "task",
+                        lambda self, kind, key, *args: seen["reasons"].append(key) if kind == "handoff" else None)
+    return seen
+
+
+def _one_handoff(loop, seen, reason):
+    assert seen["reasons"] == [reason]
+    assert len(seen["notices"]) == 1
+    assert sum(c[:2] == ["pr", "edit"] and "--add-label" in c and "ready-for-human" in c
+               for c in loop.gh.calls()) == 1
+
+
+def test_a_configured_model_refusal_hands_off_once_with_its_reason(loop, monkeypatch):
+    seen = _watch(monkeypatch)
+    for vendor in ("claude", "codex", "cursor"):
+        vendors.record_author(loop.env["STATE"], PR, vendor)
+    monkeypatch.setattr(review.Review, "review_vendor", lambda self, current: "codex")
+    assert loop.run(fixer="cursor", reviewer="codex") == 0
+    _one_handoff(loop, seen, "review_independence_denied")
+
+
+def test_an_actual_model_refusal_hands_off_once_with_its_reason(loop, monkeypatch):
+    seen = _watch(monkeypatch)
+    answers = iter([True, False])
+    monkeypatch.setattr(review.vendors, "review_allowed", lambda *args: next(answers))
+    assert loop.run(fixer="cursor", reviewer="claude") == 0
+    assert [a["role"] for a in loop.agents] == ["review"]
+    _one_handoff(loop, seen, "review_independence_denied")
+
+
+def test_a_denied_reviewer_role_hands_off_once_with_its_reason(loop, monkeypatch):
+    seen = _watch(monkeypatch)
+    monkeypatch.setattr(review.Review, "review_vendor", lambda self, current: "claude")
+    monkeypatch.setattr(config.Config, "allows", lambda self, vendor, role: role != "reviewer")
+    assert loop.run(fixer="cursor", reviewer="claude") == 0
+    _one_handoff(loop, seen, "reviewer_role_denied")
+
+
+@pytest.mark.parametrize("case, reason", [
+    ("claude post", "review_comment_post_failed"),
+    ("cursor post", "review_comment_post_failed"),
+    ("agent text", "review_run_failed"),
+    ("no artifact", "review_run_failed"),
+    ("seed", "review_author_state_failed"),
+])
+def test_a_failed_review_is_classified_where_it_fails(loop, monkeypatch, case, reason):
+    seen = _watch(monkeypatch)
+    reviewer = "claude"
+    if case == "claude post":
+        loop.after["review"] = lambda: loop.gh.fail("comment")
+    elif case == "cursor post":
+        loop.gh.set(headRefName="owner/issue-1", author={"login": "owner"})
+        loop.after["review"] = lambda: loop.gh.fail("comment")
+        reviewer = "cursor"
+    elif case == "agent text":
+        loop.reviews[:] = ["RESULT: failed could not post a comment, service unavailable"]
+    elif case == "no artifact":
+        loop.review_text = ""
+    else:
+        real, calls = review.vendors.seed_authors, []
+        monkeypatch.setattr(review.vendors, "seed_authors",
+                            lambda *args: real(*args) if not calls.append(1) and len(calls) == 1 else 1)
+    assert loop.run(fixer="cursor", reviewer=reviewer) == 0
+    _one_handoff(loop, seen, reason)
+
+
+def test_an_agent_screenshot_failure_that_mentions_a_comment_stays_a_run_failure(loop, monkeypatch):
+    seen = _watch(monkeypatch)
+    loop.reviews[:] = ["pass"]
+    loop.screens = ["RESULT: failed the comment was unavailable"]
+    assert screen_run(loop) == 0
+    _one_handoff(loop, seen, "screenshot_run_failed")

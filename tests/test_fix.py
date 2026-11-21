@@ -438,6 +438,43 @@ def test_an_invalid_description_request_keeps_the_body_and_still_pushes_the_comm
     assert any("description request not applied" in line for line in run.runner_log())
 
 
+def _codes(monkeypatch):
+    seen = []
+    original = fix.Runner.handoff
+    monkeypatch.setattr(fix.Runner, "handoff", lambda self, pr, code, title, text: (seen.append(code), original(self, pr, code, title, text))[1])
+    return seen
+
+
+@pytest.mark.parametrize("rc, code", [(1, "fix_description_write_failed"), (2, "fix_description_invalid")])
+@pytest.mark.parametrize("fixer", ["claude", "cursor"])
+def test_a_description_failure_is_classified_by_the_write_result(run, monkeypatch, fixer, rc, code):
+    if fixer == "cursor" and rc == 1:
+        pytest.skip("a GitHub failure defers the Cursor path before any handoff")
+    seen = _codes(monkeypatch)
+    monkeypatch.setattr(fix.pr_helpers, "apply_body", lambda *a, **k: (rc, False, "something", False))
+    run.agent(cursor_plan("Adopted.\n\nRESULT: fixed", commit=False) if fixer == "cursor" else {**CHECKED, "commit": False})
+    run.fix(fixer)
+    assert seen == [code]
+
+
+@pytest.mark.parametrize("rc, code", [(1, "fix_task_write_failed"), (2, "fix_task_invalid"), (3, "fix_task_invalid")])
+def test_a_task_change_failure_is_classified_by_its_result(run, monkeypatch, rc, code):
+    seen = _codes(monkeypatch)
+    monkeypatch.setattr(fix.pr_helpers, "apply_task", lambda *a, **k: (rc, False, ""))
+    run.agent({"reply": "TASK: partial\nRESULT: fixed", "file": "## Must fix\nnone\n\nRESULT: fixed\n", "commit": False})
+    run.fix("claude")
+    assert seen == [code]
+
+
+def test_a_cursor_task_change_that_is_unusable_is_invalid(run, monkeypatch):
+    seen = _codes(monkeypatch)
+    monkeypatch.setattr(fix.pr_helpers, "apply_task", lambda *a, **k: (2, False, ""))
+    monkeypatch.setattr(fix.pr_helpers, "apply_body", lambda *a, **k: (0, False, "", False))
+    run.agent(cursor_plan("TASK: partial\nRESULT: fixed", commit=False))
+    run.fix("cursor")
+    assert seen == ["fix_task_invalid"]
+
+
 COMPLETE = ("<!-- baton-task issue=419 completion=complete -->\n\nCloses #419\n\n## What changed\nDisabled buttons.\n\n"
             "## Checks to verify\nnone\n\n## Before release\nnone\n\n## Follow-ups\n- [nit] tidy copy\n")
 

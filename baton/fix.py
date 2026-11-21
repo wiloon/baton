@@ -210,9 +210,10 @@ class Runner:
         if session.run_process(["git", "-C", str(wt), "fetch", "-q", "origin", "main"]).returncode:
             notify.log(f"fetching origin/main for {wt} failed; the fixer uses the local copy")
 
-    def description_not_applied(self, pr, fixer, url, reason=""):
+    def description_not_applied(self, pr, fixer, url, reason="", rc=2):
+        """rc is apply_body's: 1 GitHub failed to write, otherwise the request was invalid."""
         detail = reason or "It was invalid or GitHub refused it"
-        code = "fix_description_write_failed" if "GitHub" in detail or "refused" in detail.lower() else "fix_description_invalid"
+        code = "fix_description_write_failed" if rc == 1 else "fix_description_invalid"
         return self.handoff(pr, code, f"PR #{pr}: description request not applied ({fixer})",
                             f"{detail}; the commits, if any, are pushed. {url}")
 
@@ -273,7 +274,8 @@ class Runner:
                 if log:
                     notify.log(log)
                 if rc != 0 and (rc != 2 or description_rc != 2):
-                    return self.handoff(pr, "fix_task_invalid", f"PR #{pr}: task completion change failed ({fixer})", url)
+                    return self.handoff(pr, "fix_task_write_failed" if rc == 1 else "fix_task_invalid",
+                                        f"PR #{pr}: task completion change failed ({fixer})", url)
         elif self.head(wt) != head:
             # Anything but a fix goes to the owner, who must see the partial work ("commit
             # what is done" in the fix prompts): push it unverified. Only a fix is gated below.
@@ -290,7 +292,7 @@ class Runner:
             if rc != 0:
                 return rc
             if description_rc != 0:
-                return self.description_not_applied(pr, fixer, url, description_reason)
+                return self.description_not_applied(pr, fixer, url, description_reason, description_rc)
             if not task_changed and not checks_changed and not description_changed:
                 return self.handoff(pr, "fix_no_commit", f"PR #{pr} needs you", f"The fix run made no commit; stopping the loop. {url}")
         if self.head(wt) != head:
@@ -306,7 +308,7 @@ class Runner:
             if rc != 0:
                 return rc
             if description_rc != 0:
-                return self.description_not_applied(pr, fixer, url, description_reason)
+                return self.description_not_applied(pr, fixer, url, description_reason, description_rc)
         base_file.unlink(missing_ok=True)
         return 0
 
@@ -379,7 +381,8 @@ class Runner:
                 notify.log(f"PR #{pr}: description update deferred after GitHub failure")
                 return 75
             if rc != 0 and (rc != 2 or description_rc != 2):
-                return self.handoff(pr, "fix_task_invalid", f"PR #{pr}: task completion change failed (cursor)", url)
+                return self.handoff(pr, "fix_task_write_failed" if rc == 1 else "fix_task_invalid",
+                                    f"PR #{pr}: task completion change failed (cursor)", url)
         moved = self.head(wt) != head
         if not moved:
             rc, checks_changed = self.recheck_without_commit(pr, "Cursor ", url, body_changed)
@@ -388,7 +391,7 @@ class Runner:
             if description_rc or not (body_changed or task_changed or checks_changed):
                 self.clear_cursor_request(pr)
                 if description_rc:
-                    return self.description_not_applied(pr, "cursor", url, description_reason)
+                    return self.description_not_applied(pr, "cursor", url, description_reason, description_rc)
                 return self.handoff(pr, "fix_no_commit", f"Cursor PR #{pr} needs you", f"Cursor's fix run made no commit. {url}")
         else:
             rc, failure, rounds = self.verify(wt, "origin/main", "cursor", "pr", pr)
@@ -407,7 +410,7 @@ class Runner:
                 return 1
         self.clear_cursor_request(pr)
         if description_rc:
-            return self.description_not_applied(pr, "cursor", url, description_reason)
+            return self.description_not_applied(pr, "cursor", url, description_reason, description_rc)
         return 0
 
 

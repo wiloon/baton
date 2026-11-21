@@ -396,7 +396,7 @@ class Tasks:
         if kind == 'handoff':
             task['reason'] = attrs['reason']
             task['task_status'] = ('planned_handoff' if attrs['reason'] in
-                                   ('auto_merge_off', 'manual_checks') else 'abnormal_handoff')
+                                   ('auto_merge_off', 'owner_review_paths', 'manual_checks') else 'abnormal_handoff')
         elif kind == 'merged':
             task['task_status'] = 'merged'
         if task['task_status'] != 'active' and kind != 'attempt_completed':

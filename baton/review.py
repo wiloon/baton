@@ -25,6 +25,7 @@ from . import advisor, agents, check_verdicts, checkpoint, checks as check_secti
 from .common import Deferred, Exhausted, changed, git, restore, strip_markers
 
 REPLY_CAP = 60000
+ALREADY = "handed_off"   # fail_reason: review_allowed already handed the PR over
 REVIEWED = ("REVIEW: pass", "REVIEW: changes")
 MARKER_LINE = re.compile(r"^(REVIEW|RESULT): ")
 
@@ -234,6 +235,12 @@ class Review:
         self.url = f"https://github.com/{self.repo}/pull/{pr}"
         self.checkpoint = Path(self.state, f"review-pending-{pr}")
         self.values = {}
+        self.fail_reason = ""   # the handoff reason of the last failed run; ALREADY when it handed off itself
+
+    def failed(self, reason, outcome):
+        """Classify a runner-generated failure where it is produced (#125)."""
+        self.fail_reason = reason
+        return outcome
 
     # --- small steps every gate shares ---
     def label(self, *options):
@@ -319,7 +326,9 @@ class Review:
         posted = "\n".join(line for line in strip_markers(reply).split("\n") if not MARKER_LINE.match(line)).rstrip("\n")
         comment = pr_helpers.gh("pr", "comment", str(pr), "-R", self.repo, "--body",
                                 f"<!-- baton-review round={round} by=cursor -->\n{posted[:REPLY_CAP]}")
-        return (outcome if comment.returncode == 0 else "RESULT: failed posting Cursor's review"), reply
+        if comment.returncode != 0:
+            return self.failed("review_comment_post_failed", "RESULT: failed posting Cursor's review"), reply
+        return outcome, reply
 
     def run_review(self, round, note, reviewer=None):
         """One reviewer run; returns OUTCOME. Use the loop's selected reviewer when supplied.
@@ -329,13 +338,13 @@ class Review:
         self.hooks.round = round
         head = git(wt, "rev-parse", "HEAD") or ""
         if not self.seed():
-            return "RESULT: failed recording PR authors"
+            return self.failed("review_author_state_failed", "RESULT: failed recording PR authors")
         if reviewer is None:
             reviewer = self.review_vendor("pool")
         followup = self.review_followup(round, reviewer)
         expected = self.env.config.models.route("review", reviewer, followup=followup).model
         if not self.review_allowed(reviewer, expected):
-            return "RESULT: failed reviewer model may be a PR author"
+            return self.failed(ALREADY, "RESULT: failed reviewer model may be a PR author")
         numstat = git(wt, "diff", "--numstat", "origin/main...HEAD") or ""
         lines = sum(int(f) for row in numstat.splitlines() for f in row.split()[:2] if f.isdecimal())
         # The code-review skill is the Matt skills plugin's; without the plugin, review in one pass.
@@ -371,7 +380,7 @@ class Review:
             self.env.with_runtime(review_followup=followup))
         outcome, model = out["outcome"], out["model"] or ""
         if not self.review_allowed(reviewer, model):
-            return "RESULT: failed actual reviewer model may be a PR author"
+            return self.failed(ALREADY, "RESULT: failed actual reviewer model may be a PR author")
         review_note = ""
         if reviewer == "codex" and "codex" in vendors.review_excluded(self.state, pr, self.fixed_by):
             mode = vendors.codex_review_mode(self.state, pr, model)
@@ -382,9 +391,9 @@ class Review:
                 posted = pr_helpers.gh("pr", "comment", str(pr), "-R", self.repo, "--body",
                                        f"<!-- baton-review round={round} by={reviewer} -->\n{review_note}{body}")
                 if posted.returncode != 0:
-                    outcome = "RESULT: failed posting review"
+                    outcome = self.failed("review_comment_post_failed", "RESULT: failed posting review")
             else:
-                outcome = "RESULT: failed no review artifact"
+                outcome = self.failed("review_run_failed", "RESULT: failed no review artifact")
         self.hooks.verdict("review", reviewer, head, round, outcome, out["reply"] or "", str(review_file))
         return outcome
 
@@ -420,10 +429,10 @@ class Review:
         vendor = self.screenshot_vendor()
         cfg = self.env.config
         if vendor not in cfg.declared() or not cfg.allows(vendor, "screenshot_reviewer"):
-            return "RESULT: failed screenshot reviewer not role-allowed"
+            return self.failed("screenshot_reviewer_role_denied", "RESULT: failed screenshot reviewer not role-allowed")
         route = self.env.config.models.route("screenshot_review", vendor)
         if not vendors.screenshot_allowed(self.state, pr, vendor, route.model, self.fixed_by):
-            return "RESULT: failed screenshot reviewer model may be a PR author"
+            return self.failed("screenshot_independence_denied", "RESULT: failed screenshot reviewer model may be a PR author")
         limit = int(self.env.config.scheduling.review_context_max_chars or 20000)
         context = Path(self.ctx, f"pr-{pr}-screenshot-review-{round}-{time.strftime('%Y%m%d-%H%M%S')}.md")
         context.write_text(issue_context(self.env, self.issue) if re.fullmatch(r"\d+", str(self.issue or "")) else "")
@@ -438,7 +447,8 @@ class Review:
             f"pr-{pr}-screenshot-review-{round}", str(self.self_dir / "review-settings.json"), str(review_file), self.env)
         outcome, model = out["outcome"], out["model"] or ""
         if not vendors.screenshot_allowed(self.state, pr, vendor, model, self.fixed_by):
-            return "RESULT: failed actual screenshot reviewer model may be a PR author"
+            return self.failed("screenshot_independence_denied",
+                               "RESULT: failed actual screenshot reviewer model may be a PR author")
         if outcome.startswith(REVIEWED):
             if review_file.is_file() and review_file.stat().st_size:
                 body = strip_markers(review_file.read_text()).rstrip("\n")
@@ -448,9 +458,9 @@ class Review:
                 posted = pr_helpers.gh("pr", "comment", str(pr), "-R", self.repo, "--body",
                                        f"<!-- baton-screenshot-review round={round} by={vendor} -->\n{review_note}{body}")
                 if posted.returncode != 0:
-                    outcome = "RESULT: failed posting screenshot review"
+                    outcome = self.failed("screenshot_comment_post_failed", "RESULT: failed posting screenshot review")
             else:
-                outcome = "RESULT: failed no screenshot review artifact"
+                outcome = self.failed("screenshot_run_failed", "RESULT: failed no screenshot review artifact")
         self.hooks.verdict("screenshot_review", vendor, head, round, outcome, out["reply"] or "", str(review_file))
         return outcome
 
@@ -461,19 +471,6 @@ class Review:
 
     def drop(self):
         self.checkpoint.unlink(missing_ok=True)
-
-    def _screenshot_fail_reason(self, outcome):
-        lower = outcome.lower()
-        if "not role-allowed" in lower:
-            return "screenshot_reviewer_role_denied"
-        if "may be a pr author" in lower or "self-review" in lower:
-            return "screenshot_independence_denied"
-        if ("no screenshot reviewer" in lower or "unavailable" in lower
-                or "are pr authors" in lower or "reviewers are" in lower):
-            return "screenshot_reviewer_unavailable"
-        if "comment" in lower or "posting" in lower:
-            return "screenshot_comment_post_failed"
-        return "screenshot_run_failed"
 
     # --- the round limit: the advisor may grant one more round (#17 / #125) ---
     def limit_snapshot(self, round, reviewer, fixer):
@@ -552,10 +549,12 @@ class Review:
                         return 0
                     self.values["reviewer"] = reviewer
                     self.save()
+                    self.fail_reason = ""
                     outcome = self.run_review(round, rnote, reviewer)
                     if not outcome.startswith(REVIEWED):
-                        reason = "review_comment_post_failed" if "comment" in outcome.lower() else "review_run_failed"
-                        self.handoff(reason, f"PR #{pr} review failed ({reviewer})", f"{outcome} {self.url}")
+                        if self.fail_reason != ALREADY:   # a refusal handed off where it was decided
+                            self.handoff(self.fail_reason or "review_run_failed", f"PR #{pr} review failed ({reviewer})",
+                                         f"{outcome} {self.url}")
                         self.drop()
                         return 0
                     verdict = "pass" if outcome.startswith("REVIEW: pass") else "changes"
@@ -572,13 +571,15 @@ class Review:
                     code_verdict = verdict
                     self.values.update(step=step, code_verdict=code_verdict, screenshot_checks=checks)
                     self.save()
+                    self.fail_reason = ""
                     try:
                         outcome = self.run_screenshot_review(round, checks)
                     except Exhausted as exhausted:
-                        outcome = exhausted.reason or "No screenshot reviewer available."
+                        outcome = self.failed("screenshot_reviewer_unavailable",
+                                              exhausted.reason or "No screenshot reviewer available.")
                     if not outcome.startswith(REVIEWED):
-                        reason = self._screenshot_fail_reason(outcome)
-                        self.handoff(reason, f"PR #{pr} screenshot review failed", f"{outcome} {self.url}")
+                        self.handoff(self.fail_reason or "screenshot_run_failed", f"PR #{pr} screenshot review failed",
+                                     f"{outcome} {self.url}")
                         self.drop()
                         return 0
                     screenshot = "1"

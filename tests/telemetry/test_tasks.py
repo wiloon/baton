@@ -33,6 +33,11 @@ class TaskTests(unittest.TestCase):
         other_repo = self.store.ensure(123, repo='acme/other')
         self.assertNotEqual(second['pipeline_id'], other_repo['pipeline_id'])
 
+    def test_an_owner_path_gate_is_a_planned_handoff(self):
+        task = self.store.ensure(321, repo='test/repo')
+        self.store.event(task['pipeline_id'], 'handoff', 'paths', reason='owner_review_paths')
+        self.assertEqual(t.read(self.store.path(task['pipeline_id']))['task_status'], 'planned_handoff')
+
     def test_an_episode_without_an_issue_records_none_and_gains_one_later(self):
         task = self.store.ensure(0, 746, repo='test/repo')
         self.assertNotIn('issue', task)

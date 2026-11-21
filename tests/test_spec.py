@@ -327,9 +327,14 @@ def test_the_round_limit_hands_the_spec_to_the_owner(loop):
     assert len(loop.runs) == 5
 
 
-def test_a_reject_is_a_note_and_a_handoff(loop):
+def test_a_reject_is_a_note_and_a_handoff(loop, monkeypatch):
+    reasons, notes = [], []
+    monkeypatch.setattr(spec.telemetry.Telemetry, "task",
+                        lambda self, kind, key, *args: reasons.append(key) if kind == "handoff" else None)
+    monkeypatch.setattr(spec.notify, "notify", lambda title, text="": notes.append(title))
     loop.script = [{"rc": 0, "status": "success", "outcome": "SPEC: reject", "reply": "no\nSPEC: reject", "model": "", "defer": ""}]
     assert loop.run() is False
+    assert reasons == ["spec_rejected"] and notes.count("#516: spec needs you") == 1
     [note] = loop.gh.posted("<!-- baton-note by=")
     assert note.endswith("round 1: reject\n\nno") and "ready-for-human" in loop.gh.labels
 
@@ -592,6 +597,9 @@ def test_same_vendor_denial_retry_publishes_only_the_verified_attempt(loop, monk
 def test_claude_spec_revision_verifies_main_session_models(loop, monkeypatch, round, scenario):
     from baton import claude_cli
 
+    reasons = []
+    monkeypatch.setattr(spec.telemetry.Telemetry, "task",
+                        lambda self, kind, key, *args: reasons.append(key) if kind == "handoff" else None)
     source = session.resolve(loop.env).config.source.read_text()
     if scenario == "shared":
         source = source.replace('[models.routes.spec_followup]\nclaude = { model = "claude_fast", effort = "low" }',
@@ -661,6 +669,7 @@ def test_claude_spec_revision_verifies_main_session_models(loop, monkeypatch, ro
         swapped = any(c[:3] == ["issue", "edit", N] and "--remove-label" in c and "agent-wip" in c
                       for c in loop.gh.calls)
         assert swapped == (scenario in ("fallback", "fallback snapshot", "unknown", "ambiguous"))
+        assert reasons == (["spec_reviser_model_unverified"] if swapped else [])
         for artifact in Path("/tmp").glob(f"baton-spec-{N}-{round}.*"):
             artifact.unlink()
 
@@ -671,6 +680,9 @@ def test_claude_spec_revision_verifies_main_session_models(loop, monkeypatch, ro
 def test_codex_spec_fallback_verifies_actual_model_at_cli(loop, monkeypatch, tmp_path, role, base, scenario):
     from baton import codex_cli
 
+    reasons = []
+    monkeypatch.setattr(spec.telemetry.Telemetry, "task",
+                        lambda self, kind, key, *args: reasons.append(key) if kind == "handoff" else None)
     source = session.resolve(loop.env).config.source.read_text().replace(
         '[models.routes.spec_followup]', '[models.routes.spec_followup]\ncodex = { model = "codex_strong" }')
     s, path = live_spec(loop, monkeypatch, source)
@@ -728,6 +740,8 @@ def test_codex_spec_fallback_verifies_actual_model_at_cli(loop, monkeypatch, tmp
         swapped = any(c[:3] == ["issue", "edit", N] and "--remove-label" in c and "agent-wip" in c
                       for c in loop.gh.calls)
         assert swapped == (scenario in ("reported unknown", "fallback identical"))
+        unverified = "spec_reviser_model_unverified" if revision else "spec_reviewer_model_unverified"
+        assert reasons == ([unverified] if swapped else [])
         for artifact in Path("/tmp").glob(f"baton-spec-{N}-2.*"):
             artifact.unlink()
 
