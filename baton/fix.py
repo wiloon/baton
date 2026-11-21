@@ -217,7 +217,11 @@ class Runner:
         """Log and best-effort comment a discarded description request; never fails the fix."""
         detail = reason or "It was invalid or GitHub refused it"
         notify.log(f"PR #{pr}: description request not applied ({fixer}) | {detail}")
-        self.comment(pr, f"<!-- baton-description-rejected by={fixer} -->\n{detail}")
+        self.comment(
+            pr,
+            f"<!-- baton-description-discarded by={fixer} -->\n"
+            f"Description request from {fixer} not applied: {detail}. The live description is unchanged.",
+        )
 
     # --- a Claude or Codex fixer ---
     def fix_pr(self, pr, wt, fixer, source, feedback, head=""):

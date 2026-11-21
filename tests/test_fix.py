@@ -480,7 +480,7 @@ def test_a_rejected_request_reports_the_exact_reason(run, gh, fixer, directory):
     run.agent({**plan, "request_directory": directory})
     assert run.fix(fixer)["rc"] == 0 and run.pushed() and not run.labelled()
     assert any(f"description request not applied ({fixer})" in line and reason in line for line in run.runner_log())
-    assert any(reason in c and fixer in c for c in run.comments())
+    assert any(reason in c and f"Description request from {fixer} not applied" in c and "unchanged" in c for c in run.comments())
     if directory:
         assert "completion=partial" in run.body() and "Refs #419" in run.body()
 
