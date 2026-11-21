@@ -463,9 +463,9 @@ def _load_vendors(raw, directory, home, aliases):
             raise ConfigError(f"{label}: unknown fields: {', '.join(sorted(extra))}")
         cli = agents.ADAPTERS[adapter]
         adapter_fields = {
-            "fallback_models": adapter in ("claude", "codex"),
-            "cache_dirs": adapter == "codex",
-            "quota_probe_model": cli.PROBE_SENDS_MODEL,
+            "fallback_models": "fallback_models" in cli.CONFIG_FIELDS,
+            "cache_dirs": "cache_dirs" in cli.CONFIG_FIELDS,
+            "quota_probe_model": "quota_probe_model" in cli.CONFIG_FIELDS,
         }
         for field, supported in adapter_fields.items():
             if field in entry and not supported:
@@ -662,7 +662,7 @@ def load(path: str | Path, *, home: Path | None = None) -> Config:
         except re.error:
             raise ConfigError(f'scheduling.{key}: invalid regular expression') from None
     for vendor in vendors:
-        if vendor.adapter == "codex":
+        if agents.ADAPTERS[vendor.adapter].REQUIRES_CACHE_DIRS:
             for cache in (config.environment.gocache, config.environment.gomodcache,
                           config.environment.gotmpdir, config.environment.node_compile_cache):
                 if cache not in vendor.cache_dirs:

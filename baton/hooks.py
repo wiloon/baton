@@ -7,7 +7,7 @@ that outlive a call (the task's pipeline id, the last run's id) are kept in the 
 file named by BATON_TELEMETRY_ITEM, created by begin_item and removed by finish_item.
 """
 
-from . import pr as pr_helpers, session
+from . import agents, pr as pr_helpers, session
 import argparse
 from dataclasses import dataclass
 import json
@@ -20,7 +20,6 @@ import time
 import uuid
 
 SHA = re.compile(r"[a-f0-9]{40,64}")
-OTEL_STAGE = {"spec": "spec-reply", "spec_review": "spec-review", "review": "review", "screenshot_review": "review", "fix": "fix"}
 
 
 @dataclass
@@ -182,29 +181,7 @@ class Telemetry:
     def child_env(self, vendor, role, run):
         if not run:
             return {}
-        if vendor == "claude":
-            # Claude Code's native metrics go to the loopback collector, whose claude.alloy
-            # keeps only bounded labels. Logs and traces stay off until their content
-            # policy is reviewed.
-            return {"CLAUDE_CODE_ENABLE_TELEMETRY": "1", "OTEL_METRICS_EXPORTER": "otlp",
-                    "OTEL_LOGS_EXPORTER": "none", "OTEL_TRACES_EXPORTER": "none",
-                    "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL": "http/protobuf",
-                    "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": "http://127.0.0.1:4320/v1/metrics",
-                    "OTEL_METRICS_INCLUDE_SESSION_ID": "false", "OTEL_METRICS_INCLUDE_ACCOUNT_UUID": "false",
-                    "OTEL_METRICS_INCLUDE_VERSION": "false", "OTEL_METRIC_EXPORT_INTERVAL": "10000"}
-        if vendor == "codex":
-            attrs = f"baton.run_id={run.run_id},baton.role={role}"
-            if run.issue:
-                attrs += f",baton.issue={run.issue}"
-            if run.pr:
-                attrs += f",baton.pr={run.pr}"
-            if role in OTEL_STAGE:
-                attrs += f",baton.stage={OTEL_STAGE[role]}"
-            if run.pipeline_id:
-                attrs += f",baton.pipeline_id={run.pipeline_id}"
-            return {"TRACEPARENT": f"00-{run.trace_id}-{run.span_id}-01", "OTEL_RESOURCE_ATTRIBUTES": attrs,
-                    "OTEL_METRIC_EXPORT_INTERVAL": "1000"}
-        return {}
+        return agents.ADAPTERS[vendor].telemetry_env(role, run)
 
 
 @session.scoped

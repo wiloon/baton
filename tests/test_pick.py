@@ -86,10 +86,11 @@ def test_stale_cursor_uses_api_refresh_only_when_declared(tmp_path, monkeypatch,
     cfg.paths.logs.mkdir(parents=True)
     before = sorted(cfg.paths.state.rglob("*"))
     refreshed = []
-    monkeypatch.setattr(pick.settle, "refresh_cursor", lambda state: refreshed.append(state))
+    monkeypatch.setattr(pick.settle, "refresh_api",
+                        lambda state, vendor: refreshed.append((state, vendor)))
     if enabled:
         assert pick.choose(sess, "dev", "cursor", "contrib", ["cursor"]) == "cursor"
-        assert refreshed == [str(cfg.paths.state)]
+        assert refreshed == [(str(cfg.paths.state), "cursor")]
     else:
         with pytest.raises(Deferred, match="no vendor can run now"):
             pick.choose(sess, "dev", "cursor", "contrib", ["cursor"])

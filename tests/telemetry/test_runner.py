@@ -48,6 +48,23 @@ class RunnerTests(unittest.TestCase):
         with self.assertRaises(ProcessLookupError):
             t.identity(123, proc)
 
+    def test_registered_adapter_run_ends_with_usage_and_model_recorded(self):
+        run = self.begin('stub')
+        log = self.log([{'type': 'system', 'subtype': 'init', 'model': 'stub-model-1'},
+                        {'type': 'result', 'usage': {'input_tokens': 5, 'output_tokens': 3}}])
+        ended = self.ledger.end(run['run_id'], 'success', log)
+        self.assertEqual(ended['status'], 'success')
+        self.assertEqual((ended['input_tokens'], ended['output_tokens']), (5, 3))
+        self.assertEqual(ended['usage_state'], 'complete')
+        self.assertEqual(ended['model'], 'stub-model-1')
+
+    def test_spec_stage_comes_from_the_adapter(self):
+        with patch.object(t, 'identity', return_value=OWNER):
+            stages = {v: self.ledger.begin(v, 'spec', 123, 60, repo='test/repo')['stage']
+                      for v in ('cursor', 'claude', 'codex', 'stub')}
+        self.assertEqual(stages, {'cursor': 'spec-review', 'claude': 'spec-reply',
+                                  'codex': 'spec-reply', 'stub': 'spec-reply'})
+
     def test_reconciliation_is_terminal_and_summary_excludes_private_content(self):
         run = self.begin()
         log = self.log([{'type': 'turn.completed', 'usage': {'input_tokens': 100,

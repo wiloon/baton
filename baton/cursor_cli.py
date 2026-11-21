@@ -12,6 +12,8 @@ SUPPORTED_ROLES = frozenset({
 })
 QUOTA_SOURCE = "api"
 QUOTA_WINDOWS = frozenset({"seven_day"})
+QUOTA_ERROR = (r"usage limit (reached|exceeded)|(monthly|weekly|daily) (usage |request )?limit "
+               r"(reached|exceeded)|(insufficient|exhausted) quota")
 IMAGES = False
 SCAN = False
 SKIP_SCREENSHOT_AFTER_REVIEW = True
@@ -23,7 +25,68 @@ PREFLIGHT_CHECKS = (("cursor-agent", "--version"),)
 VERSION_EXECUTABLE = "cursor-agent"
 PROBE_SENDS_MODEL = False
 RUNS_STEM = "cursor-runs"
+LOG_SUFFIX = ""
+CONFIG_FIELDS = frozenset()
+BUSY_RERUN = False
+REQUIRES_CACHE_DIRS = False
+COMMIT_MARKERS = ("cursoragent@cursor.com",)
+LEGACY_SEED_WITH_OWNER = False
+UNMARKED_AUTHOR_INFERENCE = False
+GITHUB_ACCESS = "runner"
+FIX_RESUMABLE_VIA_REPLY = True
+READONLY_RESET = True
+FIVE_MINUTE_CACHE_ROLES = ()
 KINDS = ("RESULT", "SPEC", "REVIEW")
+USAGE_EVENT = "result"
+USAGE_FIELDS = {"input_tokens": "inputTokens", "cache_read_tokens": "cacheReadTokens",
+                "cache_write_tokens": "cacheWriteTokens", "output_tokens": "outputTokens"}
+USAGE_CACHE_IN_INPUT = False
+SPEC_STAGE = "spec-review"
+
+
+def configure(role, route, settings, env):
+    return route.model, settings.max_minutes, LOG_SUFFIX, {}
+
+
+def attach_dispatch_inputs(options, settings="", output=""):
+    return options
+
+
+def request_otel(run):
+    return False
+
+
+def run_env(role, run):
+    return {}
+
+
+def telemetry_env(role, run):
+    return {}
+
+
+def end_line_identity(model):
+    return ""
+
+
+def work_started(log_text):
+    return False
+
+
+def reported_model(run):
+    return run.model
+
+
+def probe_command(model, directory):
+    return [], {}
+
+
+def parse_quota_log(lines):
+    return {}
+
+
+def refresh_quota(state, now, **kwargs):
+    from . import quota
+    return quota.refresh_cursor(state, now, **kwargs)
 
 
 def final_message(text):
@@ -77,3 +140,15 @@ def run(req):
         restore(req.cwd, head)
         outcome = f"RESULT: failed Cursor changed files in a read-only {req.role}"
     return Run(rc, outcome, reply, used, summary)
+
+
+def reconnect_row(row):
+    return (row.get("type"), row.get("subtype")) == ("connection", "reconnecting")
+
+
+def log_model(row, codex_home=None):
+    """(done, model) for one log row; done stops the scan."""
+    if row.get("type") == "system" and row.get("subtype") == "init":
+        model = row.get("model")
+        return True, None if str(model).lower() == "auto" else model
+    return False, None

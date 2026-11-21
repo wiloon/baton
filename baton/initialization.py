@@ -38,8 +38,14 @@ def skills_directory(root: Path) -> Path | None:
 
 
 def cache_directories(config: Config, ambient: Mapping[str, str], uid: int) -> tuple[Path, ...]:
+    from . import agents
     runtime = Path(ambient.get('XDG_RUNTIME_DIR') or '/tmp')
-    caches = config.vendor("codex").cache_dirs if "codex" in config.declared() else ()
+    caches = ()
+    for vendor_id in config.declared():
+        vendor = config.vendor(vendor_id)
+        if agents.ADAPTERS[vendor.adapter].REQUIRES_CACHE_DIRS:
+            caches = vendor.cache_dirs
+            break
     return (*caches, runtime / f'pnpm-store-operation-locks-{uid}')
 
 
