@@ -701,7 +701,10 @@ class Tick:
             # These issues can be at different steps: one whose next step no vendor can run now must
             # not block another (revision needs a pool vendor).
             issue = str(n)
-            if spec.cursor_plan(self.env, issue):
+            # Pending ADR acceptance needs a later tick to finish the merge; treat it as
+            # ready for the implementation role's vendor pool so it is not blocked when
+            # only a spec reviewer/reviser is unavailable (#122).
+            if spec.accept_pending(self.env, issue) or spec.cursor_plan(self.env, issue):
                 role = "dev"
             else:
                 role = spec.pending_role(spec.spec_state(self.env, issue)[0])

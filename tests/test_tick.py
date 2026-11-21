@@ -15,6 +15,8 @@ from baton import capacity, dev, fix, merge, notify, pick, review, scan, spec, t
 from baton.common import Deferred
 from conftest import sh
 
+REAL_CURSOR_PLAN = spec.cursor_plan   # the devrun fixture stubs it
+
 BIN = Path(__file__).resolve().parents[1] / "bin"
 LOGIN = r"^cursor$"
 DONE = {"rc": 0, "status": "success", "outcome": "RESULT: ready", "reply": "done\nRESULT: ready", "model": "gpt-x", "defer": ""}
@@ -1471,6 +1473,64 @@ def test_queue_skips_blocked_spec_review_for_runnable_dev_issue(ctx, monkeypatch
     monkeypatch.setattr(pick.settle, "probe", lambda state, logs, vendor, model: probed.append(vendor))
     assert t.next_issue() == "13"
     assert probed == ["cursor"]
+
+
+def test_queue_admits_a_pending_accept_issue_when_only_dev_can_run(ctx, monkeypatch):
+    """Pending ADR acceptance uses the dev role for vendor availability (#122)."""
+    issues(ctx, ready=[issue(12)])
+    monkeypatch.setattr(spec, "accept_pending",
+                        lambda env, n: {"pr": "77", "verdict": "x", "index": 0} if n == "12" else None)
+    monkeypatch.setattr(spec, "cursor_plan", lambda env, n: "")
+    monkeypatch.setattr(spec, "spec_state", lambda env, n: ("", 0))
+    t = ctx.make()
+    config = t.env.config
+    from dataclasses import replace
+    from baton import pick, session
+
+    cursor = config.vendor("cursor")
+    config = replace(config, vendors=tuple(replace(v, roles=("dev",)) if v == cursor else v
+                                           for v in config.vendors))
+    t.env = session.create(config, repo=config.repos[0])
+    for vendor in ("claude", "codex"):
+        (config.paths.state / f"{vendor}-cooldown-until").write_text(str(t.now + 3600))
+    probed = []
+    monkeypatch.setattr(pick.settle, "probe", lambda state, logs, vendor, model: probed.append(vendor))
+    assert t.next_issue() == "12"
+    assert probed == ["cursor"]
+
+
+def test_dev_run_does_not_dispatch_while_pending_accept_leaves_no_plan(devrun, monkeypatch):
+    """While acceptance is pending, cursor_plan is empty so the tick resumes via spec_loop (#122)."""
+    called = []
+    monkeypatch.setattr(spec, "cursor_plan", lambda env, n: "")
+    monkeypatch.setattr(tick.Tick, "spec_loop", lambda self, n: called.append(n) or False)
+    monkeypatch.setattr(tick.Tick, "pick_vendor", lambda *a, **k: pytest.fail("implementation vendor picked"))
+    t = devrun.make()
+    assert t.item(lambda: dev.run(t, devrun.issue)) == 80
+    assert called == [str(devrun.issue)]
+
+
+def test_dev_implements_the_saved_verdict_once_the_pending_accept_resumes(devrun, monkeypatch):
+    """spec_loop publishes the verdict (superseding the pending marker); dev then gets that plan (#122)."""
+    verdict = "<!-- baton-verdict: accept by=codex -->\n## Spec review (codex), round 1: accept\n\nsaved plan"
+    listed = [{"author": {"login": "owner"}, "body": f"<!-- baton-spec-accept-pending pr=77 -->\n{verdict}"}]
+    monkeypatch.setattr(spec, "cursor_plan", REAL_CURSOR_PLAN)
+    monkeypatch.setattr(spec, "comments", lambda env, n: list(listed))
+    assert spec.cursor_plan(devrun.make().env, "300") == ""   # pending: no plan yet
+    called = []
+
+    def resume(self, n):
+        called.append(n)
+        listed.append({"author": {"login": "owner"}, "body": verdict})
+        return True
+    monkeypatch.setattr(tick.Tick, "spec_loop", resume)
+    devrun.script = [implements()]
+    t, rc = devrun.go()
+    assert rc == 80 and called == ["300"]
+    run, = devrun.runs
+    text = Path(re_context(run["prompt"])).read_text()
+    assert f"<plan>\n{verdict}\n</plan>" in text
+
 
 def test_dev_writer_without_fixer_role_hands_off_after_zero_repairs(devrun, monkeypatch):
     from subprocess import CompletedProcess
