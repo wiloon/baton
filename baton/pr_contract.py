@@ -57,7 +57,7 @@ def prepare(body, issue, required_completion=None):
     if completion is None:
         _, completion = relation({"body": body, "headRefName": names.BRANCH + issue})
     if required_completion and completion != required_completion:
-        raise ValueError("a body edit cannot change task completion; request owner review")
+        raise ValueError("a body edit cannot change task completion; a fix needs a matching TASK: line")
     closing_issues = CLOSING.findall(body)
     if any(n != issue for n in closing_issues):
         raise ValueError("a task PR cannot close an unrelated issue")
