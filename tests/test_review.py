@@ -352,6 +352,7 @@ def test_a_checkpoint_mid_fix_from_the_old_runner_keeps_the_fix_range(loop):
     Path(loop.env["STATE"], f"review-pending-{PR}").write_text(
         f"pr={PR}\nwt={loop.wt}\nnote=n\nfixer=cursor\nreviewer=claude\nround=1\nstep=fix\nfix_head=abc1234\n"
         "fixed_by=''\nISSUE=297\n")
+    loop.gh.set(comments=[{"author": {"login": "owner"}, "body": "<!-- baton-review round=1 by=claude -->\nfix"}])
     loop.reviews[:] = ["pass"]
     assert loop.run() == 0
     assert loop.fixes[0]["head"] == "abc1234" and loop.fixes[0]["fixer"] == "cursor"
@@ -949,9 +950,9 @@ def test_a_screenshot_review_that_fails_goes_to_the_owner_with_neither_fix_nor_m
     elif case == "comment not posted":
         loop.after["screenshot_review"] = lambda: loop.gh.fail("comment")
     else:
-        real = review.agent_comment
-        monkeypatch.setattr(review, "agent_comment", lambda repo, owner, pr, marker, round:
-                            "" if "screenshot" in marker else real(repo, owner, pr, marker, round))
+        real = review.read_agent_comment
+        monkeypatch.setattr(review, "read_agent_comment", lambda repo, owner, pr, marker, round:
+                            ("", True) if "screenshot" in marker else real(repo, owner, pr, marker, round))
     rc = screen_run(loop)
     expected = {
         "run failed": "screenshot_run_failed",
@@ -959,7 +960,7 @@ def test_a_screenshot_review_that_fails_goes_to_the_owner_with_neither_fix_nor_m
         "comment not posted": "screenshot_comment_post_failed",
         "comment missing at fix time": "review_comment_missing",
     }[case]
-    if case in ("comment not posted", "comment missing at fix time"):
+    if case == "comment missing at fix time":
         assert rc == 75 and handoffs == [expected] and not loop.labelled("ready-for-human")
         assert loop.checkpoint() and not loop.fixes and not loop.merged
     else:
@@ -967,7 +968,7 @@ def test_a_screenshot_review_that_fails_goes_to_the_owner_with_neither_fix_nor_m
         assert loop.labelled("ready-for-human") and not loop.fixes and not loop.merged
         assert not loop.checkpoint()
         assert "stale" not in "".join(loop.comments())
-        assert not screenshot_comments(loop)
+        assert not any(c["body"].startswith("<!-- baton-screenshot-review") for c in loop.gh.pr["comments"])
 
 
 @pytest.mark.parametrize("vendor,models", [
@@ -1059,6 +1060,8 @@ cursor = { model = "cursor_analyst" }
     env.config = replace(load(source), paths=paths)
     Path(loop.env["STATE"], f"review-pending-{PR}").write_text(
         f"pr={PR}\nwt={loop.wt}\nnote=n\nfixer={vendor}\nreviewer=codex\nround={round}\nstep=fix\nISSUE=297\n")
+    loop.gh.set(comments=[{"author": {"login": "owner"},
+                           "body": f"<!-- baton-review round={round} by=codex -->\nfix"}])
     calls = []
 
     def cli(args, log, minutes, child, **kwargs):
@@ -1275,64 +1278,66 @@ def test_a_failed_review_is_classified_where_it_fails(loop, monkeypatch, case, r
         monkeypatch.setattr(review.vendors, "seed_authors",
                             lambda *args: real(*args) if not calls.append(1) and len(calls) == 1 else 1)
     rc = loop.run(fixer="cursor", reviewer=reviewer)
-    if reason == "review_comment_post_failed":
-        assert rc == 75 and not loop.labelled("ready-for-human")
-        assert loop.checkpoint()
-    else:
-        assert rc == 0
-        _one_handoff(loop, seen, reason)
-
-
-def _post_clock(loop, monkeypatch):
-    from baton import handoff
-    clock = {"now": 1_000}
-    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
-    loop.gh.set(headRefOid=sh(loop.wt, "git", "rev-parse", "HEAD"), baseRefName="main", state="OPEN")
-    loop.after["review"] = lambda: loop.gh.fail("comment")
-    return clock
-
-
-def test_a_review_comment_post_replays_the_saved_body_without_a_reviewer_run(loop, monkeypatch):
-    clock = _post_clock(loop, monkeypatch)
-    assert loop.run(fixer="cursor", reviewer="claude") == 75
-    runs = len(loop.agents)
-    assert loop.run(fixer="cursor", reviewer="claude") == 75 and len(loop.agents) == runs   # no early attempt
-    clock["now"] = 1_060
-    loop.gh.fail("comment", False)
-    loop.after.clear()
-    before = len(loop.comments())
-    assert loop.run(fixer="cursor", reviewer="claude") == 0
-    assert len([c for c in loop.comments()[before:] if c.startswith("<!-- baton-review round=1 by=claude -->")]) == 1
-    assert len(loop.agents) == runs + 1   # only round 2 ran a reviewer
-    assert loop.merged == [PR]
-    assert not list(Path(loop.env["STATE"]).glob("handoff-retry-*"))   # the success cleared the saved retry
-
-
-def test_a_review_comment_post_that_keeps_failing_replays_twice_then_hands_off_once(loop, monkeypatch):
-    clock = _post_clock(loop, monkeypatch)
-    assert loop.run(fixer="cursor", reviewer="claude") == 75
-    runs = len(loop.agents)
-    clock["now"] = 1_060
-    assert loop.run(fixer="cursor", reviewer="claude") == 75   # first replay fails: 300 s next
-    clock["now"] = 1_200
-    assert loop.run(fixer="cursor", reviewer="claude") == 75
-    clock["now"] = 1_360
-    assert loop.run(fixer="cursor", reviewer="claude") == 0   # second replay fails: one handoff
-    assert len(loop.agents) == runs and not loop.merged
-    assert len([c for c in loop.gh.calls() if c[:2] == ["pr", "edit"] and "--add-label" in c
-                and "ready-for-human" in c]) == 1
+    assert rc == 0
+    _one_handoff(loop, seen, reason)
     assert not list(Path(loop.env["STATE"]).glob("handoff-retry-*"))
 
 
-def test_a_saved_review_post_is_dropped_when_the_head_moved_during_the_wait(loop, monkeypatch):
-    clock = _post_clock(loop, monkeypatch)
-    assert loop.run(fixer="cursor", reviewer="claude") == 75
-    loop.gh.fail("comment", False)
-    loop.gh.set(headRefOid="f" * 40)   # a push landed while the post waited
+@pytest.mark.parametrize("split, recovers", [(False, True), (True, True), (False, False)])
+def test_missing_expected_feedback_waits_and_retries_before_fixing(loop, monkeypatch, split, recovers):
+    from subprocess import CompletedProcess
+
+    from baton import handoff
+
+    clock = {"now": 1_000}
+    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
+    loop.reviews = ["changes", "pass"]
+    loop.screens = ["pass", "pass"]
+    call = review.pr_helpers.call
+    marker = "<!-- baton-screenshot-review round=1 " if split else "<!-- baton-review round=1 "
+    lookups = []
+
+    def expected_comment(*args, **kwargs):
+        result = call(*args, **kwargs)
+        if args[:2] != ("pr", "view") or "comments" not in args or loop.fixes:
+            return result
+        lookups.append(clock["now"])
+        if recovers and clock["now"] >= 1_360:
+            return result
+        data = json.loads(result.stdout)
+        data["comments"] = [c for c in data["comments"] if not c["body"].startswith(marker)]
+        return CompletedProcess(result.args, result.returncode, json.dumps(data), result.stderr)
+
+    monkeypatch.setattr(review.pr_helpers, "call", expected_comment)
+    run = (lambda: screen_run(loop)) if split else (lambda: loop.run(fixer="cursor", reviewer="claude"))
+    reads_per_lookup = 2 if split else 1
+    assert run() == 75
+    assert run() == 75 and lookups == [1_000] * reads_per_lookup and not loop.fixes
     clock["now"] = 1_060
-    before = len(loop.comments())
+    assert run() == 75 and lookups == [1_000] * reads_per_lookup + [1_060] * reads_per_lookup and not loop.fixes
+    clock["now"] = 1_360
+    assert run() == 0 and lookups.count(1_360) == reads_per_lookup
+    assert bool(loop.fixes) is recovers
+    assert loop.merged == ([PR] if recovers else [])
+    assert roles(loop).count("review") == (2 if recovers else 1)
+    labels = [c for c in loop.gh.calls() if c[:2] == ["pr", "edit"] and "--add-label" in c and "ready-for-human" in c]
+    assert len(labels) == (0 if recovers else 1)
+    assert not list(Path(loop.env["STATE"]).glob("handoff-retry-*"))
+
+
+def test_an_unclassified_review_comment_read_hands_off_immediately(loop, monkeypatch):
+    from subprocess import CompletedProcess
+
+    call = review.pr_helpers.call
+
+    def failed_read(*args, **kwargs):
+        if args[:2] == ("pr", "view") and "comments" in args:
+            return CompletedProcess(args, 1, "", "")
+        return call(*args, **kwargs)
+
+    monkeypatch.setattr(review.pr_helpers, "call", failed_read)
     assert loop.run(fixer="cursor", reviewer="claude") == 0
-    assert len(loop.comments()) == before and not loop.merged and loop.labelled("ready-for-human")
+    assert loop.labelled("ready-for-human") and not loop.fixes
     assert not list(Path(loop.env["STATE"]).glob("handoff-retry-*"))
 
 

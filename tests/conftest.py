@@ -232,11 +232,23 @@ def worktree(tmp_path):
     return SimpleNamespace(origin=origin, repo=repo, wt=wt, branch="cursor/issue-297")
 
 
-@pytest.fixture(autouse=True)
-def no_gh_backoff(monkeypatch):
-    """A transient gh failure retries at once: tests never wait out the real backoff."""
-    from baton import pr as pr_helpers
-    monkeypatch.setattr(pr_helpers, "sleep", lambda seconds: None)
+@pytest.fixture
+def failed_push(monkeypatch):
+    from subprocess import CompletedProcess
+
+    from baton import session
+
+    calls = []
+    run = session.run_process
+
+    def run_process(command, **kwargs):
+        if len(command) > 3 and command[:2] == ["git", "-C"] and command[3] == "push":
+            calls.append(command)
+            return CompletedProcess(command, 1, "", "connection reset")
+        return run(command, **kwargs)
+
+    monkeypatch.setattr(session, "run_process", run_process)
+    return calls
 
 
 @pytest.fixture(autouse=True)

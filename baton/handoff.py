@@ -10,12 +10,14 @@ transient failure schedules at most two later attempts (due after 60s then 300s)
 consumed before it runs so a restart cannot reset the budget. Permanent failures and exhaustion
 hand off. Deferrals yield the tick without sleeping.
 """
-from dataclasses import dataclass
 import json
-from pathlib import Path
 import time
+from dataclasses import dataclass
+from pathlib import Path
 
-from . import advisor, notify, pr as pr_helpers
+from . import advisor, notify
+from . import pr as pr_helpers
+from .quota import atomic_json
 
 HANDOFF = advisor.HANDOFF
 DEFER = "defer"
@@ -25,6 +27,7 @@ READY = "ready-for-human"
 DELAYS = (60, 300)
 MAX_ATTEMPTS = len(DELAYS)
 clock = time.time
+RETRY_REASONS = frozenset({"review_comment_missing", "spec_comments_read_failed", "spec_pending_adr_read_failed"})
 
 # Categories: 1 rule-decided, 2 judgement, 3 needs investigation, 4 owner-only.
 RANK = {"off": 0, "observe": 1, "live": 2}
@@ -77,7 +80,6 @@ REASONS = {
     "spec_pending_accept_post_failed": Reason(1, "rule"),
     "spec_accept_post_failed": Reason(1, "rule"),
     "fix_checks_refresh_failed": Reason(1, "rule"),
-    "fix_description_write_failed": Reason(1, "rule"),
     "fix_task_write_failed": Reason(1, "rule"),
     "spec_body_edit_failed": Reason(1, "rule"),
     "spec_adr_open_failed": Reason(1, "rule"),
@@ -140,9 +142,7 @@ def load_retry(env, episode, reason):
 
 
 def save_retry(env, episode, reason, data):
-    path = retry_path(env, episode, reason)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False) + "\n")
+    atomic_json(retry_path(env, episode, reason), data)
 
 
 def clear_retry(env, episode, reason):
@@ -159,9 +159,10 @@ def label_ready(env, kind, number, remove=()):
     return pr_helpers.gh(cmd, "edit", str(number), "-R", env.repo.gh_repo, *opts)
 
 
-def _finish(env, reason, entry, *, kind, number, title, text, hooks, remove, item, close_outcomes,
+def _finish(env, reason, entry, *, kind, number, title, text, hooks, remove, item, episode, close_outcomes,
             after_labels, decision=None):
     """The one terminal handoff: outcomes, labels, telemetry, notify, log."""
+    clear_episode(env, episode)
     for point in close_outcomes:
         advisor.outcome(env, point, item, "handoff")
     result = label_ready(env, kind, number, remove=remove)
@@ -180,41 +181,33 @@ def clear_episode(env, episode):
         path.unlink(missing_ok=True)
 
 
-def gate(env, episode, reason):
-    """Where a saved category-1 retry stands: None (none saved), "wait" (not due), "due"."""
-    pending = load_retry(env, str(episode), reason)
-    if pending is None:
-        return None
-    return "due" if int(clock()) >= int(pending.get("due") or 0) else "wait"
-
-
 def _category1(env, reason, entry, *, kind, number, title, text, hooks, remove, item, episode,
                close_outcomes, after_labels, transient, continuation, resume):
     """Rule-decided recovery: schedule, consume a due attempt, or hand off (#125)."""
-    episode = str(episode or item or number)
     now = int(clock())
     pending = load_retry(env, episode, reason)
+    attempts = int(pending.get("attempts") or 0) if pending else 0
 
-    def finish(decision=None):
-        clear_episode(env, episode)
+    def finish():
         return _finish(env, reason, entry, kind=kind, number=number, title=title, text=text, hooks=hooks,
-                       remove=remove, item=item, close_outcomes=close_outcomes, after_labels=after_labels,
-                       decision=decision)
+                       remove=remove, item=item, episode=episode, close_outcomes=close_outcomes,
+                       after_labels=after_labels)
 
     if resume:
-        if pending is None:
+        if pending is None or attempts >= MAX_ATTEMPTS:
             return finish()
         due = int(pending.get("due") or 0)
         if now < due:
             return Result(DEFER, handed_off=False, continuation=pending.get("continuation"))
-        attempts = int(pending.get("attempts") or 0) + 1
+        attempts += 1
         pending = {**pending, "attempts": attempts}
+        if attempts < MAX_ATTEMPTS:
+            pending["due"] = now + DELAYS[attempts]
         save_retry(env, episode, reason, pending)
         notify.log(f"handoff-retry {reason} attempt={attempts}/{MAX_ATTEMPTS} episode={episode}")
         return Result(RETRY, handed_off=False, continuation=pending.get("continuation"))
 
     # A saved entry that was never resumed (its caller forgot) must not loop forever: hand off.
-    attempts = int(pending.get("attempts") or 0) if pending else 0
     if not transient or (pending is not None and attempts == 0) or attempts >= MAX_ATTEMPTS:
         return finish()
 
@@ -238,24 +231,28 @@ def perform(env, reason, *, kind, number, title, text, hooks, remove=(), item=""
     KIND is "pr" or "issue". REMOVE is labels to drop before adding ready-for-human. AFTER_LABELS
     receives the gh result when the caller must react to a failed swap. Recovery actions other
     than handoff are returned for the caller to execute; handoff side effects have already run.
-    Category-1: TRANSIENT schedules a deferred later attempt; RESUME consumes a due attempt
-    (RETRY) or yields again (DEFER) until due; permanent or exhausted failures hand off.
+    For eligible category-1 reads, TRANSIENT schedules a deferred attempt and RESUME consumes
+    a due attempt (RETRY) or waits (DEFER). Review lookup also accepts a missing expected comment.
     Raises UnknownReason before any side effect when REASON is not in the table.
     """
     entry = REASONS.get(reason)
     if entry is None:
         raise UnknownReason(f"unlisted handoff reason: {reason!r}")
+    episode = str(episode or item or number)
 
     def finish(decision=None):
         return _finish(env, reason, entry, kind=kind, number=number, title=title, text=text, hooks=hooks,
-                       remove=remove, item=item, close_outcomes=close_outcomes, after_labels=after_labels,
+                       remove=remove, item=item, episode=episode, close_outcomes=close_outcomes, after_labels=after_labels,
                        decision=decision)
 
-    if entry.category == 1:
+    if reason in RETRY_REASONS:
         return _category1(env, reason, entry, kind=kind, number=number, title=title, text=text,
                           hooks=hooks, remove=remove, item=item, episode=episode,
                           close_outcomes=close_outcomes, after_labels=after_labels,
                           transient=transient, continuation=continuation, resume=resume)
+
+    if entry.category == 1:
+        return finish()
 
     # Category 4 never calls the advisor. Category 2/3 may, when the effective mode allows
     # and this slice already executes the offered action (extra_round). Other recoveries fall

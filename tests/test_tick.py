@@ -829,11 +829,13 @@ def test_a_github_description_update_failure_does_not_lend_a_slot(ctx, monkeypat
             return body
         if fields == "headRefName,body":
             return {"headRefName": "agent/issue-5", "body": body}
+        if fields == "comments":
+            return {"comments": [{"author": {"login": "owner"}, "body": "<!-- baton-review round=1 by=claude -->\nfix"}]}
         return original_view(args)
 
     ctx.gh.answers["pr view"] = view_pr
     ctx.gh.answers["pr edit"] = lambda args: (
-        subprocess.CompletedProcess(args, 1, "", "HTTP 503 boom") if "--body-file" in args else "")
+        subprocess.CompletedProcess(args, 1, "", "boom") if "--body-file" in args else "")
     ctx.path("pr-body-base-11").write_text(body)
     Path(ctx.env["CTX"], "pr-11-body.md").write_text(body + "\n## Summary\nCorrected description.\n")
     checkpoint(ctx, pr="11", step="fix", wt=str(ctx.repo))
@@ -846,9 +848,6 @@ def test_a_github_description_update_failure_does_not_lend_a_slot(ctx, monkeypat
 
 @pytest.mark.parametrize("route", ["review", "owner", "switch", "switch-no-commit", "switch-review"])
 def test_a_second_tick_finishes_a_deferred_description_edit(ctx, worktree, monkeypatch, request, route):
-    from baton import handoff
-    clock = {"now": 1_000}
-    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
     pr = "11"
     original = ("<!-- baton-task issue=297 completion=complete -->\n\nCloses #297\n\n"
                 "## Summary\nOld.\n\n## Checks to verify\nnone\n")
@@ -860,6 +859,8 @@ def test_a_second_tick_finishes_a_deferred_description_edit(ctx, worktree, monke
     agent_calls, verified, reviewed, handoffs = [], [], [], []
     comments = [{"author": {"login": "owner"}, "createdAt": "2026-11-20T00:00:01Z",
                  "body": "Revise the description."}]
+    if resumes_review:
+        comments[0]["body"] = "<!-- baton-review round=1 by=claude -->\nRevise the description."
     remote_before = sh(worktree.origin, "git", "rev-parse", worktree.branch)
 
     def view(args):
@@ -871,10 +872,10 @@ def test_a_second_tick_finishes_a_deferred_description_edit(ctx, worktree, monke
         nonlocal live, labelled
         if "--body-file" in args:
             if fail_edit and route == "owner":
-                return subprocess.CompletedProcess(args, 1, "", "HTTP 503 edit refused")
+                return subprocess.CompletedProcess(args, 1, "", "edit refused")
             live = Path(args[args.index("--body-file") + 1]).read_text()
             if fail_edit:
-                return subprocess.CompletedProcess(args, 1, "", "connection reset: lost response")
+                return subprocess.CompletedProcess(args, 1, "", "lost response")
         if "--remove-label" in args and "agent-fix" in args:
             labelled = False
         if "--add-label" in args and "ready-for-human" in args:
@@ -917,7 +918,6 @@ def test_a_second_tick_finishes_a_deferred_description_edit(ctx, worktree, monke
     ctx.gh.answers["pr list"] = lambda args: (
         [{"number": int(pr), "headRefName": worktree.branch}] if labelled and "agent-fix" in args else [])
     monkeypatch.setattr(review, "paginated", lambda *args: [])
-    monkeypatch.setattr(review, "agent_review", lambda *args: "Revise the description.")
     monkeypatch.setattr(pick, "choose", lambda *args, **kwargs: (
         "codex" if switched and "codex" not in agent_calls else "cursor"))
     monkeypatch.setattr(fix.dispatch, "dispatch", agent)
@@ -927,7 +927,13 @@ def test_a_second_tick_finishes_a_deferred_description_edit(ctx, worktree, monke
     monkeypatch.setattr(review.Review, "run_review", lambda *args: "REVIEW: pass")
     if route == "switch-review":
         monkeypatch.setattr(review.advisor, "granted", lambda *args: True)
-        monkeypatch.setattr(review.Review, "run_review", lambda *args: "REVIEW: changes")
+
+        def review_with_changes(self, round, note, reviewer):
+            comments.append({"author": {"login": "owner"}, "createdAt": "2026-11-20T00:00:02Z",
+                             "body": f"<!-- baton-review round={round} by={reviewer} -->\nRevise the description."})
+            return "REVIEW: changes"
+
+        monkeypatch.setattr(review.Review, "run_review", review_with_changes)
     if resumes_review:
         checkpoint(ctx, pr=pr, step="fix", wt=str(worktree.wt), ISSUE="297", fix_head=remote_before)
         monkeypatch.setattr(tick.Tick, "review_loop", ORIGINAL_REVIEW_LOOP)
@@ -946,7 +952,6 @@ def test_a_second_tick_finishes_a_deferred_description_edit(ctx, worktree, monke
 
     fail_edit = False
     switched = route.startswith("switch")
-    clock["now"] = 1_060
     assert ctx.make().run() == 0, ctx.log()
     expected_agents = ["cursor", "codex"] if switched else ["cursor"]
     if route == "switch-review":
@@ -1575,40 +1580,10 @@ def test_forged_markers_never_reach_the_pr(devrun):
     assert "baton-verdict" not in create[create.index("--body") + 1]
 
 
-def _dev_push(monkeypatch, outcomes):
-    from baton import dev, handoff
-    from baton.common import PushResult
-    clock = {"now": 1_000}
-    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
-    pushes = []
-    monkeypatch.setattr(dev, "push_result", lambda *a, **k: pushes.append(1) or (
-        PushResult(False, True, "connection reset") if outcomes[len(pushes) - 1] == "fail" else PushResult(True)))
-    return clock, pushes
-
-
-def test_a_dev_push_replays_only_the_push_after_both_delays_then_opens_the_pr(devrun, monkeypatch):
-    clock, pushes = _dev_push(monkeypatch, ["fail", "fail", "ok"])
+def test_a_dev_push_failure_hands_off_directly(devrun, failed_push):
     devrun.script = [implements(fence=True)]
-    assert devrun.go()[1] == 75
-    assert devrun.go()[1] == 75 and len(pushes) == 1 and len(devrun.runs) == 1   # no early attempt
-    clock["now"] = 1_060
-    assert devrun.go()[1] == 75 and len(pushes) == 2   # first replay fails: 300 s next
-    clock["now"] = 1_200
-    assert devrun.go()[1] == 75 and len(pushes) == 2
-    clock["now"] = 1_360
-    assert devrun.go()[1] == 80 and len(pushes) == 3   # the push landed and the PR opened
-    assert len(devrun.runs) == 1   # the implementer never ran again
-    assert len(devrun.gh.ran("pr", "create")) == 1
-
-
-def test_a_dev_push_that_keeps_failing_hands_off_once_without_a_worker_rerun(devrun, monkeypatch):
-    clock, pushes = _dev_push(monkeypatch, ["fail"] * 3)
-    devrun.script = [implements(fence=True)]
-    assert devrun.go()[1] == 75
-    clock["now"] = 1_060
-    assert devrun.go()[1] == 75
-    clock["now"] = 1_360
-    assert devrun.go()[1] == 80 and len(pushes) == 3 and len(devrun.runs) == 1
+    assert devrun.go()[1] == 1
+    assert len(failed_push) == len(devrun.runs) == 1
     assert len(devrun.gh.ran("issue", "edit", "300", "-R", "owner/app", "--remove-label", "agent-wip",
                              "--add-label", "ready-for-human")) == 1
     assert not devrun.gh.ran("pr", "create")

@@ -39,7 +39,6 @@ class FakeGH:
         self.update_heads, self.merge_results, self.merge_fail_status = [], [], []
         self.update_stderr = "failed to update"
         self.fail_body_substr = ""
-        self.lose_body_substr = ""   # the comment lands but the response is lost
         self.keep_open_on_merge = False
 
     def __call__(self, *args, input=None):
@@ -73,8 +72,6 @@ class FakeGH:
             if self.fail_body_substr and self.fail_body_substr in body:
                 return subprocess.CompletedProcess(args, 1, "", "HTTP 503 boom")
             self.comments.append({"author": {"login": self.owner}, "body": body})
-            if self.lose_body_substr and self.lose_body_substr in body:
-                return subprocess.CompletedProcess(args, 1, "", "connection reset by peer")
         elif head == "pr list":
             out = self.adr_pr
         elif head == "pr create":
@@ -276,20 +273,15 @@ def test_a_comment_that_timed_out_but_landed_is_not_posted_twice(loop):
     assert sum(1 for c in loop.gh.calls if c[:2] == ["issue", "comment"]) == 3   # review, reply, verdict
 
 
-def test_a_gh_failure_that_outlasts_the_retries_is_in_runner_log(loop, monkeypatch):
-    """After gh backoff, category-1 schedules a later attempt instead of handing off immediately."""
-    from baton import handoff
-    clock = {"now": 1_000}
-    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
+def test_a_gh_failure_that_outlasts_the_retries_is_in_runner_log(loop):
     loop.gh.comments = []
     loop.gh.flaky["issue edit --body-file"] = [("HTTP 502: Bad Gateway", False)] * 4
     loop.script = [CHANGES, reviser(body="Goal\nNew step\n")]
-    with pytest.raises(Deferred, match="spec_body_edit_failed"):
-        loop.run()
+    assert loop.run() is False
     log = loop.log()
     assert "gh issue edit failed after 4 tries (gh: HTTP 502: Bad Gateway)" in log
-    assert "handoff-retry spec_body_edit_failed scheduled in 60s" in log
-    assert "ready-for-human" not in loop.gh.labels
+    assert "handoff spec_body_edit_failed" in log
+    assert "ready-for-human" in loop.gh.labels
 
 
 def test_a_handoff_whose_label_swap_fails_says_so(loop, monkeypatch):
@@ -861,11 +853,28 @@ def test_a_later_matching_verdict_supersedes_pending_acceptance(loop):
 def test_pending_write_failure_skips_ci_and_merge(loop):
     loop.script = [CHANGES, reviser(commit=True), ACCEPT]
     loop.gh.fail_body_substr = "baton-spec-accept-pending"
-    with pytest.raises(Deferred, match="spec_pending_accept_post_failed"):
-        loop.run()
-    assert "ready-for-human" not in loop.gh.labels
+    assert loop.run() is False
+    assert "ready-for-human" in loop.gh.labels
     assert not any(c[:2] == ["pr", "merge"] for c in loop.gh.calls)
     assert not loop.gh.posted("<!-- baton-spec-accept-pending")
+
+
+@pytest.mark.parametrize("operation", ["push", "open"])
+def test_a_failed_adr_write_hands_off_without_replay(loop, request, operation):
+    loop.script = [CHANGES, reviser(commit=True)]
+    if operation == "push":
+        pushes = request.getfixturevalue("failed_push")
+    else:
+        loop.gh.flaky["pr create"] = [("HTTP 503: Service Unavailable", False)] * 4
+    assert loop.run() is False
+    assert len(loop.runs) == 2 and "ready-for-human" in loop.gh.labels
+    creates = sum(c[:2] == ["pr", "create"] for c in loop.gh.calls)
+    if operation == "push":
+        assert len(pushes) == 1 and creates == 0
+    else:
+        assert creates == 4   # only the existing per-call gh backoff
+    assert not loop.gh.posted("<!-- baton-spec-reply")
+    assert not list(Path(loop.env["STATE"]).glob("handoff-retry-*"))
 
 
 def test_a_later_tick_resumes_an_open_adr_merge_without_spec_agents(loop, monkeypatch):
@@ -917,24 +926,16 @@ def test_a_closed_adr_pr_hands_off_without_a_verdict(loop):
     assert loop.gh.posted("<!-- baton-spec-accept-pending pr=77 -->")  # still pending
 
 
-def test_verdict_write_failure_after_merge_retries_without_another_merge(loop, monkeypatch):
-    from baton import handoff
-    clock = {"now": 1_000}
-    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
+def test_verdict_write_failure_after_merge_hands_off_with_acceptance_pending(loop):
     loop.gh.comments = [{"author": {"login": "owner"},
                          "body": f"<!-- baton-spec-accept-pending pr=77 -->\n{VERDICT_BODY}"}]
     loop.gh.pr_state = "MERGED"
-    loop.gh.fail_body_substr = "<!-- baton-verdict: accept"
-    with pytest.raises(Deferred, match="spec_accept_post_failed"):
-        loop.run()
-    assert not loop.gh.posted("<!-- baton-verdict: accept")
-    # Retry: pending still there, PR already merged — publish only.
-    clock["now"] = 1_060
-    loop.gh.fail_body_substr = ""
-    before = sum(1 for c in loop.gh.calls if c[:2] == ["pr", "merge"])
-    assert loop.run() is True
-    assert sum(1 for c in loop.gh.calls if c[:2] == ["pr", "merge"]) == before
-    assert loop.gh.posted("<!-- baton-verdict: accept by=codex")
+    loop.gh.fail_body_substr = ACCEPTED
+    assert loop.run() is False
+    assert "ready-for-human" in loop.gh.labels
+    assert loop.gh.posted(PENDING) and not loop.gh.posted(ACCEPTED)
+    assert merges(loop) == [] and loop.runs == []
+    assert not list(Path(loop.env["STATE"]).glob("handoff-retry-*"))
 
 
 def _spec_clock(monkeypatch):
@@ -944,63 +945,26 @@ def _spec_clock(monkeypatch):
     return clock
 
 
-def test_a_failed_spec_review_post_replays_the_saved_body_without_another_reviewer_run(loop, monkeypatch):
-    clock = _spec_clock(monkeypatch)
-    loop.script = [CHANGES, reviser(), ACCEPT]
-    loop.gh.fail_body_substr = "baton-spec-review round=1"
-    with pytest.raises(Deferred, match="spec_review_comment_post_failed"):
-        loop.run()
-    runs = len(loop.runs)
-    with pytest.raises(Deferred, match="spec_review_comment_post_failed"):   # no early attempt
-        loop.run()
-    assert len(loop.runs) == runs
-    clock["now"] = 1_060
-    loop.gh.fail_body_substr = ""
-    assert loop.run() is True
-    assert len(loop.gh.posted("<!-- baton-spec-review round=1 by=")) == 1   # the saved body, once
-    assert len(loop.runs) == runs + 2   # the reviser and the second review only: no reviewer rerun
-
-
-def test_a_spec_review_post_that_keeps_failing_replays_twice_then_hands_off_once(loop, monkeypatch):
-    clock = _spec_clock(monkeypatch)
-    loop.script = [CHANGES]
-    loop.gh.fail_body_substr = "baton-spec-review round=1"
-    with pytest.raises(Deferred):
-        loop.run()
-    runs = len(loop.runs)
-    clock["now"] = 1_060
-    with pytest.raises(Deferred):   # attempt 1 fails: the next delay is 300 s
-        loop.run()
-    clock["now"] = 1_100
-    with pytest.raises(Deferred):   # not due yet
-        loop.run()
-    clock["now"] = 1_360
-    assert loop.run() is False   # attempt 2 fails: one handoff
-    assert "ready-for-human" in loop.gh.labels and len(loop.runs) == runs
-
-
-def test_an_unrecognized_gh_error_hands_off_without_a_retry(loop, monkeypatch):
-    _spec_clock(monkeypatch)
-    loop.script = [CHANGES]
-    loop.gh.fails.add("issue comment")   # the fake's plain "boom": not a recognized transient failure
+@pytest.mark.parametrize("marker, script", [
+    ("baton-spec-review round=1", [CHANGES]),
+    ("baton-spec-reply round=1", [CHANGES, reviser()]),
+    ("baton-verdict: accept", [ACCEPT]),
+])
+def test_a_failed_spec_comment_hands_off_after_gh_backoff(loop, marker, script):
+    loop.script = script
+    loop.gh.fail_body_substr = marker
     assert loop.run() is False
+    assert len(loop.runs) == (2 if "reply" in marker else 1)
     assert "ready-for-human" in loop.gh.labels
+    assert not list(Path(loop.env["STATE"]).glob("handoff-retry-*"))
 
 
-def test_a_landed_comment_with_a_lost_response_is_not_posted_twice(loop, monkeypatch):
-    clock = _spec_clock(monkeypatch)
-    loop.script = [CHANGES, reviser(), ACCEPT]
-    loop.gh.fail_body_substr = "baton-spec-review round=1"
-    with pytest.raises(Deferred, match="spec_review_comment_post_failed"):
-        loop.run()
-    saved = next(Path(loop.env["STATE"]).glob("handoff-retry-*spec_review_comment_post_failed*"))
-    body = json.loads(saved.read_text())["continuation"]["body"]
-    loop.gh.fail_body_substr = ""
-    loop.gh.comments.append({"author": {"login": loop.gh.owner}, "body": body})   # it landed, the response was lost
-    clock["now"] = 1_060
-    done = loop.run()
-    assert done is True, loop.log()
-    assert len(loop.gh.posted("<!-- baton-spec-review round=1 by=")) == 1
+@pytest.mark.parametrize("stderr", ["", "HTTP 401: Bad credentials", "GraphQL: could not resolve issue"])
+def test_an_unclassified_spec_read_failure_hands_off_without_a_retry(loop, stderr):
+    loop.gh.flaky["issue view"] = [(stderr, False)]
+    assert loop.run() is False
+    assert loop.runs == [] and "ready-for-human" in loop.gh.labels
+    assert not list(Path(loop.env["STATE"]).glob("handoff-retry-*"))
 
 
 def test_a_spec_read_that_keeps_failing_replays_twice_then_hands_off_once(loop, monkeypatch):
@@ -1164,13 +1128,32 @@ def test_red_ci_after_a_confirmed_adr_update_hands_off_without_merging(loop, mon
     assert not loop.gh.posted(ACCEPTED) and loop.gh.posted(PENDING)
 
 
-def test_an_unreadable_adr_pr_state_hands_off_with_the_pending_comment_kept(loop, monkeypatch):
+@pytest.mark.parametrize("recovers", [False, True])
+def test_an_unreadable_pending_adr_pr_retries_only_the_read_before_continuing(loop, monkeypatch, recovers):
+    clock = _spec_clock(monkeypatch)
     resume_pending(loop, monkeypatch)
     loop.gh.fails.add("pr view")
+    reads = lambda: sum(c[:2] == ["pr", "view"] for c in loop.gh.calls)
     with pytest.raises(Deferred, match="spec_pending_adr_read_failed"):
         loop.run()
-    assert merges(loop) == [] and not loop.gh.posted(ACCEPTED)
-    assert loop.gh.posted(PENDING) and "ready-for-human" not in loop.gh.labels
+    assert reads() == 4
+    with pytest.raises(Deferred, match="spec_pending_adr_read_failed"):
+        loop.run()
+    assert reads() == 4 and not merges(loop)
+    clock["now"] = 1_060
+    with pytest.raises(Deferred, match="spec_pending_adr_read_failed"):
+        loop.run()
+    assert reads() == 8 and not merges(loop)
+    clock["now"] = 1_360
+    if recovers:
+        loop.gh.fails.remove("pr view")
+        loop.gh.pr_state = "MERGED"
+    assert loop.run() is recovers
+    assert reads() == (9 if recovers else 12)
+    assert bool(loop.gh.posted(ACCEPTED)) is recovers
+    assert ("ready-for-human" in loop.gh.labels) is not recovers
+    assert loop.gh.posted(PENDING) and not merges(loop) and not loop.runs
+    assert not list(Path(loop.env["STATE"]).glob("handoff-retry-*"))
 
 
 def test_unreadable_issue_comments_hand_off_instead_of_starting_a_review(loop):

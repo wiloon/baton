@@ -134,14 +134,14 @@ def test_category_1_transient_failure_defers_without_advisor_or_labels(env, monk
     monkeypatch.setattr(handoff.notify, "notify", lambda *a, **k: notes.append(1))
     monkeypatch.setattr(handoff.advisor, "advise", lambda *a, **k: calls.append(1) or handoff.advisor.Decision("handoff"))
     result = handoff.perform(
-        env, "spec_body_edit_failed", kind="issue", number="7", title="t", text="x",
+        env, "spec_comments_read_failed", kind="issue", number="7", title="t", text="x",
         hooks=hooks, item="7", episode="7", transient=True,
-        continuation={"op": "issue_edit", "path": "/tmp/body"})
+        continuation={})
     assert result.action == handoff.DEFER and not result.handed_off
     assert labelled == [] and notes == [] and calls == [] and events == []
-    state = handoff.load_retry(env, "7", "spec_body_edit_failed")
+    state = handoff.load_retry(env, "7", "spec_comments_read_failed")
     assert state["attempts"] == 0 and state["due"] == 1_060
-    assert state["continuation"] == {"op": "issue_edit", "path": "/tmp/body"}
+    assert state["continuation"] == {}
 
 
 def test_category_1_permanent_failure_hands_off_immediately(env, monkeypatch):
@@ -152,12 +152,12 @@ def test_category_1_permanent_failure_hands_off_immediately(env, monkeypatch):
                         lambda *a, **k: labelled.append(1) or MagicMock(returncode=0))
     monkeypatch.setattr(handoff.notify, "notify", lambda *a, **k: notes.append(1))
     result = handoff.perform(
-        env, "spec_body_edit_failed", kind="issue", number="7", title="t", text="x",
+        env, "spec_comments_read_failed", kind="issue", number="7", title="t", text="x",
         hooks=hooks, item="7", episode="7", transient=False)
     assert result.action == handoff.HANDOFF and result.handed_off
     assert labelled == [1] and notes == [1]
-    assert events == [("handoff", "spec_body_edit_failed", "--reason", "spec_body_edit_failed")]
-    assert handoff.load_retry(env, "7", "spec_body_edit_failed") is None
+    assert events == [("handoff", "spec_comments_read_failed", "--reason", "spec_comments_read_failed")]
+    assert handoff.load_retry(env, "7", "spec_comments_read_failed") is None
 
 
 def test_category_1_retry_waits_until_due_then_consumes_an_attempt(env, monkeypatch):
@@ -167,25 +167,32 @@ def test_category_1_retry_waits_until_due_then_consumes_an_attempt(env, monkeypa
     clock = {"now": 1_000}
     monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
     first = handoff.perform(
-        env, "review_comment_post_failed", kind="pr", number="3", title="t", text="x",
+        env, "review_comment_missing", kind="pr", number="3", title="t", text="x",
         hooks=hooks, item="3", episode="9", transient=True,
-        continuation={"op": "pr_comment", "body": "saved"})
+        continuation={"round": 1})
     assert first.action == handoff.DEFER
     clock["now"] = 1_059
     early = handoff.perform(
-        env, "review_comment_post_failed", kind="pr", number="3", title="t", text="x",
+        env, "review_comment_missing", kind="pr", number="3", title="t", text="x",
         hooks=hooks, item="3", episode="9", resume=True)
     assert early.action == handoff.DEFER
-    assert handoff.load_retry(env, "9", "review_comment_post_failed")["attempts"] == 0
+    assert handoff.load_retry(env, "9", "review_comment_missing")["attempts"] == 0
     clock["now"] = 1_060
     due = handoff.perform(
-        env, "review_comment_post_failed", kind="pr", number="3", title="t", text="x",
+        env, "review_comment_missing", kind="pr", number="3", title="t", text="x",
         hooks=hooks, item="3", episode="9", resume=True)
-    assert due.action == handoff.RETRY and due.continuation == {"op": "pr_comment", "body": "saved"}
-    assert handoff.load_retry(env, "9", "review_comment_post_failed")["attempts"] == 1
+    assert due.action == handoff.RETRY and due.continuation == {"round": 1}
+    assert handoff.load_retry(env, "9", "review_comment_missing")["attempts"] == 1
+    # A tick that stopped after consuming the attempt still observes the next delay.
+    restarted = handoff.perform(
+        env, "review_comment_missing", kind="pr", number="3", title="t", text="x",
+        hooks=hooks, item="3", episode="9", resume=True)
+    assert restarted.action == handoff.DEFER
+    assert handoff.load_retry(env, "9", "review_comment_missing")["attempts"] == 1
 
 
-def test_category_1_exhausts_after_two_later_attempts(env, monkeypatch):
+@pytest.mark.parametrize("restart", [False, True])
+def test_category_1_exhausts_after_two_later_attempts(env, monkeypatch, restart):
     labelled = []
     hooks, events = _hooks()
     monkeypatch.setattr(handoff, "label_ready",
@@ -193,25 +200,26 @@ def test_category_1_exhausts_after_two_later_attempts(env, monkeypatch):
     monkeypatch.setattr(handoff.notify, "notify", lambda *a, **k: None)
     clock = {"now": 1_000}
     monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
-    handoff.perform(env, "fix_push_failed", kind="pr", number="1", title="t", text="x",
-                    hooks=hooks, item="1", episode="1", transient=True, continuation={"op": "push"})
+    handoff.perform(env, "spec_comments_read_failed", kind="pr", number="1", title="t", text="x",
+                    hooks=hooks, item="1", episode="1", transient=True, continuation={})
     clock["now"] = 1_060
-    handoff.perform(env, "fix_push_failed", kind="pr", number="1", title="t", text="x",
+    handoff.perform(env, "spec_comments_read_failed", kind="pr", number="1", title="t", text="x",
                     hooks=hooks, item="1", episode="1", resume=True)
     # First later attempt failed again: schedule the 300s delay.
-    again = handoff.perform(env, "fix_push_failed", kind="pr", number="1", title="t", text="x",
-                            hooks=hooks, item="1", episode="1", transient=True, continuation={"op": "push"})
+    again = handoff.perform(env, "spec_comments_read_failed", kind="pr", number="1", title="t", text="x",
+                            hooks=hooks, item="1", episode="1", transient=True, continuation={})
     assert again.action == handoff.DEFER
-    state = handoff.load_retry(env, "1", "fix_push_failed")
+    state = handoff.load_retry(env, "1", "spec_comments_read_failed")
     assert state["attempts"] == 1 and state["due"] == 1_360
     clock["now"] = 1_360
-    handoff.perform(env, "fix_push_failed", kind="pr", number="1", title="t", text="x",
+    handoff.perform(env, "spec_comments_read_failed", kind="pr", number="1", title="t", text="x",
                     hooks=hooks, item="1", episode="1", resume=True)
-    # Second later attempt failed: hand off.
-    done = handoff.perform(env, "fix_push_failed", kind="pr", number="1", title="t", text="x",
-                           hooks=hooks, item="1", episode="1", transient=True, continuation={"op": "push"})
+    # The second grant uses up the budget even if the process stops before reporting failure.
+    done = handoff.perform(env, "spec_comments_read_failed", kind="pr", number="1", title="t", text="x",
+                           hooks=hooks, item="1", episode="1", transient=True, continuation={},
+                           resume=restart)
     assert done.action == handoff.HANDOFF and done.handed_off and labelled == [1]
-    assert handoff.load_retry(env, "1", "fix_push_failed") is None
+    assert handoff.load_retry(env, "1", "spec_comments_read_failed") is None
     assert events[-1][0] == "handoff"
 
 
@@ -221,10 +229,10 @@ def test_a_saved_retry_that_its_caller_did_not_resume_hands_off_instead_of_loopi
     monkeypatch.setattr(handoff, "clock", lambda: 1_000)
     monkeypatch.setattr(handoff, "label_ready", lambda *a, **k: labelled.append(1) or MagicMock(returncode=0))
     monkeypatch.setattr(handoff.notify, "notify", lambda *a, **k: None)
-    kwargs = dict(kind="issue", number="2", title="t", text="x", hooks=hooks, item="2", episode="2",
-                  transient=True, continuation={"op": "push"})
-    assert handoff.perform(env, "dev_push_failed", **kwargs).action == handoff.DEFER
-    assert handoff.perform(env, "dev_push_failed", **kwargs).action == handoff.HANDOFF   # never resumed
+    kwargs = {"kind": "issue", "number": "2", "title": "t", "text": "x", "hooks": hooks, "item": "2",
+              "episode": "2", "transient": True, "continuation": {}}
+    assert handoff.perform(env, "spec_comments_read_failed", **kwargs).action == handoff.DEFER
+    assert handoff.perform(env, "spec_comments_read_failed", **kwargs).action == handoff.HANDOFF   # never resumed
     assert labelled == [1]
 
 
@@ -233,38 +241,25 @@ def test_a_terminal_handoff_clears_every_pending_retry_of_the_episode(env, monke
     monkeypatch.setattr(handoff, "clock", lambda: 1_000)
     monkeypatch.setattr(handoff, "label_ready", lambda *a, **k: MagicMock(returncode=0))
     monkeypatch.setattr(handoff.notify, "notify", lambda *a, **k: None)
-    common = dict(kind="pr", number="1", title="t", text="x", hooks=hooks, item="1", episode="ep")
-    handoff.perform(env, "fix_push_failed", transient=True, continuation={"op": "push"}, **common)
-    handoff.perform(env, "fix_checks_refresh_failed", transient=True, continuation={"op": "apply_checks"}, **common)
+    common = {"kind": "pr", "number": "1", "title": "t", "text": "x", "hooks": hooks, "item": "1", "episode": "ep"}
+    handoff.perform(env, "spec_comments_read_failed", transient=True, continuation={}, **common)
+    handoff.perform(env, "spec_pending_adr_read_failed", transient=True, continuation={"pr": "77"}, **common)
     assert handoff.perform(env, "fix_run_failed", **common).action == handoff.HANDOFF
-    assert handoff.load_retry(env, "ep", "fix_push_failed") is not None   # a category-4 handoff keeps them
-    handoff.perform(env, "fix_push_failed", **common)   # unresumed: terminal
-    assert handoff.load_retry(env, "ep", "fix_push_failed") is None
-    assert handoff.load_retry(env, "ep", "fix_checks_refresh_failed") is None
-
-
-def test_an_unrecognized_gh_error_is_not_recoverable_but_a_transient_or_empty_one_is():
-    from baton import pr
-    err = lambda text: MagicMock(returncode=1, stderr=text)
-    assert not pr.recoverable(err("GraphQL: Could not resolve to a PullRequest"))
-    assert not pr.recoverable(err("HTTP 401: Bad credentials"))
-    assert not pr.recoverable(err("gh: command not found"))
-    assert pr.recoverable(err("HTTP 503: Service Unavailable"))
-    assert pr.recoverable(err(""))   # a lost response: the replay looks for the landed item first
+    assert handoff.load_retry(env, "ep", "spec_comments_read_failed") is None
+    assert handoff.load_retry(env, "ep", "spec_pending_adr_read_failed") is None
 
 
 def test_every_category_1_reason_is_rule_mode_with_retry_budget():
-    for reason, entry in handoff.REASONS.items():
+    for entry in handoff.REASONS.values():
         if entry.category != 1:
             continue
         assert entry.mode == "rule" and entry.actions == ()
-    assert "fix_description_write_failed" in handoff.REASONS
-    assert handoff.REASONS["fix_description_write_failed"].category == 1
 
 
-@pytest.mark.parametrize("reason", [r for r, e in handoff.REASONS.items() if e.category == 1])
+@pytest.mark.parametrize("reason", ["review_comment_missing", "spec_comments_read_failed",
+                                    "spec_pending_adr_read_failed"])
 def test_each_category_1_reason_defers_then_hands_off_through_perform(env, monkeypatch, reason):
-    """Every table reason shares the same budget: no advisor, two later attempts, then handoff."""
+    """Every replayed read shares the same budget: no advisor, two later attempts, then handoff."""
     labelled, calls = [], []
     hooks, _ = _hooks()
     clock = {"now": 1_000}

@@ -167,40 +167,17 @@ def git(cwd, *args):
     return r.stdout.rstrip("\n") if r.returncode == 0 else None
 
 
-# Transport failures worth a category-1 later attempt (#125); ref/auth/sign-off errors are not.
-PUSH_TRANSIENT = re.compile(
-    r"Could not resolve host|unable to access|Failed to connect|Connection reset|Connection timed out"
-    r"|TLS|SSL|timed out|The remote end hung up|HTTP 50[234]|error in the HTTP2 framing layer",
-    re.IGNORECASE)
-
-
-@dataclass(frozen=True)
-class PushResult:
-    ok: bool
-    transient: bool = False
-    detail: str = ""
-
-
-def push_result(wt, ref, *, upstream=False, signoff=False):
-    """Push an agent's work; classify a failure as transient transport or permanent (#44, #125)."""
-    from . import session
-    if signoff and not sign_off(wt):
-        return PushResult(False, False, "sign-off failed")
-    cmd = ["git", "-C", str(wt), "push", "-q", *(["-u"] if upstream else []), "origin", ref]
-    done = session.run_process(cmd, capture_output=True, text=True)
-    if done.returncode == 0:
-        return PushResult(True)
-    err = (done.stderr or done.stdout or "").strip()
-    return PushResult(False, bool(PUSH_TRANSIENT.search(err)), err)
-
-
 def push(wt, ref, *, upstream=False, signoff=False):
     """Push an agent's work: `git push origin REF` from worktree WT; True when it pushed.
 
     Every rule about what may leave the host lives here (#44). With SIGNOFF (the repository's
     DCO), the unpushed commits first get a Signed-off-by for their author where they lack it.
     """
-    return push_result(wt, ref, upstream=upstream, signoff=signoff).ok
+    from . import session
+    if signoff and not sign_off(wt):
+        return False
+    cmd = ["git", "-C", str(wt), "push", "-q", *(["-u"] if upstream else []), "origin", ref]
+    return session.run_process(cmd).returncode == 0
 
 
 def sign_off(wt):
