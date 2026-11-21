@@ -1113,3 +1113,78 @@ def test_accept_hands_off_red_ci_after_a_confirmed_adr_update(loop, monkeypatch)
     assert len(updates(loop)) == 1 and merges(loop) == []
     assert any("CI on the ADR PR #77 is not green" in text for text in notes)
     assert not loop.gh.posted(ACCEPTED) and loop.gh.posted(PENDING)
+
+
+# --- spec round limit is 3 (#128) ---------------------------------------------------------------
+
+def test_the_example_config_allows_three_spec_rounds():
+    config = load(Path(__file__).resolve().parents[1] / "config.example.toml")
+    assert config.scheduling.max_spec_rounds == 3
+
+
+def test_a_spec_past_the_limit_gets_one_more_round_instead_of_an_immediate_handoff(loop):
+    # Revised in round 5 under the old limit of 6: the loop keeps going past the new limit of 3
+    # (the existing round + 1 rule) and hands off at its own limit, not at once.
+    loop.gh.comments = [
+        {"author": {"login": "owner"}, "body": "<!-- baton-spec-review round=5 by=codex -->\nx"},
+        {"author": {"login": "owner"}, "body": "<!-- baton-spec-reply round=5 by=claude -->\ny"}]
+    loop.script = [CHANGES, reviser(), CHANGES]
+    assert loop.run() is False
+    assert loop.gh.posted("<!-- baton-spec-review round=6") and loop.gh.posted("<!-- baton-spec-review round=7")
+    assert len(loop.runs) == 3 and "ready-for-human" in loop.gh.labels
+
+
+# --- the advisor at the spec round limit (#17) -------------------------------------------------
+
+@pytest.fixture
+def advised(loop, monkeypatch):
+    from baton import advisor
+    from baton.config import Advisor
+    monkeypatch.setenv(advisor.KEY, "sk-" + "t" * 24)   # built, so no scanner reads a key
+    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="live"))
+    loop.advice, loop.advice_calls = [], []
+
+    def call(cfg, key, snapshot, actions):
+        loop.advice_calls.append(snapshot)
+        return loop.advice.pop(0), {}
+    monkeypatch.setattr(advisor, "call_deepseek", call)
+    return loop
+
+
+def test_the_advisor_grants_one_more_spec_round_that_ends_in_accept(advised):
+    advised.script = [CHANGES, reviser(), CHANGES, reviser(), CHANGES, reviser(), ACCEPT]
+    advised.advice = [{"action": "extra_round", "reason": "one wording point left", "evidence": []}]
+    assert advised.run() is True
+    assert len(advised.gh.posted("<!-- baton-spec-review")) == 3 and advised.gh.posted("<!-- baton-verdict: accept")
+    assert len(advised.advice_calls) == 1 and "spec round limit" in advised.advice_calls[0]
+    assert "ready-for-human" not in advised.gh.labels
+
+
+def test_a_second_spec_limit_hands_off_without_asking_again(advised):
+    advised.script = [CHANGES, reviser(), CHANGES, reviser(), CHANGES, reviser(), CHANGES]
+    advised.advice = [{"action": "extra_round", "reason": "fixable", "evidence": []}]
+    assert advised.run() is False
+    assert len(advised.gh.posted("<!-- baton-spec-review")) == 4 and "ready-for-human" in advised.gh.labels
+    assert len(advised.advice_calls) == 1
+
+
+def test_a_failed_extra_review_does_not_extend_the_next_spec_episode(advised):
+    failed = {**CHANGES, "rc": 1, "status": "failure", "outcome": "RESULT: failed reviewer crashed"}
+    advised.script = [CHANGES, reviser(), CHANGES, reviser(), CHANGES, reviser(), failed]
+    advised.advice = [{"action": "extra_round", "reason": "fixable", "evidence": []}]
+    assert advised.run() is False
+    assert "ready-for-human" in advised.gh.labels and len(advised.advice_calls) == 1
+
+    advised.gh.labels.remove("ready-for-human")
+    advised.script = [CHANGES, reviser(), CHANGES, reviser(), CHANGES]
+    advised.advice = [{"action": "handoff", "reason": "needs the owner", "evidence": []}]
+    assert advised.run() is False
+    assert len(advised.advice_calls) == 2
+    assert len(advised.runs) == 10 and "ready-for-human" in advised.gh.labels
+
+
+def test_an_advised_spec_handoff_keeps_todays_handoff(advised):
+    advised.script = [CHANGES, reviser(), CHANGES, reviser(), CHANGES]
+    advised.advice = [{"action": "handoff", "reason": "needs a product decision", "evidence": []}]
+    assert advised.run() is False
+    assert len(advised.runs) == 5 and "ready-for-human" in advised.gh.labels

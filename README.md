@@ -184,6 +184,19 @@ python -m baton file-scan DRAFT  file a kept draft as claude-found + needs-triag
 
 With several `[[repos]]`, put `--repo OWNER/NAME` before the command.
 
+### Advisor (DeepSeek)
+
+When a PR review or a spec review runs out of rounds, the optional routine advisor
+([ADR 0008](docs/adr/0008-model-judgement-is-advisory.md), #17) gets one fresh DeepSeek call with
+a redacted snapshot and the allowed actions (`extra_round` or `handoff`). In `mode = "live"` the
+runner revalidates the state and grants at most one extra round per task; a second limit, a
+failure or an answer outside the set hands off as before, and the handoff text says what the
+advisor chose. `mode = "observe"` records the advice and always hands off; `off` (the default)
+makes no call. `[[repos]] advisor = false` keeps a repository's issue and PR text off the
+provider. Decisions go to `<state>/advisor/decisions.jsonl`; once a day a "Advisor digest"
+notification lists them with how the extra rounds ended. `DEEPSEEK_API_KEY` comes from the
+environment or `[advisor] env_file` (mode 0600) and is never passed to agents.
+
 ### Maintenance mode
 
 Drain the pipeline before a deploy ([ADR 0003](docs/adr/0003-maintenance-mode-is-a-local-flag.md)):
@@ -224,7 +237,7 @@ The units assume the checkout is at `~/baton` and uv at `/usr/bin/uv`; adjust `E
 
 `config.example.toml` documents every key. Base model routes are required. Follow-up routes,
 quota probe retry settings, and `[[repos]]` `auto_merge` are optional. The repository's `auto_merge` defaults to `true`. Set it to `false` to keep
-that repository's PRs for manual merging. Edit the `[[repos]]` entry, declare your installed vendors under `[vendors.<id>]`, and
+that repository's PRs for manual merging. `owner_review_paths` (globs, default empty) keeps only the PRs that touch those files for the owner, after review and CI pass. Edit the `[[repos]]` entry, declare your installed vendors under `[vendors.<id>]`, and
 choose whether `[scheduling].auto_merge` should be enabled. The optional
 `[linear]` and `[telegram]` tables are at the end of the file.
 

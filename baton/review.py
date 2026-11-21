@@ -21,7 +21,7 @@ import re
 import sys
 import time
 
-from . import agents, check_verdicts, checkpoint, checks as check_section, dispatch, fix, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, vendors
+from . import advisor, agents, check_verdicts, checkpoint, checks as check_section, dispatch, fix, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, vendors
 from .common import Deferred, Exhausted, changed, git, restore, strip_markers
 
 REPLY_CAP = 60000
@@ -240,6 +240,7 @@ class Review:
         pr_helpers.gh("pr", "edit", str(self.pr), "-R", self.repo, *options)
 
     def handoff(self, reason, title, text):
+        advisor.outcome(self.env, "review_limit", self.pr, "handoff")
         self.label("--add-label", "ready-for-human")
         self.hooks.task("handoff", reason, "--reason", reason)
         notify.notify(title, text)
@@ -464,6 +465,31 @@ class Review:
     def drop(self):
         self.checkpoint.unlink(missing_ok=True)
 
+    # --- the round limit: the advisor may grant one more round (#17) ---
+    def advise_limit(self, round, reviewer, fixer):
+        """advisor.Decision at the review round limit: "extra_round" (one more fix and review) or
+        "handoff". The snapshot is the PR context, every round's review and the diff size."""
+        pr, wt = self.pr, self.wt
+        head = git(wt, "rev-parse", "HEAD") or ""
+        numstat = git(wt, "diff", "--numstat", "origin/main...HEAD") or ""
+        files = len(numstat.splitlines())
+        lines = sum(int(f) for row in numstat.splitlines() for f in row.split()[:2] if f.isdecimal())
+        reviews = "\n\n".join(f'<review round="{r}">\n{agent_review(self.repo, self.owner, pr, r)}\n</review>'
+                              for r in range(1, round + 1))
+        snapshot = (f"Decision point: review round limit. PR #{pr} of {self.repo} used all {round} review rounds "
+                    f"(max_review_rounds = {self.max_rounds}) and the last review still has must-fix items.\n"
+                    f"Last reviewer: {reviewer}; last fixer: {self.fixed_by or fixer or 'none'}. "
+                    f"Diff: {files} files, {lines} lines changed.\n"
+                    "Actions: extra_round = one more fix by a fixer the vendor rules pick, then one more review; "
+                    "handoff = the owner takes the PR.\n\n"
+                    f"{reviews}\n\n{review_context(self.env, pr, self.issue)}")
+
+        def still_current():
+            data = pr_helpers.view(pr, "headRefOid,state")
+            return bool(data) and data.get("state") == "OPEN" and data.get("headRefOid") == head
+        return advisor.advise(self.env, "review_limit", pr, snapshot, ("extra_round",),
+                              episode=self.issue, revalidate=still_current)
+
     # --- the loop ---
     def loop(self, note, fixer="agent", reviewer="pool"):
         """Review, fix, review again, at most MAX_REVIEW_ROUNDS reviews. Each fix goes to the
@@ -490,6 +516,7 @@ class Review:
         if self.seed():
             self.seed_contrib()
         self.label("--remove-label", "ready-for-human")
+        extra = 1 if advisor.granted(self.env, "review_limit", pr) else 0   # granted by the advisor (#17)
         while True:
             self.hooks.round = round
             if round == 1:
@@ -548,12 +575,19 @@ class Review:
                     if outcome.startswith("REVIEW: changes"):
                         verdict = "changes"
                 if verdict == "pass":
+                    advisor.outcome(self.env, "review_limit", pr, "pass")
                     break
-                if round >= self.max_rounds:
-                    self.handoff("review_limit", f"PR #{pr} needs you",
-                                 f"Still has must-fix items after {round} review rounds. {self.url}")
-                    self.drop()
-                    return 0
+                if round >= self.max_rounds + extra:
+                    decision = advisor.Decision(advisor.HANDOFF) if extra else self.advise_limit(round, reviewer, fixer)
+                    if decision.extra_round:
+                        extra = 1
+                        notify.log(f"PR #{pr}: advisor granted one more round: {decision.reason}")
+                    else:
+                        self.handoff("review_limit", f"PR #{pr} needs you",
+                                     f"Still has must-fix items after {round} review rounds. {self.url}"
+                                     + advisor.handoff_note(decision))
+                        self.drop()
+                        return 0
             if step != "fix":
                 fix_head = git(wt, "rev-parse", "HEAD") or ""
             step = "fix"
@@ -584,6 +618,7 @@ class Review:
             if rc == 75:
                 return 75
             if rc != 0:
+                advisor.outcome(self.env, "review_limit", pr, "handoff")
                 self.drop()
                 return 0
             self.fixed_by = fixer

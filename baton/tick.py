@@ -37,7 +37,7 @@ import sys
 import tempfile
 import time
 
-from . import after_merge, checkpoint, dev, fix, hooks as telemetry, maintenance, merge, names, notify, pick, pr as pr_helpers, pr_contract, review, scan, spec, tmp_sweep, vendors
+from . import advisor, after_merge, checkpoint, dev, fix, hooks as telemetry, maintenance, merge, names, notify, pick, pr as pr_helpers, pr_contract, review, scan, spec, tmp_sweep, vendors
 from .common import Deferred, git
 
 AGENT_REVIEW_NOTE = ("The PR description{issue} give the problem, its cause and the fix. Check the diagnosis first: does the "
@@ -850,6 +850,11 @@ def run(ticks):
     first.hooks().tick(manual)
     from .initialization import expire_context
     expire_context(config, first.clock())
+    try:
+        with session_bound(first.env):
+            advisor.digest(first.env)   # the daily owner digest of advisor decisions (#17)
+    except Exception as error:   # a digest never stops the tick
+        notify.append(config.paths.logs, f"advisor digest failed: {type(error).__name__}")
     (runner_state / "chain-next").unlink(missing_ok=True)
     # Upgrade the old global cooldown as Claude-only; retain today's Claude counter.
     old, new = runner_state / "cooldown-until", runner_state / "claude-cooldown-until"

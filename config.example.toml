@@ -52,7 +52,7 @@ cross_review = true
 cursor_login_re = "^(app/cursor|cursor(\\[bot\\])?)$"
 cursor_branch_re = "^cursor/"
 # Spec review rounds before an issue goes to the owner; an owner answer earns one more.
-max_spec_rounds = 6
+max_spec_rounds = 3
 # When there is nothing else to do, Claude scans one of a repository's scan_areas for bugs and
 # files what it finds as claude-found + needs-triage issues. Needs cross_review.
 scan = false
@@ -129,6 +129,10 @@ screenshot_review = false
 # false: every PR of this repository waits for the owner (ready-for-human), even when
 # [scheduling].auto_merge is true. Use it for a repository whose changes you merge yourself.
 auto_merge = true
+# Globs relative to the repository root (* also matches /). A PR that touches one, under its old
+# or new name, waits for the owner after review and CI pass, even with auto_merge on; no advisor
+# may release it. List the files that decide what agents may do (guard, quota, merge rules).
+owner_review_paths = []
 
 [repos.areas]
 # Top-level directory -> area, for per-area vendor preferences (`dev_ui = [...]`). Anything else is "other".
@@ -320,3 +324,16 @@ timeout_seconds = 600
 input_chars = 20000
 output_chars = 20000
 budget_usd = 1.0
+
+# Optional routine advisor (#17, ADR 0008): one DeepSeek call when a PR review or a spec review
+# runs out of rounds. "off" makes no call; "observe" records the advice and runs the rule (hand
+# off); "live" grants at most one extra round per task when the advisor says so. Decisions go to
+# STATE/advisor/decisions.jsonl and a daily digest. A [[repos]] entry with advisor = false keeps
+# that repository's text off the provider.
+[advisor]
+env_file = "~/.config/baton/deepseek.env"     # DEEPSEEK_API_KEY
+mode = "off"
+model = "deepseek-flash"
+base_url = "https://api.deepseek.com"
+timeout_seconds = 60
+snapshot_chars = 24000
