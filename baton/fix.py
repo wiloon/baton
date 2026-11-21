@@ -167,13 +167,17 @@ class Runner:
                          f"{self.max_verify} fix rounds.\n\n{failure[:REPLY_CAP]}", f"PR #{pr}: posting verification failure failed")
 
     # --- shared tail: after the commits are verified ---
-    def record(self, pr, fixer, wt, head, model):
+    def record(self, pr, fixer, wt, agent_head, model, cursor_base):
         """Who wrote what (author, author model, lines); False when the records failed."""
         try:
-            if agents.ADAPTERS[fixer].RECORDS_AUTHOR_MODEL:
-                vendors.record_author_model(self.state, pr, fixer, model)
-            vendors.record_author(self.state, pr, fixer)
-            vendors.record_contrib(self.state, pr, fixer, str(wt), head)
+            if cursor_base and cursor_base != agent_head:
+                vendors.record_author(self.state, pr, "cursor")
+                vendors.record_contrib(self.state, pr, "cursor", str(wt), cursor_base, agent_head)
+            if self.head(wt) != agent_head:
+                if agents.ADAPTERS[fixer].RECORDS_AUTHOR_MODEL:
+                    vendors.record_author_model(self.state, pr, fixer, model)
+                vendors.record_author(self.state, pr, fixer)
+                vendors.record_contrib(self.state, pr, fixer, str(wt), agent_head)
         except OSError:
             return False
         return True
@@ -219,9 +223,9 @@ class Runner:
         url = f"https://github.com/{self.repo}/pull/{pr}"
         fix_file = Path(f"/tmp/baton-fix-{pr}.md")
         base_file = Path(self.state, f"cursor-fix-base-{pr}")
-        if not head and base_file.is_file():
-            head = base_file.read_text().strip()
-        head = head or self.head(wt)
+        cursor_base = base_file.read_text().strip() if base_file.is_file() else ""
+        agent_head = self.head(wt)
+        head = cursor_base or head or agent_head
         # A new adapter reads the live description and owns its own request.
         self.clear_cursor_request(pr, keep_base=True)
         self.fetch_main(wt)
@@ -261,7 +265,7 @@ class Runner:
         if outcome.startswith("RESULT: fixed"):
             want = pr_helpers.task_wanted(out["reply"])
             has_request = description_request.exists() or description_request.is_symlink()
-            description_rc, description_changed, description_reason = pr_helpers.apply_body(
+            description_rc, description_changed, description_reason, task_changed = pr_helpers.apply_body(
                 pr, str(description_request), self.state, self.ctx, completion=want or None)
             Path(self.state, f"pr-body-base-{pr}").unlink(missing_ok=True)
             pr_helpers.remove_body_request(description_request)
@@ -275,7 +279,7 @@ class Runner:
         elif self.head(wt) != head:
             # Anything but a fix goes to the owner, who must see the partial work ("commit
             # what is done" in the fix prompts): push it unverified. Only a fix is gated below.
-            if not self.record(pr, fixer, wt, head, model):
+            if not self.record(pr, fixer, wt, agent_head, model, cursor_base):
                 return 1
             if not push(wt, "HEAD", signoff=self.env.repo.signoff):
                 outcome = "RESULT: failed pushing fix"
@@ -296,7 +300,7 @@ class Runner:
             if rc != 0:
                 self.verify_failed(pr, failure, rounds)
                 return self.handoff(pr, "verify_failed", f"PR #{pr}: local CI verification failed", url)
-            if not self.record(pr, fixer, wt, head, model if rounds == 0 else "unknown"):
+            if not self.record(pr, fixer, wt, agent_head, model if rounds == 0 else "unknown", cursor_base):
                 return 1
             if not push(wt, "HEAD", signoff=self.env.repo.signoff):
                 return self.handoff(pr, "push_failed", f"PR #{pr}: pushing fix failed", url)
@@ -305,6 +309,7 @@ class Runner:
                 return rc
             if description_rc != 0:
                 return self.description_not_applied(pr, fixer, url, description_reason)
+        base_file.unlink(missing_ok=True)
         return 0
 
     # --- a Cursor fixer ---
@@ -363,9 +368,8 @@ class Runner:
                 temp.write_text(want + "\n")
                 temp.replace(task_file)
         has_request = request.exists() or request.is_symlink()
-        description_rc, body_changed, description_reason = pr_helpers.apply_body(
+        description_rc, body_changed, description_reason, task_changed = pr_helpers.apply_body(
             pr, str(request), self.state, self.ctx, completion=want or None)
-        task_changed = False
         if description_rc == 1:
             notify.log(f"PR #{pr}: description update deferred after GitHub failure")
             return 75

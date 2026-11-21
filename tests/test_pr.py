@@ -200,6 +200,16 @@ def test_task_line_retargets_the_pr(gh, dirs, monkeypatch, capsys):
     assert os.listdir(ctx) == []   # the body file is gone
 
 
+def test_apply_task_cli_keeps_exit_two_when_retargeting_fails(gh, dirs, monkeypatch, capsys):
+    initial = "Closes #419\n\nThis change closes #419.\n"
+    gh.set(headRefName="cursor/issue-419", body=initial)
+    monkeypatch.setattr("sys.stdin", StringIO("TASK: partial\nRESULT: fixed\n"))
+
+    assert pr.main(["apply-task", "420"]) == 2
+    assert json.loads(capsys.readouterr().out) == {"changed": False, "log": ""}
+    assert gh.pr["body"] == initial and edits(gh) == []
+
+
 @pytest.mark.parametrize("reply", [
     "Disagree with the point.\nRESULT: fixed\n",
     'The reviewer wrote "TASK: complete" but work remains.\nRESULT: fixed\n',
@@ -227,21 +237,21 @@ def test_task_request_failures(gh, dirs):
 def test_body_request(gh, dirs, tmp_path):
     state, ctx = dirs
     gh.set(headRefName="cursor/issue-297", body="Refs #297\n\nOld description")
-    assert pr.apply_body(335, tmp_path / "missing.md", state, ctx) == (0, False, "")
+    assert pr.apply_body(335, tmp_path / "missing.md", state, ctx) == (0, False, "", False)
     request = tmp_path / "request.md"
     request.write_text("")
     assert pr.apply_body(335, request, state, ctx) == (
-        2, False, "description request must be a non-empty regular file and cannot be a symlink")
+        2, False, "description request must be a non-empty regular file and cannot be a symlink", False)
     link = tmp_path / "link.md"
     link.symlink_to(request)
     assert pr.apply_body(335, link, state, ctx) == (
-        2, False, "description request must be a non-empty regular file and cannot be a symlink")
+        2, False, "description request must be a non-empty regular file and cannot be a symlink", False)
     request.write_text("Closes #297\n\nCorrected description")   # live partial cannot become complete
-    rc, changed, reason = pr.apply_body(335, request, state, ctx)
-    assert (rc, changed) == (2, False)
+    rc, changed, reason, task_changed = pr.apply_body(335, request, state, ctx)
+    assert (rc, changed, task_changed) == (2, False, False)
     assert reason == "a body edit cannot change task completion; request owner review"
     request.write_text("Refs #297\n\nCorrected description")
-    assert pr.apply_body(335, request, state, ctx) == (0, True, "")
+    assert pr.apply_body(335, request, state, ctx) == (0, True, "", False)
     assert gh.pr["body"].endswith("Refs #297\n\nCorrected description\n")
     assert "issue=297 completion=partial" in gh.pr["body"]
     assert os.listdir(ctx) == []
@@ -254,9 +264,9 @@ def test_body_retry_recognizes_a_write_with_a_lost_response(gh, dirs, tmp_path):
     request.write_text("Refs #297\n\nCorrected description")
     gh.fail("edit")
     assert pr.apply_body(335, request, state, ctx) == (
-        1, False, "GitHub could not update the PR description")
+        1, False, "GitHub could not update the PR description", False)
     gh.fail("edit", False)
-    assert pr.apply_body(335, request, state, ctx) == (0, True, "")
+    assert pr.apply_body(335, request, state, ctx) == (0, True, "", False)
     assert len(edits(gh)) == 1   # the retry found the body already written
 
 
@@ -265,10 +275,10 @@ def test_body_without_task_validates_against_the_current_completion(gh, dirs, tm
     gh.set(headRefName="cursor/issue-419", body=PARTIAL)
     request = tmp_path / "request.md"
     request.write_text(PARTIAL.replace("A test.", "Revised text."))
-    assert pr.apply_body(420, request, state, ctx) == (0, True, "")
+    assert pr.apply_body(420, request, state, ctx) == (0, True, "", False)
     assert pr.apply_task(420, "complete", ctx)[:2] == (0, True)
     assert pr.apply_body(420, request, state, ctx) == (
-        2, False, "a body edit cannot change task completion; request owner review")
+        2, False, "a body edit cannot change task completion; request owner review", False)
 
 
 def test_task_wanted_takes_the_last_full_line(gh, dirs, tmp_path):
@@ -286,7 +296,7 @@ def test_task_change_allows_live_or_wanted_completion_in_one_edit(gh, dirs, tmp_
     gh.set(headRefName="cursor/issue-419", body=BODY.replace("242", "419"))
     request = tmp_path / "request.md"
     request.write_text(text)
-    assert pr.apply_body(420, request, state, ctx, completion="partial") == (0, True, "")
+    assert pr.apply_body(420, request, state, ctx, completion="partial") == (0, True, "", True)
     assert "issue=419 completion=partial" in gh.pr["body"] and "Refs #419" in gh.pr["body"]
     assert "Fixed." in gh.pr["body"] and "Closes #419" not in gh.pr["body"]
     assert len(edits(gh)) == 1
@@ -297,8 +307,8 @@ def test_body_without_task_still_requires_live_completion(gh, dirs, tmp_path):
     gh.set(headRefName="cursor/issue-419", body=BODY.replace("242", "419"))
     request = tmp_path / "request.md"
     request.write_text("Task completion: partial\n\n## What changed\nFixed.\n")
-    rc, changed, reason = pr.apply_body(420, request, state, ctx)
-    assert (rc, changed) == (2, False)
+    rc, changed, reason, task_changed = pr.apply_body(420, request, state, ctx)
+    assert (rc, changed, task_changed) == (2, False, False)
     assert reason == "a body edit cannot change task completion; request owner review"
     assert edits(gh) == []
 

@@ -220,17 +220,17 @@ def apply_body(pr, request, state, ctx, completion=None):
     """Apply an agent's PR description request (file REQUEST) with the runner-owned task
     relation. COMPLETION is the fixer's `TASK:` value when the fix path parsed one; the
     standalone apply-body CLI leaves it None so the body must match the live completion.
-    Returns (rc, changed, reason): rc 0 done or no request, 1 GitHub failed (retry),
-    2 invalid request. changed: the body differs from the one before the first attempt,
-    so a retry after a write whose response was lost still counts the change."""
+    Returns (rc, text_changed, reason, task_changed): rc 0 done or no request,
+    1 GitHub failed (retry), 2 invalid request. Changes are measured from before
+    the first attempt so a write whose response was lost still counts."""
     path = Path(request)
     if not path.exists() and not path.is_symlink():
-        return 0, False, ""
+        return 0, False, "", False
     if path.is_symlink() or not path.is_file() or path.stat().st_size == 0:
-        return 2, False, "description request must be a non-empty regular file and cannot be a symlink"
+        return 2, False, "description request must be a non-empty regular file and cannot be a symlink", False
     current = view(pr, "headRefName,body")
     if current is None:
-        return 1, False, "GitHub could not read the current PR description"
+        return 1, False, "GitHub could not read the current PR description", False
     before = (current.get("body") or "").rstrip("\n")
     baseline = Path(state, f"pr-body-base-{pr}")
     original = _original_body(baseline, before)
@@ -238,19 +238,28 @@ def apply_body(pr, request, state, ctx, completion=None):
         relation_source = {**current, "body": original} if completion else current
         issue, original_completion = pr_contract.relation(relation_source)
         if not re.fullmatch(r"\d+", issue) or original_completion not in ("partial", "complete"):
-            return 2, False, "cannot determine the PR's issue and task completion"
+            return 2, False, "cannot determine the PR's issue and task completion", False
+        if completion and pr_contract.relation(current)[0] != issue:
+            return 2, False, "the PR's associated issue changed since the fix began", False
         prepared = _prepare_request(path.read_text(), issue, original_completion, completion)
     except ValueError as error:
-        return 2, False, str(error)
+        return 2, False, str(error), False
     if prepared.rstrip("\n") != before and not edit_body(pr, prepared, ctx, f"pr-{pr}-body-prepared."):
-        return 1, False, "GitHub could not update the PR description"
-    return 0, prepared.rstrip("\n") != original, ""
+        return 1, False, "GitHub could not update the PR description", False
+    task_changed = bool(completion and completion != original_completion)
+    if task_changed:
+        try:
+            original = pr_contract.retarget(original, issue, completion).rstrip("\n")
+        except ValueError:
+            # The replacement also corrected text that prevented a relation-only edit.
+            pass
+    return 0, prepared.rstrip("\n") != original, "", task_changed
 
 
 def apply_task(pr, want, ctx, baseline=None):
     """Apply a parsed task completion. A saved baseline distinguishes an earlier
     landed write from a no-op. Returns (rc, changed, log): 1 GitHub failed, 2 unusable relation,
-    3 the retarget itself failed (e.g. a closing keyword in a partial PR)."""
+    3 unsafe retarget (e.g. a changed issue or a closing keyword in a partial PR)."""
     if not want:
         return 0, False, ""
     current = view(pr, "headRefName,body")
@@ -258,14 +267,14 @@ def apply_task(pr, want, ctx, baseline=None):
         return 1, False, ""
     try:
         issue, completion = pr_contract.relation(current)
-        if not re.fullmatch(r"\d+", issue):
-            return 2, False, ""
         before = (current.get("body") or "").rstrip("\n")
         original = _original_body(baseline, before)
+        original_issue, original_completion = pr_contract.relation({**current, "body": original})
+        if original_issue != issue:
+            return 3, False, f"PR #{pr}: the associated issue changed since the fix began"
+        if not re.fullmatch(r"\d+", issue):
+            return 2, False, ""
         if completion == want:
-            if original == before:
-                return 0, False, ""
-            _, original_completion = pr_contract.relation({**current, "body": original})
             return 0, original_completion != want, ""
         try:
             prepared = pr_contract.retarget(before + "\n", issue, want)
@@ -371,12 +380,14 @@ def main(argv=None):
             print(error, file=sys.stderr)
             return 1
     elif args.command == "apply-body":
-        rc, changed, _reason = apply_body(args.pr, args.request, str(env.dirs.state), str(env.dirs.ctx))
+        rc, changed, _reason, _task_changed = apply_body(args.pr, args.request, str(env.dirs.state), str(env.dirs.ctx))
         print(json.dumps({"changed": changed}))
         return rc
     elif args.command in ("apply-task", "apply-checks"):
         if args.command == "apply-task":
             rc, changed, log = apply_task(args.pr, task_wanted(sys.stdin.read()), str(env.dirs.ctx))
+            if rc == 3:
+                rc = 2
         else:
             rc, changed, log = apply_checks(args.pr, str(env.dirs.ctx))
         print(json.dumps({"changed": changed, "log": log}))

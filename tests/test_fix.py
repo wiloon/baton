@@ -252,9 +252,9 @@ def test_a_description_write_whose_response_was_lost_counts_as_a_change(run, gh)
     gh.fail("edit")
     state, ctx = str(run.root / "state"), str(run.root / "ctx")
     assert pr_helpers.apply_body(PR, str(request), state, ctx) == (
-        1, False, "GitHub could not update the PR description")
+        1, False, "GitHub could not update the PR description", False)
     gh.fail("edit", False)
-    assert pr_helpers.apply_body(PR, str(request), state, ctx) == (0, True, "")
+    assert pr_helpers.apply_body(PR, str(request), state, ctx) == (0, True, "", False)
 
 
 # --- task completion (tests/completion.sh) ---------------------------------------------------
@@ -433,6 +433,20 @@ COMPLETE = ("<!-- baton-task issue=419 completion=complete -->\n\nCloses #419\n\
 
 
 @pytest.mark.parametrize("fixer", ["cursor", "codex"])
+def test_retargeting_a_copied_body_preserves_checks_without_a_recheck(run, gh, fixer):
+    initial = COMPLETE.replace("## Checks to verify\nnone", "## Checks to verify\n- /billing: badge")
+    gh.set(body=initial)
+    reply = "TASK: partial\nRESULT: fixed\n"
+    if fixer == "cursor":
+        run.agent(cursor_plan(reply, request=initial, commit=False))
+    else:
+        run.agent({"reply": reply, "file": reply, "description": initial, "commit": False})
+
+    assert run.fix(fixer)["rc"] == 0 and not run.labelled() and not run.pushed_new
+    assert run.body() == initial.replace("completion=complete", "completion=partial").replace("Closes #419", "Refs #419")
+
+
+@pytest.mark.parametrize("fixer", ["cursor", "codex"])
 @pytest.mark.parametrize("body_says", ["partial", "complete"])
 def test_task_partial_accepts_a_matching_or_copied_body_and_pushes(run, gh, fixer, body_says):
     # Acceptance 1: live complete + TASK: partial; body may already say partial or still say complete.
@@ -596,6 +610,27 @@ def test_cursor_retries_a_failed_read_then_hands_off_an_unchanged_request(run, g
     assert run.fix("cursor")["rc"] == 1 and len(run.agent_calls) == 1 and run.labelled()
     assert run.body() == BODY
     assert any("made no commit" in line for line in run.runner_log())
+
+
+@pytest.mark.parametrize("request_kind", ["replacement", "task-only", "rejected"])
+def test_a_deferred_task_change_preserves_the_owners_issue_correction(run, gh, request_kind):
+    gh.set(body=COMPLETE, headRefName="owner-branch")
+    request = {
+        "replacement": COMPLETE.replace("Disabled buttons.", "Revised description."),
+        "task-only": None,
+        "rejected": COMPLETE.replace("issue=419", "issue=999"),
+    }[request_kind]
+    reply = "## Checks to verify\nnone\n\nTASK: partial\nRESULT: fixed"
+    run.agent(cursor_plan(reply, request=request, commit=False))
+    gh.fail("edit-before-write")
+    assert run.fix("cursor")["rc"] == 75
+
+    corrected = COMPLETE.replace("419", "420").replace("## Checks to verify\nnone", "## Checks to verify\n- Owner check")
+    gh.set(body=corrected)
+    gh.fail("edit-before-write", False)
+    assert run.fix("cursor")["rc"] == 1 and run.labelled()
+    assert run.body() == corrected
+    assert len(run.agent_calls) == 1
 
 
 @pytest.mark.parametrize("outcome", ["RESULT: failed boom", "RESULT: needs-info", "RESULT: fixed"])
