@@ -52,7 +52,7 @@ cross_review = true
 cursor_login_re = "^(app/cursor|cursor(\\[bot\\])?)$"
 cursor_branch_re = "^cursor/"
 # Spec review rounds before an issue goes to the owner; an owner answer earns one more.
-max_spec_rounds = 6
+max_spec_rounds = 3
 # When there is nothing else to do, Claude scans one of a repository's scan_areas for bugs and
 # files what it finds as claude-found + needs-triage issues. Needs cross_review.
 scan = false
