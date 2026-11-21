@@ -59,14 +59,16 @@ def test_example_and_explicit_overrides_validate(tmp_path):
     assert c.quota.five_hour_max_of("cursor") == 1.0
 
 
-@pytest.mark.parametrize("value", ["0", "1.01", "inf", "nan", "true"])
+@pytest.mark.parametrize("value", [
+    "0", "1.01", "inf", "nan", "true", pytest.param("9" * 310, id="310-digit-integer"),
+])
 def test_invalid_five_hour_max_is_rejected(tmp_path, value):
     path = write(tmp_path, with_overrides(TEXT, codex=value))
     done = subprocess.run(
         [sys.executable, "-m", "baton", "--config", str(path), "--validate"],
         cwd=ROOT, capture_output=True, text=True,
     )
-    assert done.returncode == 2
+    assert done.returncode == 2, done.stderr
     assert "vendors.codex.five_hour_max" in done.stderr
 
 
@@ -83,27 +85,28 @@ def load_override_config(tmp_path, *, codex=1.0, cursor=1.0):
                        home=tmp_path)
 
 
-def test_choose_uses_per_vendor_five_hour_max(tmp_path):
+@pytest.mark.parametrize("extras", [False, True])
+def test_choose_uses_per_vendor_five_hour_max(tmp_path, extras):
     settings = load_override_config(tmp_path).quota
     state = tmp_path / "state"
     state.mkdir()
     snap(state, "codex", week=0.2, five=0.95)
     snap(state, "claude", week=0.2, five=0.90)
     chosen, summary = vendor_policy.choose(
-        state, settings, ("claude", "codex"), ["codex", "claude"], NOW)
+        state, settings, ("claude", "codex"), ["codex", "claude"], NOW, extras=extras)
     assert chosen == "codex"
     assert "claude=blocked(5h 90% >= 90%)" in summary
     assert "codex=" in summary and "blocked" not in summary.split("codex=")[1].split()[0]
     snap(state, "codex", week=0.2, five=1.0)
     chosen, summary = vendor_policy.choose(
-        state, settings, ("claude", "codex"), ["codex", "claude"], NOW)
+        state, settings, ("claude", "codex"), ["codex", "claude"], NOW, extras=extras)
     assert chosen is None
     assert "codex=blocked(5h 100% >= 100%)" in summary
     global_only = config.load(write(tmp_path, TEXT), home=tmp_path).quota
     snap(state, "codex", week=0.2, five=0.95)
     snap(state, "claude", week=0.2, five=0.10)
     chosen, summary = vendor_policy.choose(
-        state, global_only, ("claude", "codex"), ["codex", "claude"], NOW)
+        state, global_only, ("claude", "codex"), ["codex", "claude"], NOW, extras=extras)
     assert chosen == "claude"
     assert "codex=blocked(5h 95% >= 90%)" in summary
 
@@ -204,7 +207,9 @@ def test_spec_revision_waits_for_codex_at_effective_cap(tmp_path, monkeypatch):
     assert (result["vendor"], rc) == ("codex", 0)
     details = vendors.selection_details(state, ["claude", "codex"], ["claude", "codex"],
                                         "codex", "reviser", now=NOW)
-    assert "codex[" in details and "gate=open" in details
+    entries = details.split("; ")
+    assert next(e for e in entries if e.startswith("claude[")).endswith(" gate=open")
+    assert next(e for e in entries if e.startswith("codex[")).endswith(" gate=open")
     snap(state, "codex", week=0.2, five=1.0)
     result, rc = vendors.pick(state, ["claude", "codex"], "reviser", ["claude", "codex"],
                               exclude=["claude"], by="contrib", now=NOW,
@@ -214,4 +219,6 @@ def test_spec_revision_waits_for_codex_at_effective_cap(tmp_path, monkeypatch):
     assert "5h 100% >= 100%" in result["reason"]
     details = vendors.selection_details(state, ["claude", "codex"], ["claude", "codex"],
                                         "", "reviser", now=NOW)
-    assert "5h 100% >= 100%" in details
+    entries = details.split("; ")
+    assert next(e for e in entries if e.startswith("claude[")).endswith(" gate=open")
+    assert next(e for e in entries if e.startswith("codex[")).endswith(" gate=5h 100% >= 100%")

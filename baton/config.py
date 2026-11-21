@@ -486,8 +486,7 @@ def _load_vendors(raw, directory, home, aliases):
             raise ConfigError(f"{label}.max_minutes: expected a positive integer")
         five_hour_max = entry.get("five_hour_max")
         if five_hour_max is not None:
-            if (type(five_hour_max) not in (int, float) or not math.isfinite(five_hour_max)
-                    or five_hour_max <= 0 or five_hour_max > 1):
+            if type(five_hour_max) not in (int, float) or not 0 < five_hour_max <= 1:
                 raise ConfigError(f"{label}.five_hour_max: expected a fraction at most 1")
             five_hour_max = float(five_hour_max)
         supported = agents.ADAPTERS[adapter].SUPPORTED_ROLES
