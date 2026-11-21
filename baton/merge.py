@@ -184,6 +184,69 @@ class Merger:
         lead = "The screenshot review left these checks for you" if left is not None else "Checks for you"
         return f"{lead}:" + "".join(f"\n- {item}" for item in owed)
 
+    # --- update a behind branch, then merge (#122) ---
+    def pr_merge_state(self):
+        """mergeStateStatus and headRefOid, or None when gh fails."""
+        return pr_helpers.view(self.pr, "mergeStateStatus,headRefOid")
+
+    def confirm_new_head(self, before, deadline=60):
+        """Poll until headRefOid is nonempty and different from BEFORE, or DEADLINE seconds elapse."""
+        end = time.monotonic() + deadline
+        while time.monotonic() < end:
+            data = pr_helpers.view(self.pr, "headRefOid")
+            sha = (data or {}).get("headRefOid") or ""
+            if sha and sha != before:
+                return sha
+            time.sleep(2)
+        return ""
+
+    def merge_with_updates(self, minutes, *, before_merge=None):
+        """Merge the PR, updating a behind branch at most three times (#122).
+
+        BEFORE_MERGE: optional callable() -> gate-style dict. Called after a confirmed
+        update and its CI wait, before each merge attempt. A result whose action is not
+        "merge" stops further attempts.
+
+        Returns {"ok": True} or {"ok": False, "reason": ..., "detail": ..., "gate": ...}.
+        """
+        pr, repo = str(self.pr), self.repo
+        updates, match_sha = 0, None
+        while True:
+            data = self.pr_merge_state()
+            status = (data or {}).get("mergeStateStatus")
+            if status == "BEHIND":
+                if updates >= 3:
+                    return {"ok": False, "reason": "behind_exhausted", "detail": ""}
+                before = (data or {}).get("headRefOid") or ""
+                if not before:
+                    return {"ok": False, "reason": "sha_unavailable",
+                            "detail": " mergeStateStatus is BEHIND but headRefOid is unavailable"}
+                updated = pr_helpers.gh("pr", "update-branch", pr, "-R", repo)
+                if updated.returncode != 0:
+                    return {"ok": False, "reason": "update_failed", "detail": pr_helpers.why(updated)}
+                new_sha = self.confirm_new_head(before)
+                if not new_sha:
+                    return {"ok": False, "reason": "head_unchanged",
+                            "detail": " branch head did not change after update-branch"}
+                updates += 1
+                match_sha = new_sha
+                if not self.ci_green(minutes):
+                    return {"ok": False, "reason": "ci_not_green", "detail": ""}
+                if before_merge is not None:
+                    gate = before_merge()
+                    if gate is not None and gate.get("action") != "merge":
+                        return {"ok": False, "reason": "gate", "detail": "", "gate": gate}
+            args = ["pr", "merge", pr, "-R", repo, "--merge"]
+            if match_sha:
+                args.extend(["--match-head-commit", match_sha])
+            merged = pr_helpers.gh(*args)
+            if merged.returncode == 0:
+                return {"ok": True}
+            data = self.pr_merge_state()
+            if (data or {}).get("mergeStateStatus") != "BEHIND":
+                return {"ok": False, "reason": "merge_failed", "detail": pr_helpers.why(merged)}
+            match_sha = None
+
     # --- the review passed ---
     def merge_or_handoff(self, wt, screenshot=None):
         """Merge when auto-merge is on for the runner and for this repository, CI is green and
@@ -233,11 +296,48 @@ class Merger:
                 self.drop_deferred()
             else:
                 self.keep_deferred(checks.items(body), left)
-        merged = pr_helpers.gh("pr", "merge", str(pr), "-R", self.repo, "--merge")
-        if merged.returncode != 0:
+
+        def recheck():
+            """After a branch update, re-run checks clearance and metadata preflight (ADR 0006)."""
+            nonlocal body, left
+            try:
+                body = pr_helpers.body(pr)
+                left = self.left_for_owner(screenshot, body)
+                return pr_helpers.gate(pr, defer=deferred, cleared=screenshot["checks"] if left == [] else None)
+            except Exception:
+                return {"action": "manual_checks"}
+
+        result = self.merge_with_updates(45, before_merge=recheck)
+        if not result.get("ok"):
             self.drop_deferred()
-            self.handoff("merge_failed", f"PR #{pr} merge failed", f"{url}{pr_helpers.why(merged)}")
+            reason = result.get("reason")
+            if reason == "ci_not_green":
+                self.handoff("ci_not_green", f"PR #{pr}: CI not green",
+                             f"Review passed but CI failed or timed out after updating the branch. {url}")
+                return
+            if reason == "gate":
+                gate = result.get("gate") or {"action": "manual_checks"}
+                if gate.get("action") == "queue_review":
+                    notify.log(f"PR #{pr}: merge preflight blocked: {gate['reason']}")
+                    self.label("--add-label", "agent-review")
+                    notify.notify(f"PR #{pr}: metadata review queued", f"{gate['reason']} {url}")
+                    return
+                live_body = gate.get("body")
+                left = self.left_for_owner(screenshot, live_body)
+                owed = self.owed(left, live_body if live_body is not None else body)
+                listed = self.left_text(left, owed)
+                self.handoff("manual_checks", f"PR #{pr} needs a manual check",
+                             "Review and CI passed." + (f" {listed}\n{url}" if listed else f" {url}"))
+                notify.send_shots(pr, note="Checks for you" if left is None else "", left=owed)
+                return
+            detail = result.get("detail") or ""
+            self.handoff("merge_failed", f"PR #{pr} merge failed", f"{url}{detail}")
             return
+        if deferred:   # a recheck may have refreshed left against the live body
+            if left is None:
+                self.drop_deferred()
+            else:
+                self.keep_deferred(checks.items(body) if body is not None else [], left)
         self.hooks.task("merged", "merged")
         notify.notify(f"PR #{pr} merged", url)
         # A partial PR keeps its issue open; release it for the next slice below.

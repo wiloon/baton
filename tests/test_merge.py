@@ -492,3 +492,140 @@ def test_a_repair_that_hands_the_pr_over_still_marks_the_head(repair):
     repair.fix_rc = 1
     assert repair.merger().ci_fix_round(str(repair.wt)) == 1
     assert Path(repair.env["STATE"], f"ci-fix-{PR}-{HEAD}").exists()
+
+
+# --- behind branches (#122) -----------------------------------------------------------------
+
+OLD = "a" * 40
+NEW = "b" * 40
+NEW2 = "c" * 40
+
+
+def test_a_behind_pr_updates_waits_for_ci_and_merges_with_the_new_head(run, monkeypatch):
+    monkeypatch.setattr(merge.time, "sleep", lambda s: None)
+    run.gh.set(mergeStateStatus="BEHIND", headRefOid=OLD, update_heads=[NEW], after_update_status="CLEAN")
+    run.greens = [True, True]  # initial gate CI, then new-head CI
+    run.go()
+    assert run.merged() and not run.labelled("ready-for-human")
+    merge_calls = [c for c in run.gh.calls() if c[:2] == ["pr", "merge"]]
+    assert merge_calls and "--match-head-commit" in merge_calls[0] and NEW in merge_calls[0]
+    assert any(c[:2] == ["pr", "update-branch"] for c in run.gh.calls())
+    assert run.events.count("ci") == 2
+
+
+def test_a_current_or_unknown_pr_merges_without_an_update(run):
+    run.gh.set(mergeStateStatus="UNKNOWN", headRefOid=OLD)
+    run.go()
+    assert run.merged() and not any(c[:2] == ["pr", "update-branch"] for c in run.gh.calls())
+    merge_calls = [c for c in run.gh.calls() if c[:2] == ["pr", "merge"]]
+    assert merge_calls and "--match-head-commit" not in merge_calls[0]
+
+
+def test_a_failed_merge_that_is_now_behind_updates_and_retries(run, monkeypatch):
+    monkeypatch.setattr(merge.time, "sleep", lambda s: None)
+    run.gh.set(mergeStateStatus="CLEAN", headRefOid=OLD, merge_results=[1, 0],
+               merge_fail_status=["BEHIND"], update_heads=[NEW], after_update_status="CLEAN")
+    run.greens = [True, True]
+    run.go()
+    assert run.merged()
+    updates = [c for c in run.gh.calls() if c[:2] == ["pr", "update-branch"]]
+    merges = [c for c in run.gh.calls() if c[:2] == ["pr", "merge"]]
+    assert len(updates) == 1 and len(merges) == 2 and NEW in merges[1]
+
+
+def test_three_behind_updates_exhaust_without_a_fourth(run, monkeypatch):
+    monkeypatch.setattr(merge.time, "sleep", lambda s: None)
+    run.gh.set(mergeStateStatus="BEHIND", headRefOid=OLD,
+               update_heads=[NEW, NEW2, "d" * 40], after_update_status="BEHIND",
+               merge_results=[1, 1, 1], merge_fail_status=["BEHIND", "BEHIND", "BEHIND"])
+    run.greens = [True, True, True, True]
+    run.go()
+    assert run.labelled("ready-for-human") and run.gh.pr.get("state") != "MERGED"
+    assert len([c for c in run.gh.calls() if c[:2] == ["pr", "update-branch"]]) == 3
+    assert len([c for c in run.gh.calls() if c[:2] == ["pr", "merge"]]) == 3
+    assert "notify PR #335 merge failed" in run.events
+
+
+def test_a_failed_merge_that_is_not_behind_hands_off_without_updating(run):
+    run.gh.set(mergeStateStatus="DIRTY", headRefOid=OLD, merge_results=[1], merge_fail_status=["DIRTY"])
+    run.go()
+    assert run.labelled("ready-for-human") and run.gh.pr.get("state") != "MERGED"
+    assert not any(c[:2] == ["pr", "update-branch"] for c in run.gh.calls())
+    assert "notify PR #335 merge failed" in run.events
+
+
+def test_behind_without_a_head_sha_hands_off_without_updating(run):
+    run.gh.set(mergeStateStatus="BEHIND")  # no headRefOid
+    run.go()
+    assert run.labelled("ready-for-human") and run.gh.pr.get("state") != "MERGED"
+    assert not any(c[:2] == ["pr", "update-branch"] for c in run.gh.calls())
+    assert "headRefOid is unavailable" in run.texts["PR #335 merge failed"]
+
+
+def test_an_update_branch_conflict_hands_off_with_gh_diagnostic(run, monkeypatch):
+    monkeypatch.setattr(merge.time, "sleep", lambda s: None)
+    (run.gh.root / "update-branch-stderr").write_text("refusing to merge unrelated histories\n")
+    run.gh.fail("update-branch")
+    run.gh.set(mergeStateStatus="BEHIND", headRefOid=OLD)
+    run.go()
+    assert not run.merged() and run.labelled("ready-for-human")
+    assert "refusing to merge unrelated histories" in run.texts["PR #335 merge failed"]
+    assert not any(c[:2] == ["pr", "merge"] for c in run.gh.calls())
+
+
+def test_an_unchanged_head_after_update_hands_off_without_ci_or_merge(run, monkeypatch):
+    monkeypatch.setattr(merge.time, "sleep", lambda s: None)
+    ticks = {"n": 0}
+
+    def mono():
+        ticks["n"] += 1
+        return 0 if ticks["n"] < 3 else 100
+
+    monkeypatch.setattr(merge.time, "monotonic", mono)
+    run.gh.set(mergeStateStatus="BEHIND", headRefOid=OLD)  # update succeeds but head stays OLD
+    run.go()
+    assert not run.merged() and run.labelled("ready-for-human")
+    assert any(c[:2] == ["pr", "update-branch"] for c in run.gh.calls())
+    assert not any(c[:2] == ["pr", "merge"] for c in run.gh.calls())
+    assert run.events.count("ci") == 1  # only the initial gate CI
+
+
+def test_red_ci_after_a_confirmed_update_hands_off_without_repair_or_merge(run, monkeypatch):
+    monkeypatch.setattr(merge.time, "sleep", lambda s: None)
+    run.gh.set(mergeStateStatus="BEHIND", headRefOid=OLD, update_heads=[NEW], after_update_status="CLEAN")
+    run.greens = [True, False]
+    run.go()
+    assert not run.merged() and run.labelled("ready-for-human")
+    assert "notify PR #335: CI not green" in run.events
+    assert "repair" not in run.events
+    assert not any(c[:2] == ["pr", "merge"] for c in run.gh.calls())
+
+
+def test_checks_change_during_new_head_ci_invalidates_screenshot_clearance(run, monkeypatch):
+    monkeypatch.setattr(merge.time, "sleep", lambda s: None)
+    run.gh.set(body=CLEAN.replace("none", TWO), mergeStateStatus="BEHIND", headRefOid=OLD,
+               update_heads=[NEW], after_update_status="CLEAN")
+    run.greens = [True, True]
+
+    def after_update_edit(*args, **kwargs):
+        if args[:2] == ("pr", "update-branch"):
+            run.gh.set(body=CLEAN.replace("none", TWO + "\n- A new check."), headRefOid=NEW,
+                       mergeStateStatus="CLEAN")
+        return real_gh(*args, **kwargs)
+
+    real_gh = pr_helpers.gh
+    monkeypatch.setattr(pr_helpers, "gh", after_update_edit)
+    run.go(screenshot={"checks": TWO, "comment": verdicts("1. verified", "2. verified")})
+    assert not run.merged() and run.labelled("ready-for-human")
+    assert "A new check." in run.texts["PR #335 needs a manual check"]
+
+
+def test_metadata_preflight_failure_after_update_queues_review(run, monkeypatch):
+    monkeypatch.setattr(merge.time, "sleep", lambda s: None)
+    run.gh.set(mergeStateStatus="BEHIND", headRefOid=OLD, update_heads=[NEW], after_update_status="CLEAN")
+    run.greens = [True, True]
+    monkeypatch.setattr(pr_helpers, "preflight", lambda pr: (_ for _ in ()).throw(ValueError("closes the wrong issue")))
+    run.go()
+    assert not run.merged()
+    assert any(c[:2] == ["pr", "edit"] and "agent-review" in c for c in run.gh.calls())
+    assert "notify PR #335: metadata review queued" in run.events

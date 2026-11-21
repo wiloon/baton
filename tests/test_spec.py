@@ -34,13 +34,20 @@ class FakeGH:
         self.body, self.comments, self.labels = "Goal\nOld step\n", [], {"needs-triage", "ready-for-human"}
         self.adr_pr, self.fails = "", set()
         self.flaky = {}   # "issue edit --body-file": [(stderr, landed), ...] failures before it works
+        self.pr_state = "OPEN"
+        self.merge_state, self.head_oid = "", "a" * 40
+        self.update_heads, self.merge_results, self.merge_fail_status = [], [], []
+        self.update_stderr = "failed to update"
+        self.fail_body_substr = ""
+        self.keep_open_on_merge = False
 
     def __call__(self, *args, input=None):
         self.calls.append(list(args))
         out, rc = "", 0
         head = " ".join(args[:2])
         if head in self.fails:
-            return subprocess.CompletedProcess(args, 1, "", "boom")
+            err = self.update_stderr if head == "pr update-branch" else "boom"
+            return subprocess.CompletedProcess(args, 1, "", err)
         key = head + (" --body-file" if "--body-file" in args else "")
         stderr, landed = self.flaky[key].pop(0) if self.flaky.get(key) else ("", True)
         if not landed:
@@ -61,12 +68,35 @@ class FakeGH:
                 if a == "--add-label" and i + 1 < len(args):
                     self.labels.add(args[i + 1])
         elif head == "issue comment":
-            self.comments.append({"author": {"login": self.owner}, "body": args[args.index("--body") + 1]})
+            body = args[args.index("--body") + 1]
+            if self.fail_body_substr and self.fail_body_substr in body:
+                return subprocess.CompletedProcess(args, 1, "", "boom")
+            self.comments.append({"author": {"login": self.owner}, "body": body})
         elif head == "pr list":
             out = self.adr_pr
         elif head == "pr create":
             self.adr_pr = "77"
             out = "https://github.com/owner/app/pull/77\n"
+        elif head == "pr view":
+            fields = args[args.index("--json") + 1] if "--json" in args else ""
+            data = {"state": self.pr_state, "mergeStateStatus": self.merge_state, "headRefOid": self.head_oid}
+            if "--jq" in args:
+                out = str(data.get(args[args.index("--jq") + 1].lstrip("."), "") or "")
+            else:
+                out = json.dumps({k: data[k] for k in fields.split(",") if k in data})
+        elif head == "pr update-branch":
+            if self.update_heads:
+                self.head_oid = self.update_heads.pop(0)
+        elif head == "pr merge":
+            if self.merge_results:
+                rc = self.merge_results.pop(0)
+                if rc != 0:
+                    if self.merge_fail_status:
+                        self.merge_state = self.merge_fail_status.pop(0)
+                elif not self.keep_open_on_merge:
+                    self.pr_state = "MERGED"
+            elif not self.keep_open_on_merge:
+                self.pr_state = "MERGED"
         return subprocess.CompletedProcess(args, 1, "", stderr) if stderr else subprocess.CompletedProcess(args, rc, out, "")
 
     def posted(self, marker):
@@ -273,7 +303,8 @@ def test_adr_edits_are_pushed_as_a_docs_pr_that_merges_on_accept(loop):
     loop.script = [CHANGES, reviser(commit=True), ACCEPT]
     assert loop.run() is True
     assert loop.gh.ran("pr", "create", "--head", f"docs/spec-issue-{N}", "--base", "main")
-    assert loop.gh.ran("pr", "merge", "77", "--merge")
+    assert any(c[:3] == ["pr", "merge", "77"] and "--merge" in c for c in loop.gh.calls)
+    assert loop.gh.posted("<!-- baton-spec-accept-pending pr=77 -->")
     reply, = loop.gh.posted("<!-- baton-spec-reply round=1 by=")
     assert "\nADR revisions: #77\n" in reply
     assert "docs PR #77" in loop.runs[2]["prompt"]
@@ -283,8 +314,9 @@ def test_an_accept_with_a_red_adr_pr_goes_to_the_owner(loop):
     loop.script = [CHANGES, reviser(commit=True), ACCEPT]
     loop.ci = False
     assert loop.run() is False
-    assert "ready-for-human" in loop.gh.labels and not loop.gh.posted("<!-- baton-verdict")
-    assert not loop.gh.ran("pr", "merge")
+    assert "ready-for-human" in loop.gh.labels and not loop.gh.posted("<!-- baton-verdict: accept")
+    assert loop.gh.posted("<!-- baton-spec-accept-pending pr=77 -->")
+    assert not any(c[:2] == ["pr", "merge"] for c in loop.gh.calls)
 
 
 def test_the_round_limit_hands_the_spec_to_the_owner(loop):
@@ -769,3 +801,133 @@ def test_an_owner_body_without_manual_checks_needs_none_kept(gated):
 def test_an_unchanged_owner_body_is_accepted(gated):
     gated.script = [ACCEPT]
     assert gated.run() is True and not refused(gated)
+
+
+# --- pending acceptance of an ADR merge (#122) ----------------------------------------------
+
+VERDICT_BODY = ("<!-- baton-verdict: accept by=codex -->\n"
+                "## Spec review (codex), round 1: accept\n\nall good")
+
+
+def test_cursor_plan_is_empty_while_acceptance_is_pending(loop):
+    loop.gh.comments += [
+        {"author": {"login": "owner"}, "body": "<!-- baton-verdict: accept by=claude -->\nold plan"},
+        {"author": {"login": "owner"},
+         "body": f"<!-- baton-spec-accept-pending pr=77 -->\n{VERDICT_BODY}"}]
+    assert spec.cursor_plan(loop.env, N) == ""
+    assert spec.accept_pending(loop.env, N)["pr"] == "77"
+
+
+def test_a_later_matching_verdict_supersedes_pending_acceptance(loop):
+    loop.gh.comments += [
+        {"author": {"login": "owner"},
+         "body": f"<!-- baton-spec-accept-pending pr=77 -->\n{VERDICT_BODY}"},
+        {"author": {"login": "owner"}, "body": VERDICT_BODY}]
+    assert spec.accept_pending(loop.env, N) is None
+    assert spec.cursor_plan(loop.env, N) == VERDICT_BODY
+
+
+def test_pending_write_failure_skips_ci_and_merge(loop):
+    loop.script = [CHANGES, reviser(commit=True), ACCEPT]
+    loop.gh.fail_body_substr = "baton-spec-accept-pending"
+    assert loop.run() is False
+    assert "ready-for-human" in loop.gh.labels
+    assert not any(c[:2] == ["pr", "merge"] for c in loop.gh.calls)
+    assert not loop.gh.posted("<!-- baton-spec-accept-pending")
+
+
+def test_a_later_tick_resumes_an_open_adr_merge_without_spec_agents(loop, monkeypatch):
+    monkeypatch.setattr(merge.time, "sleep", lambda s: None)
+    loop.gh.comments = [{"author": {"login": "owner"},
+                         "body": f"<!-- baton-spec-accept-pending pr=77 -->\n{VERDICT_BODY}"}]
+    loop.gh.adr_pr, loop.gh.pr_state, loop.gh.merge_state = "77", "OPEN", ""
+    loop.script = []  # no agent dispatch
+    assert loop.run() is True
+    assert loop.runs == []
+    assert any(c[:3] == ["pr", "merge", "77"] for c in loop.gh.calls)
+    [verdict] = loop.gh.posted("<!-- baton-verdict: accept by=codex")
+    assert verdict == VERDICT_BODY
+    assert spec.cursor_plan(loop.env, N) == VERDICT_BODY
+    assert "ready-for-agent" in loop.gh.labels
+
+
+def test_a_merged_adr_pr_publishes_the_saved_verdict_without_ci_or_merge(loop):
+    loop.gh.comments = [{"author": {"login": "owner"},
+                         "body": f"<!-- baton-spec-accept-pending pr=77 -->\n{VERDICT_BODY}"}]
+    loop.gh.pr_state = "MERGED"
+    loop.ci = False  # must not be consulted
+    assert loop.run() is True
+    assert not any(c[:2] == ["pr", "merge"] for c in loop.gh.calls)
+    assert loop.gh.posted("<!-- baton-verdict: accept by=codex")
+    assert "ready-for-agent" in loop.gh.labels
+
+
+def test_a_closed_adr_pr_hands_off_without_a_verdict(loop):
+    loop.gh.comments = [{"author": {"login": "owner"},
+                         "body": f"<!-- baton-spec-accept-pending pr=77 -->\n{VERDICT_BODY}"}]
+    loop.gh.pr_state = "CLOSED"
+    assert loop.run() is False
+    assert "ready-for-human" in loop.gh.labels and not loop.gh.posted("<!-- baton-verdict: accept")
+    assert loop.gh.posted("<!-- baton-spec-accept-pending pr=77 -->")  # still pending
+
+
+def test_verdict_write_failure_after_merge_retries_without_another_merge(loop):
+    loop.gh.comments = [{"author": {"login": "owner"},
+                         "body": f"<!-- baton-spec-accept-pending pr=77 -->\n{VERDICT_BODY}"}]
+    loop.gh.pr_state = "MERGED"
+    loop.gh.fail_body_substr = "<!-- baton-verdict: accept"
+    assert loop.run() is False
+    assert not loop.gh.posted("<!-- baton-verdict: accept")
+    # Retry: pending still there, PR already merged — publish only.
+    loop.gh.fail_body_substr = ""
+    before = sum(1 for c in loop.gh.calls if c[:2] == ["pr", "merge"])
+    assert loop.run() is True
+    assert sum(1 for c in loop.gh.calls if c[:2] == ["pr", "merge"]) == before
+    assert loop.gh.posted("<!-- baton-verdict: accept by=codex")
+
+
+def test_deleting_the_pending_comment_restores_normal_spec_selection(loop):
+    # Pending was removed; a prior review remains, so the loop resumes as a revision.
+    loop.gh.comments = [
+        {"author": {"login": "owner"}, "body": "<!-- baton-spec-review round=1 by=codex -->\nx"}]
+    loop.script = [reviser(), ACCEPT]
+    assert loop.run() is True
+    assert loop.runs and loop.runs[0]["role"] == "spec"
+
+
+def test_merge_success_while_pr_stays_open_hands_off_without_a_verdict(loop):
+    loop.gh.comments = [{"author": {"login": "owner"},
+                         "body": f"<!-- baton-spec-accept-pending pr=77 -->\n{VERDICT_BODY}"}]
+    loop.gh.pr_state = "OPEN"
+    loop.gh.keep_open_on_merge = True
+    assert loop.run() is False
+    assert any(c[:2] == ["pr", "merge"] for c in loop.gh.calls)
+    assert "ready-for-human" in loop.gh.labels and not loop.gh.posted("<!-- baton-verdict: accept")
+
+
+def test_spec_accept_updates_a_behind_adr_pr_before_merging(loop, monkeypatch):
+    monkeypatch.setattr(merge.time, "sleep", lambda s: None)
+    loop.script = [CHANGES, reviser(commit=True), ACCEPT]
+    loop.gh.merge_state = "BEHIND"
+    loop.gh.update_heads = ["b" * 40]
+    assert loop.run() is True
+    assert any(c[:2] == ["pr", "update-branch"] for c in loop.gh.calls)
+    merges = [c for c in loop.gh.calls if c[:2] == ["pr", "merge"]]
+    assert merges and "--match-head-commit" in merges[0] and "b" * 40 in merges[0]
+    assert loop.gh.posted("<!-- baton-verdict: accept")
+
+
+def test_three_behind_updates_on_the_spec_path_hand_off_with_merge_failed(loop, monkeypatch):
+    monkeypatch.setattr(merge.time, "sleep", lambda s: None)
+    notes = []
+    monkeypatch.setattr(spec.notify, "notify", lambda title, text="": notes.append(text))
+    loop.script = [CHANGES, reviser(commit=True), ACCEPT]
+    loop.gh.merge_state = "BEHIND"
+    loop.gh.update_heads = ["b" * 40, "c" * 40, "d" * 40]
+    loop.gh.merge_results = [1, 1, 1]
+    loop.gh.merge_fail_status = ["BEHIND", "BEHIND", "BEHIND"]
+    assert loop.run() is False
+    assert len([c for c in loop.gh.calls if c[:2] == ["pr", "update-branch"]]) == 3
+    assert "ready-for-human" in loop.gh.labels and not loop.gh.posted("<!-- baton-verdict: accept")
+    assert loop.gh.posted("<!-- baton-spec-accept-pending pr=77 -->")
+    assert any("merging the ADR PR #77 failed" in text for text in notes)

@@ -85,8 +85,38 @@ elif args[:2] == ["pr", "comment"]:
     sys.exit(1 if fails("comment") else 0)
 elif args[:2] == ["pr", "list"]:
     print(len(pr.get("open_prs", [])) if "--jq" in args else json.dumps(pr.get("open_prs", [])))
+elif args[:2] == ["pr", "update-branch"]:
+    if fails("update-branch"):
+        err = (root / "update-branch-stderr").read_text() if (root / "update-branch-stderr").exists() else "failed to update"
+        print(err, file=sys.stderr)
+        sys.exit(1)
+    heads = pr.get("update_heads") or []
+    if heads:
+        pr["headRefOid"] = heads.pop(0)
+        if "after_update_status" in pr:
+            pr["mergeStateStatus"] = pr["after_update_status"]
+        (root / "pr.json").write_text(json.dumps(pr))
+    sys.exit(0)
 elif args[:2] == ["pr", "merge"]:
-    sys.exit(1 if fails("merge") else 0)
+    results = pr.get("merge_results")
+    if isinstance(results, list) and results:
+        rc = results.pop(0)
+        if rc != 0:
+            statuses = pr.get("merge_fail_status")
+            if isinstance(statuses, list) and statuses:
+                pr["mergeStateStatus"] = statuses.pop(0)
+            elif isinstance(statuses, str):
+                pr["mergeStateStatus"] = statuses
+        else:
+            pr["state"] = "MERGED"
+            pr["mergeStateStatus"] = "UNKNOWN"
+        (root / "pr.json").write_text(json.dumps(pr))
+        sys.exit(rc)
+    if fails("merge"):
+        sys.exit(1)
+    pr["state"] = "MERGED"
+    (root / "pr.json").write_text(json.dumps(pr))
+    sys.exit(0)
 elif args[:1] == ["api"]:
     print(json.dumps(pr.get("inline", [])))
 elif args[:2] == ["issue", "list"]:

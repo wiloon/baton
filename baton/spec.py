@@ -42,14 +42,21 @@ VERDICT = re.compile(r"<!-- baton-verdict: (accept|revise)( by=(cursor|codex|cla
 STATE_RE = re.compile(r"<!-- baton-spec-(?P<k>review|reply) round=(?P<r>[0-9]+)(?P<h> human)?")
 KIND_RE = r"<!-- baton-spec-%s round=[0-9]+( human)? by=(?P<v>[a-z]+) -->"
 VERDICT_LINE = re.compile(r"^(SPEC|RESULT): ")
+PENDING_ACCEPT = re.compile(
+    r"^<!-- baton-spec-accept-pending pr=(?P<pr>\d+) -->\n(?P<verdict>.*)", re.DOTALL)
 
 
 @session.scoped
 def comments(env, issue):
-    """The issue's comments, or None when gh fails."""
+    """The issue's comments, or None when gh fails or the payload is unreadable."""
     env = session.resolve(env)
     result = pr_helpers.gh("issue", "view", str(issue), "-R", env.repo.gh_repo, "--json", "comments")
-    return (json.loads(result.stdout).get("comments") or []) if result.returncode == 0 else None
+    if result.returncode != 0:
+        return None
+    try:
+        return json.loads(result.stdout).get("comments") or []
+    except (ValueError, TypeError):
+        return None
 
 
 @session.scoped
@@ -59,17 +66,56 @@ def owner_bodies(env, issue):
             if (c.get("author") or {}).get("login") == env.owner]
 
 
+def pending_accept_in(listed, owner, login_re=None):
+    """The latest valid pending-acceptance comment by OWNER that is not yet superseded by a
+    later owner/cursor verdict with the same saved body: {pr, verdict, index}, or None."""
+    found = None
+    for i, c in enumerate(listed or ()):
+        if (c.get("author") or {}).get("login") != owner:
+            continue
+        match = PENDING_ACCEPT.match(c.get("body") or "")
+        if match and VERDICT.match(match["verdict"]):
+            found = {"pr": match["pr"], "verdict": match["verdict"], "index": i}
+    if not found:
+        return None
+    login_re = login_re or r"^(app/cursor|cursor(\[bot\])?)$"
+    for i, c in enumerate(listed or ()):
+        if i <= found["index"]:
+            continue
+        login = (c.get("author") or {}).get("login") or ""
+        body = c.get("body") or ""
+        if (login == owner or re.search(login_re, login)) and body == found["verdict"]:
+            return None
+    return found
+
+
+@session.scoped
+def accept_pending(env, issue):
+    """Pending acceptance for ISSUE when comments are readable; None when absent, superseded,
+    or unreadable."""
+    env = session.resolve(env)
+    listed = comments(env, issue)
+    if listed is None:
+        return None
+    login_re = env.config.scheduling.cursor_login_re or r"^(app/cursor|cursor(\[bot\])?)$"
+    return pending_accept_in(listed, env.owner, login_re)
+
+
 @session.scoped
 def cursor_plan(env, issue):
     """The body of the latest accept/revise verdict comment of the owner, Cursor or an agent
-    posting for Cursor; empty when there is none."""
+    posting for Cursor; empty when there is none, or while an acceptance is still pending (#122)."""
     env = session.resolve(env)
     login_re = env.config.scheduling.cursor_login_re or r"^(app/cursor|cursor(\[bot\])?)$"
+    listed = comments(env, issue) or ()
+    if pending_accept_in(listed, env.owner, login_re):
+        return ""
     found = []
-    for c in comments(env, issue) or ():
+    for c in listed:
         login = (c.get("author") or {}).get("login") or ""
-        if (login == env.owner or re.search(login_re, login)) and VERDICT.match(c.get("body") or ""):
-            found.append(c["body"])
+        body = c.get("body") or ""
+        if (login == env.owner or re.search(login_re, login)) and VERDICT.match(body):
+            found.append(body)
     return found[-1] if found else ""
 
 
@@ -354,27 +400,77 @@ class Spec:
         self.handoff(f"{reviewer}'s spec review failed: {outcome}")
         return "stop"
 
-    def accept(self, reviewer, round, mode_note, reply):
-        """Merge the ADR PR when there is one, post the verdict, and make the issue runnable."""
-        n, pr = self.issue, self.pr
-        if pr:
-            if not merge.Merger(self.env, self.hooks, pr, n).ci_green(30):
-                self.handoff(f"{reviewer} accepted, but CI on the ADR PR #{pr} is not green.")
-                return "stop"
-            merged = self.gh("pr", "merge", pr, "--merge")
-            if merged.returncode != 0:
-                self.handoff(f"{reviewer} accepted, but merging the ADR PR #{pr} failed.{pr_helpers.why(merged)}")
-                return "stop"
-            notify.notify(f"#{n}: ADR PR #{pr} merged", f"https://github.com/{self.repo}/pull/{pr}")
-        if not self.post(f"<!-- baton-verdict: accept by={reviewer} -->\n"
-                         f"## Spec review ({reviewer}), round {round}: accept\n\n{mode_note}{reply[:REPLY_CAP]}",
-                         f"posting {reviewer}'s accept failed"):
+    def accept_verdict(self, reviewer, round, mode_note, reply):
+        return (f"<!-- baton-verdict: accept by={reviewer} -->\n"
+                f"## Spec review ({reviewer}), round {round}: accept\n\n{mode_note}{reply[:REPLY_CAP]}")
+
+    def pr_state(self, pr):
+        """OPEN / MERGED / CLOSED, or None when gh fails."""
+        data = pr_helpers.view(pr, "state")
+        return (data or {}).get("state") if data is not None else None
+
+    def publish_accept(self, verdict):
+        """Post the saved verdict and make the issue runnable. Keeps pending acceptance if the
+        verdict write fails so a later tick can finish after the ADR PR is merged."""
+        n = self.issue
+        if not self.post(verdict, "posting the accept verdict failed"):
             return "stop"
         self.gh("issue", "edit", n, "--remove-label", "needs-triage", "--add-label", "ready-for-agent")
         merge.remove_worktree(self.repo_dir, self.wt)
-        notify.notify(f"#{n}: spec accepted (round {round})", self.url)
+        round_m = re.search(r"round (\d+): accept", verdict)
+        notify.notify(f"#{n}: spec accepted (round {round_m.group(1) if round_m else '?'})", self.url)
         self.finish()
         return "accept"
+
+    def merge_adr_and_publish(self, pr, verdict, *, reviewer=""):
+        """CI + shared merge helper for an open ADR PR, then publish the verdict once MERGED."""
+        n, who = self.issue, reviewer or "the reviewer"
+        merger = merge.Merger(self.env, self.hooks, pr, n)
+        if not merger.ci_green(30):
+            self.handoff(f"{who} accepted, but CI on the ADR PR #{pr} is not green.")
+            return "stop"
+        result = merger.merge_with_updates(30)
+        if not result.get("ok"):
+            if result.get("reason") == "ci_not_green":
+                self.handoff(f"{who} accepted, but CI on the ADR PR #{pr} is not green.")
+            else:
+                self.handoff(f"{who} accepted, but merging the ADR PR #{pr} failed.{result.get('detail') or ''}")
+            return "stop"
+        if self.pr_state(pr) != "MERGED":
+            self.handoff(f"{who} accepted, but ADR PR #{pr} is still open after the merge attempt.")
+            return "stop"
+        notify.notify(f"#{n}: ADR PR #{pr} merged", f"https://github.com/{self.repo}/pull/{pr}")
+        return self.publish_accept(verdict)
+
+    def resume_pending_accept(self, pending):
+        """Resume an accepted spec whose ADR merge was interrupted (#122)."""
+        pr, verdict = pending["pr"], pending["verdict"]
+        self.pr = pr
+        state = self.pr_state(pr)
+        if state is None:
+            self.handoff(f"Could not read ADR PR #{pr} to resume acceptance.")
+            return False
+        if state == "MERGED":
+            return self.publish_accept(verdict) == "accept"
+        if state == "CLOSED":
+            self.handoff(f"ADR PR #{pr} was closed without merging; acceptance stays pending.")
+            return False
+        if state != "OPEN":
+            self.handoff(f"ADR PR #{pr} state is unreadable ({state}); acceptance stays pending.")
+            return False
+        return self.merge_adr_and_publish(pr, verdict) == "accept"
+
+    def accept(self, reviewer, round, mode_note, reply):
+        """Merge the ADR PR when there is one, post the verdict, and make the issue runnable."""
+        n, pr = self.issue, self.pr
+        verdict = self.accept_verdict(reviewer, round, mode_note, reply[:REPLY_CAP])
+        if pr:
+            pending = f"<!-- baton-spec-accept-pending pr={pr} -->\n{verdict}"
+            if not self.post(pending, f"posting pending acceptance for ADR PR #{pr} failed"):
+                self.handoff(f"{reviewer} accepted, but posting pending acceptance failed.")
+                return "stop"
+            return self.merge_adr_and_publish(pr, verdict, reviewer=reviewer)
+        return self.publish_accept(verdict)
 
     # --- the reviser's round ---
     def revise_round(self, round, context):
@@ -472,6 +568,15 @@ class Spec:
         """True once the spec reviewer accepted (verdict comment posted, any ADR PR merged),
         False when the owner or a failure took over. Deferred when a vendor cannot run now."""
         n, env = self.issue, self.env
+        listed = comments(env, n)
+        if listed is None:
+            self.handoff("Could not read issue comments to check pending acceptance.")
+            return False
+        pending = pending_accept_in(listed, env.owner)
+        if pending:
+            # Resume the ADR merge without a worktree, vendor pick or agent dispatch (#122).
+            self.gh("issue", "edit", n, "--remove-label", "ready-for-human", "--add-label", "agent-wip")
+            return self.resume_pending_accept(pending)
         kind, round = spec_state(env, n)
         if pending_role(kind) == "reviser":
             step = "revise"   # the reviewer asked for changes, or the owner answered
