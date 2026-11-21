@@ -19,15 +19,14 @@ close. Code still enforces review independence, owner authorization, quota limit
 grants (ADR 0007), retry limits and actual CI results. An advisor cannot widen its own action set
 or declare a failed check passed.
 
-There are two kinds of advisor:
-
-- **Routine advisor.** This is one stateless call to an API model outside the worker
-  subscriptions, DeepSeek by default. Scheduling judgement then does not compete with worker
-  quota, and it keeps working when a worker vendor's five-hour window is full.
-- **Escalation advisor.** Before the runner hands a task to the owner, it starts a fresh
-  Claude Code headless session. The session has read-only tools (`gh` view and list, state files,
-  logs, diffs) and a single structured decision as its output. It spends Claude subscription
-  quota, so it runs only at handoff and never on idle ticks.
+The **routine advisor** makes one stateless call to an API model outside the worker
+subscriptions, DeepSeek by default. Scheduling judgement keeps working when a worker vendor's
+five-hour window is full. Before a task handoff, the runner classifies the reason in code.
+Rules handle known waits and safe retries. Owner-only reasons go directly to the owner.
+For judgement calls, the routine advisor can choose among the applicable bounded recovery
+actions. For a problem that needs investigation, it may recommend one retry of the failed
+step or a handoff. The decision records can justify a separate follow-up for a backend with
+read-only tools behind the same interface if these retries frequently fail.
 
 Every advisor call starts a fresh session, and no conversation carries over to the next call.
 Continuity lives in state files, GitHub and the decision record. Each call appends a **decision
@@ -37,12 +36,18 @@ own memory. A learned pattern reaches an advisor prompt only through the improve
 (ADR 0001), as a reviewed change in this repository.
 
 A new decision point starts in **observation mode**. The runner records the recommendation and
-then executes the existing rule. Letting a decision point change work requires its own decision,
-backed by evaluation evidence from observation mode. The owner may instead enable a decision point
-live from the start when its action set is bounded so that the worst wrong choice costs one more
-round followed by today's handoff. The review round limit and the spec round limit (#17) are
-enabled that way: the advisor may grant one extra round per task episode, and a second limit hands
-off without another call. `mode = "observe"` switches them back.
+then executes the rule. Letting a decision point change work requires its own decision, backed
+by evaluation evidence from observation mode. The owner can enable a decision point live from
+the start when its worst wrong choice costs at most one more bounded attempt followed by the
+existing handoff, within the runner's normal authorization, review and retry rules. This covers
+the review and spec round limits (#17) and the bounded recovery steps identified for live use
+in #125. An advisor action that can resume a merge or supply an answer for a reviser to act on
+starts in observation. Rules and owner-only reasons never call the advisor.
+
+The global `off`, `observe` and `live` setting caps the mode of every decision point. In global
+`live`, the runner uses each point's approved mode, so new points can be evaluated while the
+round limits stay live. A repository can turn the advisor off. The runner persists at most one
+advisor action per reason and task episode, and a recurrence after that action goes to handoff.
 
 ## Considered options
 
@@ -59,7 +64,13 @@ off without another call. `mode = "observe"` switches them back.
 
 - Advisor usage is recorded separately from workload usage.
 - The routine advisor sends issue and PR content to an external provider. A repository can turn
-  the routine advisor off, and its decision points then use the rules.
+  the routine advisor off, and its decision points then use the rules. #125 keeps raw diffs,
+  CI log excerpts and local repository file contents out of advisor payloads pending an owner
+  decision about data egress. Diff size and CI check status can provide context within the
+  existing redaction boundary.
+- Advisor-authored answers carry separate provenance and have advisory authority in the spec
+  loop. The owner must decide which kinds of answers may be used live before the runner can
+  publish one and resume revision.
 - Over time, rule code should shrink into fallback paths while the mechanism stays the same:
   state machine, quota and leases, permissions, review independence and side-effect execution.
   Later bounded agents, such as issue decomposition, follow the same contract. They return data
@@ -75,3 +86,7 @@ off without another call. `mode = "observe"` switches them back.
 - Issue #17 (owner, 2026-11-20): the review and spec round limits go live without an observation
   period, because their actions are bounded to one extra round; every other decision point keeps
   the observation-first default.
+- Issue #125 (owner direction, 2026-11-20): use the routine advisor at eligible task handoffs in
+  place of a default Claude Code escalation session. Record the allowed live recovery steps
+  per decision point so merge recovery and spec answers can start in observation alongside the
+  existing live round limits.
