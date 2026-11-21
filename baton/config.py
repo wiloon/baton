@@ -91,6 +91,10 @@ class Repo:
     screenshot_review: bool = False
     # false: every PR of this repository waits for the owner, whatever scheduling.auto_merge says.
     auto_merge: bool = True
+    # Globs relative to the repository root (fnmatch: * also matches /). A PR whose diff touches
+    # one, under its old or new name, never auto-merges: it goes to the owner after review and
+    # CI pass, and no advisor may release it (#131).
+    owner_review_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -370,7 +374,7 @@ def _section(name, cls, data, directory, home):
     for key, typ in hints.items():
         value, label = data.get(key, defaults.get(key)), f"{name}.{key}"
         if typ in (tuple[str, ...], tuple[Path, ...]):
-            if not isinstance(value, list) or any(type(v) is not str for v in value):
+            if not isinstance(value, (list, tuple)) or any(type(v) is not str for v in value):
                 raise ConfigError(f"{label}: expected an array of strings")
             if any(not v.strip() for v in value):
                 raise ConfigError(f"{label}: entries must be nonempty")
@@ -703,6 +707,8 @@ def _check_repo(repo):
         raise ConfigError('repos.secret_env_keys: expected UPPER_CASE names')
     if any(not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.]*', p) for p in repo.tmp_prefixes):
         raise ConfigError('repos.tmp_prefixes: expected plain names such as myapp')
+    if any(p.startswith('/') or '..' in p.split('/') for p in repo.owner_review_paths):
+        raise ConfigError('repos.owner_review_paths: expected globs relative to the repository root')
 
 
 def main(argv=None):

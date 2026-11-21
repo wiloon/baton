@@ -117,6 +117,13 @@ elif args[:2] == ["pr", "merge"]:
     pr["state"] = "MERGED"
     (root / "pr.json").write_text(json.dumps(pr))
     sys.exit(0)
+elif args[:1] == ["api"] and any(a.endswith("/files") for a in args):
+    if fails("files"):
+        sys.exit(1)
+    for f in pr.get("files_api", []):
+        print(f["filename"])
+        if f.get("previous_filename"):
+            print(f["previous_filename"])
 elif args[:1] == ["api"]:
     print(json.dumps(pr.get("inline", [])))
 elif args[:2] == ["issue", "list"]:

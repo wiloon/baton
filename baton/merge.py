@@ -14,6 +14,7 @@ CLI for the bash callers that stay (the tick's recovery, the spec round, the cle
 
 from . import session
 import argparse
+from fnmatch import fnmatchcase
 import json
 import os
 from pathlib import Path
@@ -247,6 +248,21 @@ class Merger:
                 return {"ok": False, "reason": "merge_failed", "detail": pr_helpers.why(merged)}
             match_sha = None
 
+    # --- owner-review paths (#131) ---
+    def owner_paths_touched(self):
+        """The PR's paths (old and new names of a rename) that match the repository's
+        owner_review_paths; [] when it sets none or the PR touches none; None when the file
+        list can't be read."""
+        globs = self.env.repo.owner_review_paths
+        if not globs:
+            return []
+        listed = pr_helpers.gh("api", "--paginate", f"repos/{self.repo}/pulls/{self.pr}/files",
+                               "--jq", '.[] | .filename, (.previous_filename // empty)')
+        if listed.returncode != 0:
+            return None
+        paths = sorted({line.strip() for line in listed.stdout.splitlines() if line.strip()})
+        return [p for p in paths if any(fnmatchcase(p, g) for g in globs)]
+
     # --- the review passed ---
     def merge_or_handoff(self, wt, screenshot=None):
         """Merge when auto-merge is on for the runner and for this repository, CI is green and
@@ -270,6 +286,14 @@ class Merger:
             if self.ci_fix_round(wt) != 0 or not self.ci_green(45):
                 self.handoff("ci_not_green", f"PR #{pr}: CI not green", f"Review passed but CI failed or timed out. {url}")
                 return
+        touched = self.owner_paths_touched()
+        if touched != []:
+            # Reserved for the owner: never an advisor decision point (#131, #125).
+            what = ("the changed files could not be read" if touched is None
+                    else "it touches owner-review paths: " + ", ".join(touched))
+            self.handoff("owner_review_paths", f"PR #{pr} review and CI passed",
+                         f"Not auto-merged: {what}. Ready for you. {url}")
+            return
         body, left = None, None
         try:
             body = pr_helpers.body(pr)
