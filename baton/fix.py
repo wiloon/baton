@@ -376,7 +376,7 @@ class Runner:
             if rc == 1:
                 notify.log(f"PR #{pr}: description update deferred after GitHub failure")
                 return 75
-            if rc != 0 and description_rc != 2:
+            if rc != 0 and (rc != 2 or description_rc != 2):
                 return self.handoff(pr, "", f"PR #{pr}: task completion change failed (cursor)", url)
         moved = self.head(wt) != head
         if not moved:
