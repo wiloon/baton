@@ -1113,3 +1113,22 @@ def test_accept_hands_off_red_ci_after_a_confirmed_adr_update(loop, monkeypatch)
     assert len(updates(loop)) == 1 and merges(loop) == []
     assert any("CI on the ADR PR #77 is not green" in text for text in notes)
     assert not loop.gh.posted(ACCEPTED) and loop.gh.posted(PENDING)
+
+
+# --- spec round limit is 3 (#128) ---------------------------------------------------------------
+
+def test_the_example_config_allows_three_spec_rounds():
+    config = load(Path(__file__).resolve().parents[1] / "config.example.toml")
+    assert config.scheduling.max_spec_rounds == 3
+
+
+def test_a_spec_past_the_limit_gets_one_more_round_instead_of_an_immediate_handoff(loop):
+    # Revised in round 5 under the old limit of 6: the loop keeps going past the new limit of 3
+    # (the existing round + 1 rule) and hands off at its own limit, not at once.
+    loop.gh.comments = [
+        {"author": {"login": "owner"}, "body": "<!-- baton-spec-review round=5 by=codex -->\nx"},
+        {"author": {"login": "owner"}, "body": "<!-- baton-spec-reply round=5 by=claude -->\ny"}]
+    loop.script = [CHANGES, reviser(), CHANGES]
+    assert loop.run() is False
+    assert loop.gh.posted("<!-- baton-spec-review round=6") and loop.gh.posted("<!-- baton-spec-review round=7")
+    assert len(loop.runs) == 3 and "ready-for-human" in loop.gh.labels

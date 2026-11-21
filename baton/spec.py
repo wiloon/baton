@@ -585,7 +585,7 @@ class Spec:
         else:
             step, round = "review", 1
             self.keep_owner_body()
-        max_rounds = max(int(env.config.scheduling.max_spec_rounds or 6), round + 1)   # an owner answer earns another round
+        max_rounds = max(int(env.config.scheduling.max_spec_rounds or 3), round + 1)   # an owner answer earns another round
         if git(self.repo_dir, "rev-parse", "-q", "--verify", f"origin/{self.branch}") is not None:
             self.base = f"origin/{self.branch}"
         if not self.worktree():
