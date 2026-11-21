@@ -37,9 +37,15 @@ of adapters supplies validation and dispatch. Adding an adapter requires a catal
   to the owner.
 - Disabling a vendor takes a config edit, including removal of its explicit route, model and
   preference references. Historical attribution survives disablement.
+- A pending reply-protocol fix request belongs to the adapter that produced it. If another
+  eligible fixer is selected, it starts a fresh request using the current PR description and
+  keeps the original fix base for verifying local commits. Existing unmarked pending requests
+  can be resumed by the adapter that provided the legacy reply protocol (Cursor).
 
 ## Revision record
 
 - Issue #103: record the hard role allowlist and its effect on selection, waiting and handoff.
 - Issue #106: route behaviour through registered adapter capabilities so another adapter can
   use existing workflow roles without adding vendor branches or new configuration fields.
+- Issue #113: record who owns a pending reply fix so adapter reselection cannot replay another
+  fixer's request or skip verification of its unpushed commits.
