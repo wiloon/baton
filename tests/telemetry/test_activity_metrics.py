@@ -173,5 +173,70 @@ class IntervalActivityTests(unittest.TestCase):
             t.activity_metrics([self.record()], lambda *args: emitted.append(args), 160, state)
             self.assertIn(('activity_in_interval', 1, '{agent="claude"}'), emitted)
 
+class ActiveSecondsTests(unittest.TestCase):
+    """Busy seconds tell a 5 s run apart from a fully busy interval."""
+    def record(self, agent='claude', started=120, ended=140, status='success'):
+        return dict(agent=agent, started=started, ended=ended, status=status)
+
+    def observe(self, state, records, now):
+        result = {}
+        t.active_seconds(records, now, lambda name, value, labels='': result.__setitem__(labels, value), state)
+        return {v: result['{agent="' + v + '"}'] for v in t.VENDORS}
+
+    def test_overlapping_runs_count_once_and_clip_to_the_interval(self):
+        records = [self.record(started=80, ended=130), self.record(started=110, ended=150),
+                   self.record('codex', 155, 0, 'running')]
+        self.assertEqual(t.busy_seconds(records, 'claude', 100, 160), 50)
+        self.assertEqual(t.busy_seconds(records, 'codex', 100, 160), 5)
+        self.assertEqual(t.busy_seconds(records, 'cursor', 100, 160), 0)
+
+    def test_run_between_polls_and_idle_interval(self):
+        self.assertEqual(t.busy_seconds([self.record(started=120, ended=125)], 'claude', 100, 160), 5)
+        self.assertEqual(t.busy_seconds([self.record(started=40, ended=100)], 'claude', 100, 160), 0)
+        # A record without timestamps cannot add time.
+        self.assertEqual(t.busy_seconds([dict(agent='claude', status='success')], 'claude', 100, 160), 0)
+
+    def test_counter_accumulates_across_observations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            first = self.observe(state, [], 100)
+            self.assertEqual(first, {v: 0 for v in t.VENDORS})  # first observation adds nothing
+            self.assertEqual(self.observe(state, [self.record(started=120, ended=125)], 160)['claude'], 5)
+            busy = [self.record(started=150, ended=0, status='running')]
+            self.assertEqual(self.observe(state, busy, 220)['claude'], 65)
+
+    def test_unknown_interval_adds_nothing_and_keeps_the_total(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            self.observe(state, [], 100)
+            self.observe(state, [self.record(started=120, ended=130)], 160)
+            # Gap over 150 s: the busy run inside it is not guessed.
+            self.assertEqual(self.observe(state, [self.record(started=200, ended=300)], 400)['claude'], 10)
+            self.assertEqual(self.observe(state, [self.record(started=410, ended=420)], 460)['claude'], 20)
+
+    def test_failed_read_neither_emits_nor_advances(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            emitted = []
+            t.activity_metrics([], lambda *args: emitted.append(args), 100, state)
+            path = state / 'telemetry' / 'active-seconds.json'
+            saved = path.read_text()
+            emitted.clear()
+            t.activity_metrics(None, lambda *args: emitted.append(args), 130, state)
+            self.assertFalse([e for e in emitted if e[0] == 'active_seconds_total'])
+            self.assertEqual(path.read_text(), saved)
+
+    def test_corrupt_state_restarts_from_zero(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            path = state / 'telemetry' / 'active-seconds.json'
+            for text in ('not json', '[]', '{"observed": true, "seconds": {"claude": -5}}'):
+                t.atomic(path, text)
+                self.assertEqual(self.observe(state, [self.record()], 160)['claude'], 0)
+
+    def test_collect_exports_the_counter(self):
+        result = ActivityTests.collect(self, [])
+        self.assertIn('baton_active_seconds_total{agent="claude"} 0', result)
+
 if __name__ == '__main__':
     unittest.main()

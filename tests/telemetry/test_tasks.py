@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+import uuid
 from unittest.mock import patch
 from test_runner import t, OWNER
 from baton.config import ROUTE_ROLES, load
@@ -112,6 +113,23 @@ class TaskTests(unittest.TestCase):
         record = self.end_run('cursor', {'type': 'result', 'usage': {'inputTokens': 1, 'outputTokens': 2}})
         self.assertNotIn('cost_usd', record)
         self.assertEqual(record['cost_state'], 'unavailable')
+
+    def test_runs_of_one_task_share_a_trace_with_their_own_spans(self):
+        ledger = t.Ledger(self.state)
+        with patch.object(t, 'identity', return_value=OWNER), patch.object(t.subprocess, 'run', side_effect=OSError):
+            review = ledger.begin('codex', 'review', 123, 60, 123, 456, 1, repo='test/repo')
+            fix = ledger.begin('claude', 'fix', 123, 60, 123, 456, repo='test/repo')
+            other = ledger.begin('codex', 'review', 123, 60, 124, 0, repo='test/repo')
+            probe = ledger.begin('codex', 'probe', 123, 60, repo='test/repo')
+        self.assertEqual(review['pipeline_id'], fix['pipeline_id'])
+        self.assertEqual(review['trace_id'], uuid.UUID(review['pipeline_id']).hex)
+        self.assertEqual(review['trace_id'], fix['trace_id'])
+        self.assertNotEqual(review['span_id'], fix['span_id'])
+        self.assertNotEqual(other['trace_id'], review['trace_id'])
+        self.assertNotIn('pipeline_id', probe)
+        self.assertRegex(probe['trace_id'], r'^[a-f0-9]{32}$')
+        # The stored record is what replays and TRACEPARENT read back.
+        self.assertEqual(t.read(ledger.path(fix['run_id']))['trace_id'], review['trace_id'])
 
     def test_run_links_and_snapshot_missing_usage_is_not_zero(self):
         ledger = t.Ledger(self.state)
