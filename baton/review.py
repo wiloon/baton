@@ -257,13 +257,14 @@ class Review:
     def label(self, *options):
         pr_helpers.gh("pr", "edit", str(self.pr), "-R", self.repo, *options)
 
-    def handoff(self, reason, title, text, *, snapshot="", revalidate=None, transient=False, resume=False):
+    def handoff(self, reason, title, text, *, snapshot="", revalidate=None, transient=False,
+                continuation=None, resume=False):
         """Return the shared handoff result, including feedback lookup deferrals (#125)."""
         return owner_handoff.perform(
             self.env, reason, kind="pr", number=self.pr,
             title=title, text=text, hooks=self.hooks, item=self.pr, episode=self.issue,
             snapshot=snapshot, revalidate=revalidate, close_outcomes=("review_limit",),
-            transient=transient, resume=resume)
+            transient=transient, continuation=continuation, resume=resume)
 
     def fixer_feedback(self, round, screenshot):
         """Read the expected trusted feedback, consuming a saved retry before any lookup."""
@@ -272,7 +273,14 @@ class Review:
         reason = "review_comment_missing"
         title = f"PR #{pr} review comment missing"
         text = f"A review comment of round {round} is unavailable. {self.url}"
-        if owner_handoff.load_retry(self.env, episode, reason) is not None:
+        continuation = {"pr": str(pr), "round": round}
+        pending = owner_handoff.load_retry(self.env, episode, reason)
+        if pending is not None:
+            saved = pending.get("continuation") or {}
+            if saved.get("pr") != continuation["pr"] or saved.get("round") != continuation["round"]:
+                owner_handoff.clear_retry(self.env, episode, reason)
+                pending = None
+        if pending is not None:
             result = self.handoff(reason, title, text, resume=True)
             if result.action != owner_handoff.RETRY:
                 return "", 75 if result.action == owner_handoff.DEFER else 0
@@ -287,7 +295,7 @@ class Review:
             owner_handoff.clear_retry(self.env, episode, reason)
             return feedback, None
 
-        result = self.handoff(reason, title, text, transient=retryable)
+        result = self.handoff(reason, title, text, transient=retryable, continuation=continuation)
         return "", 75 if result.action == owner_handoff.DEFER else 0
 
     def render(self, template, **pairs):

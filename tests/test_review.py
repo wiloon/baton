@@ -1341,6 +1341,35 @@ def test_an_unclassified_review_comment_read_hands_off_immediately(loop, monkeyp
     assert not list(Path(loop.env["STATE"]).glob("handoff-retry-*"))
 
 
+@pytest.mark.parametrize("stale", [
+    {"pr": str(PR), "round": 1},          # leftover of an earlier round of this PR
+    {"pr": "111111", "round": 2},         # leftover of another PR of the same episode
+])
+def test_a_leftover_review_comment_retry_from_another_round_or_pr_does_not_defer(loop, monkeypatch, stale):
+    """A dropped checkpoint must not resume a stale review_comment_missing entry (#125)."""
+    from baton import handoff
+
+    monkeypatch.setattr(handoff, "clock", lambda: 1_000)
+    env = session.resolve(loop.env)
+    handoff.save_retry(env, "297", "review_comment_missing", {
+        "attempts": 0,
+        "due": 1_300,   # still waiting: a matching entry would defer
+        "continuation": stale,
+        "reason": "review_comment_missing",
+        "episode": "297",
+    })
+    Path(loop.env["STATE"], f"review-pending-{PR}").write_text(
+        f"pr={PR}\nwt={loop.wt}\nnote=n\nfixer=cursor\nreviewer=claude\nround=2\nstep=fix\n"
+        f"fix_head=\nfixed_by=\nISSUE=297\n")
+    loop.gh.set(comments=[{"author": {"login": "owner"},
+                           "body": "<!-- baton-review round=2 by=claude -->\nfix round two",
+                           "createdAt": "2026-10-27T10:00:00Z"}])
+    loop.reviews, loop.screens = ["pass"], ["pass"]
+    assert loop.run(fixer="cursor", reviewer="claude") == 0
+    assert len(loop.fixes) == 1 and "fix round two" in loop.fixes[0]["feedback"]
+    assert not list(Path(loop.env["STATE"]).glob("handoff-retry-*"))
+
+
 def test_an_agent_screenshot_failure_that_mentions_a_comment_stays_a_run_failure(loop, monkeypatch):
     seen = _watch(monkeypatch)
     loop.reviews[:] = ["pass"]
