@@ -1697,6 +1697,6 @@ def test_dev_writer_without_fixer_role_hands_off_after_zero_repairs(devrun, monk
     assert t.item(lambda: dev.run(t, devrun.issue)) == 80
     note, = devrun.gh.ran("issue", "comment")
     assert "after 0 of 2 fix rounds" in body_of(note)
-    assert ("handoff", "verify_failed", "--reason", "verify_failed") in events
+    assert ("handoff", "dev_verify_failed", "--reason", "dev_verify_failed") in events
     assert not devrun.gh.ran("pr", "create")
     assert "agent/issue-300" not in sh(devrun.repo, "git", "ls-remote", "--heads", "origin")

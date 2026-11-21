@@ -923,7 +923,13 @@ def test_a_screenshot_review_that_fails_goes_to_the_owner_with_neither_fix_nor_m
         monkeypatch.setattr(review, "agent_comment", lambda repo, owner, pr, marker, round:
                             "" if "screenshot" in marker else real(repo, owner, pr, marker, round))
     assert screen_run(loop) == 0
-    assert handoffs == ["review_failed"]
+    expected = {
+        "run failed": "screenshot_run_failed",
+        "missing artifact": "screenshot_run_failed",
+        "comment not posted": "screenshot_comment_post_failed",
+        "comment missing at fix time": "review_comment_missing",
+    }[case]
+    assert handoffs == [expected]
     assert loop.labelled("ready-for-human") and not loop.fixes and not loop.merged
     assert not loop.checkpoint()
     assert "stale" not in "".join(loop.comments())
@@ -1091,7 +1097,7 @@ def test_screenshot_exhaustion_hands_off_once(loop, monkeypatch):
                         lambda self, kind, key, *args: handoffs.append(key) if kind == "handoff" else None)
     assert screen_run(loop) == 0
     assert [run["role"] for run in loop.agents] == ["review"]
-    assert handoffs == ["review_failed"]
+    assert handoffs == ["screenshot_reviewer_unavailable"]
     assert len(notices) == 1 and "all screenshot reviewers are PR authors" in notices[0][1]
     assert sum(c[:2] == ["pr", "edit"] and "--add-label" in c and "ready-for-human" in c
                for c in loop.gh.calls()) == 1

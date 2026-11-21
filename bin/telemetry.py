@@ -243,10 +243,29 @@ def gh_timeline(repo, pr):
 
 # Task events are deliberately bounded metadata, never agent prose.
 EVENTS = ('started', 'run_completed', 'review', 'screenshot_review', 'spec_review', 'fix', 'ci', 'verify', 'ci_fix', 'handoff', 'merged', 'attempt_completed')
-REASONS = ('none', 'auto_merge_off', 'manual_checks', 'review_failed', 'review_limit',
-           'fix_failed', 'needs_info', 'no_commit', 'push_failed', 'spec_failed',
-           'spec_limit', 'spec_rejected', 'ci_not_green', 'merge_failed', 'implementation_failed',
-           'verify_failed')
+REASONS = ('none',
+           'review_limit', 'spec_limit',
+           'review_run_failed', 'screenshot_run_failed', 'spec_review_run_failed', 'spec_revision_run_failed',
+           'fix_run_failed', 'fix_no_commit', 'fix_description_invalid', 'fix_task_invalid',
+           'dev_run_failed', 'dev_result_invalid', 'dev_task_invalid',
+           'ci_before_merge_not_green', 'ci_after_update_not_green',
+           'spec_adr_ci_before_merge_not_green', 'spec_adr_ci_after_update_not_green',
+           'review_comment_missing',
+           'review_comment_post_failed', 'screenshot_comment_post_failed', 'spec_review_comment_post_failed',
+           'spec_reply_post_failed', 'spec_comments_read_failed', 'spec_pending_adr_read_failed',
+           'spec_pending_accept_post_failed', 'spec_accept_post_failed',
+           'fix_checks_refresh_failed', 'fix_description_write_failed', 'fix_task_write_failed',
+           'spec_body_edit_failed', 'spec_adr_open_failed',
+           'dev_push_failed', 'fix_push_failed', 'spec_adr_push_failed',
+           'review_author_state_failed',
+           'dev_verify_failed', 'fix_verify_failed',
+           'fix_worktree_diverged',
+           'merge_failed', 'spec_adr_merge_failed', 'spec_adr_merge_unconfirmed', 'spec_adr_state_invalid',
+           'reviewer_unavailable', 'screenshot_reviewer_unavailable', 'reviewer_role_denied',
+           'screenshot_reviewer_role_denied', 'review_independence_denied', 'screenshot_independence_denied',
+           'spec_reviewer_model_unverified', 'spec_reviser_model_unverified',
+           'auto_merge_off', 'owner_review_paths', 'manual_checks', 'spec_rejected', 'spec_adr_closed',
+           'fix_needs_info', 'dev_blocked', 'spec_questions')
 CI_RESULTS = ('pass', 'failure', 'no_checks', 'pending', 'timeout', 'cancelled', 'infra_error', 'unknown')
 
 

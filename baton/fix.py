@@ -49,15 +49,12 @@ class Runner:
         self.hooks = hooks or telemetry.from_env(env, issue=env.runtime.issue, pr=pr, round=round)
 
     # --- the owner handoff every gate shares ---
-    def label_human(self, pr):
-        pr_helpers.gh("pr", "edit", str(pr), "-R", self.repo, "--add-label", "ready-for-human")
-
     def handoff(self, pr, reason, title, text):
         """Label the PR for the owner, record why, say so on Telegram; always rc 1."""
-        self.label_human(pr)
-        if reason:
-            self.hooks.task("handoff", reason, "--reason", reason)
-        notify.notify(title, text)
+        from . import handoff as owner_handoff
+        owner_handoff.perform(
+            self.env, reason, kind="pr", number=pr,
+            title=title, text=text, hooks=self.hooks, item=pr)
         return 1
 
     def comment(self, pr, body, failed=""):
@@ -187,7 +184,7 @@ class Runner:
         if log:
             notify.log(log)
         if rc != 0:
-            return self.handoff(pr, "", f"{who}PR #{pr}: Checks not refreshed",
+            return self.handoff(pr, "fix_checks_refresh_failed", f"{who}PR #{pr}: Checks not refreshed",
                                 f"The fix is pushed but the description may still list stale checks. {url}")
         return 0
 
@@ -201,7 +198,7 @@ class Runner:
         if log:
             notify.log(log)
         if rc != 0:
-            return self.handoff(pr, "", f"{who}PR #{pr}: Checks not refreshed",
+            return self.handoff(pr, "fix_checks_refresh_failed", f"{who}PR #{pr}: Checks not refreshed",
                                 f"The description may still list stale checks. {url}"), False
         return 0, changed
 
@@ -215,7 +212,8 @@ class Runner:
 
     def description_not_applied(self, pr, fixer, url, reason=""):
         detail = reason or "It was invalid or GitHub refused it"
-        return self.handoff(pr, "", f"PR #{pr}: description request not applied ({fixer})",
+        code = "fix_description_write_failed" if "GitHub" in detail or "refused" in detail.lower() else "fix_description_invalid"
+        return self.handoff(pr, code, f"PR #{pr}: description request not applied ({fixer})",
                             f"{detail}; the commits, if any, are pushed. {url}")
 
     # --- a Claude or Codex fixer ---
@@ -275,7 +273,7 @@ class Runner:
                 if log:
                     notify.log(log)
                 if rc != 0 and (rc != 2 or description_rc != 2):
-                    return self.handoff(pr, "", f"PR #{pr}: task completion change failed ({fixer})", url)
+                    return self.handoff(pr, "fix_task_invalid", f"PR #{pr}: task completion change failed ({fixer})", url)
         elif self.head(wt) != head:
             # Anything but a fix goes to the owner, who must see the partial work ("commit
             # what is done" in the fix prompts): push it unverified. Only a fix is gated below.
@@ -285,8 +283,8 @@ class Runner:
                 outcome = "RESULT: failed pushing fix"
         if not outcome.startswith("RESULT: fixed"):
             if outcome.startswith("RESULT: needs-info"):
-                return self.handoff(pr, "needs_info", f"PR #{pr} has questions", url)
-            return self.handoff(pr, "fix_failed", f"PR #{pr} fix failed ({fixer})", f"{outcome} {url}")
+                return self.handoff(pr, "fix_needs_info", f"PR #{pr} has questions", url)
+            return self.handoff(pr, "fix_run_failed", f"PR #{pr} fix failed ({fixer})", f"{outcome} {url}")
         if self.head(wt) == head:
             rc, checks_changed = self.recheck_without_commit(pr, "", url, description_changed)
             if rc != 0:
@@ -294,16 +292,16 @@ class Runner:
             if description_rc != 0:
                 return self.description_not_applied(pr, fixer, url, description_reason)
             if not task_changed and not checks_changed and not description_changed:
-                return self.handoff(pr, "no_commit", f"PR #{pr} needs you", f"The fix run made no commit; stopping the loop. {url}")
+                return self.handoff(pr, "fix_no_commit", f"PR #{pr} needs you", f"The fix run made no commit; stopping the loop. {url}")
         if self.head(wt) != head:
             rc, failure, rounds = self.verify(wt, "origin/main", fixer, "pr", pr)
             if rc != 0:
                 self.verify_failed(pr, failure, rounds)
-                return self.handoff(pr, "verify_failed", f"PR #{pr}: local CI verification failed", url)
+                return self.handoff(pr, "fix_verify_failed", f"PR #{pr}: local CI verification failed", url)
             if not self.record(pr, fixer, wt, agent_head, model if rounds == 0 else "unknown", cursor_base):
                 return 1
             if not push(wt, "HEAD", signoff=self.env.repo.signoff):
-                return self.handoff(pr, "push_failed", f"PR #{pr}: pushing fix failed", url)
+                return self.handoff(pr, "fix_push_failed", f"PR #{pr}: pushing fix failed", url)
             rc = self.refresh_checks(pr, "", url)
             if rc != 0:
                 return rc
@@ -360,8 +358,8 @@ class Runner:
                 self.comment(pr, f"<!-- baton-fix by=cursor -->\n{reply[:REPLY_CAP]}", f"PR #{pr}: posting Cursor's reply failed")
             if not outcome.startswith("RESULT: fixed"):
                 if outcome.startswith("RESULT: needs-info"):
-                    return self.handoff(pr, "needs_info", f"Cursor PR #{pr} has questions", url)
-                return self.handoff(pr, "fix_failed", f"Cursor PR #{pr} fix failed", f"{outcome} {url}")
+                    return self.handoff(pr, "fix_needs_info", f"Cursor PR #{pr} has questions", url)
+                return self.handoff(pr, "fix_run_failed", f"Cursor PR #{pr} fix failed", f"{outcome} {url}")
             if request.exists() or request.is_symlink() or want:
                 # Publish the fixed attempt after saving its checks, before any GitHub edit.
                 temp = task_file.with_suffix(".tmp")
@@ -381,7 +379,7 @@ class Runner:
                 notify.log(f"PR #{pr}: description update deferred after GitHub failure")
                 return 75
             if rc != 0 and (rc != 2 or description_rc != 2):
-                return self.handoff(pr, "", f"PR #{pr}: task completion change failed (cursor)", url)
+                return self.handoff(pr, "fix_task_invalid", f"PR #{pr}: task completion change failed (cursor)", url)
         moved = self.head(wt) != head
         if not moved:
             rc, checks_changed = self.recheck_without_commit(pr, "Cursor ", url, body_changed)
@@ -391,12 +389,12 @@ class Runner:
                 self.clear_cursor_request(pr)
                 if description_rc:
                     return self.description_not_applied(pr, "cursor", url, description_reason)
-                return self.handoff(pr, "no_commit", f"Cursor PR #{pr} needs you", f"Cursor's fix run made no commit. {url}")
+                return self.handoff(pr, "fix_no_commit", f"Cursor PR #{pr} needs you", f"Cursor's fix run made no commit. {url}")
         else:
             rc, failure, rounds = self.verify(wt, "origin/main", "cursor", "pr", pr)
             if rc != 0:
                 self.verify_failed(pr, failure, rounds)
-                return self.handoff(pr, "verify_failed", f"Cursor PR #{pr}: local CI verification failed", url)
+                return self.handoff(pr, "fix_verify_failed", f"Cursor PR #{pr}: local CI verification failed", url)
         try:
             vendors.record_author(self.state, pr, "cursor")
         except OSError:
@@ -404,7 +402,7 @@ class Runner:
         vendors.record_contrib(self.state, pr, "cursor", str(wt), head)
         if moved:
             if not push(wt, branch, signoff=self.env.repo.signoff):
-                return self.handoff(pr, "push_failed", f"Cursor PR #{pr}: push failed", url)
+                return self.handoff(pr, "fix_push_failed", f"Cursor PR #{pr}: push failed", url)
             if self.refresh_checks(pr, "Cursor ", url):
                 return 1
         self.clear_cursor_request(pr)

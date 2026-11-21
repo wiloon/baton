@@ -77,10 +77,10 @@ class ContributionTests(unittest.TestCase):
         self.store.event(spec_only['pipeline_id'], 'handoff', 'h', reason='spec_limit')
         docs = self.store.ensure(34, 35, repo='test/repo')                          # spec round's ADR PR, not the owner's
         self.agent_run('claude', 'spec', 34, 35)
-        self.store.event(docs['pipeline_id'], 'handoff', 'h', reason='spec_failed')
+        self.store.event(docs['pipeline_id'], 'handoff', 'h', reason='spec_review_run_failed')
         validation = self.store.ensure(32, repo='telemetry-validation/x')
         self.agent_run('codex', 'dev', 32, 0, repo='telemetry-validation/x')
-        self.store.event(validation['pipeline_id'], 'handoff', 'h', reason='push_failed')
+        self.store.event(validation['pipeline_id'], 'handoff', 'h', reason='fix_push_failed')
         self.store.ensure(33, repo='test/repo')                                     # active: not counted yet
         self.agent_run('codex', 'dev', 33, 0)
         m = self.metrics()

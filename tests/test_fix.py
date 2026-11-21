@@ -277,13 +277,23 @@ def test_without_a_real_change_the_owner_takes_over(run, reply):
 # --- the gate ladder -----------------------------------------------------------------------------
 
 @pytest.mark.parametrize("outcome, title, reason", [
-    ("RESULT: needs-info what?", f"PR #{PR} has questions", "needs_info"),
-    ("RESULT: failed boom", f"PR #{PR} fix failed (claude)", "fix_failed"),
+    ("RESULT: needs-info what?", f"PR #{PR} has questions", "fix_needs_info"),
+    ("RESULT: failed boom", f"PR #{PR} fix failed (claude)", "fix_run_failed"),
 ])
-def test_needs_info_and_failure_go_to_the_owner(run, outcome, title, reason):
+def test_needs_info_and_failure_go_to_the_owner(run, outcome, title, reason, monkeypatch):
+    seen = []
+    from baton import fix as fix_mod
+    original = fix_mod.Runner.handoff
+
+    def record(self, pr, code, ttl, text):
+        seen.append(code)
+        return original(self, pr, code, ttl, text)
+
+    monkeypatch.setattr(fix_mod.Runner, "handoff", record)
     run.agent({"outcome": outcome, "commit": False})
     assert run.fix()["rc"] == 1 and run.labelled()
     assert any(line.startswith(title) for line in run.runner_log())
+    assert seen == [reason]
 
 
 def test_a_fix_with_no_commit_stops_the_loop(run):

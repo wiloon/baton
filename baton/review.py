@@ -21,7 +21,7 @@ import re
 import sys
 import time
 
-from . import advisor, agents, check_verdicts, checkpoint, checks as check_section, dispatch, fix, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, vendors
+from . import advisor, agents, check_verdicts, checkpoint, checks as check_section, dispatch, fix, handoff as owner_handoff, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, vendors
 from .common import Deferred, Exhausted, changed, git, restore, strip_markers
 
 REPLY_CAP = 60000
@@ -239,11 +239,12 @@ class Review:
     def label(self, *options):
         pr_helpers.gh("pr", "edit", str(self.pr), "-R", self.repo, *options)
 
-    def handoff(self, reason, title, text):
-        advisor.outcome(self.env, "review_limit", self.pr, "handoff")
-        self.label("--add-label", "ready-for-human")
-        self.hooks.task("handoff", reason, "--reason", reason)
-        notify.notify(title, text)
+    def handoff(self, reason, title, text, *, snapshot="", revalidate=None):
+        """Terminal owner handoff through the shared entry (#125). Returns the entry Result."""
+        return owner_handoff.perform(
+            self.env, reason, kind="pr", number=self.pr,
+            title=title, text=text, hooks=self.hooks, item=self.pr, episode=self.issue,
+            snapshot=snapshot, revalidate=revalidate, close_outcomes=("review_limit",))
 
     def render(self, template, **pairs):
         return prompts.render(self.self_dir / template, list(pairs.items()), env=self.env)
@@ -274,17 +275,13 @@ class Review:
         not review it. The PR goes to the owner otherwise."""
         cfg = self.env.config
         if vendor not in cfg.declared() or not cfg.allows(vendor, "reviewer"):
-            self.label("--add-label", "ready-for-human")
-            self.hooks.task("handoff", "review_failed", "--pr", str(self.pr), "--reason", "review_failed")
-            notify.notify(f"PR #{self.pr} needs you",
-                          f"Reviewer {vendor} is not configured for code review.")
+            self.handoff("reviewer_role_denied", f"PR #{self.pr} needs you",
+                         f"Reviewer {vendor} is not configured for code review.")
             return False
         if vendors.review_allowed(self.state, self.pr, vendor, model, self.fixed_by):
             return True
-        self.label("--add-label", "ready-for-human")
-        self.hooks.task("handoff", "review_failed", "--pr", str(self.pr), "--reason", "review_failed")
-        notify.notify(f"PR #{self.pr} needs you",
-                      f"Reviewer {vendor}/{model or 'unknown'} may have written the code under review; refusing self-review.")
+        self.handoff("review_independence_denied", f"PR #{self.pr} needs you",
+                     f"Reviewer {vendor}/{model or 'unknown'} may have written the code under review; refusing self-review.")
         return False
 
     def seed(self):
@@ -465,10 +462,22 @@ class Review:
     def drop(self):
         self.checkpoint.unlink(missing_ok=True)
 
-    # --- the round limit: the advisor may grant one more round (#17) ---
-    def advise_limit(self, round, reviewer, fixer):
-        """advisor.Decision at the review round limit: "extra_round" (one more fix and review) or
-        "handoff". The snapshot is the PR context, every round's review and the diff size."""
+    def _screenshot_fail_reason(self, outcome):
+        lower = outcome.lower()
+        if "not role-allowed" in lower:
+            return "screenshot_reviewer_role_denied"
+        if "may be a pr author" in lower or "self-review" in lower:
+            return "screenshot_independence_denied"
+        if ("no screenshot reviewer" in lower or "unavailable" in lower
+                or "are pr authors" in lower or "reviewers are" in lower):
+            return "screenshot_reviewer_unavailable"
+        if "comment" in lower or "posting" in lower:
+            return "screenshot_comment_post_failed"
+        return "screenshot_run_failed"
+
+    # --- the round limit: the advisor may grant one more round (#17 / #125) ---
+    def limit_snapshot(self, round, reviewer, fixer):
+        """(snapshot, revalidate) for the review_limit decision point."""
         pr, wt = self.pr, self.wt
         head = git(wt, "rev-parse", "HEAD") or ""
         numstat = git(wt, "diff", "--numstat", "origin/main...HEAD") or ""
@@ -487,8 +496,7 @@ class Review:
         def still_current():
             data = pr_helpers.view(pr, "headRefOid,state")
             return bool(data) and data.get("state") == "OPEN" and data.get("headRefOid") == head
-        return advisor.advise(self.env, "review_limit", pr, snapshot, ("extra_round",),
-                              episode=self.issue, revalidate=still_current)
+        return snapshot, still_current
 
     # --- the loop ---
     def loop(self, note, fixer="agent", reviewer="pool"):
@@ -538,7 +546,7 @@ class Review:
                     try:
                         reviewer = self.review_vendor(reviewer)
                     except Exhausted as exhausted:
-                        self.handoff("review_failed", f"PR #{pr} needs you",
+                        self.handoff("reviewer_unavailable", f"PR #{pr} needs you",
                                      exhausted.reason or "No eligible reviewer for this PR.")
                         self.drop()
                         return 0
@@ -546,7 +554,8 @@ class Review:
                     self.save()
                     outcome = self.run_review(round, rnote, reviewer)
                     if not outcome.startswith(REVIEWED):
-                        self.handoff("review_failed", f"PR #{pr} review failed ({reviewer})", f"{outcome} {self.url}")
+                        reason = "review_comment_post_failed" if "comment" in outcome.lower() else "review_run_failed"
+                        self.handoff(reason, f"PR #{pr} review failed ({reviewer})", f"{outcome} {self.url}")
                         self.drop()
                         return 0
                     verdict = "pass" if outcome.startswith("REVIEW: pass") else "changes"
@@ -568,7 +577,8 @@ class Review:
                     except Exhausted as exhausted:
                         outcome = exhausted.reason or "No screenshot reviewer available."
                     if not outcome.startswith(REVIEWED):
-                        self.handoff("review_failed", f"PR #{pr} screenshot review failed", f"{outcome} {self.url}")
+                        reason = self._screenshot_fail_reason(outcome)
+                        self.handoff(reason, f"PR #{pr} screenshot review failed", f"{outcome} {self.url}")
                         self.drop()
                         return 0
                     screenshot = "1"
@@ -578,14 +588,15 @@ class Review:
                     advisor.outcome(self.env, "review_limit", pr, "pass")
                     break
                 if round >= self.max_rounds + extra:
-                    decision = advisor.Decision(advisor.HANDOFF) if extra else self.advise_limit(round, reviewer, fixer)
-                    if decision.extra_round:
+                    snap, check = self.limit_snapshot(round, reviewer, fixer)
+                    result = self.handoff(
+                        "review_limit", f"PR #{pr} needs you",
+                        f"Still has must-fix items after {round} review rounds. {self.url}",
+                        snapshot=snap, revalidate=check)
+                    if result.action == "extra_round":
                         extra = 1
-                        notify.log(f"PR #{pr}: advisor granted one more round: {decision.reason}")
+                        notify.log(f"PR #{pr}: advisor granted one more round: {result.decision.reason}")
                     else:
-                        self.handoff("review_limit", f"PR #{pr} needs you",
-                                     f"Still has must-fix items after {round} review rounds. {self.url}"
-                                     + advisor.handoff_note(decision))
                         self.drop()
                         return 0
             if step != "fix":
@@ -599,7 +610,7 @@ class Review:
                 code = agent_comment(self.repo, self.owner, pr, "baton-review", round)
                 shots = agent_comment(self.repo, self.owner, pr, "baton-screenshot-review", round)
                 if not (code and shots):
-                    self.handoff("review_failed", f"PR #{pr} review comment missing",
+                    self.handoff("review_comment_missing", f"PR #{pr} review comment missing",
                                  f"A review comment of round {round} is unavailable. {self.url}")
                     self.drop()
                     return 0

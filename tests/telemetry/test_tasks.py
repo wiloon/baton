@@ -36,7 +36,7 @@ class TaskTests(unittest.TestCase):
     def test_an_episode_without_an_issue_records_none_and_gains_one_later(self):
         task = self.store.ensure(0, 746, repo='test/repo')
         self.assertNotIn('issue', task)
-        self.store.event(task['pipeline_id'], 'handoff', 'failed', reason='fix_failed')
+        self.store.event(task['pipeline_id'], 'handoff', 'failed', reason='fix_run_failed')
         record = next(t.read(p) for p in (self.store.root / 'events').glob('*.json') if t.read(p)['event_kind'] == 'handoff')
         for payload in self.store.payloads(record):
             keys = {a['key'] for a in payload['resourceLogs'][0]['scopeLogs'][0]['logRecords'][0]['attributes']}
@@ -58,11 +58,11 @@ class TaskTests(unittest.TestCase):
     def test_a_merge_after_a_handoff_ends_the_episode_merged_and_keeps_the_handoff(self):
         task = self.store.ensure(123, 456, repo='test/repo')
         pipeline = task['pipeline_id']
-        self.store.event(pipeline, 'handoff', 'needs-info', reason='needs_info')
+        self.store.event(pipeline, 'handoff', 'needs-info', reason='fix_needs_info')
         self.store.event(pipeline, 'merged', 'merged', merged_by='owner')
         merged = t.read(self.store.path(pipeline))
         self.assertEqual(merged['task_status'], 'merged')
-        self.assertEqual(merged['reason'], 'needs_info')
+        self.assertEqual(merged['reason'], 'fix_needs_info')
         kinds = sorted(t.read(p)['event_kind'] for p in (self.store.root / 'events').glob('*.json'))
         self.assertEqual(kinds, ['handoff', 'merged', 'started'])
         self.assertEqual(self.store.latest(456, repo='test/repo'), pipeline)
@@ -129,7 +129,7 @@ class TaskTests(unittest.TestCase):
         with patch.object(t, 'identity', return_value=OWNER), patch.object(t.subprocess, 'run', side_effect=OSError):
             run2 = ledger.begin('codex', 'fix', 123, 60, 123, 456, repo='test/repo')
         ledger.end(run2['run_id'], 'interrupted')
-        self.store.event(run['pipeline_id'], 'handoff', 'failed', reason='fix_failed')
+        self.store.event(run['pipeline_id'], 'handoff', 'failed', reason='fix_run_failed')
         record = next(t.read(p) for p in (self.store.root / 'events').glob('*.json') if t.read(p)['event_kind']=='handoff')
         row = fields(self.store.payloads(record)[1])
         self.assertEqual(row['incomplete_runs'], '1')
@@ -188,14 +188,14 @@ class TaskTests(unittest.TestCase):
         pipeline = task['pipeline_id']
         self.store.event(pipeline, 'verify', 'pr:456:head:failure', ci_result='failure', duration_ms=12500)
         self.store.event(pipeline, 'ci_fix', 'pr:456:head', agent='codex', head_sha='a'*40)
-        self.store.event(pipeline, 'handoff', 'verify-failed', reason='verify_failed')
+        self.store.event(pipeline, 'handoff', 'verify-failed', reason='fix_verify_failed')
         records = [t.read(p) for p in (self.store.root/'events').glob('*.json')]
         verify = next(r for r in records if r['event_kind'] == 'verify')
         event, _ = self.store.payloads(verify)
         attrs = {a['key']: next(iter(a['value'].values())) for a in event['resourceLogs'][0]['scopeLogs'][0]['logRecords'][0]['attributes']}
         self.assertEqual(attrs['duration_ms'], '12500')
         self.assertEqual(attrs['ci_result'], 'failure')
-        self.assertEqual(t.read(self.store.path(pipeline))['reason'], 'verify_failed')
+        self.assertEqual(t.read(self.store.path(pipeline))['reason'], 'fix_verify_failed')
         with self.assertRaises(ValueError):
             self.store.event(pipeline, 'verify', 'bad-duration', duration_ms=-1)
 

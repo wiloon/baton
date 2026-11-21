@@ -658,8 +658,9 @@ def test_claude_spec_revision_verifies_main_session_models(loop, monkeypatch, ro
     else:
         assert not replies
         assert loop.gh.body == "Goal\nOld step\n"
-        assert loop.gh.ran("issue", "edit", N, "--remove-label", "agent-wip") == (
-            scenario in ("fallback", "fallback snapshot", "unknown", "ambiguous"))
+        swapped = any(c[:3] == ["issue", "edit", N] and "--remove-label" in c and "agent-wip" in c
+                      for c in loop.gh.calls)
+        assert swapped == (scenario in ("fallback", "fallback snapshot", "unknown", "ambiguous"))
         for artifact in Path("/tmp").glob(f"baton-spec-{N}-{round}.*"):
             artifact.unlink()
 
@@ -724,8 +725,9 @@ def test_codex_spec_fallback_verifies_actual_model_at_cli(loop, monkeypatch, tmp
         assert f"same-vendor-different-model (codex/{base} after codex/{other})" in posted[0]
     else:
         assert not posted
-        assert loop.gh.ran("issue", "edit", N, "--remove-label", "agent-wip") == (
-            scenario in ("reported unknown", "fallback identical"))
+        swapped = any(c[:3] == ["issue", "edit", N] and "--remove-label" in c and "agent-wip" in c
+                      for c in loop.gh.calls)
+        assert swapped == (scenario in ("reported unknown", "fallback identical"))
         for artifact in Path("/tmp").glob(f"baton-spec-{N}-2.*"):
             artifact.unlink()
 
