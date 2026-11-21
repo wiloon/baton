@@ -324,3 +324,16 @@ timeout_seconds = 600
 input_chars = 20000
 output_chars = 20000
 budget_usd = 1.0
+
+# Optional routine advisor (#17, ADR 0008): one DeepSeek call when a PR review or a spec review
+# runs out of rounds. "off" makes no call; "observe" records the advice and runs the rule (hand
+# off); "live" grants at most one extra round per task when the advisor says so. Decisions go to
+# STATE/advisor/decisions.jsonl and a daily digest. A [[repos]] entry with advisor = false keeps
+# that repository's text off the provider.
+[advisor]
+env_file = "~/.config/baton/deepseek.env"     # DEEPSEEK_API_KEY
+mode = "off"
+model = "deepseek-flash"
+base_url = "https://api.deepseek.com"
+timeout_seconds = 60
+snapshot_chars = 24000

@@ -31,7 +31,7 @@ import subprocess
 import sys
 import time
 
-from . import agents, checks as check_section, claude_cli, dispatch, e2e_gate, fix, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, review, vendors
+from . import advisor, agents, checks as check_section, claude_cli, dispatch, e2e_gate, fix, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, review, vendors
 from .common import Deferred, changed, git, permission_denials, push, restore, strip_markers
 
 REPLY_CAP = 60000
@@ -261,6 +261,7 @@ class Spec:
     def handoff(self, why, reason="spec_failed"):
         """The owner takes over; the loop resumes once they answer on the issue and remove
         ready-for-human."""
+        advisor.outcome(self.env, "spec_limit", self.issue, "handoff")
         swapped = self.gh("issue", "edit", self.issue, "--remove-label", "agent-wip", "--add-label", "ready-for-human")
         self.hooks.task("handoff", reason, "--reason", reason)
         if swapped.returncode != 0:
@@ -342,9 +343,42 @@ class Spec:
         return problems
 
     # --- the reviewer's round ---
+    def advise_limit(self, round, reviewer, reply, context):
+        """advisor.Decision at the spec round limit (#17): "extra_round" (one more revision and
+        review) or "handoff". The snapshot is the issue with its spec comments and the last review."""
+        n, env = self.issue, self.env
+        state = spec_state(env, n)
+        try:
+            issue_text = Path(context).read_text()
+        except OSError:
+            issue_text = ""
+        diff = git(self.wt, "diff", "--stat", "origin/main...HEAD") or "no ADR changes"
+        snapshot = (f"Decision point: spec round limit. Issue #{n} of {self.repo} used {round} spec review rounds "
+                    f"and the last reviewer ({reviewer}) still asks for changes.\n"
+                    "Actions: extra_round = one more revision of the issue by an agent, then one more review; "
+                    "handoff = the owner takes the spec.\n\n"
+                    f'<last-review round="{round}" by="{reviewer}">\n{reply}\n</last-review>\n\n'
+                    f"<adr-changes>\n{diff}\n</adr-changes>\n\n{issue_text}")
+        return advisor.advise(env, "spec_limit", n, snapshot, ("extra_round",), episode=n,
+                              revalidate=lambda: spec_state(env, n) == state)
+
+    def at_limit(self, round, max_rounds, reviewer, reply, context, why):
+        """True when the spec goes on for one advisor-granted round; otherwise hands off."""
+        if round < max_rounds + self.extra:
+            return True
+        decision = advisor.Decision(advisor.HANDOFF) if self.extra else self.advise_limit(round, reviewer, reply, context)
+        if decision.extra_round:
+            self.extra = 1
+            notify.log(f"#{self.issue}: advisor granted one more spec round: {decision.reason}")
+            return True
+        self.handoff(why + advisor.handoff_note(decision), "spec_limit")
+        return False
+
     def review_round(self, round, max_rounds, context):
         """"accept", "changes" or "stop" (the owner or a failure took over)."""
         n, wt, env = self.issue, self.wt, self.env
+        if not hasattr(self, "extra"):
+            self.extra = 1 if advisor.granted(env, "spec_limit", n) else 0   # granted by the advisor (#17)
         adr_note = "No ADR has been revised yet."
         if git(wt, "rev-list", "origin/main..HEAD"):
             adr_note = (f"Earlier rounds revised ADRs on this branch (docs PR #{self.pr or '?'}): "
@@ -378,9 +412,8 @@ class Spec:
                              f"{reviewer} accepted, but the issue body breaks the runner's rules:\n\n{points}\n\n"
                              f"{mode_note}{reply[:REPLY_CAP]}", f"posting the refused accept of {reviewer} failed"):
                 return "stop"
-            if round >= max_rounds:
-                self.handoff(f"{reviewer} accepted, but the issue body breaks the runner's rules after {round} spec rounds.",
-                             "spec_limit")
+            if not self.at_limit(round, max_rounds, reviewer, points, context,
+                                 f"{reviewer} accepted, but the issue body breaks the runner's rules after {round} spec rounds."):
                 return "stop"
             return "changes"
         if outcome.startswith("SPEC: changes"):
@@ -388,8 +421,8 @@ class Spec:
                              f"## Spec review ({reviewer}), round {round}\n\n{mode_note}{reply[:REPLY_CAP]}",
                              f"posting {reviewer}'s spec review failed"):
                 return "stop"
-            if round >= max_rounds:
-                self.handoff(f"{reviewer} still has points after {round} spec rounds.", "spec_limit")
+            if not self.at_limit(round, max_rounds, reviewer, reply[:REPLY_CAP], context,
+                                 f"{reviewer} still has points after {round} spec rounds."):
                 return "stop"
             return "changes"
         if outcome.startswith("SPEC: reject"):
@@ -419,6 +452,7 @@ class Spec:
         merge.remove_worktree(self.repo_dir, self.wt)
         round_m = re.search(r"round (\d+): accept", verdict)
         notify.notify(f"#{n}: spec accepted (round {round_m.group(1) if round_m else '?'})", self.url)
+        advisor.outcome(self.env, "spec_limit", n, "accept")
         self.finish()
         return "accept"
 
