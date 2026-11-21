@@ -25,8 +25,10 @@ class ActivityTests(unittest.TestCase):
 
     def test_idle_has_explicit_zero_for_all_vendors_and_no_execution_rows(self):
         result = self.collect([])
-        for vendor in t.VENDORS:
+        # Collect emits activity for declared config vendors only (config.example.toml).
+        for vendor in ('claude', 'codex', 'cursor'):
             self.assertIn('baton_running_by_agent{agent="' + vendor + '"} 0', result)
+        self.assertNotIn('baton_running_by_agent{agent="stub"}', result)
         self.assertNotIn('baton_current_execution_started_seconds', result)
 
     def test_failed_ledger_is_unknown_instead_of_idle(self):
@@ -131,18 +133,20 @@ class IntervalActivityTests(unittest.TestCase):
 
     def test_short_completed_run_is_active_even_when_no_process_is_running(self):
         records = [self.record()]
-        self.assertEqual(self.values(records), {'claude': 1, 'cursor': 0, 'codex': 0})
+        self.assertEqual(self.values(records),
+                         {vendor: int(vendor == 'claude') for vendor in t.VENDORS})
         emitted = []
         t.activity_metrics(records, lambda *args: emitted.append(args), 160)
         self.assertIn(('running_by_agent', 0, '{agent="claude"}'), emitted)
 
     def test_previous_interval_runs_do_not_make_idle_intervals_active(self):
         self.assertEqual(self.values([self.record(ended=100)]),
-                         {'claude': 0, 'cursor': 0, 'codex': 0})
+                         {vendor: 0 for vendor in t.VENDORS})
 
     def test_long_run_and_concurrent_vendors_are_preserved(self):
         records = [self.record('claude', 80, 120), self.record('codex', 90, 200, 'running')]
-        self.assertEqual(self.values(records), {'claude': 1, 'cursor': 0, 'codex': 1})
+        self.assertEqual(self.values(records),
+                         {vendor: int(vendor in ('claude', 'codex')) for vendor in t.VENDORS})
 
     def test_failed_first_and_long_gap_observations_are_unknown(self):
         for records, previous, now in [(None, 100, 160), ([], float('nan'), 160),
