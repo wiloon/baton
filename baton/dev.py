@@ -149,13 +149,13 @@ def finish_opening(tick, intent, path):
     except Exception as error:
         tick.log(f"PR #{pr}: filing side bugs failed: {error}")
     try:
-        tick.review_loop(pr, intent["wt"], REVIEW_NOTE.format(dev=vendor, issue=issue), "agent", "pool", issue=issue)
+        rc = tick.review_loop(pr, intent["wt"], REVIEW_NOTE.format(dev=vendor, issue=issue), "agent", "pool", issue=issue)
     finally:
         # Once the review checkpoint exists it owns continuation, even if this call defers.
         if (tick.state / f"review-pending-{pr}").exists():
             path.unlink(missing_ok=True)
     path.unlink(missing_ok=True)
-    return 80
+    return 75 if rc == 75 else 80
 
 
 def resume_opening(tick, path):

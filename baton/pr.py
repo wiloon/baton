@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -19,6 +20,12 @@ import time
 from . import pr_contract
 
 TASK_LINE = re.compile(r"TASK: (partial|complete)")
+
+
+def task_wanted(reply):
+    """The fixer's last full-line `TASK: partial|complete`, or '' when absent."""
+    wanted = [m[1] for line in reply.split("\n") if (m := TASK_LINE.fullmatch(line))]
+    return wanted[-1] if wanted else ""
 
 
 # A gh failure worth another try: the network or GitHub's edge, not the request (#46).
@@ -175,53 +182,104 @@ def preflight(pr):
     pr_contract.preflight(data)
 
 
-def apply_body(pr, request, state, ctx):
+def _prepare_request(text, issue, live, wanted):
+    """Canonical body for a description request. WANTED from `TASK:` may authorize a
+    change: the text may carry the live completion or the requested one; the result
+    uses WANTED. With no WANTED (or when it matches LIVE), the text must match LIVE."""
+    if not wanted or wanted == live:
+        return pr_contract.prepare(text, issue, live)
+    try:
+        prepared = pr_contract.prepare(text, issue, live)
+    except ValueError as error:
+        if str(error) != "a body edit cannot change task completion; request owner review":
+            raise
+        return pr_contract.prepare(text, issue, wanted)
+    return pr_contract.retarget(prepared, issue, wanted)
+
+
+def remove_body_request(path):
+    """Discard even a rejected directory at the agent's request path."""
+    try:
+        path.unlink(missing_ok=True)
+    except IsADirectoryError:
+        shutil.rmtree(path)
+
+
+def _original_body(baseline, current):
+    if baseline is None:
+        return current
+    if baseline.is_file():
+        return baseline.read_text().rstrip("\n")
+    temp = baseline.with_suffix(".tmp")
+    temp.write_text(current + "\n")
+    temp.replace(baseline)
+    return current
+
+
+def apply_body(pr, request, state, ctx, completion=None):
     """Apply an agent's PR description request (file REQUEST) with the runner-owned task
-    relation. Returns (rc, changed): rc 0 done or no request, 1 GitHub failed (retry),
-    2 invalid request. changed: the body differs from the one before the first attempt,
-    so a retry after a write whose response was lost still counts the change."""
+    relation. COMPLETION is the fixer's `TASK:` value when the fix path parsed one; the
+    standalone apply-body CLI leaves it None so the body must match the live completion.
+    Returns (rc, text_changed, reason, task_changed): rc 0 done or no request,
+    1 GitHub failed (retry), 2 invalid request. Changes are measured from before
+    the first attempt so a write whose response was lost still counts."""
     path = Path(request)
     if not path.exists() and not path.is_symlink():
-        return 0, False
+        return 0, False, "", False
     if path.is_symlink() or not path.is_file() or path.stat().st_size == 0:
-        return 2, False
+        return 2, False, "description request must be a non-empty regular file and cannot be a symlink", False
     current = view(pr, "headRefName,body")
     if current is None:
-        return 1, False
-    try:
-        issue, completion = pr_contract.relation(current)
-        if not re.fullmatch(r"\d+", issue) or completion not in ("partial", "complete"):
-            return 2, False
-        prepared = pr_contract.prepare(path.read_text(), issue, completion)
-    except ValueError:
-        return 2, False
+        return 1, False, "GitHub could not read the current PR description", False
     before = (current.get("body") or "").rstrip("\n")
     baseline = Path(state, f"pr-body-base-{pr}")
-    if not baseline.exists():
-        baseline.write_text(before + "\n")
+    original = _original_body(baseline, before)
+    try:
+        relation_source = {**current, "body": original} if completion else current
+        issue, original_completion = pr_contract.relation(relation_source)
+        if not re.fullmatch(r"\d+", issue) or original_completion not in ("partial", "complete"):
+            return 2, False, "cannot determine the PR's issue and task completion", False
+        if completion and pr_contract.relation(current)[0] != issue:
+            return 2, False, "the PR's associated issue changed since the fix began", False
+        prepared = _prepare_request(path.read_text(), issue, original_completion, completion)
+    except ValueError as error:
+        return 2, False, str(error), False
     if prepared.rstrip("\n") != before and not edit_body(pr, prepared, ctx, f"pr-{pr}-body-prepared."):
-        return 1, False
-    return 0, prepared.rstrip("\n") != baseline.read_text().rstrip("\n")
+        return 1, False, "GitHub could not update the PR description", False
+    task_changed = bool(completion and completion != original_completion)
+    if task_changed:
+        try:
+            original = pr_contract.retarget(original, issue, completion).rstrip("\n")
+        except ValueError:
+            # The replacement also corrected text that prevented a relation-only edit.
+            pass
+    return 0, prepared.rstrip("\n") != original, "", task_changed
 
 
-def apply_task(pr, reply, ctx):
-    """A fixer that agrees with a reviewer about the task completion ends its reply with
-    a `TASK: partial|complete` line of its own; rewrite the PR's task relation (Refs/
-    Closes) to match. Returns (rc, changed, log): rc 1 GitHub failed, 2 invalid relation."""
-    wanted = [m[1] for line in reply.split("\n") if (m := TASK_LINE.fullmatch(line))]
-    if not wanted:
+def apply_task(pr, want, ctx, baseline=None):
+    """Apply a parsed task completion. A saved baseline distinguishes an earlier
+    landed write from a no-op. Returns (rc, changed, log): 1 GitHub failed, 2 unusable relation,
+    3 unsafe retarget (e.g. a changed issue or a closing keyword in a partial PR)."""
+    if not want:
         return 0, False, ""
-    want = wanted[-1]
     current = view(pr, "headRefName,body")
     if current is None:
         return 1, False, ""
     try:
         issue, completion = pr_contract.relation(current)
+        before = (current.get("body") or "").rstrip("\n")
+        original = _original_body(baseline, before)
+        original_issue, original_completion = pr_contract.relation({**current, "body": original})
+        if original_issue != issue:
+            return 3, False, f"PR #{pr}: the associated issue changed since the fix began"
         if not re.fullmatch(r"\d+", issue):
             return 2, False, ""
         if completion == want:
-            return 0, False, ""
-        prepared = pr_contract.retarget((current.get("body") or "") + "\n", issue, want)
+            return 0, original_completion != want, ""
+        try:
+            prepared = pr_contract.retarget(before + "\n", issue, want)
+        except ValueError:
+            return 3, False, ""
     except ValueError:
         return 2, False, ""
     if not edit_body(pr, prepared, ctx, f"pr-{pr}-task."):
@@ -322,12 +380,14 @@ def main(argv=None):
             print(error, file=sys.stderr)
             return 1
     elif args.command == "apply-body":
-        rc, changed = apply_body(args.pr, args.request, str(env.dirs.state), str(env.dirs.ctx))
+        rc, changed, _reason, _task_changed = apply_body(args.pr, args.request, str(env.dirs.state), str(env.dirs.ctx))
         print(json.dumps({"changed": changed}))
         return rc
     elif args.command in ("apply-task", "apply-checks"):
         if args.command == "apply-task":
-            rc, changed, log = apply_task(args.pr, sys.stdin.read(), str(env.dirs.ctx))
+            rc, changed, log = apply_task(args.pr, task_wanted(sys.stdin.read()), str(env.dirs.ctx))
+            if rc == 3:
+                rc = 2
         else:
             rc, changed, log = apply_checks(args.pr, str(env.dirs.ctx))
         print(json.dumps({"changed": changed, "log": log}))
