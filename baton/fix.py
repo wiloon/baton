@@ -294,7 +294,12 @@ class Runner:
                 if rc == 1:
                     return self.category1(pr, "fix_task_write_failed",
                                           f"PR #{pr}: task completion change failed ({fixer})", url,
-                                          transient=task_transient, continuation={"op": "apply_task", "want": want})
+                                          transient=task_transient,
+                                          continuation={"op": "apply_task", "want": want, "fixer": fixer,
+                                                        "head": head, "agent_head": agent_head, "model": model,
+                                                        "cursor_base": cursor_base, "description_rc": description_rc,
+                                                        "description_changed": description_changed,
+                                                        "description_reason": description_reason})
                 if rc != 0 and (rc != 2 or description_rc != 2):
                     return self.handoff(pr, "fix_task_invalid",
                                         f"PR #{pr}: task completion change failed ({fixer})", url)
@@ -310,11 +315,18 @@ class Runner:
                 outcome = "RESULT: failed pushing fix"
                 if pushed.transient:
                     return self.category1(pr, "fix_push_failed", f"PR #{pr}: pushing fix failed", url,
-                                          transient=True, continuation={"op": "push", "ref": "HEAD"})
+                                          transient=True, continuation={"op": "push", "ref": "HEAD", "outcome": outcome,
+                                                                        "fixer": fixer})
         if not outcome.startswith("RESULT: fixed"):
             if outcome.startswith("RESULT: needs-info"):
                 return self.handoff(pr, "fix_needs_info", f"PR #{pr} has questions", url)
             return self.handoff(pr, "fix_run_failed", f"PR #{pr} fix failed ({fixer})", f"{outcome} {url}")
+        return self.finish_fix(pr, wt, fixer, head, agent_head, model, cursor_base, url, base_file, task_changed,
+                               description_rc, description_changed, description_reason)
+
+    def finish_fix(self, pr, wt, fixer, head, agent_head, model, cursor_base, url, base_file, task_changed,
+                   description_rc, description_changed, description_reason):
+        """The part of a Claude/Codex fix after its description and task writes: verify, push, refresh."""
         if self.head(wt) == head:
             rc, checks_changed = self.recheck_without_commit(pr, "", url, description_changed)
             if rc != 0:
@@ -333,7 +345,10 @@ class Runner:
             pushed = push_result(wt, "HEAD", signoff=self.env.repo.signoff)
             if not pushed.ok:
                 return self.category1(pr, "fix_push_failed", f"PR #{pr}: pushing fix failed", url,
-                                      transient=pushed.transient, continuation={"op": "push", "ref": "HEAD"})
+                                      transient=pushed.transient,
+                                      continuation={"op": "push", "ref": "HEAD", "fixer": fixer,
+                                                    "description_rc": description_rc,
+                                                    "description_reason": description_reason})
             from . import handoff as owner_handoff
             owner_handoff.clear_retry(self.env, str(pr), "fix_push_failed")
             rc = self.refresh_checks(pr, "", url)
@@ -463,17 +478,87 @@ class Runner:
                 return self.category1(pr, "fix_push_failed", f"Cursor PR #{pr}: push failed", url,
                                       transient=pushed.transient, continuation={"op": "push", "ref": branch})
             owner_handoff.clear_retry(self.env, str(pr), "fix_push_failed")
-            if self.refresh_checks(pr, "Cursor ", url):
-                return 1
+            rc = self.refresh_checks(pr, "Cursor ", url)
+            if rc:
+                return rc
         if discarded and moved:
             self.description_discarded(pr, "cursor", description_reason)
         self.clear_cursor_request(pr)
         return 0
 
 
+def resume_pending(runner, pr, wt):
+    """Replay a saved category-1 write of an earlier fix run, without running the fixer again.
+
+    None: nothing saved. 75: the saved retry is not due. Otherwise the step's rc."""
+    from . import handoff as owner_handoff
+    url = f"https://github.com/{runner.repo}/pull/{pr}"
+    for reason in ("fix_push_failed", "fix_checks_refresh_failed", "fix_task_write_failed"):
+        state = owner_handoff.gate(runner.env, str(pr), reason)
+        if state is None:
+            continue
+        if reason == "fix_task_write_failed" and "fixer" not in (owner_handoff.load_retry(
+                runner.env, str(pr), reason) or {}).get("continuation", {}):
+            continue   # Cursor's own task write resumes inside its run
+        if state == "wait":
+            return 75
+        res = runner.handoff(pr, reason, f"PR #{pr}: resuming {reason}", url, resume=True)
+        if res == 75:
+            return 75
+        if not isinstance(res, owner_handoff.Result) or res.action != owner_handoff.RETRY:
+            return 1
+        cont = res.continuation or {}
+        base_file = Path(runner.state, f"cursor-fix-base-{pr}")
+        op = cont.get("op")
+        if op == "push":
+            pushed = push_result(wt, cont.get("ref") or "HEAD", signoff=runner.env.repo.signoff)
+            if not pushed.ok:
+                return runner.category1(pr, reason, f"PR #{pr}: pushing fix failed", url,
+                                        transient=pushed.transient, continuation=cont)
+            owner_handoff.clear_retry(runner.env, str(pr), reason)
+            if cont.get("outcome"):
+                if cont["outcome"].startswith("RESULT: needs-info"):
+                    return runner.handoff(pr, "fix_needs_info", f"PR #{pr} has questions", url)
+                return runner.handoff(pr, "fix_run_failed", f"PR #{pr} fix failed ({cont.get('fixer')})",
+                                      f"{cont['outcome']} {url}")
+            rc = runner.refresh_checks(pr, "", url)
+            if rc:
+                return rc
+            if int(cont.get("description_rc") or 0):
+                runner.description_discarded(pr, cont.get("fixer") or "", cont.get("description_reason") or "")
+        elif op == "apply_checks":
+            rc = runner.refresh_checks(pr, "", url)
+            if rc:
+                return rc
+        elif op == "apply_task":
+            rc, task_changed, log, task_transient = pr_helpers.apply_task(pr, cont.get("want") or "", runner.ctx)
+            if log:
+                notify.log(log)
+            if rc == 1:
+                return runner.category1(pr, reason, f"PR #{pr}: task completion change failed", url,
+                                        transient=task_transient, continuation=cont)
+            if rc != 0 and (rc != 2 or int(cont.get("description_rc") or 0) != 2):
+                return runner.handoff(pr, "fix_task_invalid", f"PR #{pr}: task completion change failed", url)
+            owner_handoff.clear_retry(runner.env, str(pr), reason)
+            return runner.finish_fix(
+                pr, wt, cont.get("fixer") or "", cont.get("head") or "", cont.get("agent_head") or "",
+                cont.get("model") or "unknown", cont.get("cursor_base") or "", url, base_file, task_changed,
+                int(cont.get("description_rc") or 0), bool(cont.get("description_changed")),
+                cont.get("description_reason") or "")
+        else:
+            return runner.handoff(pr, reason, f"PR #{pr}: unusable saved retry", url)
+        base_file.unlink(missing_ok=True)
+        runner.clear_cursor_request(pr)
+        return 0
+    return None
+
+
 def fix_pr(runner, pr, wt, fixer, source, feedback, head=""):
     """The fix run for any fixer, with its fix telemetry; rc 0 done, 1 handed off, 75 deferred
     (Deferred when a vendor cannot run now)."""
+    pending = resume_pending(runner, pr, wt)
+    if pending is not None:
+        return pending
     if fixer == "cursor":
         rc = runner.cursor_fix(pr, wt, source, feedback, head)
         runner.hooks.fix("cursor", runner.round or 0, runner.reply)

@@ -330,7 +330,7 @@ class Spec:
 
     def _replay_reply_post(self, cont, round):
         body = cont.get("body") or ""
-        if not self.post(body, "posting saved spec reply failed", reason="spec_reply_post_failed"):
+        if not self.post(body, "posting saved spec reply failed", reason="spec_reply_post_failed", resumed=True):
             return "stop"
         return "revised"
 
@@ -345,8 +345,23 @@ class Spec:
         owner_handoff.clear_retry(self.env, self.issue, "spec_adr_push_failed")
         return "revised"
 
+    def open_adr_pr(self):
+        """The open ADR PR for this branch against main (a lost create response), or ''."""
+        listed = self.gh("pr", "list", "--head", self.branch, "--base", "main", "--state", "open",
+                         "--json", "number,headRefName,baseRefName")
+        try:
+            found = [p for p in json.loads(listed.stdout or "[]") if p.get("headRefName") == self.branch
+                     and p.get("baseRefName") == "main"] if listed.returncode == 0 else []
+        except (ValueError, TypeError, AttributeError):
+            return ""
+        return str(found[0]["number"]) if len(found) == 1 else ""
+
     def _replay_adr_open(self, cont, round):
         from . import handoff as owner_handoff
+        if (existing := self.open_adr_pr()):
+            owner_handoff.clear_retry(self.env, self.issue, "spec_adr_open_failed")
+            self.pr = existing
+            return "revised"
         created = self.gh("pr", "create", "--head", self.branch, "--base", "main",
                           "--title", f"docs(adr): spec revisions for #{self.issue}", "--body",
                           f"ADR revisions from the spec review of #{self.issue}.\n\n"
@@ -359,14 +374,28 @@ class Spec:
         self.pr = created.stdout.strip().rsplit("/", 1)[-1]
         return "revised"
 
-    def post(self, body, failed, *, reason=""):
-        """Publish BODY. On failure, reason (when set) schedules a category-1 retry or hands off."""
-        if reason:
+    def landed(self, body):
+        """True when the runner's exact BODY is already an issue comment (a lost write response)."""
+        listed = comments(self.env, self.issue)
+        return any(c.get("body", "").strip() == body.strip()
+                   and (c.get("author") or {}).get("login") == self.env.owner for c in listed or [])
+
+    def post(self, body, failed, *, reason="", extra=None, resumed=False):
+        """Publish BODY. On failure, reason (when set) schedules a category-1 retry or hands off.
+
+        RESUMED: the caller already consumed this reason's due attempt. EXTRA joins the saved continuation."""
+        replay = False
+        if reason and not resumed:
             cont = self.resume_category1(reason)
             if cont is False:
                 return False
-        posted = self.gh("issue", "comment", self.issue, "--body", body)
-        if posted.returncode == 0:
+            replay = cont is not None
+        elif reason:
+            replay = True
+        posted = None
+        if not (replay and self.landed(body)):
+            posted = self.gh("issue", "comment", self.issue, "--body", body)
+        if posted is None or posted.returncode == 0:
             if reason:
                 from . import handoff as owner_handoff
                 owner_handoff.clear_retry(self.env, self.issue, reason)
@@ -375,8 +404,33 @@ class Spec:
         if reason:
             self.category1(f"{failed}{pr_helpers.why(posted)}", reason,
                            transient=pr_helpers.recoverable(posted),
-                           continuation={"op": "issue_comment", "body": body})
+                           continuation={"op": "issue_comment", "body": body, **(extra or {})})
         return False
+
+    def replay_posts(self, round, max_rounds, context):
+        """A saved review or accept post replays before any reviewer runs; None when none is saved."""
+        from . import handoff as owner_handoff
+        for reason in ("spec_review_comment_post_failed", "spec_pending_accept_post_failed",
+                       "spec_accept_post_failed"):
+            saved = owner_handoff.load_retry(self.env, self.issue, reason)
+            if saved is None:
+                continue
+            cont = saved.get("continuation") or {}
+            if reason == "spec_accept_post_failed":
+                return "accept" if self.publish_accept(cont.get("verdict") or cont.get("body") or "") == "accept" else "stop"
+            if reason == "spec_pending_accept_post_failed":
+                if not self.post(cont.get("body") or "", "posting pending acceptance failed", reason=reason, extra=cont):
+                    return "stop"
+                return self.merge_adr_and_publish(cont.get("pr"), cont.get("verdict") or "",
+                                                  reviewer=cont.get("reviewer") or "")
+            if not self.post(cont.get("body") or "", "posting the spec review failed", reason=reason, extra=cont):
+                return "stop"
+            reviewer = cont.get("reviewer") or "reviewer"
+            if not self.at_limit(int(cont.get("round") or round), max_rounds, reviewer, cont.get("points") or "",
+                                 context, cont.get("limit") or ""):
+                return "stop"
+            return "changes"
+        return None
 
     def worktree(self):
         if self.path("spec-paused").is_file() and self.wt.is_dir():
@@ -477,6 +531,9 @@ class Spec:
         n, wt, env = self.issue, self.wt, self.env
         if not hasattr(self, "extra"):
             self.extra = 1 if advisor.granted(env, "spec_limit", n) else 0   # granted by the advisor (#17)
+        replayed = self.replay_posts(round, max_rounds, context)
+        if replayed is not None:
+            return replayed
         adr_note = "No ADR has been revised yet."
         if git(wt, "rev-list", "origin/main..HEAD"):
             adr_note = (f"Earlier rounds revised ADRs on this branch (docs PR #{self.pr or '?'}): "
@@ -510,7 +567,9 @@ class Spec:
                              f"## Spec review ({reviewer}), round {round}: accept refused by the runner\n\n"
                              f"{reviewer} accepted, but the issue body breaks the runner's rules:\n\n{points}\n\n"
                              f"{mode_note}{reply[:REPLY_CAP]}", f"posting the refused accept of {reviewer} failed",
-                             reason="spec_review_comment_post_failed"):
+                             reason="spec_review_comment_post_failed",
+                             extra={"round": round, "reviewer": reviewer, "points": points, "limit":
+                                    f"{reviewer} accepted, but the issue body breaks the runner's rules after {round} spec rounds."}):
                 return "stop"
             if not self.at_limit(round, max_rounds, reviewer, points, context,
                                  f"{reviewer} accepted, but the issue body breaks the runner's rules after {round} spec rounds."):
@@ -520,7 +579,9 @@ class Spec:
             if not self.post(f"<!-- baton-spec-review round={round} by={reviewer} -->\n"
                              f"## Spec review ({reviewer}), round {round}\n\n{mode_note}{reply[:REPLY_CAP]}",
                              f"posting {reviewer}'s spec review failed",
-                             reason="spec_review_comment_post_failed"):
+                             reason="spec_review_comment_post_failed",
+                             extra={"round": round, "reviewer": reviewer, "points": reply[:REPLY_CAP],
+                                    "limit": f"{reviewer} still has points after {round} spec rounds."}):
                 return "stop"
             if not self.at_limit(round, max_rounds, reviewer, reply[:REPLY_CAP], context,
                                  f"{reviewer} still has points after {round} spec rounds."):
@@ -547,7 +608,8 @@ class Spec:
         """Post the saved verdict and make the issue runnable. Keeps pending acceptance if the
         verdict write fails so a later tick can finish after the ADR PR is merged."""
         n = self.issue
-        if not self.post(verdict, "posting the accept verdict failed", reason="spec_accept_post_failed"):
+        if not self.post(verdict, "posting the accept verdict failed", reason="spec_accept_post_failed",
+                         extra={"verdict": verdict}):
             return "stop"
         self.gh("issue", "edit", n, "--remove-label", "needs-triage", "--add-label", "ready-for-agent")
         merge.remove_worktree(self.repo_dir, self.wt)
@@ -585,12 +647,17 @@ class Spec:
         """Resume an accepted spec whose ADR merge was interrupted (#122)."""
         pr, verdict = pending["pr"], pending["verdict"]
         self.pr = pr
+        if self.resume_category1("spec_pending_adr_read_failed") is False:
+            return False
         state = self.pr_state(pr)
         if state is None:
             self.category1(f"Could not read ADR PR #{pr} to resume acceptance.",
-                           "spec_pending_adr_read_failed", transient=True,
+                           "spec_pending_adr_read_failed",
+                           transient=pr_helpers.last_failure_transient(),
                            continuation={"op": "adr_read", "pr": pr})
             return False
+        from . import handoff as owner_handoff
+        owner_handoff.clear_retry(self.env, self.issue, "spec_pending_adr_read_failed")
         if state == "MERGED":
             return self.publish_accept(verdict) == "accept"
         if state == "CLOSED":
@@ -609,7 +676,8 @@ class Spec:
         if pr:
             pending = f"<!-- baton-spec-accept-pending pr={pr} -->\n{verdict}"
             if not self.post(pending, f"posting pending acceptance for ADR PR #{pr} failed",
-                             reason="spec_pending_accept_post_failed"):
+                             reason="spec_pending_accept_post_failed",
+                             extra={"pr": pr, "verdict": verdict, "reviewer": reviewer}):
                 return "stop"
             return self.merge_adr_and_publish(pr, verdict, reviewer=reviewer)
         return self.publish_accept(verdict)
@@ -618,6 +686,9 @@ class Spec:
     def revise_round(self, round, context):
         """"revised" or "stop" (the owner or a failure took over)."""
         n, wt, env = self.issue, self.wt, self.env
+        # A revision follows only a review comment that exists: a saved post of it already landed.
+        from . import handoff as owner_handoff
+        owner_handoff.clear_retry(env, n, "spec_review_comment_post_failed")
         # Resume a deferred body edit / reply without another reviser run (#125).
         for reason, replay in (
             ("spec_body_edit_failed", self._replay_body_edit),
@@ -736,12 +807,17 @@ class Spec:
         """True once the spec reviewer accepted (verdict comment posted, any ADR PR merged),
         False when the owner or a failure took over. Deferred when a vendor cannot run now."""
         n, env = self.issue, self.env
+        if self.resume_category1("spec_comments_read_failed") is False:
+            return False
         listed = comments(env, n)
         if listed is None:
             self.category1("Could not read issue comments to check pending acceptance.",
-                           "spec_comments_read_failed", transient=True,
+                           "spec_comments_read_failed",
+                           transient=pr_helpers.last_failure_transient(),
                            continuation={"op": "comments_read"})
             return False
+        from . import handoff as owner_handoff
+        owner_handoff.clear_retry(env, n, "spec_comments_read_failed")
         pending = pending_accept_in(listed, env.owner)
         if pending:
             # Resume the ADR merge without a worktree, vendor pick or agent dispatch (#122).

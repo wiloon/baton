@@ -303,7 +303,13 @@ class Review:
         return None, self.category1("review_comment_missing", title, text,
                                     transient=True, continuation=cont)
 
-    def resume_comment_post(self, reason):
+    def comment_landed(self, body):
+        """True when the runner's exact BODY is already a PR comment by the trusted author (a lost response)."""
+        data = pr_helpers.view(self.pr, "comments")
+        return any(c.get("body", "").strip() == body.strip() and (c.get("author") or {}).get("login") == self.owner
+                   for c in (data or {}).get("comments") or [])
+
+    def resume_comment_post(self, reason, round=None):
         """Replay a saved review/screenshot comment without re-running the worker (#125).
 
         Returns (outcome_or_None, rc): outcome continues the loop; rc 75 defers; rc 0 after handoff.
@@ -320,8 +326,19 @@ class Review:
             return None, 0
         cont = result.continuation or {}
         body = cont.get("body") or ""
-        posted = pr_helpers.gh("pr", "comment", str(self.pr), "-R", self.repo, "--body", body)
-        if posted.returncode == 0:
+        current = pr_helpers.view(self.pr, "headRefOid,baseRefName,state") or {}
+        if ((cont.get("head") and current.get("headRefOid") != cont["head"])
+                or (cont.get("base") and current.get("baseRefName") != cont["base"])
+                or (round is not None and cont.get("round") is not None and int(cont["round"]) != int(round))
+                or (current and current.get("state") != "OPEN")):
+            # The PR moved while the post waited: the saved verdict no longer describes it.
+            self.category1(reason, f"PR #{self.pr} review comment",
+                           f"The PR changed while a review comment waited to be posted. {self.url}", transient=False)
+            self.drop()
+            return None, 0
+        posted = None if self.comment_landed(body) else pr_helpers.gh(
+            "pr", "comment", str(self.pr), "-R", self.repo, "--body", body)
+        if posted is None or posted.returncode == 0:
             owner_handoff.clear_retry(self.env, self.issue or self.pr, reason)
             return cont.get("outcome") or "REVIEW: pass", None
         rc = self.category1(reason, f"PR #{self.pr} review comment",
@@ -405,7 +422,7 @@ class Review:
         if comment.returncode != 0:
             return self.failed("review_comment_post_failed", "RESULT: failed posting Cursor's review",
                                transient=pr_helpers.recoverable(comment),
-                               continuation={"body": body, "outcome": outcome}), reply
+                               continuation={"body": body, "outcome": outcome, "head": head, "round": round, "base": "main"}), reply
         return outcome, reply
 
     def run_review(self, round, note, reviewer=None):
@@ -471,7 +488,7 @@ class Review:
                 if posted.returncode != 0:
                     outcome = self.failed("review_comment_post_failed", "RESULT: failed posting review",
                                           transient=pr_helpers.recoverable(posted),
-                                          continuation={"body": text, "outcome": outcome})
+                                          continuation={"body": text, "outcome": outcome, "head": head, "round": round, "base": "main"})
             else:
                 outcome = self.failed("review_run_failed", "RESULT: failed no review artifact")
         self.hooks.verdict("review", reviewer, head, round, outcome, out["reply"] or "", str(review_file))
@@ -541,7 +558,7 @@ class Review:
                     outcome = self.failed("screenshot_comment_post_failed",
                                           "RESULT: failed posting screenshot review",
                                           transient=pr_helpers.recoverable(posted),
-                                          continuation={"body": text, "outcome": outcome})
+                                          continuation={"body": text, "outcome": outcome, "head": head, "round": round, "base": "main"})
             else:
                 outcome = self.failed("screenshot_run_failed", "RESULT: failed no screenshot review artifact")
         self.hooks.verdict("screenshot_review", vendor, head, round, outcome, out["reply"] or "", str(review_file))
@@ -623,7 +640,7 @@ class Review:
             if step in ("review", "screenshot"):
                 verdict = code_verdict
                 if step == "review":
-                    resumed, rc = self.resume_comment_post("review_comment_post_failed")
+                    resumed, rc = self.resume_comment_post("review_comment_post_failed", round)
                     if rc is not None:
                         return rc
                     if resumed is not None:
@@ -665,7 +682,7 @@ class Review:
                     code_verdict = verdict
                     self.values.update(step=step, code_verdict=code_verdict, screenshot_checks=checks)
                     self.save()
-                    resumed, rc = self.resume_comment_post("screenshot_comment_post_failed")
+                    resumed, rc = self.resume_comment_post("screenshot_comment_post_failed", round)
                     if rc is not None:
                         return rc
                     if resumed is not None:

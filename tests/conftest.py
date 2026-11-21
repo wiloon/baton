@@ -233,6 +233,13 @@ def worktree(tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def no_gh_backoff(monkeypatch):
+    """A transient gh failure retries at once: tests never wait out the real backoff."""
+    from baton import pr as pr_helpers
+    monkeypatch.setattr(pr_helpers, "sleep", lambda seconds: None)
+
+
+@pytest.fixture(autouse=True)
 def no_runner_credentials(monkeypatch):
     """The runner reads its keys from its environment first (#328): a developer's must not reach a test."""
     from baton.credentials import RUNNER_KEYS

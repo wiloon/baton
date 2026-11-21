@@ -204,6 +204,71 @@ def test_a_failed_checks_refresh_defers_under_the_category1_budget(run, gh, monk
                for line in run.runner_log())
 
 
+def test_a_checks_refresh_that_keeps_failing_replays_twice_then_hands_off_once(run, gh, monkeypatch):
+    clock = _due(monkeypatch)
+    gh.fail("edit-before-write")
+    run.agent({"file": "## Checks to verify\n- /billing: brand colour\n\nRESULT: fixed\n"})
+    assert run.fix()["rc"] == 75
+    assert run.fix()["rc"] == 75 and len(run.agent_calls) == 1   # no early attempt, no fixer rerun
+    clock["now"] = 1_060
+    assert run.fix()["rc"] == 75 and len(run.agent_calls) == 1   # first replay fails: 300 s next
+    clock["now"] = 1_200
+    assert run.fix()["rc"] == 75
+    clock["now"] = 1_360
+    assert run.fix()["rc"] == 1 and len(run.agent_calls) == 1   # second replay fails: one handoff
+    assert len([c for c in gh.calls() if c[:2] == ["pr", "edit"] and "ready-for-human" in c]) == 1
+
+
+def test_a_failed_checks_refresh_recovers_without_running_the_fixer_again(run, gh, monkeypatch):
+    clock = _due(monkeypatch)
+    gh.fail("edit")
+    run.agent({"file": "## Checks to verify\n- /billing: brand colour\n\nRESULT: fixed\n"})
+    assert run.fix()["rc"] == 75
+    gh.fail("edit", False)
+    clock["now"] = 1_060
+    assert run.fix()["rc"] == 0 and len(run.agent_calls) == 1 and not run.labelled()
+    assert section(run.body(), "Checks to verify") == "- /billing: brand colour"
+
+
+def test_a_fix_push_replays_only_the_push_then_refreshes_the_checks(run, gh, monkeypatch):
+    from baton import fix as fix_module
+    from baton.common import PushResult
+    clock = _due(monkeypatch)
+    results = [PushResult(False, True, "connection reset"), PushResult(False, True, "connection reset"),
+               PushResult(True)]
+    pushes = []
+    monkeypatch.setattr(fix_module, "push_result", lambda *a, **k: pushes.append(1) or results[len(pushes) - 1])
+    run.agent({"file": "## Checks to verify\n- /billing: brand colour\n\nRESULT: fixed\n"})
+    assert run.fix()["rc"] == 75 and len(pushes) == 1
+    assert run.fix()["rc"] == 75 and len(pushes) == 1   # no early attempt
+    clock["now"] = 1_060
+    assert run.fix()["rc"] == 75 and len(pushes) == 2
+    clock["now"] = 1_360
+    assert run.fix()["rc"] == 0 and len(pushes) == 3 and len(run.agent_calls) == 1
+    assert section(run.body(), "Checks to verify") == "- /billing: brand colour"
+
+
+def test_a_fix_push_that_keeps_failing_hands_off_once(run, gh, monkeypatch):
+    from baton import fix as fix_module
+    from baton.common import PushResult
+    clock = _due(monkeypatch)
+    monkeypatch.setattr(fix_module, "push_result", lambda *a, **k: PushResult(False, True, "connection reset"))
+    run.agent({"file": "## Checks to verify\nnone\n\nRESULT: fixed\n"})
+    assert run.fix()["rc"] == 75
+    clock["now"] = 1_060
+    assert run.fix()["rc"] == 75
+    clock["now"] = 1_360
+    assert run.fix()["rc"] == 1 and len(run.agent_calls) == 1
+    assert len([c for c in gh.calls() if c[:2] == ["pr", "edit"] and "ready-for-human" in c]) == 1
+
+
+def test_a_deferred_cursor_checks_refresh_keeps_its_deferral(run, gh, monkeypatch):
+    _due(monkeypatch)
+    run.agent(cursor_plan("## Checks to verify\n- /billing: tab colour\n\nRESULT: fixed"))
+    gh.fail("edit")
+    assert run.fix("cursor")["rc"] == 75 and not run.labelled()
+
+
 def cursor_plan(reply, **more):
     return {"reply": reply, **more}
 

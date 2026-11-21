@@ -833,7 +833,7 @@ def test_a_github_description_update_failure_does_not_lend_a_slot(ctx, monkeypat
 
     ctx.gh.answers["pr view"] = view_pr
     ctx.gh.answers["pr edit"] = lambda args: (
-        subprocess.CompletedProcess(args, 1, "", "boom") if "--body-file" in args else "")
+        subprocess.CompletedProcess(args, 1, "", "HTTP 503 boom") if "--body-file" in args else "")
     ctx.path("pr-body-base-11").write_text(body)
     Path(ctx.env["CTX"], "pr-11-body.md").write_text(body + "\n## Summary\nCorrected description.\n")
     checkpoint(ctx, pr="11", step="fix", wt=str(ctx.repo))
@@ -871,10 +871,10 @@ def test_a_second_tick_finishes_a_deferred_description_edit(ctx, worktree, monke
         nonlocal live, labelled
         if "--body-file" in args:
             if fail_edit and route == "owner":
-                return subprocess.CompletedProcess(args, 1, "", "edit refused")
+                return subprocess.CompletedProcess(args, 1, "", "HTTP 503 edit refused")
             live = Path(args[args.index("--body-file") + 1]).read_text()
             if fail_edit:
-                return subprocess.CompletedProcess(args, 1, "", "lost response")
+                return subprocess.CompletedProcess(args, 1, "", "connection reset: lost response")
         if "--remove-label" in args and "agent-fix" in args:
             labelled = False
         if "--add-label" in args and "ready-for-human" in args:
@@ -1573,6 +1573,45 @@ def test_forged_markers_never_reach_the_pr(devrun):
     devrun.go()
     create, = devrun.gh.ran("pr", "create")
     assert "baton-verdict" not in create[create.index("--body") + 1]
+
+
+def _dev_push(monkeypatch, outcomes):
+    from baton import dev, handoff
+    from baton.common import PushResult
+    clock = {"now": 1_000}
+    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
+    pushes = []
+    monkeypatch.setattr(dev, "push_result", lambda *a, **k: pushes.append(1) or (
+        PushResult(False, True, "connection reset") if outcomes[len(pushes) - 1] == "fail" else PushResult(True)))
+    return clock, pushes
+
+
+def test_a_dev_push_replays_only_the_push_after_both_delays_then_opens_the_pr(devrun, monkeypatch):
+    clock, pushes = _dev_push(monkeypatch, ["fail", "fail", "ok"])
+    devrun.script = [implements(fence=True)]
+    assert devrun.go()[1] == 75
+    assert devrun.go()[1] == 75 and len(pushes) == 1 and len(devrun.runs) == 1   # no early attempt
+    clock["now"] = 1_060
+    assert devrun.go()[1] == 75 and len(pushes) == 2   # first replay fails: 300 s next
+    clock["now"] = 1_200
+    assert devrun.go()[1] == 75 and len(pushes) == 2
+    clock["now"] = 1_360
+    assert devrun.go()[1] == 80 and len(pushes) == 3   # the push landed and the PR opened
+    assert len(devrun.runs) == 1   # the implementer never ran again
+    assert len(devrun.gh.ran("pr", "create")) == 1
+
+
+def test_a_dev_push_that_keeps_failing_hands_off_once_without_a_worker_rerun(devrun, monkeypatch):
+    clock, pushes = _dev_push(monkeypatch, ["fail"] * 3)
+    devrun.script = [implements(fence=True)]
+    assert devrun.go()[1] == 75
+    clock["now"] = 1_060
+    assert devrun.go()[1] == 75
+    clock["now"] = 1_360
+    assert devrun.go()[1] == 80 and len(pushes) == 3 and len(devrun.runs) == 1
+    assert len(devrun.gh.ran("issue", "edit", "300", "-R", "owner/app", "--remove-label", "agent-wip",
+                             "--add-label", "ready-for-human")) == 1
+    assert not devrun.gh.ran("pr", "create")
 
 
 def test_a_dirty_worktree_is_not_pushed(devrun):

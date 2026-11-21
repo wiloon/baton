@@ -215,16 +215,42 @@ def test_category_1_exhausts_after_two_later_attempts(env, monkeypatch):
     assert events[-1][0] == "handoff"
 
 
-def test_category_1_success_clears_pending_retry(env, monkeypatch):
+def test_a_saved_retry_that_its_caller_did_not_resume_hands_off_instead_of_looping(env, monkeypatch):
+    hooks, _ = _hooks()
+    labelled = []
+    monkeypatch.setattr(handoff, "clock", lambda: 1_000)
+    monkeypatch.setattr(handoff, "label_ready", lambda *a, **k: labelled.append(1) or MagicMock(returncode=0))
+    monkeypatch.setattr(handoff.notify, "notify", lambda *a, **k: None)
+    kwargs = dict(kind="issue", number="2", title="t", text="x", hooks=hooks, item="2", episode="2",
+                  transient=True, continuation={"op": "push"})
+    assert handoff.perform(env, "dev_push_failed", **kwargs).action == handoff.DEFER
+    assert handoff.perform(env, "dev_push_failed", **kwargs).action == handoff.HANDOFF   # never resumed
+    assert labelled == [1]
+
+
+def test_a_terminal_handoff_clears_every_pending_retry_of_the_episode(env, monkeypatch):
     hooks, _ = _hooks()
     monkeypatch.setattr(handoff, "clock", lambda: 1_000)
     monkeypatch.setattr(handoff, "label_ready", lambda *a, **k: MagicMock(returncode=0))
     monkeypatch.setattr(handoff.notify, "notify", lambda *a, **k: None)
-    handoff.perform(env, "dev_push_failed", kind="issue", number="2", title="t", text="x",
-                    hooks=hooks, item="2", episode="2", transient=True, continuation={"op": "push"})
-    assert handoff.load_retry(env, "2", "dev_push_failed") is not None
-    handoff.clear_retry(env, "2", "dev_push_failed")
-    assert handoff.load_retry(env, "2", "dev_push_failed") is None
+    common = dict(kind="pr", number="1", title="t", text="x", hooks=hooks, item="1", episode="ep")
+    handoff.perform(env, "fix_push_failed", transient=True, continuation={"op": "push"}, **common)
+    handoff.perform(env, "fix_checks_refresh_failed", transient=True, continuation={"op": "apply_checks"}, **common)
+    assert handoff.perform(env, "fix_run_failed", **common).action == handoff.HANDOFF
+    assert handoff.load_retry(env, "ep", "fix_push_failed") is not None   # a category-4 handoff keeps them
+    handoff.perform(env, "fix_push_failed", **common)   # unresumed: terminal
+    assert handoff.load_retry(env, "ep", "fix_push_failed") is None
+    assert handoff.load_retry(env, "ep", "fix_checks_refresh_failed") is None
+
+
+def test_an_unrecognized_gh_error_is_not_recoverable_but_a_transient_or_empty_one_is():
+    from baton import pr
+    err = lambda text: MagicMock(returncode=1, stderr=text)
+    assert not pr.recoverable(err("GraphQL: Could not resolve to a PullRequest"))
+    assert not pr.recoverable(err("HTTP 401: Bad credentials"))
+    assert not pr.recoverable(err("gh: command not found"))
+    assert pr.recoverable(err("HTTP 503: Service Unavailable"))
+    assert pr.recoverable(err(""))   # a lost response: the replay looks for the landed item first
 
 
 def test_every_category_1_reason_is_rule_mode_with_retry_budget():

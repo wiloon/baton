@@ -52,15 +52,19 @@ def transient(result):
 
 
 def recoverable(result):
-    """True when a category-1 later attempt may still succeed (#125).
+    """True when a category-1 later attempt may still succeed (#125): a recognized transient
+    failure, or an inconclusive one with no error text (a lost response; the replay first looks
+    for the landed item). Any other error text, such as auth or GraphQL errors, hands off at once."""
+    return transient(result) or not (result.stderr or "").strip()
 
-    Recognized transient failures qualify. So do inconclusive answers (empty stderr, a write
-    whose response was lost): only a clear permanent 4xx fails closed immediately.
-    """
-    stderr = result.stderr or ""
-    if re.search(r"HTTP 4\d\d", stderr) and not re.search(r"secondary rate limit", stderr, re.IGNORECASE):
-        return False
-    return True
+
+# The final result of the last `gh` call: a failed read has no result of its own to classify.
+last_result = None
+
+
+def last_failure_transient():
+    """True when the last failed `gh` call was a recognized transient failure."""
+    return last_result is not None and last_result.returncode != 0 and recoverable(last_result)
 
 
 def why(result):
@@ -120,14 +124,17 @@ def gh(*args, input=None, limit=None):
     retrying a write that is not idempotent (a comment, `pr create`, `issue create`,
     `pr merge`), it checks whether the first try landed. The one entry point for every
     baton `gh` call (#46); the final failure's stderr is in the result (why())."""
+    global last_result
     result = call(*args, input=input, limit=limit)
     for pause in BACKOFF:
         if result.returncode == 0 or not transient(result):
             break
         sleep(pause)
         if (done := _landed(args, input)) is not None:
+            last_result = done
             return done
         result = call(*args, input=input, limit=limit)
+    last_result = result
     if result.returncode != 0 and transient(result):
         from . import notify   # notify imports this module
         notify.log(f"gh {' '.join(args[:2])} failed after {len(BACKOFF) + 1} tries{why(result)}")
@@ -243,7 +250,7 @@ def apply_body(pr, request, state, ctx, completion=None):
         return 2, False, "description request must be a non-empty regular file and cannot be a symlink", False, False
     current = view(pr, "headRefName,body")
     if current is None:
-        return 1, False, "GitHub could not read the current PR description", False, True
+        return 1, False, "GitHub could not read the current PR description", False, last_failure_transient()
     before = (current.get("body") or "").rstrip("\n")
     baseline = Path(state, f"pr-body-base-{pr}")
     original = _original_body(baseline, before)
@@ -280,7 +287,7 @@ def apply_task(pr, want, ctx, baseline=None):
         return 0, False, "", False
     current = view(pr, "headRefName,body")
     if current is None:
-        return 1, False, "", True
+        return 1, False, "", last_failure_transient()
     try:
         issue, completion = pr_contract.relation(current)
         before = (current.get("body") or "").rstrip("\n")
@@ -336,7 +343,7 @@ def apply_checks(pr, ctx):
         checks = None
     current = body(pr)
     if current is None:
-        return 1, False, "", True
+        return 1, False, "", last_failure_transient()
     updated = pr_contract.set_checks(current, checks).rstrip("\n")
     changed = updated != current
     if changed:

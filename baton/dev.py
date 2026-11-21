@@ -233,6 +233,9 @@ def run(tick, issue):
         if not plan:
             tick.notify(f"#{issue}: spec accepted but no plan comment found", url)
             return 1
+    waiting = resume_push(tick, issue, wt, branch, body, url)
+    if waiting is not None:
+        return waiting
     resume_note, ok = setup_worktree(tick, wt, branch, issue)
     if not ok:
         return 1
@@ -273,15 +276,51 @@ def run(tick, issue):
     if not pushed.ok:
         return stop(tick, issue, "dev_push_failed", f"#{issue}: pushing {dev_vendor}'s branch failed",
                     f"{branch} is committed in {wt}. {url}",
-                    transient=pushed.transient, continuation={"op": "push", "ref": branch})
+                    transient=pushed.transient,
+                    continuation={"op": "push", "ref": branch, "vendor": dev_vendor, "model": dev_model,
+                                  "rounds": rounds, "base": base, "gate": verifier.gate_result or ""})
+    return open_pr(tick, issue, wt, branch, body, dev_vendor, dev_model, rounds, base, verifier.gate_result, url)
+
+
+def resume_push(tick, issue, wt, branch, body, url):
+    """A saved dev push waits for its delay, then replays only the push: no worker rerun. None: nothing saved."""
+    from . import handoff as owner_handoff
+    state = owner_handoff.gate(tick.env, issue, "dev_push_failed")
+    if state is None:
+        return None
+    if state == "wait":
+        return 75
+    env, repo = tick.env.with_runtime(issue=str(issue)), tick.gh_repo
+    result = owner_handoff.perform(
+        env, "dev_push_failed", kind="issue", number=issue, remove=("agent-wip",),
+        title=f"#{issue}: pushing the branch failed", text=f"{branch} is committed in {wt}. {url}",
+        hooks=tick.hooks(issue), item=issue, episode=issue, resume=True)
+    if result.action == owner_handoff.DEFER:
+        return 75
+    if result.action != owner_handoff.RETRY:
+        return 80
+    cont = result.continuation or {}
+    pushed = push_result(wt, branch, upstream=True, signoff=tick.env.repo.signoff)
+    if not pushed.ok:
+        return stop(tick, issue, "dev_push_failed", f"#{issue}: pushing the branch failed",
+                    f"{branch} is committed in {wt}. {url}", transient=pushed.transient, continuation=cont)
+    owner_handoff.clear_retry(env, str(issue), "dev_push_failed")
+    return open_pr(tick, issue, wt, branch, body, cont.get("vendor") or "unknown", cont.get("model") or "unknown",
+                   int(cont.get("rounds") or 0), cont.get("base") or git(wt, "rev-parse", "origin/main"),
+                   cont.get("gate") or "", url)
+
+
+def open_pr(tick, issue, wt, branch, body, dev_vendor, dev_model, rounds, base, gate_result, url):
+    """Create the PR for a pushed branch and finish the opening."""
+    env, repo = tick.env, tick.gh_repo
     lines = Path(body).read_text().split("\n")
     try:
         text = pr_body(check_section.canonicalize(Path(body).read_text()), issue)
     except ValueError:
         return stop(tick, issue, "dev_task_invalid", f"#{issue}: invalid PR task relation",
                     f"Review the completion field in {body}. {url}")
-    if verifier.gate_result:
-        text += f"\n\n## E2E gate\n{verifier.gate_result}, on {git(wt, 'rev-parse', '--short', 'HEAD')}. The runner ran this."
+    if gate_result:
+        text += f"\n\n## E2E gate\n{gate_result}, on {git(wt, 'rev-parse', '--short', 'HEAD')}. The runner ran this."
     intent = {"issue": str(issue), "branch": branch, "wt": str(wt), "base": base,
               "head": git(wt, "rev-parse", "HEAD"), "vendor": dev_vendor,
               "model": dev_model if rounds == 0 else "unknown", "pr": ""}

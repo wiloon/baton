@@ -159,6 +159,35 @@ def label_ready(env, kind, number, remove=()):
     return pr_helpers.gh(cmd, "edit", str(number), "-R", env.repo.gh_repo, *opts)
 
 
+def _finish(env, reason, entry, *, kind, number, title, text, hooks, remove, item, close_outcomes,
+            after_labels, decision=None):
+    """The one terminal handoff: outcomes, labels, telemetry, notify, log."""
+    for point in close_outcomes:
+        advisor.outcome(env, point, item, "handoff")
+    result = label_ready(env, kind, number, remove=remove)
+    if after_labels:
+        after_labels(result)
+    hooks.task("handoff", reason, "--reason", reason)
+    body = (text() if callable(text) else text) + (advisor.handoff_note(decision) if decision else "")
+    notify.notify(title, body)
+    notify.log(f"handoff {reason} category={entry.category}")
+    return Result(HANDOFF, decision, True)
+
+
+def clear_episode(env, episode):
+    """Drop every pending category-1 retry of EPISODE (a terminal handoff ends them all)."""
+    for path in Path(str(env.dirs.state)).glob(f"handoff-retry-{episode}-*.json"):
+        path.unlink(missing_ok=True)
+
+
+def gate(env, episode, reason):
+    """Where a saved category-1 retry stands: None (none saved), "wait" (not due), "due"."""
+    pending = load_retry(env, str(episode), reason)
+    if pending is None:
+        return None
+    return "due" if int(clock()) >= int(pending.get("due") or 0) else "wait"
+
+
 def _category1(env, reason, entry, *, kind, number, title, text, hooks, remove, item, episode,
                close_outcomes, after_labels, transient, continuation, resume):
     """Rule-decided recovery: schedule, consume a due attempt, or hand off (#125)."""
@@ -167,17 +196,10 @@ def _category1(env, reason, entry, *, kind, number, title, text, hooks, remove, 
     pending = load_retry(env, episode, reason)
 
     def finish(decision=None):
-        clear_retry(env, episode, reason)
-        for point in close_outcomes:
-            advisor.outcome(env, point, item, "handoff")
-        result = label_ready(env, kind, number, remove=remove)
-        if after_labels:
-            after_labels(result)
-        hooks.task("handoff", reason, "--reason", reason)
-        body = (text() if callable(text) else text) + (advisor.handoff_note(decision) if decision else "")
-        notify.notify(title, body)
-        notify.log(f"handoff {reason} category={entry.category}")
-        return Result(HANDOFF, decision, True)
+        clear_episode(env, episode)
+        return _finish(env, reason, entry, kind=kind, number=number, title=title, text=text, hooks=hooks,
+                       remove=remove, item=item, close_outcomes=close_outcomes, after_labels=after_labels,
+                       decision=decision)
 
     if resume:
         if pending is None:
@@ -191,12 +213,11 @@ def _category1(env, reason, entry, *, kind, number, title, text, hooks, remove, 
         notify.log(f"handoff-retry {reason} attempt={attempts}/{MAX_ATTEMPTS} episode={episode}")
         return Result(RETRY, handed_off=False, continuation=pending.get("continuation"))
 
-    if not transient:
+    # A saved entry that was never resumed (its caller forgot) must not loop forever: hand off.
+    attempts = int(pending.get("attempts") or 0) if pending else 0
+    if not transient or (pending is not None and attempts == 0) or attempts >= MAX_ATTEMPTS:
         return finish()
 
-    attempts = int(pending.get("attempts") or 0) if pending else 0
-    if attempts >= MAX_ATTEMPTS:
-        return finish()
     delay = DELAYS[attempts]
     save_retry(env, episode, reason, {
         "attempts": attempts,
@@ -226,16 +247,9 @@ def perform(env, reason, *, kind, number, title, text, hooks, remove=(), item=""
         raise UnknownReason(f"unlisted handoff reason: {reason!r}")
 
     def finish(decision=None):
-        for point in close_outcomes:
-            advisor.outcome(env, point, item, "handoff")
-        result = label_ready(env, kind, number, remove=remove)
-        if after_labels:
-            after_labels(result)
-        hooks.task("handoff", reason, "--reason", reason)
-        body = (text() if callable(text) else text) + (advisor.handoff_note(decision) if decision else "")
-        notify.notify(title, body)
-        notify.log(f"handoff {reason} category={entry.category}")
-        return Result(HANDOFF, decision, True)
+        return _finish(env, reason, entry, kind=kind, number=number, title=title, text=text, hooks=hooks,
+                       remove=remove, item=item, close_outcomes=close_outcomes, after_labels=after_labels,
+                       decision=decision)
 
     if entry.category == 1:
         return _category1(env, reason, entry, kind=kind, number=number, title=title, text=text,

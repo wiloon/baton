@@ -1283,6 +1283,59 @@ def test_a_failed_review_is_classified_where_it_fails(loop, monkeypatch, case, r
         _one_handoff(loop, seen, reason)
 
 
+def _post_clock(loop, monkeypatch):
+    from baton import handoff
+    clock = {"now": 1_000}
+    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
+    loop.gh.set(headRefOid=sh(loop.wt, "git", "rev-parse", "HEAD"), baseRefName="main", state="OPEN")
+    loop.after["review"] = lambda: loop.gh.fail("comment")
+    return clock
+
+
+def test_a_review_comment_post_replays_the_saved_body_without_a_reviewer_run(loop, monkeypatch):
+    clock = _post_clock(loop, monkeypatch)
+    assert loop.run(fixer="cursor", reviewer="claude") == 75
+    runs = len(loop.agents)
+    assert loop.run(fixer="cursor", reviewer="claude") == 75 and len(loop.agents) == runs   # no early attempt
+    clock["now"] = 1_060
+    loop.gh.fail("comment", False)
+    loop.after.clear()
+    before = len(loop.comments())
+    assert loop.run(fixer="cursor", reviewer="claude") == 0
+    assert len([c for c in loop.comments()[before:] if c.startswith("<!-- baton-review round=1 by=claude -->")]) == 1
+    assert len(loop.agents) == runs + 1   # only round 2 ran a reviewer
+    assert loop.merged == [PR]
+    assert not list(Path(loop.env["STATE"]).glob("handoff-retry-*"))   # the success cleared the saved retry
+
+
+def test_a_review_comment_post_that_keeps_failing_replays_twice_then_hands_off_once(loop, monkeypatch):
+    clock = _post_clock(loop, monkeypatch)
+    assert loop.run(fixer="cursor", reviewer="claude") == 75
+    runs = len(loop.agents)
+    clock["now"] = 1_060
+    assert loop.run(fixer="cursor", reviewer="claude") == 75   # first replay fails: 300 s next
+    clock["now"] = 1_200
+    assert loop.run(fixer="cursor", reviewer="claude") == 75
+    clock["now"] = 1_360
+    assert loop.run(fixer="cursor", reviewer="claude") == 0   # second replay fails: one handoff
+    assert len(loop.agents) == runs and not loop.merged
+    assert len([c for c in loop.gh.calls() if c[:2] == ["pr", "edit"] and "--add-label" in c
+                and "ready-for-human" in c]) == 1
+    assert not list(Path(loop.env["STATE"]).glob("handoff-retry-*"))
+
+
+def test_a_saved_review_post_is_dropped_when_the_head_moved_during_the_wait(loop, monkeypatch):
+    clock = _post_clock(loop, monkeypatch)
+    assert loop.run(fixer="cursor", reviewer="claude") == 75
+    loop.gh.fail("comment", False)
+    loop.gh.set(headRefOid="f" * 40)   # a push landed while the post waited
+    clock["now"] = 1_060
+    before = len(loop.comments())
+    assert loop.run(fixer="cursor", reviewer="claude") == 0
+    assert len(loop.comments()) == before and not loop.merged and loop.labelled("ready-for-human")
+    assert not list(Path(loop.env["STATE"]).glob("handoff-retry-*"))
+
+
 def test_an_agent_screenshot_failure_that_mentions_a_comment_stays_a_run_failure(loop, monkeypatch):
     seen = _watch(monkeypatch)
     loop.reviews[:] = ["pass"]
