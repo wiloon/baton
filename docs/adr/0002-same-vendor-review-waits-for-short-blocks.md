@@ -8,10 +8,14 @@ A cross-check by another vendor catches more than one vendor checking itself wit
 model, so same-vendor review (Codex reviewing Codex, Claude revising Claude's spec) is a last
 resort. We allow it only when every other vendor that could do the job is blocked for the long
 term: weekly quota at its cap, a dead credential, or a cooldown longer than a configurable
-threshold. If any of them is blocked only for the short term (5-hour window full, or a short
-cooldown), the item defers and waits for that vendor rather than falling back. The rule is
-symmetric across vendors: Claude out of its 5-hour window makes a Codex-written PR wait for
+threshold. If any of them is blocked only for the short term (5-hour window at or above its
+effective cap, or a short cooldown), the item defers and waits for that vendor. The rule is
+symmetric across vendors. Claude out of its 5-hour window makes a Codex-written PR wait for
 Claude just as Codex out of its 5-hour window makes Claude's work wait for Codex.
+
+For a vendor with a reported 5-hour window, use `[vendors.<id>] five_hour_max` when set and
+`[quota] quota_five_hour_max` otherwise. A vendor without a 5-hour window has no 5-hour quota
+block.
 
 Apply this comparison to declared vendors eligible for the role (ADR 0007) and the
 current task. A same-vendor fallback must be role-allowed and pass its adapter's model
@@ -47,3 +51,5 @@ eligibility policy (ADRs 0004 and 0005).
   while the PR waits for independent review.
 - Issue #103: scope fallback and short-block waiting to role-eligible vendors so a vendor
   outside the registry or allowlist cannot run or hold up the step.
+- Issue #148: use each vendor's effective 5-hour cap for short quota blocks so one vendor
+  can use its full 5-hour window while others keep their reserve.
