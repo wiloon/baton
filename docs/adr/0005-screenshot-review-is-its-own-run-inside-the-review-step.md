@@ -60,31 +60,31 @@ fix                        reads both, answers Must fix and design findings, re-
   When feedback is cut, the design findings survive with the Must fix section.
 - The runner tracks the design exchange itself and does not trust a later review to repeat it.
   Each finding gets a stable id when the runner first reads it, `D<round>.<n>` (the round that
-  raised it and its number there); the id never changes, so a later round's finding with the
-  same number is a different finding. The loop's checkpoint holds every open finding by id (with
-  the text of the checks it blocks) and every disagreement, across rounds and a deferred resume.
-  From the checkpoint the runner renders one `Open design findings` block, by id, into every fix
+  raised it and its number there); the id never changes, so a later round's finding with the same
+  number is a different finding. The loop's checkpoint holds every open finding by id (with the
+  text of the checks it blocks) and every disagreement, across rounds and a deferred resume. From
+  the checkpoint the runner renders one `Open design findings` block, by id, into every fix
   feedback (also a round with no screenshot review, whose fixer otherwise sees only the code
   review) and into every screenshot prompt after round 1. The fixer answers and the reviewer
-  judges by id, never by the comment's local number. A loop that starts without a checkpoint
-  gets a fresh loop id, kept in the checkpoint across a deferred resume, and a fix comment
-  carries the loop and its round (`<!-- baton-fix by=<vendor> loop=<id> round=<n> -->`), so a
-  review reads only the answers this loop's fixer gave since the previous screenshot review.
-  Round numbers restart at 1 when the same PR starts a new loop (after the owner's feedback,
-  for example), so a comment of another loop, or one with no loop id, is never an answer. A round's fixer runs with that round's number, after its
-  screenshot review, so the replies since the previous screenshot review are the fix comments
-  with `previous screenshot round <= round < current round` (the fix that answered round 1's
-  review is `round=1`; with no previous screenshot review the lower bound is round 1). That review must judge every open id in the block exactly
-  once under `## Design answers`. An id with no valid, single answer stays open, however many
-  rounds pass. Only the fixer's *current* answer decides a disposition: the answer to that id
-  in the fix replies since the previous screenshot review, which must be exactly one valid line
-  (an id answered twice, even identically, or in two of those replies, counts as unanswered).
-  An earlier round's answer is history: the block shows it, labelled as earlier, but it never
-  makes a disagreement and never closes an id. A held finding whose current answer is
-  `rejected` is a disagreement for the owner; a held finding the fixer adopted, did not answer,
-  or answered ambiguously stays open. Only a valid `resolved` answer closes an id, and nothing
-  closes a disagreement, so a later review that omits one, or a round with no screenshot
-  review, cannot drop it.
+  judges by id, never by the comment's local number. A loop that starts without a checkpoint gets
+  a fresh loop id, kept in the checkpoint across a deferred resume, and a fix comment carries the
+  loop and its round (`<!-- baton-fix by=<vendor> loop=<id> round=<n> -->`), so a review reads
+  only the answers this loop's fixer gave since the previous screenshot review. Round numbers
+  restart at 1 when the same PR starts a new loop (after the owner's feedback, for example), so a
+  comment of another loop, or one with no loop id, is never an answer. A round's fixer runs with
+  that round's number, after its screenshot review, so the replies since the previous screenshot
+  review are the fix comments with `previous screenshot round <= round < current round` (the fix
+  that answered round 1's review is `round=1`; with no previous screenshot review the lower bound
+  is round 1). That review must judge every open id in the block exactly once under `## Design
+  answers`. An id with no valid, single answer stays open, however many rounds pass. Only the
+  fixer's *current* answer decides a disposition: the answer to that id in the fix replies since
+  the previous screenshot review, which must be exactly one valid line (an id answered twice, even
+  identically, or in two of those replies, counts as unanswered). An earlier round's answer is
+  history: the block shows it, labelled as earlier, but it never makes a disagreement and never
+  closes an id. A held finding whose current answer is `rejected` is a disagreement for the owner;
+  a held finding the fixer adopted, did not answer, or answered ambiguously stays open. Only a
+  valid `resolved` answer closes an id, and nothing closes a disagreement, so a later review that
+  omits one, or a round with no screenshot review, cannot drop it.
 - A fix run that commits nothing is not a `no_commit` hand-off when its reply answers every
   design finding (all `rejected`) and the feedback had no Must fix item: the next round's
   screenshot review judges the rejections. The fixer still re-shoots as the fix rules say.
