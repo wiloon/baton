@@ -41,8 +41,9 @@ by evaluation evidence from observation mode. The owner can enable a decision po
 the start when its worst wrong choice costs at most one more bounded attempt followed by the
 existing handoff, within the runner's normal authorization, review and retry rules. This covers
 the review and spec round limits (#17) and the bounded recovery steps identified for live use
-in #125. An advisor action that can resume a merge or supply an answer for a reviser to act on
-starts in observation. Rules and owner-only reasons never call the advisor.
+in #125. An advisor action that can resume a merge starts in observation. For spec questions,
+the owner approved live use of complete grounded answers that restate decisions already made.
+Reversible defaults stay in observation. Rules and owner-only reasons never call the advisor.
 
 The global `off`, `observe` and `live` setting caps the mode of every decision point. In global
 `live`, the runner uses each point's approved mode, so new points can be evaluated while the
@@ -63,14 +64,15 @@ advisor action per reason and task episode, and a recurrence after that action g
 ## Consequences
 
 - Advisor usage is recorded separately from workload usage.
-- The routine advisor sends issue and PR content to an external provider. A repository can turn
-  the routine advisor off, and its decision points then use the rules. #125 keeps raw diffs,
-  CI log excerpts and local repository file contents out of advisor payloads pending an owner
-  decision about data egress. Diff size and CI check status can provide context within the
-  existing redaction boundary.
-- Advisor-authored answers carry separate provenance and have advisory authority in the spec
-  loop. The owner must decide which kinds of answers may be used live before the runner can
-  publish one and resume revision.
+- The routine advisor sends bounded issue and PR content to an external provider. Baseline
+  context can include diff size and CI check status. Each repository must opt in separately
+  to raw diff excerpts, CI log excerpts and local repository documents used as citation
+  evidence. Each opt-in defaults to off. Redaction and payload limits apply to all fields.
+  A repository can turn the routine advisor off and use the rules at every decision point.
+- Advisor-authored answers carry separate provenance. In live mode the runner can publish a
+  complete, cited grounded answer set and resume revision within the remaining budget.
+  Independent spec review and normal merge gates still apply. Reversible defaults and new
+  owner decisions lead to handoff, and a genuine owner answer takes precedence.
 - Over time, rule code should shrink into fallback paths while the mechanism stays the same:
   state machine, quota and leases, permissions, review independence and side-effect execution.
   Later bounded agents, such as issue decomposition, follow the same contract. They return data
@@ -90,3 +92,7 @@ advisor action per reason and task episode, and a recurrence after that action g
   place of a default Claude Code escalation session. Record the allowed live recovery steps
   per decision point so merge recovery and spec answers can start in observation alongside the
   existing live round limits.
+- Issue #125 (round 1 owner answers): allow complete, cited grounded answers to resume revision
+  within existing review gates to reduce handoffs. Keep reversible defaults in observation and
+  require separate repository opt-ins for the three excerpt types to preserve the current data
+  boundary when only the advisor is enabled.
