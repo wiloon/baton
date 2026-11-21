@@ -255,7 +255,7 @@ def make_hooks(runner, **context):
 
 def test_a_task_event_keeps_the_pipeline_for_the_next_one(runner):
     telemetry = make_hooks(runner, issue=142, pr=168)
-    telemetry.task("handoff", "handoff", "--reason", "fix_failed")
+    telemetry.task("handoff", "handoff", "--reason", "fix_run_failed")
     telemetry.task("merged", "merged")
     first, second = runner.calls()
     assert first[:9] == ["task", "handoff", "--repo", "owner/app", "--issue", "142", "--pr", "168", "--key"]

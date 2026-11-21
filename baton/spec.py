@@ -258,18 +258,26 @@ class Spec:
                 "points and these changes, and read code only to verify a resolution or text the revision added.")
 
     # --- small steps ---
-    def handoff(self, why, reason="spec_failed"):
+    def handoff(self, why, reason="spec_review_run_failed", *, snapshot="", revalidate=None):
         """The owner takes over; the loop resumes once they answer on the issue and remove
-        ready-for-human."""
-        advisor.outcome(self.env, "spec_limit", self.issue, "handoff")
-        swapped = self.gh("issue", "edit", self.issue, "--remove-label", "agent-wip", "--add-label", "ready-for-human")
-        self.hooks.task("handoff", reason, "--reason", reason)
-        if swapped.returncode != 0:
-            # Nothing runs the task now, but agent-wip would say otherwise (#46).
-            why += (" Swapping agent-wip for ready-for-human failed too, so the issue still looks in progress: "
-                    f"fix its labels by hand.{pr_helpers.why(swapped)}")
-            notify.log(f"#{self.issue}: handoff label swap failed{pr_helpers.why(swapped)}")
-        notify.notify(f"#{self.issue}: spec needs you", f"{why} {self.url}")
+        ready-for-human. Returns the shared-entry Result (#125)."""
+        from . import handoff as owner_handoff
+        message = [why]
+
+        def after_labels(swapped):
+            if swapped.returncode != 0:
+                # Nothing runs the task now, but agent-wip would say otherwise (#46).
+                message[0] += (" Swapping agent-wip for ready-for-human failed too, so the issue still looks "
+                               f"in progress: fix its labels by hand.{pr_helpers.why(swapped)}")
+                notify.log(f"#{self.issue}: handoff label swap failed{pr_helpers.why(swapped)}")
+
+        return owner_handoff.perform(
+            self.env, reason, kind="issue", number=self.issue, remove=("agent-wip",),
+            title=f"#{self.issue}: spec needs you",
+            text=lambda: f"{message[0]} {self.url}",
+            hooks=self.hooks, item=self.issue, episode=self.issue,
+            snapshot=snapshot, revalidate=revalidate, close_outcomes=("spec_limit",),
+            after_labels=after_labels)
 
     def post(self, body, failed):
         posted = self.gh("issue", "comment", self.issue, "--body", body)
@@ -343,9 +351,8 @@ class Spec:
         return problems
 
     # --- the reviewer's round ---
-    def advise_limit(self, round, reviewer, reply, context):
-        """advisor.Decision at the spec round limit (#17): "extra_round" (one more revision and
-        review) or "handoff". The snapshot is the issue with its spec comments and the last review."""
+    def limit_snapshot(self, round, reviewer, reply, context):
+        """(snapshot, revalidate) for the spec_limit decision point (#17 / #125)."""
         n, env = self.issue, self.env
         state = spec_state(env, n)
         try:
@@ -359,19 +366,18 @@ class Spec:
                     "handoff = the owner takes the spec.\n\n"
                     f'<last-review round="{round}" by="{reviewer}">\n{reply}\n</last-review>\n\n'
                     f"<adr-changes>\n{diff}\n</adr-changes>\n\n{issue_text}")
-        return advisor.advise(env, "spec_limit", n, snapshot, ("extra_round",), episode=n,
-                              revalidate=lambda: spec_state(env, n) == state)
+        return snapshot, (lambda: spec_state(env, n) == state)
 
     def at_limit(self, round, max_rounds, reviewer, reply, context, why):
         """True when the spec goes on for one advisor-granted round; otherwise hands off."""
         if round < max_rounds + self.extra:
             return True
-        decision = advisor.Decision(advisor.HANDOFF) if self.extra else self.advise_limit(round, reviewer, reply, context)
-        if decision.extra_round:
+        snap, check = self.limit_snapshot(round, reviewer, reply, context)
+        result = self.handoff(why, "spec_limit", snapshot=snap, revalidate=check)
+        if result.action == "extra_round":
             self.extra = 1
-            notify.log(f"#{self.issue}: advisor granted one more spec round: {decision.reason}")
+            notify.log(f"#{self.issue}: advisor granted one more spec round: {result.decision.reason}")
             return True
-        self.handoff(why + advisor.handoff_note(decision), "spec_limit")
         return False
 
     def review_round(self, round, max_rounds, context):
@@ -394,7 +400,8 @@ class Spec:
             followup=self.followup(round, reviewer, last_vendor))
         outcome, model = out["outcome"], out["model"] or ""
         if self.unverified(reviewer, last_vendor, model, other_model):
-            self.handoff("Codex spec reviewer model was not verified as different from the reviser model.")
+            self.handoff("Codex spec reviewer model was not verified as different from the reviser model.",
+                         "spec_reviewer_model_unverified")
             return "stop"
         mode_note = self.mode_note("Review", reviewer, last_vendor, model, other_model)
         if changed(wt, head):
@@ -430,7 +437,7 @@ class Spec:
                     f"## Spec review ({reviewer}), round {round}: reject\n\n{reply[:REPLY_CAP]}")
             self.handoff(f"{reviewer} rejects the issue.", "spec_rejected")
             return "stop"
-        self.handoff(f"{reviewer}'s spec review failed: {outcome}")
+        self.handoff(f"{reviewer}'s spec review failed: {outcome}", "spec_review_run_failed")
         return "stop"
 
     def accept_verdict(self, reviewer, round, mode_note, reply):
@@ -461,17 +468,21 @@ class Spec:
         n, who = self.issue, reviewer or "the reviewer"
         merger = merge.Merger(self.env, self.hooks, pr, n)
         if not merger.ci_green(30):
-            self.handoff(f"{who} accepted, but CI on the ADR PR #{pr} is not green.")
+            self.handoff(f"{who} accepted, but CI on the ADR PR #{pr} is not green.",
+                         "spec_adr_ci_before_merge_not_green")
             return "stop"
         result = merger.merge_with_updates(30)
         if not result.get("ok"):
-            if result.get("reason") == "ci_not_green":
-                self.handoff(f"{who} accepted, but CI on the ADR PR #{pr} is not green.")
+            if result.get("reason") == "ci_after_update_not_green":
+                self.handoff(f"{who} accepted, but CI on the ADR PR #{pr} is not green.",
+                             "spec_adr_ci_after_update_not_green")
             else:
-                self.handoff(f"{who} accepted, but merging the ADR PR #{pr} failed.{result.get('detail') or ''}")
+                self.handoff(f"{who} accepted, but merging the ADR PR #{pr} failed.{result.get('detail') or ''}",
+                             "spec_adr_merge_failed")
             return "stop"
         if self.pr_state(pr) != "MERGED":
-            self.handoff(f"{who} accepted, but ADR PR #{pr} is still open after the merge attempt.")
+            self.handoff(f"{who} accepted, but ADR PR #{pr} is still open after the merge attempt.",
+                         "spec_adr_merge_unconfirmed")
             return "stop"
         notify.notify(f"#{n}: ADR PR #{pr} merged", f"https://github.com/{self.repo}/pull/{pr}")
         return self.publish_accept(verdict)
@@ -482,15 +493,16 @@ class Spec:
         self.pr = pr
         state = self.pr_state(pr)
         if state is None:
-            self.handoff(f"Could not read ADR PR #{pr} to resume acceptance.")
+            self.handoff(f"Could not read ADR PR #{pr} to resume acceptance.", "spec_pending_adr_read_failed")
             return False
         if state == "MERGED":
             return self.publish_accept(verdict) == "accept"
         if state == "CLOSED":
-            self.handoff(f"ADR PR #{pr} was closed without merging; acceptance stays pending.")
+            self.handoff(f"ADR PR #{pr} was closed without merging; acceptance stays pending.", "spec_adr_closed")
             return False
         if state != "OPEN":
-            self.handoff(f"ADR PR #{pr} state is unreadable ({state}); acceptance stays pending.")
+            self.handoff(f"ADR PR #{pr} state is unreadable ({state}); acceptance stays pending.",
+                         "spec_adr_state_invalid")
             return False
         return self.merge_adr_and_publish(pr, verdict) == "accept"
 
@@ -501,7 +513,8 @@ class Spec:
         if pr:
             pending = f"<!-- baton-spec-accept-pending pr={pr} -->\n{verdict}"
             if not self.post(pending, f"posting pending acceptance for ADR PR #{pr} failed"):
-                self.handoff(f"{reviewer} accepted, but posting pending acceptance failed.")
+                self.handoff(f"{reviewer} accepted, but posting pending acceptance failed.",
+                             "spec_pending_accept_post_failed")
                 return "stop"
             return self.merge_adr_and_publish(pr, verdict, reviewer=reviewer)
         return self.publish_accept(verdict)
@@ -538,7 +551,8 @@ class Spec:
         outcome, model = out["outcome"], out["model"] or ""
         if (self.unverified(reviser, last_vendor, model, other_model)
                 or (reviser == last_vendor == "claude" and not claude_cli.distinct_models(model, other_model))):
-            self.handoff(f"{reviser.capitalize()} spec reviser model was not verified as different from the reviewer model.")
+            self.handoff(f"{reviser.capitalize()} spec reviser model was not verified as different from the reviewer model.",
+                         "spec_reviser_model_unverified")
             return "stop"
         mode_note = self.mode_note("Revision", reviser, last_vendor, model, other_model)
         comment, body = Path(f"{out_base}.comment"), Path(f"{out_base}.body")
@@ -552,13 +566,14 @@ class Spec:
             human = " human"
         else:
             why = f" A command was denied ({denied[0]}): check the spec role's permissions." if denied else ""
-            self.handoff(f"{reviser} spec run failed: {outcome}{why}")
+            self.handoff(f"{reviser} spec run failed: {outcome}{why}", "spec_revision_run_failed")
             return "stop"
         if body.is_file() and body.stat().st_size:
             body.write_text(check_section.canonicalize(strip_markers(body.read_text())).rstrip("\n") + "\n")
             edited = self.gh("issue", "edit", n, "--body-file", str(body))
             if edited.returncode != 0:
-                self.handoff(f"Applying {reviser} revised issue body failed ({body}).{pr_helpers.why(edited)}")
+                self.handoff(f"Applying {reviser} revised issue body failed ({body}).{pr_helpers.why(edited)}",
+                             "spec_body_edit_failed")
                 return "stop"
         if git(wt, "rev-list", f"{self.base}..HEAD"):
             try:
@@ -566,7 +581,7 @@ class Spec:
             except OSError:
                 return "stop"
             if not push(wt, self.branch, upstream=True, signoff=self.env.repo.signoff):
-                self.handoff(f"Pushing {self.branch} failed.")
+                self.handoff(f"Pushing {self.branch} failed.", "spec_adr_push_failed")
                 return "stop"
             self.base = f"origin/{self.branch}"
             if not self.pr:
@@ -576,7 +591,8 @@ class Spec:
                                   "once a spec reviewer accepts the spec; the issue stays open for implementation.\n\n"
                                   f"## {check_section.HEADING}\nnone")
                 if created.returncode != 0:
-                    self.handoff(f"Opening the ADR PR for {self.branch} failed.{pr_helpers.why(created)}")
+                    self.handoff(f"Opening the ADR PR for {self.branch} failed.{pr_helpers.why(created)}",
+                                 "spec_adr_open_failed")
                     return "stop"
                 self.pr = created.stdout.strip().rsplit("/", 1)[-1]
         try:
@@ -593,7 +609,7 @@ class Spec:
             leftover.unlink()
         if human:
             self.handoff(f"{reviser} has questions only you can answer. Reply on the issue, then remove ready-for-human.",
-                         "needs_info")
+                         "spec_questions")
             return "stop"
         return "revised"
 
@@ -604,7 +620,7 @@ class Spec:
         n, env = self.issue, self.env
         listed = comments(env, n)
         if listed is None:
-            self.handoff("Could not read issue comments to check pending acceptance.")
+            self.handoff("Could not read issue comments to check pending acceptance.", "spec_comments_read_failed")
             return False
         pending = pending_accept_in(listed, env.owner)
         if pending:

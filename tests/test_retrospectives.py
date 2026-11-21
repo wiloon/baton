@@ -474,7 +474,7 @@ def test_real_producer_events_and_attempts_are_consumed_read_only(host, monkeypa
         task=store.ensure(12,13,repo='acme/app')
         pipe=task['pipeline_id']
         store.event(pipe,'ci','checks',ci_result='failure',duration_ms=1000)
-        store.event(pipe,'handoff','checks-failed',reason='ci_not_green')
+        store.event(pipe,'handoff','checks-failed',reason='ci_before_merge_not_green')
         store.attempt(pipe,str(uuid.uuid4()),int(past*1000),1)
     before={p:p.read_bytes() for p in (host.state/'telemetry').rglob('*.json')}
     assert host.run()[0]['state']=='success'

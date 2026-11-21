@@ -549,8 +549,11 @@ class Tick:
         # Fast-forward only: local commits a failed push left behind are kept and pushed with the fix.
         if not (session.run_process(["git", "-C", wt, "checkout", "-q", head_ref]).returncode == 0
                 and session.run_process(["git", "-C", wt, "merge", "-q", "--ff-only", f"origin/{head_ref}"]).returncode == 0):
-            pr_helpers.gh("pr", "edit", pr, "-R", self.gh_repo, "--remove-label", "agent-fix", "--add-label", "ready-for-human")
-            self.notify(f"PR #{pr} needs you", f"{wt} has diverged from origin/{head_ref}. {url}")
+            from . import handoff as owner_handoff
+            owner_handoff.perform(
+                self.env, "fix_worktree_diverged", kind="pr", number=pr, remove=("agent-fix",),
+                title=f"PR #{pr} needs you", text=f"{wt} has diverged from origin/{head_ref}. {url}",
+                hooks=self.hooks(issue or "0", pr=pr), item=pr, episode=issue or pr)
             return 80
         feedback_file = self.state / f"owner-fix-feedback-{pr}"
         feedback = feedback_file.read_text() if feedback_file.is_file() else review.human_feedback(self.gh_repo, self.owner, pr)

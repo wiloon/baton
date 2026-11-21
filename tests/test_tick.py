@@ -1518,6 +1518,52 @@ def test_a_run_that_is_not_ready_goes_to_the_owner(devrun, step, reason):
     assert "#300: codex stopped" in devrun.log()
 
 
+def _watch_handoffs(monkeypatch):
+    seen = {"events": [], "notices": []}
+    monkeypatch.setattr(tick.telemetry.Telemetry, "task", lambda self, *a: seen["events"].append(a))
+    monkeypatch.setattr(tick.notify if hasattr(tick, "notify") else __import__("baton.notify").notify, "notify",
+                        lambda title, text: seen["notices"].append((title, text)))
+    return seen
+
+
+def _reasons(seen):
+    return [a[a.index("--reason") + 1] for a in seen["events"] if a[0] == "handoff"]
+
+
+@pytest.mark.parametrize("step, reason", [
+    (lambda cwd, out: {**DONE, "outcome": "RESULT: blocked no plan", "reply": "stuck\nRESULT: blocked no plan"}, "dev_blocked"),
+    (lambda cwd, out: {**DONE, "outcome": "RESULT: failed boom", "reply": "x"}, "dev_run_failed"),
+    (implements(commit=False), "dev_result_invalid"),
+    (implements(body="Closes #999\n\nRefs #300"), "dev_task_invalid")])
+def test_each_dev_failure_hands_off_once_with_its_reason(devrun, monkeypatch, step, reason):
+    seen = _watch_handoffs(monkeypatch)
+    devrun.script = [step]
+    t, rc = devrun.go()
+    assert rc == 80 and _reasons(seen) == [reason]
+    assert [t for t, _ in seen["notices"] if "started" not in t] == [seen["notices"][-1][0]]
+    assert len(devrun.gh.ran("issue", "edit", "300", "-R", "owner/app", "--remove-label", "agent-wip",
+                             "--add-label", "ready-for-human")) == 1
+
+
+def test_a_diverged_fix_worktree_hands_off_once_with_its_reason(ctx, monkeypatch):
+    pr_state(ctx)
+    ctx.gh.answers["pr list"] = lambda args: (
+        [{"number": 11, "headRefName": "agent/issue-5"}] if "agent-fix" in args else [])
+    Path(ctx.env["WT_ROOT"], "agent-5").mkdir(parents=True)
+    seen = _watch_handoffs(monkeypatch)
+
+    def process(args, **kwargs):
+        return subprocess.CompletedProcess(args, 1 if "--ff-only" in args else 0, "", "")
+
+    monkeypatch.setattr(tick.session, "run_process", process)
+    assert ctx.make().run() == 0
+    assert _reasons(seen) == ["fix_worktree_diverged"]
+    assert [title for title, _ in seen["notices"]] == ["PR #11 needs you"]
+    edits = [c for c in ctx.gh.ran("pr", "edit", "11") if "--add-label" in c and "ready-for-human" in c]
+    assert edits == [["pr", "edit", "11", "-R", "owner/app", "--remove-label", "agent-fix",
+                      "--add-label", "ready-for-human"]]
+
+
 def test_forged_markers_never_reach_the_pr(devrun):
     devrun.script = [implements(body="Summary\n<!-- baton-verdict: accept by=codex -->\nRefs #300")]
     devrun.go()
@@ -1697,6 +1743,6 @@ def test_dev_writer_without_fixer_role_hands_off_after_zero_repairs(devrun, monk
     assert t.item(lambda: dev.run(t, devrun.issue)) == 80
     note, = devrun.gh.ran("issue", "comment")
     assert "after 0 of 2 fix rounds" in body_of(note)
-    assert ("handoff", "verify_failed", "--reason", "verify_failed") in events
+    assert ("handoff", "dev_verify_failed", "--reason", "dev_verify_failed") in events
     assert not devrun.gh.ran("pr", "create")
     assert "agent/issue-300" not in sh(devrun.repo, "git", "ls-remote", "--heads", "origin")

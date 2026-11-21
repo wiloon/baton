@@ -5,9 +5,10 @@ them with a reason and evidence. The runner revalidates and acts; on any failure
 the set, or `mode = "observe"`, the rule result stands. Every call is a decision record in
 the runner state's advisor/decisions.jsonl. Advisors cause no side effects and keep no memory.
 
-Decision points (#17): `review_limit` (baton.review) and `spec_limit` (baton.spec). Each grants at
-most one extra round per task episode: the grant is a state file, so a second limit hands off
-without another call.
+Decision points (#17, #125): task handoffs go through `baton.handoff.perform`, which consults this
+module for judgement and investigation reasons. `review_limit` and `spec_limit` still grant at most
+one extra round per task episode: the grant is a state file, so a second limit hands off without
+another call.
 """
 from dataclasses import dataclass
 import hashlib
@@ -162,15 +163,17 @@ def call_deepseek(cfg, key, snapshot, actions):
     return json.loads(content), data.get("usage") or {}
 
 
-def advise(env, point, item, snapshot, actions, *, episode="", revalidate=None, rule=HANDOFF):
+def advise(env, point, item, snapshot, actions, *, episode="", revalidate=None, rule=HANDOFF, mode=None):
     """The action to execute at POINT for ITEM (a PR or issue number). ACTIONS always contains
     HANDOFF. REVALIDATE() is called before a non-handoff action executes and must return True when
-    the state still matches the snapshot. Never raises."""
+    the state still matches the snapshot. MODE overrides the configured global mode when the
+    caller already applied ADR 0008's ceiling (#125). Never raises."""
     env = session.resolve(env)
     actions = tuple(dict.fromkeys((HANDOFF, *actions)))
-    if not enabled(env):
-        return Decision(rule)
     cfg = settings(env)
+    effective = mode if mode in ("observe", "live", "off") else cfg.mode
+    if effective == "off" or not (effective in ("observe", "live") and getattr(env.repo, "advisor", True)):
+        return Decision(rule)
     if granted(env, point, item):
         return Decision(rule, failure="extra round already granted in this episode")
     started = time.monotonic()
@@ -192,7 +195,7 @@ def advise(env, point, item, snapshot, actions, *, episode="", revalidate=None, 
                             record.get("advised", ""), "duplicate snapshot")
     record = {"kind": "decision", "ts": int(time.time()), "point": point, "repo": env.repo.gh_repo, "item": str(item),
               "episode": str(episode), "snapshot_sha": digest, "actions": list(actions), "backend": "deepseek",
-              "model": cfg.model, "prompt_version": PROMPT_VERSION, "mode": cfg.mode, "rule": rule}
+              "model": cfg.model, "prompt_version": PROMPT_VERSION, "mode": effective, "rule": rule}
     advised, reason, evidence, usage = "", "", [], {}
     try:
         if key:
@@ -213,7 +216,7 @@ def advise(env, point, item, snapshot, actions, *, episode="", revalidate=None, 
     except (ValueError, KeyError, IndexError, TypeError, AttributeError, RuntimeError) as error:
         failure = f"malformed reply: {type(error).__name__}: {redact(str(error), values)[:120]}"
     executed = rule
-    if not failure and advised != rule and cfg.mode == "live":
+    if not failure and advised != rule and effective == "live":
         try:
             fresh = revalidate() if revalidate else True
         except Exception:
