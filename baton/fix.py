@@ -210,12 +210,15 @@ class Runner:
         if session.run_process(["git", "-C", str(wt), "fetch", "-q", "origin", "main"]).returncode:
             notify.log(f"fetching origin/main for {wt} failed; the fixer uses the local copy")
 
-    def description_not_applied(self, pr, fixer, url, reason="", rc=2):
-        """rc is apply_body's: 1 GitHub failed to write, otherwise the request was invalid."""
+    def description_discarded(self, pr, fixer, reason):
+        """Log and best-effort comment a discarded description request; never fails the fix."""
         detail = reason or "It was invalid or GitHub refused it"
-        code = "fix_description_write_failed" if rc == 1 else "fix_description_invalid"
-        return self.handoff(pr, code, f"PR #{pr}: description request not applied ({fixer})",
-                            f"{detail}; the commits, if any, are pushed. {url}")
+        notify.log(f"PR #{pr}: description request not applied ({fixer}) | {detail}")
+        self.comment(
+            pr,
+            f"<!-- baton-description-discarded by={fixer} -->\n"
+            f"Discarded the PR description request from {fixer}.\n\n{detail}",
+        )
 
     # --- a Claude or Codex fixer ---
     def fix_pr(self, pr, wt, fixer, source, feedback, head=""):
@@ -292,7 +295,7 @@ class Runner:
             if rc != 0:
                 return rc
             if description_rc != 0:
-                return self.description_not_applied(pr, fixer, url, description_reason, description_rc)
+                self.description_discarded(pr, fixer, description_reason)
             if not task_changed and not checks_changed and not description_changed:
                 return self.handoff(pr, "fix_no_commit", f"PR #{pr} needs you", f"The fix run made no commit; stopping the loop. {url}")
         if self.head(wt) != head:
@@ -308,7 +311,7 @@ class Runner:
             if rc != 0:
                 return rc
             if description_rc != 0:
-                return self.description_not_applied(pr, fixer, url, description_reason, description_rc)
+                self.description_discarded(pr, fixer, description_reason)
         base_file.unlink(missing_ok=True)
         return 0
 
@@ -373,11 +376,17 @@ class Runner:
         if description_rc == 1:
             notify.log(f"PR #{pr}: description update deferred after GitHub failure")
             return 75
+        discarded = description_rc == 2
+        if discarded:
+            pr_helpers.remove_body_request(request)
+            has_request = False
         if not has_request or description_rc:
             rc, task_changed, log = pr_helpers.apply_task(pr, want, self.ctx, baseline_file)
             if log:
                 notify.log(log)
             if rc == 1:
+                if discarded:
+                    self.description_discarded(pr, "cursor", description_reason)
                 notify.log(f"PR #{pr}: description update deferred after GitHub failure")
                 return 75
             if rc != 0 and (rc != 2 or description_rc != 2):
@@ -388,10 +397,10 @@ class Runner:
             rc, checks_changed = self.recheck_without_commit(pr, "Cursor ", url, body_changed)
             if rc != 0:
                 return rc
-            if description_rc or not (body_changed or task_changed or checks_changed):
+            if discarded:
+                self.description_discarded(pr, "cursor", description_reason)
+            if not (body_changed or task_changed or checks_changed):
                 self.clear_cursor_request(pr)
-                if description_rc:
-                    return self.description_not_applied(pr, "cursor", url, description_reason, description_rc)
                 return self.handoff(pr, "fix_no_commit", f"Cursor PR #{pr} needs you", f"Cursor's fix run made no commit. {url}")
         else:
             rc, failure, rounds = self.verify(wt, "origin/main", "cursor", "pr", pr)
@@ -408,9 +417,9 @@ class Runner:
                 return self.handoff(pr, "fix_push_failed", f"Cursor PR #{pr}: push failed", url)
             if self.refresh_checks(pr, "Cursor ", url):
                 return 1
+        if discarded and moved:
+            self.description_discarded(pr, "cursor", description_reason)
         self.clear_cursor_request(pr)
-        if description_rc:
-            return self.description_not_applied(pr, "cursor", url, description_reason, description_rc)
         return 0
 
 
