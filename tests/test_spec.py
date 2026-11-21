@@ -1041,7 +1041,75 @@ def test_an_unreadable_adr_pr_state_hands_off_with_the_pending_comment_kept(loop
 
 
 def test_unreadable_issue_comments_hand_off_instead_of_starting_a_review(loop):
+    loop.gh.labels = {"needs-triage"}   # the handoff must add ready-for-human, not find it there
     loop.gh.fails.add("issue view")
     assert loop.run() is False
     assert loop.runs == [] and not loop.gh.ran("pr", "create")
     assert not loop.gh.posted(ACCEPTED) and "ready-for-human" in loop.gh.labels
+
+
+def accept_now(loop, monkeypatch):
+    """A review round that ends in an accept with ADR edits, so Spec.accept posts the pending
+    comment and merges the ADR PR in the same run; the handoff texts land in the returned list."""
+    monkeypatch.setattr(merge.time, "sleep", lambda s: None)
+    notes = []
+    monkeypatch.setattr(spec.notify, "notify", lambda title, text="": notes.append(text))
+    loop.script = [CHANGES, reviser(commit=True), ACCEPT]
+    return notes
+
+
+def test_accept_retries_a_failed_adr_merge_that_is_now_behind(loop, monkeypatch):
+    accept_now(loop, monkeypatch)
+    loop.gh.merge_results = [1, 0]
+    loop.gh.merge_fail_status = ["BEHIND"]
+    loop.gh.update_heads = ["b" * 40]
+    assert loop.run() is True
+    assert len(updates(loop)) == 1 and len(merges(loop)) == 2 and "b" * 40 in merges(loop)[1]
+    assert loop.gh.posted(ACCEPTED)
+
+
+@pytest.mark.parametrize("status", ["DIRTY", ""])
+def test_accept_hands_off_a_failed_adr_merge_with_another_or_unavailable_status(
+        loop, monkeypatch, status):
+    notes = accept_now(loop, monkeypatch)
+    loop.gh.merge_results = [1]
+    loop.gh.merge_fail_status = [status]
+    assert loop.run() is False
+    assert updates(loop) == [] and len(merges(loop)) == 1
+    assert any("merging the ADR PR #77 failed" in text for text in notes)
+    assert not loop.gh.posted(ACCEPTED) and loop.gh.posted(PENDING)
+
+
+def test_accept_hands_off_an_adr_update_branch_failure_with_ghs_stderr(loop, monkeypatch):
+    notes = accept_now(loop, monkeypatch)
+    loop.gh.merge_state = "BEHIND"
+    loop.gh.fails.add("pr update-branch")
+    loop.gh.update_stderr = "refusing to merge unrelated histories"
+    assert loop.run() is False
+    assert merges(loop) == []
+    assert any("refusing to merge unrelated histories" in text for text in notes)
+    assert not loop.gh.posted(ACCEPTED) and loop.gh.posted(PENDING)
+
+
+def test_accept_skips_ci_and_merge_when_the_adr_head_does_not_change(loop, monkeypatch):
+    notes = accept_now(loop, monkeypatch)
+    greens = []
+    monkeypatch.setattr(merge.Merger, "ci_green", lambda self, minutes: greens.append(minutes) or True)
+    loop.gh.merge_state = "BEHIND"   # the update succeeds but the head stays the same
+    assert loop.run() is False
+    assert len(updates(loop)) == 1 and merges(loop) == []
+    assert greens == [30]   # only the gate before the update
+    assert any("did not change" in text for text in notes)
+    assert not loop.gh.posted(ACCEPTED) and loop.gh.posted(PENDING)
+
+
+def test_accept_hands_off_red_ci_after_a_confirmed_adr_update(loop, monkeypatch):
+    notes = accept_now(loop, monkeypatch)
+    answers = iter([True, False])
+    monkeypatch.setattr(merge.Merger, "ci_green", lambda self, minutes: next(answers))
+    loop.gh.merge_state = "BEHIND"
+    loop.gh.update_heads = ["b" * 40]
+    assert loop.run() is False
+    assert len(updates(loop)) == 1 and merges(loop) == []
+    assert any("CI on the ADR PR #77 is not green" in text for text in notes)
+    assert not loop.gh.posted(ACCEPTED) and loop.gh.posted(PENDING)
