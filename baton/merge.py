@@ -211,8 +211,8 @@ class Merger:
         """
         pr, repo = str(self.pr), self.repo
         updates, match_sha = 0, None
+        data = self.pr_merge_state()
         while True:
-            data = self.pr_merge_state()
             status = (data or {}).get("mergeStateStatus")
             if status == "BEHIND":
                 if updates >= 3:
@@ -242,7 +242,7 @@ class Merger:
             merged = pr_helpers.gh(*args)
             if merged.returncode == 0:
                 return {"ok": True}
-            data = self.pr_merge_state()
+            data = self.pr_merge_state()   # carried into the next iteration, never re-read
             if (data or {}).get("mergeStateStatus") != "BEHIND":
                 return {"ok": False, "reason": "merge_failed", "detail": pr_helpers.why(merged)}
             match_sha = None

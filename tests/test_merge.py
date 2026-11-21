@@ -624,8 +624,41 @@ def test_metadata_preflight_failure_after_update_queues_review(run, monkeypatch)
     monkeypatch.setattr(merge.time, "sleep", lambda s: None)
     run.gh.set(mergeStateStatus="BEHIND", headRefOid=OLD, update_heads=[NEW], after_update_status="CLEAN")
     run.greens = [True, True]
-    monkeypatch.setattr(pr_helpers, "preflight", lambda pr: (_ for _ in ()).throw(ValueError("closes the wrong issue")))
+    calls = {"n": 0}
+
+    def preflight(pr):
+        calls["n"] += 1
+        if any(c[:2] == ["pr", "update-branch"] for c in run.gh.calls()):
+            raise ValueError("closes the wrong issue")   # only the post-update recheck fails
+    monkeypatch.setattr(pr_helpers, "preflight", preflight)
     run.go()
-    assert not run.merged()
+    assert calls["n"] == 2
+    assert any(c[:2] == ["pr", "update-branch"] for c in run.gh.calls())
+    assert not run.merged() and not any(c[:2] == ["pr", "merge"] for c in run.gh.calls())
     assert any(c[:2] == ["pr", "edit"] and "agent-review" in c for c in run.gh.calls())
     assert "notify PR #335: metadata review queued" in run.events
+
+
+def test_a_failed_merge_reread_behind_is_not_read_again_before_the_update(run, monkeypatch):
+    monkeypatch.setattr(merge.time, "sleep", lambda s: None)
+    reads = iter([{"mergeStateStatus": "CLEAN", "headRefOid": OLD},
+                  {"mergeStateStatus": "BEHIND", "headRefOid": OLD}])
+    monkeypatch.setattr(merge.Merger, "pr_merge_state",
+                        lambda self: next(reads, {"mergeStateStatus": "UNKNOWN", "headRefOid": NEW}))
+    run.gh.set(headRefOid=OLD, merge_results=[1, 1, 1], update_heads=[NEW])
+    run.greens = [True, True]
+    run.go()
+    assert run.gh.pr.get("state") != "MERGED" and run.labelled("ready-for-human")
+    assert len([c for c in run.gh.calls() if c[:2] == ["pr", "update-branch"]]) == 1
+    assert len([c for c in run.gh.calls() if c[:2] == ["pr", "merge"]]) == 2
+
+
+def test_a_failed_merge_with_unavailable_status_hands_off_without_updating(run, monkeypatch):
+    reads = iter([{"mergeStateStatus": "CLEAN", "headRefOid": OLD}])
+    monkeypatch.setattr(merge.Merger, "pr_merge_state", lambda self: next(reads, None))
+    run.gh.set(headRefOid=OLD, merge_results=[1])
+    run.go()
+    assert run.gh.pr.get("state") != "MERGED" and run.labelled("ready-for-human")
+    assert not any(c[:2] == ["pr", "update-branch"] for c in run.gh.calls())
+    assert len([c for c in run.gh.calls() if c[:2] == ["pr", "merge"]]) == 1
+    assert "notify PR #335 merge failed" in run.events

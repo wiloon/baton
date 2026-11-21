@@ -842,6 +842,9 @@ def test_a_later_tick_resumes_an_open_adr_merge_without_spec_agents(loop, monkey
                          "body": f"<!-- baton-spec-accept-pending pr=77 -->\n{VERDICT_BODY}"}]
     loop.gh.adr_pr, loop.gh.pr_state, loop.gh.merge_state = "77", "OPEN", ""
     loop.script = []  # no agent dispatch
+    monkeypatch.setattr(spec.Spec, "worktree", lambda self: pytest.fail("spec worktree set up"))
+    monkeypatch.setattr(spec.Spec, "pick", lambda *a, **k: pytest.fail("spec vendor picked"))
+    monkeypatch.setattr(spec.pick, "choose", lambda *a, **k: pytest.fail("vendor picked"))
     assert loop.run() is True
     assert loop.runs == []
     assert any(c[:3] == ["pr", "merge", "77"] for c in loop.gh.calls)
@@ -849,6 +852,17 @@ def test_a_later_tick_resumes_an_open_adr_merge_without_spec_agents(loop, monkey
     assert verdict == VERDICT_BODY
     assert spec.cursor_plan(loop.env, N) == VERDICT_BODY
     assert "ready-for-agent" in loop.gh.labels
+
+
+def test_a_resumed_adr_merge_rechecks_ci_first(loop, monkeypatch):
+    monkeypatch.setattr(spec.Spec, "worktree", lambda self: pytest.fail("spec worktree set up"))
+    loop.gh.comments = [{"author": {"login": "owner"},
+                         "body": f"<!-- baton-spec-accept-pending pr=77 -->\n{VERDICT_BODY}"}]
+    loop.gh.adr_pr, loop.gh.pr_state = "77", "OPEN"
+    loop.ci = False
+    assert loop.run() is False
+    assert not any(c[:2] == ["pr", "merge"] for c in loop.gh.calls) and loop.runs == []
+    assert not loop.gh.posted("<!-- baton-verdict: accept")
 
 
 def test_a_merged_adr_pr_publishes_the_saved_verdict_without_ci_or_merge(loop):
@@ -931,3 +945,103 @@ def test_three_behind_updates_on_the_spec_path_hand_off_with_merge_failed(loop, 
     assert "ready-for-human" in loop.gh.labels and not loop.gh.posted("<!-- baton-verdict: accept")
     assert loop.gh.posted("<!-- baton-spec-accept-pending pr=77 -->")
     assert any("merging the ADR PR #77 failed" in text for text in notes)
+
+
+# --- behind branches and unreadable state through the spec entry points (#122) ----------------
+
+PENDING = "<!-- baton-spec-accept-pending pr=77"
+ACCEPTED = "<!-- baton-verdict: accept"
+
+
+def resume_pending(loop, monkeypatch):
+    """An open ADR PR whose acceptance is pending; the handoff texts land in the returned list."""
+    monkeypatch.setattr(merge.time, "sleep", lambda s: None)
+    notes = []
+    monkeypatch.setattr(spec.notify, "notify", lambda title, text="": notes.append(text))
+    loop.gh.comments = [{"author": {"login": "owner"}, "body": f"{PENDING} -->\n{VERDICT_BODY}"}]
+    loop.gh.adr_pr, loop.gh.pr_state = "77", "OPEN"
+    return notes
+
+
+def merges(loop):
+    return [c for c in loop.gh.calls if c[:2] == ["pr", "merge"]]
+
+
+def updates(loop):
+    return [c for c in loop.gh.calls if c[:2] == ["pr", "update-branch"]]
+
+
+def test_a_failed_adr_merge_that_is_now_behind_updates_and_retries(loop, monkeypatch):
+    resume_pending(loop, monkeypatch)
+    loop.gh.merge_results = [1, 0]
+    loop.gh.merge_fail_status = ["BEHIND"]
+    loop.gh.update_heads = ["b" * 40]
+    assert loop.run() is True
+    assert len(updates(loop)) == 1 and len(merges(loop)) == 2 and "b" * 40 in merges(loop)[1]
+    assert loop.gh.posted(ACCEPTED)
+
+
+@pytest.mark.parametrize("status", ["DIRTY", ""])
+def test_a_failed_adr_merge_with_another_or_unavailable_status_hands_off(loop, monkeypatch, status):
+    notes = resume_pending(loop, monkeypatch)
+    loop.gh.merge_results = [1]
+    loop.gh.merge_fail_status = [status]
+    assert loop.run() is False
+    assert updates(loop) == [] and len(merges(loop)) == 1
+    assert any("merging the ADR PR #77 failed" in text for text in notes)
+    assert not loop.gh.posted(ACCEPTED) and loop.gh.posted(PENDING)
+
+
+def test_an_adr_update_branch_failure_hands_off_with_ghs_stderr(loop, monkeypatch):
+    notes = resume_pending(loop, monkeypatch)
+    loop.gh.merge_state = "BEHIND"
+    loop.gh.fails.add("pr update-branch")
+    loop.gh.update_stderr = "refusing to merge unrelated histories"
+    assert loop.run() is False
+    assert merges(loop) == []
+    assert any("refusing to merge unrelated histories" in text for text in notes)
+    assert not loop.gh.posted(ACCEPTED)
+
+
+def test_an_unchanged_adr_head_after_update_skips_ci_and_merge(loop, monkeypatch):
+    notes = resume_pending(loop, monkeypatch)
+    ticks = {"n": 0}
+
+    def mono():
+        ticks["n"] += 1
+        return 0 if ticks["n"] < 3 else 100
+    monkeypatch.setattr(merge.time, "monotonic", mono)
+    greens = []
+    monkeypatch.setattr(merge.Merger, "ci_green", lambda self, minutes: greens.append(minutes) or True)
+    loop.gh.merge_state = "BEHIND"   # the update succeeds but the head stays the same
+    assert loop.run() is False
+    assert len(updates(loop)) == 1 and merges(loop) == []
+    assert greens == [30]   # only the gate before the update
+    assert any("did not change" in text for text in notes)
+
+
+def test_red_ci_after_a_confirmed_adr_update_hands_off_without_merging(loop, monkeypatch):
+    notes = resume_pending(loop, monkeypatch)
+    answers = iter([True, False])
+    monkeypatch.setattr(merge.Merger, "ci_green", lambda self, minutes: next(answers))
+    loop.gh.merge_state = "BEHIND"
+    loop.gh.update_heads = ["b" * 40]
+    assert loop.run() is False
+    assert len(updates(loop)) == 1 and merges(loop) == []
+    assert any("CI on the ADR PR #77 is not green" in text for text in notes)
+    assert not loop.gh.posted(ACCEPTED) and loop.gh.posted(PENDING)
+
+
+def test_an_unreadable_adr_pr_state_hands_off_with_the_pending_comment_kept(loop, monkeypatch):
+    resume_pending(loop, monkeypatch)
+    loop.gh.fails.add("pr view")
+    assert loop.run() is False
+    assert merges(loop) == [] and not loop.gh.posted(ACCEPTED)
+    assert loop.gh.posted(PENDING) and "ready-for-human" in loop.gh.labels
+
+
+def test_unreadable_issue_comments_hand_off_instead_of_starting_a_review(loop):
+    loop.gh.fails.add("issue view")
+    assert loop.run() is False
+    assert loop.runs == [] and not loop.gh.ran("pr", "create")
+    assert not loop.gh.posted(ACCEPTED) and "ready-for-human" in loop.gh.labels

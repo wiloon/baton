@@ -15,6 +15,8 @@ from baton import capacity, dev, fix, merge, notify, pick, review, scan, spec, t
 from baton.common import Deferred
 from conftest import sh
 
+REAL_CURSOR_PLAN = spec.cursor_plan   # the devrun fixture stubs it
+
 BIN = Path(__file__).resolve().parents[1] / "bin"
 LOGIN = r"^cursor$"
 DONE = {"rc": 0, "status": "success", "outcome": "RESULT: ready", "reply": "done\nRESULT: ready", "model": "gpt-x", "defer": ""}
@@ -1506,6 +1508,29 @@ def test_dev_run_does_not_dispatch_while_pending_accept_leaves_no_plan(devrun, m
     t = devrun.make()
     assert t.item(lambda: dev.run(t, devrun.issue)) == 80
     assert called == [str(devrun.issue)]
+
+
+def test_dev_implements_the_saved_verdict_once_the_pending_accept_resumes(devrun, monkeypatch):
+    """spec_loop publishes the verdict (superseding the pending marker); dev then gets that plan (#122)."""
+    verdict = "<!-- baton-verdict: accept by=codex -->\n## Spec review (codex), round 1: accept\n\nsaved plan"
+    listed = [{"author": {"login": "owner"}, "body": f"<!-- baton-spec-accept-pending pr=77 -->\n{verdict}"}]
+    monkeypatch.setattr(spec, "cursor_plan", REAL_CURSOR_PLAN)
+    monkeypatch.setattr(spec, "comments", lambda env, n: list(listed))
+    assert spec.cursor_plan(devrun.make().env, "300") == ""   # pending: no plan yet
+    called = []
+
+    def resume(self, n):
+        called.append(n)
+        listed.append({"author": {"login": "owner"}, "body": verdict})
+        return True
+    monkeypatch.setattr(tick.Tick, "spec_loop", resume)
+    devrun.script = [implements()]
+    t, rc = devrun.go()
+    assert rc == 80 and called == ["300"]
+    run, = devrun.runs
+    text = Path(re_context(run["prompt"])).read_text()
+    assert f"<plan>\n{verdict}\n</plan>" in text
+
 
 def test_dev_writer_without_fixer_role_hands_off_after_zero_repairs(devrun, monkeypatch):
     from subprocess import CompletedProcess
