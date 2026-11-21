@@ -51,7 +51,7 @@ class OwnerMergeHookTests(unittest.TestCase):
         return [json.loads(p.read_text()) for p in (self.root / 'telemetry/events').glob('*.json')]
 
     def test_an_owner_merge_of_a_handed_off_pr_is_recorded_once(self):
-        self.hooks().task('handoff', 'needs_info', '--reason', 'needs_info')
+        self.hooks().task('handoff', 'fix_needs_info', '--reason', 'fix_needs_info')
         self.assertTrue(self.hooks().owner_merged())
         self.assertTrue(self.hooks().owner_merged())
         merged = [e for e in self.events() if e['event_kind'] == 'merged']

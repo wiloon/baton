@@ -48,9 +48,10 @@ class Merger:
         pr_helpers.gh("pr", "edit", str(self.pr), "-R", self.repo, *options)
 
     def handoff(self, reason, title, text):
-        self.label("--add-label", "ready-for-human")
-        self.hooks.task("handoff", reason, "--reason", reason)
-        notify.notify(title, text)
+        from . import handoff as owner_handoff
+        owner_handoff.perform(
+            self.env, reason, kind="pr", number=self.pr,
+            title=title, text=text, hooks=self.hooks, item=self.pr, episode=self.issue)
 
     # --- CI ---
     def ci_green(self, minutes):
@@ -232,7 +233,7 @@ class Merger:
                 updates += 1
                 match_sha = new_sha
                 if not self.ci_green(minutes):
-                    return {"ok": False, "reason": "ci_not_green", "detail": ""}
+                    return {"ok": False, "reason": "ci_after_update_not_green", "detail": ""}
                 if before_merge is not None:
                     gate = before_merge()
                     if gate is not None and gate.get("action") != "merge":
@@ -284,7 +285,8 @@ class Merger:
             return
         if not self.ci_green(45):
             if self.ci_fix_round(wt) != 0 or not self.ci_green(45):
-                self.handoff("ci_not_green", f"PR #{pr}: CI not green", f"Review passed but CI failed or timed out. {url}")
+                self.handoff("ci_before_merge_not_green", f"PR #{pr}: CI not green",
+                             f"Review passed but CI failed or timed out. {url}")
                 return
         touched = self.owner_paths_touched()
         if touched != []:
@@ -335,8 +337,8 @@ class Merger:
         if not result.get("ok"):
             self.drop_deferred()
             reason = result.get("reason")
-            if reason == "ci_not_green":
-                self.handoff("ci_not_green", f"PR #{pr}: CI not green",
+            if reason == "ci_after_update_not_green":
+                self.handoff("ci_after_update_not_green", f"PR #{pr}: CI not green",
                              f"Review passed but CI failed or timed out after updating the branch. {url}")
                 return
             if reason == "gate":

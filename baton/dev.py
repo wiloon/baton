@@ -105,9 +105,10 @@ def is_partial(text, issue):
 
 def stop(tick, issue, reason, title, text):
     """The handoff every gate shares: ready-for-human, a telemetry handoff, a Telegram message."""
-    pr_helpers.gh("issue", "edit", issue, "-R", tick.gh_repo, "--remove-label", "agent-wip", "--add-label", "ready-for-human")
-    tick.hooks(issue).task("handoff", reason, "--reason", reason)
-    tick.notify(title, text)
+    from . import handoff as owner_handoff
+    owner_handoff.perform(
+        tick.env, reason, kind="issue", number=issue, remove=("agent-wip",),
+        title=title, text=text, hooks=tick.hooks(issue), item=issue, episode=issue)
     return 80
 
 
@@ -254,7 +255,8 @@ def run(tick, issue):
         reply = "\n".join(line for line in strip_markers(out.get("reply") or "").split("\n") if not line.startswith("RESULT: "))
         pr_helpers.gh("issue", "comment", issue, "-R", repo, "--body",
                       f"<!-- baton-note by={dev_vendor} -->\n{dev_vendor} stopped: {fail}\n\n{reply[:REPLY_CAP]}")
-        return stop(tick, issue, "implementation_failed", f"#{issue}: {dev_vendor} stopped", f"{fail} {url}")
+        reason = "dev_blocked" if fail.startswith("blocked") else "dev_result_invalid" if outcome.startswith("RESULT: ready") else "dev_run_failed"
+        return stop(tick, issue, reason, f"#{issue}: {dev_vendor} stopped", f"{fail} {url}")
 
     verifier = fix.Runner(env, hooks)
     verifier.gate_applies = not is_partial(Path(body).read_text(), issue)
@@ -263,18 +265,17 @@ def run(tick, issue):
         pr_helpers.gh("issue", "comment", issue, "-R", repo, "--body",
                       f"<!-- baton-note by={dev_vendor} -->\nLocal CI verification failed before push after {rounds} of "
                       f"{env.config.scheduling.max_verify_fixes or 2} fix rounds. Nothing was pushed.\n\n{failure[:REPLY_CAP]}")
-        return stop(tick, issue, "verify_failed", f"#{issue}: local CI verification failed", url)
+        return stop(tick, issue, "dev_verify_failed", f"#{issue}: local CI verification failed", url)
     if not push(wt, branch, upstream=True, signoff=tick.env.repo.signoff):
-        stop(tick, issue, "push_failed", f"#{issue}: pushing {dev_vendor}'s branch failed",
+        stop(tick, issue, "dev_push_failed", f"#{issue}: pushing {dev_vendor}'s branch failed",
              f"{branch} is committed in {wt}. {url}")
         return 1
     lines = Path(body).read_text().split("\n")
     try:
         text = pr_body(check_section.canonicalize(Path(body).read_text()), issue)
     except ValueError:
-        pr_helpers.gh("issue", "edit", issue, "-R", repo, "--remove-label", "agent-wip", "--add-label", "ready-for-human")
-        tick.notify(f"#{issue}: invalid PR task relation", f"Review the completion field in {body}. {url}")
-        return 1
+        return stop(tick, issue, "dev_task_invalid", f"#{issue}: invalid PR task relation",
+                    f"Review the completion field in {body}. {url}")
     if verifier.gate_result:
         text += f"\n\n## E2E gate\n{verifier.gate_result}, on {git(wt, 'rev-parse', '--short', 'HEAD')}. The runner ran this."
     intent = {"issue": str(issue), "branch": branch, "wt": str(wt), "base": base,

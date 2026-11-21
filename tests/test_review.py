@@ -10,6 +10,7 @@ import uuid
 import pytest
 
 from baton import checkpoint, merge, pick, review, session, tick, vendors
+from baton import config
 from baton.config import load
 from baton.dispatch import dispatch as dispatch_run
 from baton.fix import fix_pr as fix_pr_run
@@ -844,7 +845,8 @@ def test_unknown_codex_writer_provenance_cannot_fall_back_to_codex_for_screensho
 
 
 @pytest.mark.parametrize("reported, posts", [("gpt-6.2-astra", False), ("gpt-6.1-sol", True)])
-def test_the_model_dispatch_reports_decides_whether_the_screenshot_comment_is_posted(loop, reported, posts):
+def test_the_model_dispatch_reports_decides_whether_the_screenshot_comment_is_posted(loop, monkeypatch, reported, posts):
+    seen = _watch(monkeypatch)
     write_codex(loop, "gpt-6.2-astra")
     loop.after["review"] = lambda: rest(loop, "claude", 86400)   # only the Codex fallback is left
     loop.reviews, loop.screens = ["pass"], ["pass"]
@@ -852,9 +854,23 @@ def test_the_model_dispatch_reports_decides_whether_the_screenshot_comment_is_po
     assert screen_run(loop) == 0
     assert roles(loop) == ["review", "screenshot_review"]
     assert bool(screenshot_comments(loop)) == posts and bool(loop.merged) == posts
-    assert loop.labelled("ready-for-human") != posts
     if posts:
+        assert not loop.labelled("ready-for-human")
         assert "same-vendor-different-model (codex/gpt-6.1-sol)" in screenshot_comments(loop)[0]
+    else:
+        _one_handoff(loop, seen, "screenshot_independence_denied")
+
+
+def test_a_denied_screenshot_reviewer_role_hands_off_once_with_its_reason(loop, monkeypatch):
+    seen = _watch(monkeypatch)
+    allows = config.Config.allows
+    monkeypatch.setattr(config.Config, "allows",
+                        lambda self, vendor, role: role != "screenshot_reviewer" and allows(self, vendor, role))
+    loop.reviews = ["pass"]
+    assert screen_run(loop) == 0
+    assert roles(loop) == ["review"] and not screenshot_comments(loop)
+    assert not loop.fixes and not loop.merged
+    _one_handoff(loop, seen, "screenshot_reviewer_role_denied")
 
 
 def test_a_short_block_on_the_other_vendor_defers_the_screenshot_fallback_and_resumes_after_it(loop):
@@ -935,7 +951,13 @@ def test_a_screenshot_review_that_fails_goes_to_the_owner_with_neither_fix_nor_m
         monkeypatch.setattr(review, "agent_comment", lambda repo, owner, pr, marker, round:
                             "" if "screenshot" in marker else real(repo, owner, pr, marker, round))
     assert screen_run(loop) == 0
-    assert handoffs == ["review_failed"]
+    expected = {
+        "run failed": "screenshot_run_failed",
+        "missing artifact": "screenshot_run_failed",
+        "comment not posted": "screenshot_comment_post_failed",
+        "comment missing at fix time": "review_comment_missing",
+    }[case]
+    assert handoffs == [expected]
     assert loop.labelled("ready-for-human") and not loop.fixes and not loop.merged
     assert not loop.checkpoint()
     assert "stale" not in "".join(loop.comments())
@@ -1103,7 +1125,7 @@ def test_screenshot_exhaustion_hands_off_once(loop, monkeypatch):
                         lambda self, kind, key, *args: handoffs.append(key) if kind == "handoff" else None)
     assert screen_run(loop) == 0
     assert [run["role"] for run in loop.agents] == ["review"]
-    assert handoffs == ["review_failed"]
+    assert handoffs == ["screenshot_reviewer_unavailable"]
     assert len(notices) == 1 and "all screenshot reviewers are PR authors" in notices[0][1]
     assert sum(c[:2] == ["pr", "edit"] and "--add-label" in c and "ready-for-human" in c
                for c in loop.gh.calls()) == 1
@@ -1176,3 +1198,82 @@ def test_an_advised_handoff_says_why(advised):
     assert len(advised.fixes) == 1 and advised.labelled("ready-for-human")
     assert any("Advisor (DeepSeek) chose handoff: the same design disagreement repeats" in line
                for line in advised.log())
+
+
+# --- one handoff per terminal review failure, classified where it is produced (#125) ------------
+
+def _watch(monkeypatch):
+    seen = {"reasons": [], "notices": []}
+    monkeypatch.setattr(review.notify, "notify", lambda title, text: seen["notices"].append((title, text)))
+    monkeypatch.setattr(review.telemetry.Telemetry, "task",
+                        lambda self, kind, *args: seen["reasons"].append(args) if kind == "handoff" else None)
+    return seen
+
+
+def _one_handoff(loop, seen, reason):
+    assert seen["reasons"] == [(reason, "--reason", reason)]
+    assert len(seen["notices"]) == 1
+    assert sum(c[:2] == ["pr", "edit"] and "--add-label" in c and "ready-for-human" in c
+               for c in loop.gh.calls()) == 1
+
+
+def test_a_configured_model_refusal_hands_off_once_with_its_reason(loop, monkeypatch):
+    seen = _watch(monkeypatch)
+    for vendor in ("claude", "codex", "cursor"):
+        vendors.record_author(loop.env["STATE"], PR, vendor)
+    monkeypatch.setattr(review.Review, "review_vendor", lambda self, current: "codex")
+    assert loop.run(fixer="cursor", reviewer="codex") == 0
+    _one_handoff(loop, seen, "review_independence_denied")
+
+
+def test_an_actual_model_refusal_hands_off_once_with_its_reason(loop, monkeypatch):
+    seen = _watch(monkeypatch)
+    answers = iter([True, False])
+    monkeypatch.setattr(review.vendors, "review_allowed", lambda *args: next(answers))
+    assert loop.run(fixer="cursor", reviewer="claude") == 0
+    assert [a["role"] for a in loop.agents] == ["review"]
+    _one_handoff(loop, seen, "review_independence_denied")
+
+
+def test_a_denied_reviewer_role_hands_off_once_with_its_reason(loop, monkeypatch):
+    seen = _watch(monkeypatch)
+    monkeypatch.setattr(review.Review, "review_vendor", lambda self, current: "claude")
+    monkeypatch.setattr(config.Config, "allows", lambda self, vendor, role: role != "reviewer")
+    assert loop.run(fixer="cursor", reviewer="claude") == 0
+    _one_handoff(loop, seen, "reviewer_role_denied")
+
+
+@pytest.mark.parametrize("case, reason", [
+    ("claude post", "review_comment_post_failed"),
+    ("cursor post", "review_comment_post_failed"),
+    ("agent text", "review_run_failed"),
+    ("no artifact", "review_run_failed"),
+    ("seed", "review_author_state_failed"),
+])
+def test_a_failed_review_is_classified_where_it_fails(loop, monkeypatch, case, reason):
+    seen = _watch(monkeypatch)
+    reviewer = "claude"
+    if case == "claude post":
+        loop.after["review"] = lambda: loop.gh.fail("comment")
+    elif case == "cursor post":
+        loop.gh.set(headRefName="owner/issue-1", author={"login": "owner"})
+        loop.after["review"] = lambda: loop.gh.fail("comment")
+        reviewer = "cursor"
+    elif case == "agent text":
+        loop.reviews[:] = ["RESULT: failed could not post a comment, service unavailable"]
+    elif case == "no artifact":
+        loop.review_text = ""
+    else:
+        real, calls = review.vendors.seed_authors, []
+        monkeypatch.setattr(review.vendors, "seed_authors",
+                            lambda *args: real(*args) if not calls.append(1) and len(calls) == 1 else 1)
+    assert loop.run(fixer="cursor", reviewer=reviewer) == 0
+    _one_handoff(loop, seen, reason)
+
+
+def test_an_agent_screenshot_failure_that_mentions_a_comment_stays_a_run_failure(loop, monkeypatch):
+    seen = _watch(monkeypatch)
+    loop.reviews[:] = ["pass"]
+    loop.screens = ["RESULT: failed the comment was unavailable"]
+    assert screen_run(loop) == 0
+    _one_handoff(loop, seen, "screenshot_run_failed")
