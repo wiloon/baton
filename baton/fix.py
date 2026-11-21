@@ -225,8 +225,8 @@ class Runner:
         Path(self.ctx, f"pr-{pr}-fix-checks.json").unlink(missing_ok=True)
         template = "codex-fix-prompt.md" if fixer == "codex" else "fix-prompt.md"
         description = Path(self.ctx, f"pr-{pr}-description.md")
-        if fixer in ("cursor", "codex"):  # No GitHub access: the runner reads and writes the description.
-            description.write_text(pr_helpers.body(pr) or "")
+        # Claude and Codex edit the description through /tmp; the runner applies it (#75).
+        description.write_text(pr_helpers.body(pr) or "")
         shots_note, env = "", None
         if self.env.repo.screenshot_review:   # the next review looks at fresh screenshots (#50)
             shots = Path(self.ctx, f"pr-{pr}-shots")

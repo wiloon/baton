@@ -353,6 +353,24 @@ NEW_DESCRIPTION = "## What changed\nCorrected text.\n\n## Checks to verify\nnone
 CHECKED = {"file": "## Must fix\n1. adopted\n\n## Checks to verify\n- /billing: colour\n\nRESULT: fixed\n"}
 
 
+def test_a_claude_fixer_can_submit_a_description_only_replacement(run):
+    # #75: Claude gets the same snapshot + replacement channel as Codex; no commit is progress.
+    head = sh(run.worktree, "git", "rev-parse", "HEAD")
+    remote = sh(run.root / "origin.git", "git", "rev-parse", "cursor/issue-1")
+    run.agent({"commit": False, "file": "## Must fix\n1. adopted — listed the commit\n\n"
+                                        "## Checks to verify\nnone\n\nRESULT: fixed\n",
+               "description": NEW_DESCRIPTION})
+    assert run.fix()["rc"] == 0 and not run.labelled()
+    path = Path(env_ctx(), f"pr-{PR}-description.md")
+    assert str(path) in run.prompts[0]
+    assert path.read_text().rstrip("\n") == BODY.rstrip("\n")
+    assert "Corrected text." in run.body() and "Disabled buttons." not in run.body()
+    assert "<!-- baton-task issue=419 completion=partial -->" in run.body() and "Refs #419" in run.body()
+    assert section(run.body(), "Checks to verify") == "none"
+    assert sh(run.worktree, "git", "rev-parse", "HEAD") == head
+    assert sh(run.root / "origin.git", "git", "rev-parse", "cursor/issue-1") == remote == head
+
+
 def test_a_codex_fixer_can_read_the_current_description(run):
     run.agent(dict(CHECKED))
     run.fix("codex")

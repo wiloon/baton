@@ -44,11 +44,15 @@ def test_dev_prompt_keeps_closing_keywords_to_its_own_issue():
     assert "To mention another issue, write its number without one" in text("dev-prompt.md")
 
 
-def test_codex_fix_prompt_routes_description_fixes_through_the_runner():
-    prompt = text("codex-fix-prompt.md")
-    assert "`{{PR_DESCRIPTION_FILE}}`" in prompt
-    assert "`/tmp/baton-fix-{{PR}}.md.body`" in prompt
-    assert "You have no GitHub access" in prompt
+def test_fix_prompts_route_description_fixes_through_the_runner():
+    for name in ("fix-prompt.md", "codex-fix-prompt.md"):
+        prompt = text(name)
+        assert "`{{PR_DESCRIPTION_FILE}}`" in prompt, name
+        assert "`/tmp/baton-fix-{{PR}}.md.body`" in prompt, name
+        assert "adopt a description review point" in prompt, name
+        assert "make that description inaccurate" in prompt, name
+        assert "keeping the task relation" in prompt, name
+        assert "`TASK: complete` or `TASK: partial`" in prompt, name
 
 
 def test_fix_prompts_answer_nits_in_the_form_the_runner_reads():

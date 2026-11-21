@@ -84,6 +84,10 @@ case "$tool" in
       has "${S}gh[[:space:]]+pr[[:space:]]+comment\b" && deny "the runner posts review/fix artifacts"
       has "${S}git([[:space:]]+-C[[:space:]]+[^[:space:]]+)?[[:space:]]+push\b" && deny "the runner pushes"
     fi
+    if [[ "$ROLE" == fix ]]; then
+      has "${S}gh[[:space:]]+pr[[:space:]]+(create|edit)\b" \
+        && deny "the fixer edits the PR description under /tmp; the runner applies it"
+    fi
     if [[ "$ROLE" == dev ]]; then
       has "${S}gh[[:space:]]+(pr|issue)[[:space:]]+(create|edit|comment|close|reopen|ready|review|merge)\b" \
         && deny "the implementer has no GitHub write access; the runner opens the PR"
