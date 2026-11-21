@@ -76,8 +76,8 @@ def _git(wt, *args):
                           capture_output=True, check=False)
 
 
-def record_contrib(state, pr, vendor, wt, base):
-    result = _git(wt, "diff", "--numstat", base, "HEAD")
+def record_contrib(state, pr, vendor, wt, base, end="HEAD"):
+    result = _git(wt, "diff", "--numstat", base, end)
     lines = _changed_lines(result.stdout)
     if lines > 0:
         with state_path(state, pr, "contrib").open("a") as file:

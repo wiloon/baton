@@ -44,7 +44,9 @@ def fails(name):
     return (root / f"{name}-fails").exists()
 pr = json.loads((root / "pr.json").read_text())
 if args[:2] == ["pr", "view"]:
-    if fails("view"):
+    if fails("view") or (fails("relation-after-body-edit") and "--jq" not in args
+                         and args[args.index("--json") + 1] == "headRefName,body"
+                         and (root / "body-written").exists()):
         sys.exit(1)
     if "--jq" in args and args[args.index("--jq") + 1] == '.headRefName + " " + .author.login':
         print(pr["headRefName"] + " " + pr["author"]["login"])
@@ -55,9 +57,12 @@ if args[:2] == ["pr", "view"]:
 elif args[:2] == ["pr", "edit"] and "--body-file" not in args:
     sys.exit(1 if fails("label") else 0)
 elif args[:2] == ["pr", "edit"]:
+    if fails("edit-before-write"):
+        sys.exit(1)
     source = args[args.index("--body-file") + 1]
     pr["body"] = sys.stdin.read() if source == "-" else pathlib.Path(source).read_text()
     (root / "pr.json").write_text(json.dumps(pr))
+    (root / "body-written").touch()
     if fails("edit"):
         sys.exit(1)   # also a write whose response was lost
 elif args[:2] == ["pr", "checks"]:
