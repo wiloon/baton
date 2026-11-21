@@ -108,12 +108,25 @@ def run(gh, tmp_path, monkeypatch):
         def pushed(self):
             return sh(wt, "git", "rev-parse", "HEAD") == sh(origin, "git", "rev-parse", "cursor/issue-1")
 
+        def watch_pushes(self):
+            hook = wt / ".git" / "hooks" / "pre-push"
+            hook.write_text('#!/bin/sh\nprintf "push\\n" >> push-attempts.log\n')
+            hook.chmod(0o755)
+
+        def push_attempts(self):
+            log = wt / "push-attempts.log"
+            return log.read_text().splitlines() if log.exists() else []
+
+        def remote_head(self):
+            return sh(origin, "git", "rev-parse", "cursor/issue-1")
+
     state = Run()
 
     def stub(vendor, role, prompt, tag, cwd, settings="", output="", env=None, hooks=None):
         state.agent_calls.append((vendor, role, tag, output))
         state.prompts.append(prompt)
-        plan = {"outcome": "RESULT: fixed", "reply": "", "commit": True, "rc": 0, "model": "", **state.plans.pop(0)}
+        plan = {"outcome": "RESULT: fixed", "reply": "", "commit": True, "rc": 0, "model": "",
+                "request_directory": False, **state.plans.pop(0)}
         if plan["rc"] == 75:
             return {"rc": 75, "status": "quota", "outcome": "", "reply": None, "model": "", "defer": "quota exhausted"}
         if plan["commit"]:
@@ -124,11 +137,19 @@ def run(gh, tmp_path, monkeypatch):
         if plan.get("stray"):
             Path(cwd, "stray.txt").write_text("x\n")
         if plan.get("request"):
-            Path(env_ctx(), f"pr-{PR}-body.md").write_text(plan["request"])
+            request = Path(env_ctx(), f"pr-{PR}-body.md")
+            if plan["request_directory"]:
+                request.mkdir()
+            else:
+                request.write_text(plan["request"])
         if output and plan.get("file") is not None:
             Path(output).write_text(plan["file"])
         if output and plan.get("description") is not None:
-            Path(f"{output}.body").write_text(plan["description"])
+            request = Path(f"{output}.body")
+            if plan["request_directory"]:
+                request.mkdir()
+            else:
+                request.write_text(plan["description"])
         return {"rc": 0, "status": "success", "outcome": plan["outcome"], "reply": plan["reply"], "model": plan["model"],
                 "defer": ""}
     state.agent_calls = []
@@ -416,6 +437,7 @@ COMPLETE = ("<!-- baton-task issue=419 completion=complete -->\n\nCloses #419\n\
 def test_task_partial_accepts_a_matching_or_copied_body_and_pushes(run, gh, fixer, body_says):
     # Acceptance 1: live complete + TASK: partial; body may already say partial or still say complete.
     gh.set(body=COMPLETE, headRefName="cursor/issue-419")
+    gh.fail("relation-after-body-edit")
     text = ("Task completion: partial\n\n## What changed\nFixed all items.\n\n## Checks to verify\nnone\n"
             if body_says == "partial" else
             "Task completion: complete\n\n## What changed\nFixed all items.\n\n## Checks to verify\nnone\n")
@@ -427,6 +449,24 @@ def test_task_partial_accepts_a_matching_or_copied_body_and_pushes(run, gh, fixe
     assert run.fix(fixer)["rc"] == 0 and run.pushed() and not run.labelled()
     assert "completion=partial" in run.body() and "Refs #419" in run.body()
     assert "Fixed all items." in run.body() and "Closes #419" not in run.body()
+
+
+@pytest.mark.parametrize("fixer", ["cursor", "codex"])
+@pytest.mark.parametrize("directory", [True, False], ids=["directory", "no-relation"])
+def test_a_rejected_request_reports_the_exact_reason(run, gh, fixer, directory):
+    reply = "TASK: partial\nRESULT: fixed"
+    if directory:
+        reason = "description request must be a non-empty regular file and cannot be a symlink"
+        gh.set(body=COMPLETE)
+    else:
+        reason = "cannot determine the PR's issue and task completion"
+        gh.set(body="Original description.", headRefName="feature/no-issue")
+    plan = cursor_plan(reply, request=BODY) if fixer == "cursor" else {**CHECKED, "reply": reply, "description": BODY}
+    run.agent({**plan, "request_directory": directory})
+    assert run.fix(fixer)["rc"] == 1 and run.pushed() and run.labelled()
+    assert f"PR #{PR}: description request not applied ({fixer}) | {reason}; the commits, if any, are pushed. {URL}" in run.runner_log()
+    if directory:
+        assert "completion=partial" in run.body() and "Refs #419" in run.body()
 
 
 @pytest.mark.parametrize("fixer", ["cursor", "codex"])
@@ -449,7 +489,7 @@ def test_a_rejected_body_never_reaches_the_pr(run, gh, fixer, reply, description
 
 
 @pytest.mark.parametrize("fixer", ["cursor", "codex"])
-def test_a_rejected_body_with_task_partial_still_pushes_and_retargets(run, gh, fixer):
+def test_a_rejected_body_with_task_partial_still_pushes_and_retargets(run, gh, monkeypatch, fixer):
     # Acceptance 3: rejected description, valid TASK: partial → push, Refs, shared handoff with reason.
     gh.set(body=COMPLETE, headRefName="cursor/issue-419")
     bad = "Task completion: partial\nTask completion: complete\n\n## What changed\nNope.\n"
@@ -457,7 +497,20 @@ def test_a_rejected_body_with_task_partial_still_pushes_and_retargets(run, gh, f
         run.agent(cursor_plan("## Checks to verify\nnone\n\nTASK: partial\nRESULT: fixed", request=bad))
     else:
         run.agent({**CHECKED, "description": bad, "reply": "TASK: partial\nRESULT: fixed\n"})
+    label_heads = []
+    call_gh = fix.pr_helpers.gh
+
+    def observe_label(*args, **kwargs):
+        if args[:2] == ("pr", "edit") and "--add-label" in args and "ready-for-human" in args:
+            label_heads.append(run.remote_head())
+        return call_gh(*args, **kwargs)
+
+    monkeypatch.setattr(fix.pr_helpers, "gh", observe_label)
+    old_head = run.remote_head()
+    run.watch_pushes()
     assert run.fix(fixer)["rc"] == 1 and run.pushed() and run.labelled()
+    assert label_heads == [run.remote_head()] and label_heads != [old_head]
+    assert run.push_attempts() == ["push"]
     assert "Nope." not in run.body() and "Disabled buttons." in run.body()
     assert "completion=partial" in run.body() and "Refs #419" in run.body()
     assert any("description request not applied" in line and "conflicting" in line
@@ -472,7 +525,9 @@ def test_a_rejected_body_with_no_commit_hands_off_without_pushing(run, gh, fixer
         run.agent(cursor_plan("RESULT: fixed", request=bad, commit=False))
     else:
         run.agent({**CHECKED, "commit": False, "description": bad, "reply": "RESULT: fixed\n"})
-    assert run.fix(fixer)["rc"] == 1 and run.labelled() and not run.pushed_new
+    run.watch_pushes()
+    assert run.fix(fixer)["rc"] == 1 and run.labelled()
+    assert run.push_attempts() == []
     assert "Nope." not in run.body() and "Closes #419" in run.body()
 
 
@@ -493,22 +548,57 @@ def test_cursor_defers_body_and_task_then_resumes_without_an_agent(run, gh):
     gh.set(body=COMPLETE, headRefName="cursor/issue-419")
     text = "Task completion: partial\n\n## What changed\nFixed all items.\n\n## Checks to verify\nnone\n"
     run.agent(cursor_plan("## Checks to verify\nnone\n\nTASK: partial\nRESULT: fixed", request=text))
-    gh.fail("edit")
+    gh.fail("edit-before-write")
     assert run.fix("cursor")["rc"] == 75 and len(run.agent_calls) == 1 and not run.labelled()
-    gh.fail("edit", False)
+    assert run.body() == COMPLETE
+    gh.fail("edit-before-write", False)
     assert run.fix("cursor")["rc"] == 0 and len(run.agent_calls) == 1 and run.pushed()
     assert "completion=partial" in run.body() and "Refs #419" in run.body()
     assert "Fixed all items." in run.body()
 
 
-def test_cursor_resumes_a_task_only_edit_after_github_failure(run, gh):
-    gh.set(body=COMPLETE, headRefName="cursor/issue-419")
+@pytest.mark.parametrize("failure", ["edit", "edit-before-write"])
+def test_cursor_resumes_a_task_only_edit_after_github_failure(run, gh, failure):
+    initial = COMPLETE.replace("## Checks to verify\nnone", "## Checks to verify\n- /billing: badge")
+    gh.set(body=initial, headRefName="cursor/issue-419")
     run.agent(cursor_plan("Agreed.\nTASK: partial\nRESULT: fixed", commit=False))
-    gh.fail("edit")
+    gh.fail(failure)
     assert run.fix("cursor")["rc"] == 75 and len(run.agent_calls) == 1 and not run.labelled()
-    gh.fail("edit", False)
+    if failure == "edit-before-write":
+        assert run.body() == initial
+    gh.fail(failure, False)
     assert run.fix("cursor")["rc"] == 0 and len(run.agent_calls) == 1 and not run.pushed_new
     assert "completion=partial" in run.body() and "Refs #419" in run.body()
+    assert section(run.body(), "Checks to verify") == "- /billing: badge"
+
+
+def test_cursor_retries_a_failed_read_then_hands_off_an_unchanged_request(run, gh):
+    run.agent(cursor_plan("RESULT: fixed", request=BODY, commit=False))
+    gh.fail("view")
+    assert run.fix("cursor")["rc"] == 75 and not run.labelled()
+    gh.fail("view", False)
+    assert run.fix("cursor")["rc"] == 1 and len(run.agent_calls) == 1 and run.labelled()
+    assert run.body() == BODY
+    assert any("made no commit" in line for line in run.runner_log())
+
+
+@pytest.mark.parametrize("outcome", ["RESULT: failed boom", "RESULT: needs-info", "RESULT: fixed"])
+def test_cursor_does_not_resume_a_run_interrupted_before_checks_are_saved(run, gh, monkeypatch, outcome):
+    from baton import pr as pr_helpers
+    request = BODY.replace("Disabled buttons.", "Stale description.")
+    first = cursor_plan(f"## Checks to verify\n- /old: badge\n\n{outcome}", request=request, commit=False)
+    run.agent({**first, "outcome": outcome},
+              cursor_plan("## Checks to verify\n- /new: badge\n\nRESULT: fixed", commit=False))
+    with monkeypatch.context() as patch:
+        def interrupt(*args):
+            raise KeyboardInterrupt
+        patch.setattr(pr_helpers, "split_checks", interrupt)
+        with pytest.raises(KeyboardInterrupt):
+            run.fix("cursor")
+    assert run.body() == BODY
+    assert run.fix("cursor")["rc"] == 0 and len(run.agent_calls) == 2
+    assert section(run.body(), "Checks to verify") == "- /new: badge"
+    assert "Stale description." not in run.body()
 
 
 def test_cursor_resumes_task_after_a_rejected_body_when_github_fails(run, gh):
@@ -527,15 +617,15 @@ def test_cursor_resumes_task_after_a_rejected_body_when_github_fails(run, gh):
 def test_cursor_lost_body_response_still_counts_on_resume(run, gh):
     # Lost success response: fake gh writes then fails; retry sees the landed body vs baseline.
     gh.set(body=COMPLETE, headRefName="cursor/issue-419")
-    text = "Task completion: partial\n\n## What changed\nFixed all items.\n\n## Checks to verify\nnone\n"
+    text = COMPLETE.replace("Disabled buttons.", "Fixed all items.")
     run.agent(cursor_plan("## Checks to verify\nnone\n\nTASK: partial\nRESULT: fixed",
                           request=text, commit=False))
     gh.fail("edit")
     assert run.fix("cursor")["rc"] == 75
-    # Body already landed; leave fail on so the retry still reports through the baseline path.
-    gh.fail("edit", False)
-    assert run.fix("cursor")["rc"] == 0 and len(run.agent_calls) == 1
     assert "Fixed all items." in run.body() and "completion=partial" in run.body()
+    # Keep the edit failure active. The retry can finish using the already-landed body.
+    assert run.fix("cursor")["rc"] == 0 and len(run.agent_calls) == 1
+    assert len([c for c in gh.calls() if c[:2] == ["pr", "edit"] and "--body-file" in c]) == 1
 
 
 def test_a_description_request_from_an_earlier_run_is_not_applied(run):

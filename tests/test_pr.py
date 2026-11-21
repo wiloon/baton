@@ -1,6 +1,7 @@
 """baton.pr against a fake gh: the cases tests/manual-checks.sh and
 tests/completion.sh drive through fix_pr, plus the merge gate."""
 import json
+from io import StringIO
 import os
 from pathlib import Path
 
@@ -186,12 +187,15 @@ def test_details_and_relation(gh, monkeypatch, branch):
         pr.details(335, "acme-owner", r"^cursor$")
 
 
-def test_task_line_retargets_the_pr(gh, dirs):
+def test_task_line_retargets_the_pr(gh, dirs, monkeypatch, capsys):
     _, ctx = dirs
     gh.set(headRefName="cursor/issue-419", body=PARTIAL)
-    rc, changed, log = pr.apply_task(420, "Agreed: #420 delivers every acceptance item.\nTASK: complete\nRESULT: fixed\n", ctx)
-    assert (rc, changed) == (0, True)
-    assert log == "PR #420: task completion partial -> complete at the fixer's request; the next review checks it"
+    monkeypatch.setattr("sys.stdin", StringIO("Agreed.\nTASK: complete\nRESULT: fixed\n"))
+    assert pr.main(["apply-task", "420"]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "changed": True,
+        "log": "PR #420: task completion partial -> complete at the fixer's request; the next review checks it",
+    }
     assert "issue=419 completion=complete" in gh.pr["body"] and "\nCloses #419\n" in gh.pr["body"]
     assert os.listdir(ctx) == []   # the body file is gone
 
@@ -204,7 +208,7 @@ def test_task_line_retargets_the_pr(gh, dirs):
 def test_no_task_request_changes_nothing(gh, dirs, reply):
     _, ctx = dirs
     gh.set(headRefName="cursor/issue-419", body=PARTIAL)
-    assert pr.apply_task(420, reply, ctx) == (0, False, "")
+    assert pr.apply_task(420, pr.task_wanted(reply), ctx) == (0, False, "")
     assert edits(gh) == []
 
 
@@ -212,10 +216,10 @@ def test_task_request_failures(gh, dirs):
     _, ctx = dirs
     gh.set(headRefName="cursor/issue-419", body=PARTIAL)
     gh.fail("edit")
-    assert pr.apply_task(420, "TASK: complete\n", ctx)[0] == 1
+    assert pr.apply_task(420, "complete", ctx)[0] == 1
     gh.fail("edit", False)
     gh.set(headRefName="main", body="No relation.")
-    assert pr.apply_task(420, "TASK: complete\n", ctx)[0] == 2
+    assert pr.apply_task(420, "complete", ctx)[0] == 2
 
 
 # --- description requests ---------------------------------------------------------------
@@ -254,6 +258,17 @@ def test_body_retry_recognizes_a_write_with_a_lost_response(gh, dirs, tmp_path):
     gh.fail("edit", False)
     assert pr.apply_body(335, request, state, ctx) == (0, True, "")
     assert len(edits(gh)) == 1   # the retry found the body already written
+
+
+def test_body_without_task_validates_against_the_current_completion(gh, dirs, tmp_path):
+    state, ctx = dirs
+    gh.set(headRefName="cursor/issue-419", body=PARTIAL)
+    request = tmp_path / "request.md"
+    request.write_text(PARTIAL.replace("A test.", "Revised text."))
+    assert pr.apply_body(420, request, state, ctx) == (0, True, "")
+    assert pr.apply_task(420, "complete", ctx)[:2] == (0, True)
+    assert pr.apply_body(420, request, state, ctx) == (
+        2, False, "a body edit cannot change task completion; request owner review")
 
 
 def test_task_wanted_takes_the_last_full_line(gh, dirs, tmp_path):

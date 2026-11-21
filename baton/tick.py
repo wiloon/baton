@@ -154,9 +154,10 @@ class Tick:
             if a["cursor_fix"]:
                 n = a["cursor_fix"]
                 for path in (state / f"cursor-fix-base-{n}", state / f"pr-body-base-{n}",
-                             state / f"cursor-fix-task-{n}", self.ctx / f"pr-{n}-body.md",
+                             state / f"cursor-fix-task-{n}", state / f"owner-fix-feedback-{n}",
                              self.ctx / f"pr-{n}-fix-checks.json"):
                     path.unlink(missing_ok=True)
+                pr_helpers.remove_body_request(self.ctx / f"pr-{n}-body.md")
         elif a["issue"]:
             pr_helpers.gh("issue", "edit", a["issue"], "-R", self.gh_repo, "--remove-label", "agent-wip")
 
@@ -255,8 +256,7 @@ class Tick:
         return loop.loop(note, fixer, reviewer)
 
     def fix_pr(self, pr, wt, fixer, source, feedback, issue="", head=""):
-        if fixer == "cursor":
-            self.active["cursor_fix"] = str(pr)
+        self.active["cursor_fix"] = str(pr)
         runner = fix.Runner(self.env.with_runtime(issue=issue, pr=str(pr)), self.hooks(issue, pr), pr, "")
         return fix.fix_pr(runner, pr, wt, fixer, source, feedback, head)
 
@@ -465,9 +465,9 @@ class Tick:
         if state != "OPEN":
             path.unlink(missing_ok=True)
             return 0
-        self.review_loop(pr, saved.get("wt", ""), saved.get("note", ""), saved.get("fixer", ""), saved.get("reviewer", ""),
-                         issue=saved.get("ISSUE", ""))
-        return 80
+        rc = self.review_loop(pr, saved.get("wt", ""), saved.get("note", ""), saved.get("fixer", ""),
+                              saved.get("reviewer", ""), issue=saved.get("ISSUE", ""))
+        return 75 if rc == 75 else 80
 
     # --- pick work: a PR the owner labelled agent-review ----------------------------------------
     def pick_review(self):
@@ -513,11 +513,11 @@ class Tick:
             return 1
         if ok == "cursor":
             self.notify(f"PR #{pr}: independent review resumes", url)
-            self.review_loop(pr, wt, CURSOR_REVIEW_NOTE, "agent", "pool", issue=issue)
+            rc = self.review_loop(pr, wt, CURSOR_REVIEW_NOTE, "agent", "pool", issue=issue)
         else:
             self.notify(f"PR #{pr}: an independent vendor reviews it", url)
-            self.review_loop(pr, wt, AGENT_REVIEW_NOTE.format(issue=f" and issue #{issue}" if issue else ""), "agent", "pool", issue=issue)
-        return 80
+            rc = self.review_loop(pr, wt, AGENT_REVIEW_NOTE.format(issue=f" and issue #{issue}" if issue else ""), "agent", "pool", issue=issue)
+        return 75 if rc == 75 else 80
 
     # --- pick work: an agent PR the owner labelled agent-fix --------------------------------------
     def pick_fix(self):
@@ -538,7 +538,7 @@ class Tick:
         return self.after_item(self.item(lambda: self.fix_item(pr, head_ref)))
 
     def fix_item(self, pr, head_ref):
-        self.active["pr"] = str(pr)
+        self.active["cursor_fix"] = self.active["pr"] = str(pr)
         issue = names.issue_of(head_ref)
         wt = str(names.worktree_for(self.wt_root, head_ref))
         url = f"https://github.com/{self.gh_repo}/pull/{pr}"
@@ -552,7 +552,8 @@ class Tick:
             pr_helpers.gh("pr", "edit", pr, "-R", self.gh_repo, "--remove-label", "agent-fix", "--add-label", "ready-for-human")
             self.notify(f"PR #{pr} needs you", f"{wt} has diverged from origin/{head_ref}. {url}")
             return 80
-        feedback = review.human_feedback(self.gh_repo, self.owner, pr)
+        feedback_file = self.state / f"owner-fix-feedback-{pr}"
+        feedback = feedback_file.read_text() if feedback_file.is_file() else review.human_feedback(self.gh_repo, self.owner, pr)
         if not feedback.strip():
             pr_helpers.gh("pr", "edit", pr, "-R", self.gh_repo, "--remove-label", "agent-fix")
             self.notify(f"PR #{pr}: nothing to fix", f"No new review feedback from {self.owner}.")
@@ -564,17 +565,25 @@ class Tick:
             self.log(f"PR #{pr}: commit {commit} has no known vendor; not counted")
         fixer = self.pick_vendor("fixer", "contrib", self.all_vendors(), pr=pr, issue=issue)
         self.notify(f"PR #{pr}: {fixer} is addressing your review", url)
+        # Posting a fix reply advances human_feedback's cutoff even when an edit defers.
+        if not feedback_file.is_file():
+            temp = feedback_file.with_suffix(".tmp")
+            temp.write_text(feedback)
+            temp.replace(feedback_file)
         # The label stays only on a deferral, so the fix resumes; any other outcome drops it.
         rc = self.fix_pr(pr, wt, fixer, f"{self.owner} (the repository owner)", feedback, issue)
+        if rc == 75:
+            return 75
+        feedback_file.unlink(missing_ok=True)
         pr_helpers.gh("pr", "edit", pr, "-R", self.gh_repo, "--remove-label", "agent-fix")
         if rc != 0:
             return 80
-        self.review_loop(pr, wt, f"""{fixer} just addressed this review feedback from {self.owner}. Check that each point is resolved or convincingly answered in its `<!-- baton-fix by={fixer}` comment, and review the new commits. The rest of the PR was reviewed before.
+        rc = self.review_loop(pr, wt, f"""{fixer} just addressed this review feedback from {self.owner}. Check that each point is resolved or convincingly answered in its `<!-- baton-fix by={fixer}` comment, and review the new commits. The rest of the PR was reviewed before.
 
 <feedback>
 {feedback}
 </feedback>""", "agent", "pool", fixer, issue)
-        return 80
+        return 75 if rc == 75 else 80
 
     # --- pick work: an issue for the pipeline ------------------------------------------------------
     def pick_issue(self):
