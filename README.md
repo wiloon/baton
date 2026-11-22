@@ -189,14 +189,17 @@ With several `[[repos]]`, put `--repo OWNER/NAME` before the command.
 When a PR review or a spec review runs out of rounds, the optional routine advisor
 ([ADR 0008](docs/adr/0008-model-judgement-is-advisory.md), #17) gets one fresh DeepSeek call with
 a redacted snapshot and the allowed actions (`extra_round` or `handoff`). In `mode = "live"` the
-runner revalidates the state and grants at most one extra round per task; a second limit, a
-failure or an answer outside the set hands off as before, and the handoff text says what the
-advisor chose. The advisor is also consulted, in observation only, when CI is not green before
+runner revalidates the state and grants at most one extra round per task episode. Failed
+review, fix, spec, implementation, local verification and worktree steps can also send a
+redacted step snapshot. Where the role and task allow it, `retry_step` repeats the failed step
+and `retry_step_other_vendor` switches to an eligible alternate. Live mode grants at most one
+retry per failure reason per episode. Verification keeps its existing repair budget. The
+advisor is also consulted, in observation only, when CI is not green before
 a merge, when a merge fails, and when an ADR PR cannot be merged. Those calls send the PR title,
 description, the latest review and fix comments and, for an ADR, the acceptance text, all
 redacted. The only action offered there is one bounded read-only retry; it appears in the
 handoff text as "recommended, not executed (observation)" and never goes live, so the task is
-always handed off. `mode = "observe"` records the advice and always hands off; `off` (the default)
+always handed off. `mode = "observe"` records the advice and follows the existing rule. `off` (the default)
 makes no call. `[[repos]] advisor = false` keeps a repository's issue and PR text off the
 provider. Decisions go to `<state>/advisor/decisions.jsonl`; once a day a "Advisor digest"
 notification lists them with how the extra rounds ended (merged or accepted). `DEEPSEEK_API_KEY` comes from the

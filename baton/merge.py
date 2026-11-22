@@ -165,7 +165,7 @@ class Merger:
             # Only a real handoff by the repair run ends here; any other failure (e.g. recording
             # authorship) falls through to the merge gate's own CI handoff.
             return HANDED_OFF if runner.handed_off else 1
-        self.hooks.task("ci_fix", f"pr:{pr}:{head}", "--agent", fixer, "--head-sha", head)
+        self.hooks.task("ci_fix", f"pr:{pr}:{head}", "--agent", runner.last_fixer or fixer, "--head-sha", head)
         return 0
 
     # --- the task behind the PR ---

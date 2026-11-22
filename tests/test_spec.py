@@ -55,7 +55,8 @@ class FakeGH:
         if not landed:
             return subprocess.CompletedProcess(args, 1, "", stderr)
         if head == "issue view" and "comments" in args[args.index("--json") + 1]:
-            data = {"title": "T", "body": self.body, "comments": self.comments}
+            data = {"title": "T", "body": self.body, "comments": self.comments,
+                    "state": "OPEN", "labels": [{"name": label} for label in sorted(self.labels)]}
             out = json.dumps(data)
         elif head == "issue view":
             out = self.body + "\n"
@@ -1480,6 +1481,49 @@ def test_spec_review_run_failed_live_retry_step_same_vendor_once(advised):
     reviewers = [r for r in advised.runs if r["role"] == "spec_review"]
     assert len(reviewers) == 2 and reviewers[0]["vendor"] == reviewers[1]["vendor"]
     assert len(advised.advice_calls) == 1
+
+
+def test_round_two_retry_cannot_switch_to_the_latest_reviser(advised):
+    failed = {**CHANGES, "rc": 1, "status": "failure", "outcome": "RESULT: failed reviewer crashed"}
+    advised.script = [CHANGES, reviser(), failed, ACCEPT]
+    advised.advice = [{"action": "retry_step_other_vendor", "reason": "try the reviser",
+                       "evidence": ["Decision point: spec_review_run_failed"]}]
+    assert advised.run() is True
+    assert [run["vendor"] for run in advised.runs[1:]] == ["codex", "claude", "cursor"]
+
+
+def test_spec_retry_rejects_an_owner_edit_during_advice(advised, monkeypatch):
+    from baton import advisor
+
+    failed = {**CHANGES, "rc": 1, "status": "failure", "outcome": "RESULT: failed reviewer crashed"}
+    advised.script = [failed, ACCEPT]
+    advised.advice = [{"action": "retry_step", "reason": "transient",
+                       "evidence": ["Decision point: spec_review_run_failed"]}]
+    call = advisor.call_deepseek
+
+    def edited(*args, **kwargs):
+        advised.gh.body += "\nOwner changed the requested outcome."
+        return call(*args, **kwargs)
+
+    monkeypatch.setattr(advisor, "call_deepseek", edited)
+    assert advised.run() is False
+    assert len(advised.runs) == 1
+    assert "ready-for-human" in advised.gh.labels
+
+
+def test_alternate_reviser_renders_its_prompt_and_clears_failed_artifacts(advised):
+    advised.gh.comments = [{"author": {"login": "owner"},
+                            "body": "<!-- baton-spec-review round=1 by=cursor -->\nChange the goal"}]
+    advised.script = [reviser(comment="stale reply", body="stale body", outcome="RESULT: failed"),
+                      dict(REVISED)]
+    advised.advice = [{"action": "retry_step_other_vendor", "reason": "try a different reviser",
+                       "evidence": ["Decision point: spec_revision_run_failed"]}]
+    assert advised.run() is False
+    first, second = advised.runs
+    assert {first["vendor"], second["vendor"]} == {"claude", "codex"}
+    assert first["prompt"].splitlines()[0] != second["prompt"].splitlines()[0]
+    assert advised.gh.body == "Goal\nOld step\n"
+    assert not advised.gh.posted("<!-- baton-spec-reply")
 
 
 def test_spec_revision_denied_spent_across_recovery(advised, tmp_path, monkeypatch):

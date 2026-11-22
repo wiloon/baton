@@ -259,6 +259,8 @@ class Tick:
     def fix_pr(self, pr, wt, fixer, source, feedback, issue="", head=""):
         self.active["cursor_fix"] = str(pr)
         runner = fix.Runner(self.env.with_runtime(issue=issue, pr=str(pr)), self.hooks(issue, pr), pr, "")
+        runner.required_retry_label = "agent-fix"
+        self.fix_runner = runner
         return fix.fix_pr(runner, pr, wt, fixer, source, feedback, head)
 
     def spec_loop(self, issue):
@@ -562,36 +564,47 @@ class Tick:
             return 1
         # Fast-forward only: local commits a failed push left behind are kept and pushed with the fix.
         from . import handoff as owner_handoff, recovery
-        if not (session.run_process(["git", "-C", wt, "checkout", "-q", head_ref]).returncode == 0
-                and session.run_process(["git", "-C", wt, "merge", "-q", "--ff-only", f"origin/{head_ref}"]).returncode == 0):
-            ready, detail = recovery.worktree_ready(wt, head_ref)
-            if not ready:
-                owner_handoff.perform(
-                    self.env, "fix_worktree_diverged", kind="pr", number=pr, remove=("agent-fix",),
-                    item=pr, episode=issue or pr,
-                    title=f"PR #{pr} needs you", text=f"{wt}: {detail}. {url}",
-                    hooks=self.hooks(issue or "0", pr=pr))
+        reason = "fix_worktree_diverged"
+        episode = issue or pr
+        detail = f"{wt} could not fast-forward to origin/{head_ref}. {url}"
+
+        def handoff(text=detail, **kwargs):
+            return owner_handoff.perform(
+                self.env, reason, kind="pr", number=pr, remove=("agent-fix",),
+                item=pr, episode=episode, title=f"PR #{pr} needs you", text=text,
+                hooks=self.hooks(issue or "0", pr=pr), **kwargs)
+
+        def binding():
+            if not recovery.worktree_ready(wt, head_ref)[0]:
+                return None
+            remote = git(wt, "rev-parse", f"origin/{head_ref}")
+            current = recovery.worker_fingerprint(wt, pr, extra={"origin_branch": remote},
+                                                  head_ref=head_ref, required_label="agent-fix")
+            return current if current and current["remote_head"] == remote else None
+
+        def fast_forward():
+            return (session.run_process(["git", "-C", wt, "checkout", "-q", head_ref]).returncode == 0
+                    and session.run_process(["git", "-C", wt, "merge", "-q", "--ff-only",
+                                             f"origin/{head_ref}"]).returncode == 0)
+
+        pending = recovery.resume(self.env, episode, pr, lambda saved: saved == reason, binding, handoff, local=True)
+        if pending is False:
+            return 80
+        if not fast_forward():
+            ready, why = recovery.worktree_ready(wt, head_ref)
+            if pending or not ready:
+                handoff(text=f"{wt}: {why}. {url}" if why else detail)
                 return 80
-            fingerprint = recovery.pr_fingerprint(wt, pr, extra={"branch": head_ref})
-            snapshot = (f"Decision point: fix_worktree_diverged. Repository {self.gh_repo}, PR #{pr}.\n"
-                        f"Worktree: {wt}; branch: {head_ref}.\nOutcome: fast-forward merge failed.\n"
-                        "Actions: retry_step = one more worktree preparation when still safe; handoff = the owner takes the PR.\n")
-            result = owner_handoff.perform(
-                self.env, "fix_worktree_diverged", kind="pr", number=pr, remove=("agent-fix",),
-                item=pr, episode=issue or pr,
-                title=f"PR #{pr} needs you", text=f"{wt} has diverged from origin/{head_ref}. {url}",
-                hooks=self.hooks(issue or "0", pr=pr), snapshot=snapshot, observed_actions=("retry_step",),
-                revalidate=lambda: recovery.worktree_ready(wt, head_ref)[0])
-            if result.handed_off:
+            retry = recovery.request(self.env, episode, pr, reason, "worktree", "", detail,
+                                     binding(), binding, handoff, local=True)
+            if not retry:
                 return 80
-            if not (session.run_process(["git", "-C", wt, "checkout", "-q", head_ref]).returncode == 0
-                    and session.run_process(["git", "-C", wt, "merge", "-q", "--ff-only", f"origin/{head_ref}"]).returncode == 0):
-                owner_handoff.perform(
-                    self.env, "fix_worktree_diverged", kind="pr", number=pr, remove=("agent-fix",),
-                    item=pr, episode=issue or pr,
-                    title=f"PR #{pr} needs you", text=f"{wt} has diverged from origin/{head_ref}. {url}",
-                    hooks=self.hooks(issue or "0", pr=pr))
+            if not fast_forward():
+                handoff()
                 return 80
+            pending = retry
+        if pending:
+            recovery.clear(self.env, episode, pr)
         feedback_file = self.state / f"owner-fix-feedback-{pr}"
         feedback = feedback_file.read_text() if feedback_file.is_file() else review.human_feedback(self.gh_repo, self.owner, pr)
         if not feedback.strip():
@@ -603,7 +616,8 @@ class Tick:
             return 1
         for commit in vendors.seed_contrib(str(self.state), pr, wt):
             self.log(f"PR #{pr}: commit {commit} has no known vendor; not counted")
-        fixer = self.pick_vendor("fixer", "contrib", self.all_vendors(), pr=pr, issue=issue)
+        fixer = "agent" if recovery.path(self.env, episode, pr).exists() else self.pick_vendor(
+            "fixer", "contrib", self.all_vendors(), pr=pr, issue=issue)
         self.notify(f"PR #{pr}: {fixer} is addressing your review", url)
         # Posting a fix reply advances human_feedback's cutoff even when an edit defers.
         if not feedback_file.is_file():
@@ -611,6 +625,7 @@ class Tick:
             temp.write_text(feedback)
             temp.replace(feedback_file)
         # The label stays only on a deferral, so the fix resumes; any other outcome drops it.
+        self.fix_runner = None
         rc = self.fix_pr(pr, wt, fixer, f"{self.owner} (the repository owner)", feedback, issue)
         if rc == 75:
             return 75
@@ -618,11 +633,14 @@ class Tick:
         pr_helpers.gh("pr", "edit", pr, "-R", self.gh_repo, "--remove-label", "agent-fix")
         if rc != 0:
             return 80
+        if self.fix_runner:
+            fixer = self.fix_runner.last_fixer or fixer
+        fixed_by = " ".join(dict.fromkeys([*(self.fix_runner.attempt_authors if self.fix_runner else []), fixer]))
         rc = self.review_loop(pr, wt, f"""{fixer} just addressed this review feedback from {self.owner}. Check that each point is resolved or convincingly answered in its `<!-- baton-fix by={fixer}` comment, and review the new commits. The rest of the PR was reviewed before.
 
 <feedback>
 {feedback}
-</feedback>""", "agent", "pool", fixer, issue)
+</feedback>""", "agent", "pool", fixed_by, issue)
         return 75 if rc == 75 else 80
 
     # --- pick work: an issue for the pipeline ------------------------------------------------------
@@ -778,6 +796,8 @@ class Tick:
             self.log(f"{len(pending)} issue(s) still waiting on review (agent-wip), cap {cap}, {len(deferred)} deferred, "
                      f"{limit}; not starting new work: " + "; ".join(why))
             return ""
+        from . import recovery
+
         waiting = self.pending_specs()
         for n in self.candidates():
             if str(n) in waiting or any(names.issue_of(b) == str(n) for b in branches):
@@ -793,6 +813,9 @@ class Tick:
             if payload is None:
                 continue
             if spec.accept_pending(self.env, issue, listed=payload["comments"]):
+                self.recovered_issues[issue] = payload
+                return issue
+            if recovery.path(self.env, issue, issue).exists():
                 self.recovered_issues[issue] = payload
                 return issue
             role = spec.role_from(payload["comments"], self.env)

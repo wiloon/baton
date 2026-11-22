@@ -400,6 +400,8 @@ def finish_episode(env, task_kind, item, result):
     points = {legacy}
     try:
         for decision in pending_decisions(env, task_kind, item):
+            if task_kind == "issue" and result == "accept" and not decision["point"].startswith("spec_"):
+                continue
             append(env, {**{key: decision[key] for key in ("point", "repo", "task_kind", "item", "episode", "decision_id")},
                          "kind": "outcome", "ts": int(time.time()), "result": result})
             points.add(decision["point"])
@@ -408,6 +410,11 @@ def finish_episode(env, task_kind, item, result):
             grant_path(env, reason, item).unlink(missing_ok=True)
     except OSError as error:
         notify.log(f"advisor {task_kind} #{item}: could not finish episode ({type(error).__name__})")
+    if result in ("merged", "closed"):
+        from . import recovery
+        recovery.clear_item(env, item)
+        if task_kind == "issue":
+            recovery.clear_episode(env, item)
 
 
 def handoff_note(decision):

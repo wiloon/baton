@@ -46,9 +46,10 @@ PENDING_ACCEPT = re.compile(
     r"^<!-- baton-spec-accept-pending pr=(?P<pr>\d+)(?: head=(?P<head>[0-9a-f]{40}))? -->\n(?P<verdict>.*)", re.DOTALL)
 
 
-def read_issue(env, issue):
+def read_issue(env, issue, *, recovery=False):
     """Return ({title, body, comments}, transient) or (None, transient). One gh call (#151)."""
-    result = pr_helpers.gh("issue", "view", str(issue), "-R", env.repo.gh_repo, "--json", "title,body,comments")
+    fields = "title,body,comments,state,labels" if recovery else "title,body,comments"
+    result = pr_helpers.gh("issue", "view", str(issue), "-R", env.repo.gh_repo, "--json", fields)
     if result.returncode != 0:
         return None, pr_helpers.transient(result)
     try:
@@ -62,6 +63,10 @@ def read_issue(env, issue):
         if (not isinstance(comment, dict) or not isinstance(comment.get("body"), str)
                 or not isinstance(comment.get("author") or {}, dict)):
             return None, False
+    if recovery and (data.get("state") != "OPEN" or not isinstance(data.get("labels"), list)
+                     or any(not isinstance(label, dict) for label in data["labels"])
+                     or any(label.get("name") == "ready-for-human" for label in data["labels"])):
+        return None, False
     return data, False
 
 
@@ -216,14 +221,14 @@ def reply_text(reply):
 
 
 def trusted_comment_digest(listed, owner, login_re):
-    """SHA-256 of the latest owner or cursor comment on the issue."""
+    """Bind the owner and Cursor comments used to choose the spec step."""
     login_re = login_re or r"^(app/cursor|cursor(\[bot\])?)$"
     bodies = []
     for comment in listed or []:
         login = (comment.get("author") or {}).get("login") or ""
         if login == owner or re.search(login_re, login):
             bodies.append(comment.get("body") or "")
-    return recovery.feedback_digest(bodies[-1]) if bodies else ""
+    return recovery.feedback_digest(json.dumps(bodies))
 
 
 class Spec:
@@ -337,77 +342,48 @@ class Spec:
 
     def spec_binding(self, round_s, issue_body, listed):
         login_re = self.env.config.scheduling.cursor_login_re
-        return recovery.spec_fingerprint(
-            str(self.wt), self.issue, branch=self.branch, base=self.base,
+        fingerprint = recovery.spec_fingerprint(
+            str(self.wt), self.issue, base=self.base,
             issue_body=issue_body, comment_digest=trusted_comment_digest(listed, self.env.owner, login_re),
             round_s=round_s, adr_head=getattr(self, "adr_head", "") or "")
+        fingerprint["base_head"] = git(self.wt, "rev-parse", self.base)
+        if (fingerprint["branch"] != self.branch or not fingerprint["local_head"]
+                or not fingerprint["clean"] or not fingerprint["base_head"]):
+            return None
+        return fingerprint
+
+    def retry_binding(self, round_s):
+        payload, _ = read_issue(self.env, self.issue, recovery=True)
+        if payload is None:
+            return None
+        adr, _ = self.discover_adr()
+        if adr is None or str(adr.get("headRefOid", "")) != getattr(self, "adr_head", ""):
+            return None
+        return self.spec_binding(round_s, payload["body"], payload["comments"])
 
     def recover_worker(self, why, reason, vendor, detail, *, role="spec_reviewer", round_s="",
                        issue_body="", listed=(), last_vendor="", other_model="", spec_followup=False,
                        budget=None):
-        from . import advisor
-        from .common import Exhausted
-        entry = owner_handoff.REASONS.get(reason)
-        mode = owner_handoff.capped_mode(
-            advisor.settings(self.env).mode if advisor.enabled(self.env) else "off",
-            entry.mode if entry else "off")
-        if not entry or mode != "live":
-            self.handoff(why, reason)
-            return owner_handoff.HANDOFF, vendor
-        episode = self.issue
-        pending = recovery.load(self.env, episode, self.issue)
-        if pending and pending["reason"] == reason and not pending.get("dispatched"):
-            current = self.spec_binding(round_s, issue_body, listed)
-            if not recovery.fingerprint_matches(pending, current):
-                self.handoff(why, reason)
-                return owner_handoff.HANDOFF, vendor
-            try:
-                vendor = recovery.select_vendor(
-                    self.env, pending, mode="contrib", candidates=pick.all_vendors(self.env),
-                    issue=self.issue, other_model=other_model, spec_followup=spec_followup)
-            except (Deferred, Exhausted):
-                raise
-            recovery.mark_dispatched(self.env, pending)
-            return pending["action"], vendor
-        offered = recovery.offered_actions(entry, vendor, pick.all_vendors(self.env))
-        if not offered:
-            self.handoff(why, reason)
-            return owner_handoff.HANDOFF, vendor
         fingerprint = self.spec_binding(round_s, issue_body, listed)
-        snapshot = (f"Decision point: {reason}. Repository {self.repo}, issue #{self.issue}.\n"
-                    f"Failed vendor: {vendor}; role: {role}.\nOutcome: {detail}\n"
-                    "Actions: retry_step = one more attempt with the same vendor; "
-                    "retry_step_other_vendor = one attempt with an eligible alternate; "
-                    "handoff = the owner takes the issue.\n")
-        result = self.handoff(why, reason, snapshot=snapshot,
-                              revalidate=lambda: recovery.revalidate_spec(
-                                  fingerprint, str(self.wt), self.issue, branch=self.branch, base=self.base,
-                                  issue_body=issue_body,
-                                  comment_digest=trusted_comment_digest(listed, self.env.owner,
-                                                                        self.env.config.scheduling.cursor_login_re),
-                                  round_s=round_s, adr_head=getattr(self, "adr_head", "") or ""),
-                              observed_actions=offered)
-        if result.action == owner_handoff.HANDOFF:
-            return owner_handoff.HANDOFF, vendor
-        # Keep the preceding role's vendor excluded (independence) plus the failed attempt.
-        exclusions = [v for v in (last_vendor, vendor) if v]
-        budget = dict(budget or {})
-        recovery.persist_grant(self.env, result, role=role, failed_vendor=vendor, exclusions=exclusions,
-                               budget=budget, fingerprint=fingerprint, episode=episode, item=self.issue, reason=reason)
-        saved = recovery.load(self.env, episode, self.issue)
-        try:
-            vendor = recovery.select_vendor(
-                self.env, saved, mode="contrib", candidates=pick.all_vendors(self.env),
-                issue=self.issue, other_model=other_model, spec_followup=spec_followup)
-        except Deferred:
-            raise
-        except Exhausted as exhausted:
-            recovery.clear(self.env, episode, self.issue)
-            self.handoff(exhausted.reason or why, reason)
-            return owner_handoff.HANDOFF, vendor
-        notify.log(f"#{self.issue}: advisor granted {result.action} for {role} ({vendor}): {result.decision.reason}")
-        recovery.mark_dispatched(self.env, saved)
-        return result.action, vendor
+        result = recovery.request(
+            self.env, self.issue, self.issue, reason, role, vendor, detail, fingerprint,
+            lambda: self.retry_binding(round_s),
+            lambda text=why, **kw: self.handoff(text, reason, **kw),
+            exclusions=[last_vendor] if last_vendor else [], budget=budget,
+            **self.retry_picker(role, other_model, spec_followup))
+        return result
+
+    def retry_picker(self, role, other_model, spec_followup):
+        candidates = list(self.env.config.quota.vendor_pool) if role == "reviser" else pick.all_vendors(self.env)
+        return dict(mode="contrib", candidates=candidates, issue=self.issue, other_model=other_model,
+                    spec_followup=spec_followup)
+
+    def resume_worker(self, role, reason, round, other_model, spec_followup=False):
+        return recovery.resume(
+            self.env, self.issue, self.issue, lambda saved: saved.startswith("spec_"),
+            lambda: self.retry_binding(round),
+            lambda text: self.handoff(text, reason),
+            **self.retry_picker(role, other_model, spec_followup))
 
     def retry_read(self, read, why, reason, *, continuation=None):
         """Consume a waiting attempt before reading; return the value or hand off."""
@@ -550,8 +526,12 @@ class Spec:
         head = git(wt, "rev-parse", "HEAD") or ""
         last_vendor = last_by(listed, env.owner, "reply")
         other_model = last_model(env, n, "reply", round - 1, last_vendor)
-        reviewer = self.pick("spec_reviewer", pick.all_vendors(env), last_vendor, other_model)
-        attempt = 0
+        pending = self.resume_worker("spec_reviewer", "spec_review_run_failed", round, other_model)
+        if pending is False:
+            return "stop"
+        reviewer = pending[1] if pending else self.pick("spec_reviewer", pick.all_vendors(env),
+                                                        last_vendor, other_model)
+        attempt = int(bool(pending))
         while True:
             tag = f"issue-{n}-spec-{round}" + (f"-retry{attempt}" if attempt else "")
             out = self.agent(reviewer, "spec_review", self.render(
@@ -601,12 +581,13 @@ class Spec:
                         f"## Spec review ({reviewer}), round {round}: reject\n\n{reply[:REPLY_CAP]}")
                 self.handoff(f"{reviewer} rejects the issue.", "spec_rejected")
                 return "stop"
-            action, reviewer = self.recover_worker(
+            retry = self.recover_worker(
                 f"{reviewer}'s spec review failed: {outcome}", "spec_review_run_failed", reviewer, outcome,
                 round_s=str(round), issue_body=issue_body, listed=listed, last_vendor=last_vendor,
                 other_model=other_model, spec_followup=self.followup(round, reviewer, last_vendor))
-            if action == owner_handoff.HANDOFF:
+            if not retry:
                 return "stop"
+            _, reviewer = retry
             attempt += 1
 
     def accept_verdict(self, reviewer, round, mode_note, reply):
@@ -673,6 +654,7 @@ class Spec:
         round_m = re.search(r"round (\d+): accept", verdict)
         notify.notify(f"#{n}: spec accepted (round {round_m.group(1) if round_m else '?'})", self.url)
         advisor.finish_episode(self.env, "issue", n, "accept")
+        recovery.clear(self.env, n, n)
         self.finish()
         return "accept"
 
@@ -777,20 +759,23 @@ class Spec:
         last_vendor = last_by(listed, env.owner, "review")
         other_model = last_model(env, n, "review", round, last_vendor)
         claude_followup = self.reviser_followup(round, "claude", last_vendor)
-        reviser = self.pick("reviser", list(env.config.quota.vendor_pool), last_vendor, other_model,
-                            spec_followup=claude_followup)
+        pending = self.resume_worker("reviser", "spec_revision_run_failed", round, other_model, claude_followup)
+        if pending is False:
+            return "stop"
+        reviser = pending[1] if pending else self.pick(
+            "reviser", list(env.config.quota.vendor_pool), last_vendor, other_model, spec_followup=claude_followup)
         self.mark_base(round)
-        template = self.self_dir / ("codex-spec-prompt.md" if reviser == "codex" else "spec-prompt.md")
-        prompt = self.render(
-            template, ISSUE=n, GH_REPO=self.repo, WORKTREE=str(wt), BRANCH=self.branch, ROUND=str(round),
-            CONTEXT_FILE=str(context), OUT=out_base)
-        followup = reviser == "claude" and claude_followup
-        pending = recovery.load(self.env, n, n)
-        denied_spent = bool((pending or {}).get("remaining_budget", {}).get("denied_spent")) if (
-            pending and pending.get("reason") == "spec_revision_run_failed" and not pending.get("dispatched")) else False
-        attempt = 0
+        denied_spent = bool(pending and pending[0]["remaining_budget"].get("denied_spent"))
+        attempt = int(bool(pending))
         human = ""
         while True:
+            template = self.self_dir / ("codex-spec-prompt.md" if reviser == "codex" else "spec-prompt.md")
+            prompt = self.render(
+                template, ISSUE=n, GH_REPO=self.repo, WORKTREE=str(wt), BRANCH=self.branch, ROUND=str(round),
+                CONTEXT_FILE=str(context), OUT=out_base)
+            followup = reviser == "claude" and claude_followup
+            for suffix in (".body", ".comment"):
+                Path(f"{out_base}{suffix}").unlink(missing_ok=True)
             tag = f"issue-{n}-spec-reply-{round}" + (f"-retry{attempt}" if attempt else "")
             out = self.agent(reviser, "spec", prompt, tag, "spec-settings.json", out_base, followup=followup)
             denied = permission_denials(out.get("log", "")) if out["outcome"].startswith("RESULT: failed") else []
@@ -823,15 +808,14 @@ class Spec:
                 human = " human"
                 break
             why = f" A command was denied ({denied[0]}): check the spec role's permissions." if denied else ""
-            action, reviser = self.recover_worker(
+            retry = self.recover_worker(
                 f"{reviser} spec run failed: {outcome}{why}", "spec_revision_run_failed", reviser, outcome,
                 role="reviser", round_s=str(round), issue_body=issue_body, listed=listed,
                 last_vendor=last_vendor, other_model=other_model, spec_followup=claude_followup,
                 budget={"denied_spent": denied_spent})
-            if action == owner_handoff.HANDOFF:
+            if not retry:
                 return "stop"
-            pending = recovery.load(self.env, n, n)
-            denied_spent = bool((pending or {}).get("remaining_budget", {}).get("denied_spent", denied_spent))
+            _, reviser = retry
             attempt += 1
         if body.is_file() and body.stat().st_size:
             body.write_text(check_section.canonicalize(strip_markers(body.read_text())).rstrip("\n") + "\n")
@@ -923,10 +907,15 @@ class Spec:
         max_rounds = max(int(env.config.scheduling.max_spec_rounds or 3), round + 1)   # an owner answer earns another round
         if git(self.repo_dir, "rev-parse", "-q", "--verify", f"origin/{self.branch}") is not None:
             self.base = f"origin/{self.branch}"
+        recovering_worker = recovery.path(env, n, n).exists()
+        if recovering_worker and not (self.wt.is_dir() and self.path("spec-paused").is_file()):
+            self.handoff("The saved recovery worktree is missing.", "spec_review_run_failed")
+            return False
         if not self.worktree():
             notify.log(f"spec worktree for #{n} failed")
             return False
-        self.gh("issue", "edit", n, "--remove-label", "ready-for-human", "--add-label", "agent-wip")
+        if not recovering_worker:
+            self.gh("issue", "edit", n, "--remove-label", "ready-for-human", "--add-label", "agent-wip")
         # Sent by started() once a vendor is picked: a deferred tick (no vendor can run now) repeats every
         # timer interval, and announcing each one floods the owner with notices of work that never ran.
         self.announce = f"#{n}: spec review (round {round}, {'revision' if step == 'revise' else step})"

@@ -704,6 +704,7 @@ def repair(run, monkeypatch):
 
     def fix_pr(runner, pr, wt, fixer, source, feedback, head=""):
         run.fixes.append({"fixer": fixer, "source": source, "feedback": feedback, "round": runner.round})
+        runner.last_fixer = getattr(run, "effective_fixer", "")
         if run.fix_rc and run.fix_hands_off:
             runner.handed_off = True
         return run.fix_rc
@@ -720,6 +721,16 @@ def test_a_code_check_failure_gets_one_repair_round_per_head(repair):
     assert repair.fixes[0]["round"] == "ci" and Path(repair.env["STATE"], f"ci-fix-{PR}-{HEAD}").exists()
     assert repair.merger().ci_fix_round(str(repair.wt)) == 1   # the same head is not repaired twice
     assert len(repair.fixes) == 1
+
+
+def test_ci_repair_event_uses_the_effective_fixer(repair, monkeypatch):
+    seen = []
+    repair.effective_fixer = "codex"
+    merger = repair.merger()
+    monkeypatch.setattr(merger.hooks, "task", lambda *args: seen.append(args))
+    monkeypatch.setattr(merge.pick, "choose", lambda *args, **kwargs: "claude")
+    assert merger.ci_fix_round(str(repair.wt)) == 0
+    assert seen == [("ci_fix", f"pr:{PR}:{HEAD}", "--agent", "codex", "--head-sha", HEAD)]
 
 
 def test_an_image_build_failure_is_not_sent_to_a_code_fixer(repair):

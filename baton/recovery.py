@@ -7,14 +7,12 @@ vendor selection so a deferral or restart cannot lose dispatch constraints.
 import hashlib
 import json
 from pathlib import Path
+import re
 
-from . import notify, pick
+from . import notify, pick, vendors
 from . import pr as pr_helpers
 from .common import Exhausted, git
 from .quota import atomic_json
-
-# Test seam: raw CI log marker that must not reach advisor snapshots (PR #163 point 4).
-LOG_EXCERPT_MARKER = "ADVISOR_VERIFY_LOG_EXCERPT_MARKER"
 
 REQUIRED = frozenset({
     "action", "failed_vendor", "exclusions", "remaining_budget", "fingerprint",
@@ -32,30 +30,43 @@ def path(env, episode, item):
 
 
 def _valid(record):
+    from .handoff import REASONS
+
     if not isinstance(record, dict):
         return False
     if not REQUIRED <= set(record):
         return False
+    if not all(isinstance(record[key], str) for key in ("failed_vendor", "role", "episode", "item", "reason", "decision_id")):
+        return False
     if record["action"] not in ("retry_step", "retry_step_other_vendor"):
         return False
-    if not isinstance(record["exclusions"], list):
+    entry = REASONS.get(record["reason"])
+    if not entry or entry.mode != "live" or record["action"] not in entry.actions:
         return False
-    if not isinstance(record["remaining_budget"], dict):
+    if not isinstance(record["exclusions"], list) or not all(isinstance(v, str) for v in record["exclusions"]):
         return False
-    if not isinstance(record["fingerprint"], dict):
+    budget = record["remaining_budget"]
+    if not isinstance(budget, dict):
         return False
-    return all(isinstance(record[key], str) for key in ("failed_vendor", "role", "episode", "item", "reason", "decision_id"))
+    if record["reason"] in ("fix_verify_failed", "dev_verify_failed"):
+        if any(type(budget.get(key)) is not int or budget[key] < 0 for key in ("verify_repairs", "repairs_used")):
+            return False
+        if record["reason"] == "dev_verify_failed" and not isinstance(budget.get("body"), str):
+            return False
+    if not isinstance(record["fingerprint"], dict) or not record["fingerprint"]:
+        return False
+    return True
 
 
 def load(env, episode, item):
     location = path(env, episode, item)
     try:
-        if not location.is_file():
-            return None
         record = json.loads(location.read_text())
+    except FileNotFoundError:
+        return None
     except (OSError, ValueError) as error:
         raise RecoveryUnreadable(f"unreadable recovery {location.name}") from error
-    if not _valid(record):
+    if (not _valid(record) or record["episode"] != str(episode) or record["item"] != str(item)):
         raise RecoveryUnreadable(f"invalid recovery {location.name}")
     return record
 
@@ -84,56 +95,46 @@ def clear_episode(env, episode):
             notify.log(f"could not clear {entry.name}: {error}")
 
 
+def clear_item(env, item):
+    for entry in Path(env.dirs.state).glob(f"recovery-*-{item}.json"):
+        try:
+            entry.unlink(missing_ok=True)
+        except OSError as error:
+            notify.log(f"could not clear {entry.name}: {error}")
+
+
 def fingerprint_matches(record, current):
-    """True when every stored fingerprint field still matches CURRENT."""
-    stored = record.get("fingerprint") or {}
-    if not isinstance(current, dict):
-        return False
-    for key, value in stored.items():
-        if current.get(key) != value:
-            return False
-    return True
+    """A newer binding field must also be present in the saved recovery."""
+    return bool(current) and record.get("fingerprint") == current
 
 
-def pr_fingerprint(wt, pr, *, remote_head="", base="", feedback_digest="", round_s="", extra=None):
+def pr_fingerprint(wt, pr, *, remote_head="", base="", round_s="", extra=None):
     """Bind recovery to local and remote PR state."""
     branch = git(wt, "branch", "--show-current") or ""
     local_head = git(wt, "rev-parse", "HEAD") or ""
-    clean = not bool(git(wt, "status", "--porcelain"))
+    clean = git(wt, "status", "--porcelain") == ""
     data = {"pr": str(pr), "branch": branch, "local_head": local_head, "clean": clean,
-            "remote_head": remote_head, "base": base, "feedback_digest": feedback_digest, "round": str(round_s)}
+            "remote_head": remote_head, "base": base, "round": str(round_s)}
     if extra:
         data.update(extra)
     return data
 
 
-def issue_fingerprint(wt, issue, *, branch="", base="", extra=None):
-    branch = branch or git(wt, "branch", "--show-current") or ""
+def issue_fingerprint(wt, issue, *, base=""):
+    branch = git(wt, "branch", "--show-current") or ""
     local_head = git(wt, "rev-parse", "HEAD") or ""
-    clean = not bool(git(wt, "status", "--porcelain"))
-    data = {"issue": str(issue), "branch": branch, "local_head": local_head, "clean": clean, "base": base or ""}
-    if extra:
-        data.update(extra)
-    return data
+    clean = git(wt, "status", "--porcelain") == ""
+    return {"issue": str(issue), "branch": branch, "local_head": local_head, "clean": clean, "base": base or ""}
 
 
-def spec_fingerprint(wt, issue, *, branch="", base="", issue_body="", comment_digest="", round_s="", adr_head=""):
+def spec_fingerprint(wt, issue, *, base="", issue_body="", comment_digest="", round_s="", adr_head=""):
     """Bind spec recovery to issue body, trusted comment, round, ADR head, and worktree (#125 point 6)."""
-    data = issue_fingerprint(wt, issue, branch=branch, base=base)
+    data = issue_fingerprint(wt, issue, base=base)
     data["issue_body"] = feedback_digest(issue_body)
     data["comment_digest"] = comment_digest or ""
     data["round"] = str(round_s)
     data["adr_head"] = adr_head or ""
     return data
-
-
-def mark_dispatched(env, record):
-    """Note that the granted retry has been dispatched; keep the record until success or handoff."""
-    if not record:
-        return None
-    updated = {**record, "dispatched": True}
-    persist(env, updated)
-    return updated
 
 
 def feedback_digest(text):
@@ -148,13 +149,15 @@ def worktree_ready(wt, branch):
     current = git(wt, "branch", "--show-current") or ""
     if current != branch:
         return False, f"branch is {current!r}, expected {branch!r}"
-    if git(wt, "status", "--porcelain"):
+    if git(wt, "status", "--porcelain") != "":
         return False, "worktree has local changes"
     head = git(wt, "rev-parse", "HEAD") or ""
     if not head:
         return False, "HEAD unreadable"
     remote = git(wt, "rev-parse", f"origin/{branch}") if branch else ""
-    if remote and head != remote:
+    if not remote:
+        return False, "origin branch unreadable"
+    if head != remote:
         ok = session.run_process(["git", "-C", str(wt), "merge-base", "--is-ancestor", head, f"origin/{branch}"],
                                  capture_output=True).returncode == 0
         if not ok:
@@ -165,8 +168,6 @@ def worktree_ready(wt, branch):
 def verify_status(*, repairs_used, max_repairs, failure=""):
     """Structured verification status without raw CI log excerpts (point 4)."""
     text = failure or ""
-    if LOG_EXCERPT_MARKER in text:
-        raise ValueError("raw verify log marker in failure text")
     if "Last 200 lines:" in text:
         text = text.split("Last 200 lines:")[0].rstrip()
     summary = ""
@@ -179,17 +180,25 @@ def verify_status(*, repairs_used, max_repairs, failure=""):
             f"outcome failed; summary: {summary or 'unknown'}")
 
 
-def offered_actions(entry, failed_vendor, vendors_list, *, pin_same=True):
-    """Actions the evidence supports for a live worker failure."""
-    if not entry or entry.mode != "live" or not entry.actions:
+def retry_candidates(env, role, candidates, *, mode, pr="", fixed_by="", exclusions=()):
+    """Static eligibility; temporary quota and cooldown blocks belong to the picker."""
+    allowed = vendors._role_eligible(role, pool_only=role == "reviser", env=env)
+    eligible = [v for v in candidates if v in allowed and v not in exclusions]
+    if mode == "review":
+        check = vendors.screenshot_allowed if role == "screenshot_reviewer" else vendors.review_allowed
+        route = "screenshot_review" if role == "screenshot_reviewer" else "review"
+        eligible = [v for v in eligible if check(str(env.dirs.state), pr, v,
+                                                env.config.models.route(route, v).model, fixed_by)]
+    return eligible
+
+
+def offered_actions(entry, failed_vendor, candidates, *, pinned=False, local=False):
+    if not entry:
         return ()
-    offered = []
-    if "retry_step" in entry.actions:
-        offered.append("retry_step")
-    if "retry_step_other_vendor" in entry.actions:
-        if any(v != failed_vendor for v in vendors_list):
-            offered.append("retry_step_other_vendor")
-    return tuple(offered)
+    return tuple(action for action in entry.actions if
+                 (action == "retry_step" and (local or failed_vendor in candidates))
+                 or (action == "retry_step_other_vendor" and not pinned and not local
+                     and any(v != failed_vendor for v in candidates)))
 
 
 def decision_id(env, reason, item):
@@ -221,64 +230,147 @@ def persist_grant(env, result, *, role, failed_vendor, exclusions, budget, finge
     return record
 
 
-def select_vendor(env, record, *, mode, candidates, pr="", issue="", fixed_by="", other_model="", spec_followup=False,
-                  pinned=False):
-    """Pick the vendor for a persisted recovery action."""
-    failed = record["failed_vendor"]
-    exclusions = list(record["exclusions"])
-    if record["action"] == "retry_step":
-        if pinned or record["role"] == "screenshot_reviewer":
-            return failed
-        return failed
-    exclude = ",".join(dict.fromkeys([*exclusions, failed]))
-    return pick.choose(env, record["role"], failed, mode, candidates, pr=pr, issue=issue, exclude=exclude,
-                       fixed_by=fixed_by, other_model=other_model, spec_followup=spec_followup,
-                       pinned=pinned or record["role"] == "screenshot_reviewer")
+def select_vendor(env, record, *, mode, candidates, pr="", issue="", fixed_by="", other_model="",
+                  spec_followup=False, pinned=False):
+    """Select from the role's candidates with strict recovery constraints."""
+    role, failed = record["role"], record["failed_vendor"]
+    exclusions = [v for v in record["exclusions"] if v]
+    same = record["action"] == "retry_step"
+    if not same:
+        exclusions.append(failed)
+    eligible = retry_candidates(env, role, candidates, mode=mode, pr=pr,
+                                fixed_by=fixed_by, exclusions=exclusions)
+    state = str(env.dirs.state)
+    fallback = same and mode == "review" and failed in vendors.review_excluded(state, pr, fixed_by)
+    selected = record.get("selected_vendor")
+    if selected and not same:
+        eligible = [v for v in eligible if v == selected]
+    if same and not fallback:
+        eligible = [v for v in eligible if v == failed]
+    if not eligible or (same and failed not in eligible) or (pinned and not same):
+        raise Exhausted(role, "No eligible vendor for the saved retry.")
+    vendor = pick.choose(env, role, failed if same else selected or "", mode, eligible, pr=pr, issue=issue,
+                           exclude=" ".join(dict.fromkeys(filter(None, exclusions))), fixed_by=fixed_by,
+                           other_model=other_model, spec_followup=spec_followup, pinned=same)
+    if vendor not in eligible or (same and vendor != failed):
+        raise Exhausted(role, "Picker returned a vendor outside the saved retry constraints.")
+    return vendor
 
 
 def open_pr_head(pr):
-    data = pr_helpers.view(pr, "headRefOid,state,baseRefName")
-    if not data or data.get("state") != "OPEN":
+    fields = "headRefOid,state,baseRefName,headRefName,body,comments,labels,reviews"
+    try:
+        data = pr_helpers.view(pr, fields)
+    except (ValueError, TypeError):
+        return None
+    if (not isinstance(data, dict) or data.get("state") != "OPEN"
+            or not isinstance(data.get("headRefOid"), str) or not re.fullmatch(r"[a-f0-9]{40,64}", data["headRefOid"])
+            or not isinstance(data.get("baseRefName"), str) or not data["baseRefName"]
+            or not isinstance(data.get("headRefName"), str) or not data["headRefName"]
+            or not isinstance(data.get("body"), str)
+            or any(not isinstance(data.get(key), list) or any(not isinstance(row, dict) for row in data[key])
+                   for key in ("comments", "labels", "reviews"))
+            or any(not isinstance(row.get("body"), str) for row in data["comments"])):
         return None
     return data
 
 
-def revalidate_pr(pr, fingerprint, wt=""):
+def worker_fingerprint(wt, pr, *, round_s="", extra=None, head_ref="", required_label=""):
     data = open_pr_head(pr)
-    current = {}
-    if data:
-        current["remote_head"] = data.get("headRefOid") or ""
-        current["base"] = data.get("baseRefName") or ""
-    if wt:
-        current.update(pr_fingerprint(wt, pr))
-    elif not current:
-        return False
-    keys = [key for key in fingerprint if key in current]
-    if not keys:
-        return False
-    return all(fingerprint.get(key) == current.get(key) for key in keys)
+    if not data or head_ref and data.get("headRefName") != head_ref:
+        return None
+    names = {label.get("name") for label in data["labels"]}
+    if "ready-for-human" in names or required_label and required_label not in names:
+        return None
+    current = pr_fingerprint(wt, pr, remote_head=data["headRefOid"], base=data["baseRefName"],
+                             round_s=round_s, extra=extra)
+    if not current["clean"] or not current["branch"] or not current["local_head"]:
+        return None
+    evidence = {key: data.get(key) for key in ("headRefName", "body", "comments", "labels", "reviews")}
+    current["pr_evidence"] = feedback_digest(json.dumps(evidence, sort_keys=True))
+    current["head_ref"] = data.get("headRefName")
+    feedback = [comment for comment in data["comments"] if not comment["body"].startswith("<!-- baton-fix by=")]
+    current["feedback"] = feedback_digest(json.dumps([feedback, data.get("reviews")], sort_keys=True))
+    return current
 
 
-def revalidate_worker(fingerprint, wt, pr):
-    """Re-read local worktree state and optional remote head before a worker retry."""
-    if not wt:
+def resume(env, episode, item, match, binding, handoff, *, local=False, **picker):
+    """Load before the normal step. A deferral leaves the action and budget intact."""
+    try:
+        record = load(env, episode, item)
+        if record is None or not match(record["reason"]):
+            return None
+        return resolve(env, record, binding, local=local, **picker)
+    except (RecoveryUnreadable, Exhausted) as error:
+        handoff(str(error))
         return False
-    current = pr_fingerprint(wt, pr)
-    for key in ("local_head", "clean", "branch", "pr"):
-        if fingerprint.get(key) not in ("", None) and fingerprint.get(key) != current.get(key):
-            return False
-    remote = fingerprint.get("remote_head")
-    if remote:
-        data = open_pr_head(pr)
-        if not data or data.get("headRefOid") != remote:
-            return False
-    return True
 
 
-def revalidate_spec(fingerprint, wt, issue, *, branch, base, issue_body, comment_digest, round_s, adr_head):
-    """Re-read spec binding fields before a worker retry."""
-    if not wt:
-        return False
-    current = spec_fingerprint(wt, issue, branch=branch, base=base, issue_body=issue_body,
-                               comment_digest=comment_digest, round_s=round_s, adr_head=adr_head)
-    return fingerprint_matches({"fingerprint": fingerprint}, current)
+def resolve(env, record, binding, *, local=False, **picker):
+    from . import advisor
+    if not advisor.enabled(env) or advisor.settings(env).mode != "live":
+        raise RecoveryUnreadable("Live recovery is disabled.")
+    if not fingerprint_matches(record, binding()):
+        raise RecoveryUnreadable("Saved recovery inputs changed or could not be read.")
+    if not record["decision_id"] or record["decision_id"] != decision_id(env, record["reason"], record["item"]):
+        raise RecoveryUnreadable("Saved recovery grant could not be confirmed.")
+    vendor = record["failed_vendor"] if local else select_vendor(env, record, **picker)
+    if not local and not fingerprint_matches(record, binding()):
+        raise RecoveryUnreadable("Saved recovery inputs changed during selection.")
+    if not local and not record.get("selected_vendor"):
+        record = {**record, "selected_vendor": vendor}
+        persist(env, record)
+    return record, vendor
+
+
+def verification_progress(env, episode, item, vendor):
+    """Reserve repair runs before dispatch and advance the saved local head after each run."""
+    record = load(env, episode, item)
+    if not record:
+        return None
+    budget = record["remaining_budget"]
+
+    def checkpoint(used, remaining, head):
+        budget["repairs_used"] = used
+        budget["verify_repairs"] = remaining
+        previous = record["fingerprint"]["local_head"]
+        if "attempts" in budget and head != previous:
+            budget["attempts"].append([vendor, "unknown", previous, head])
+        record["fingerprint"]["local_head"] = head
+        persist(env, record)
+
+    return checkpoint
+
+
+def request(env, episode, item, reason, role, vendor, detail, fingerprint, binding, handoff,
+            *, exclusions=(), budget=None, local=False, **picker):
+    """Ask once, save the grant before selection, and re-read before dispatch."""
+    from . import advisor
+    from . import handoff as owner_handoff
+
+    if not advisor.enabled(env):
+        handoff()
+        return None
+    candidates = [] if local else retry_candidates(
+        env, role, picker["candidates"], mode=picker["mode"], pr=picker.get("pr", ""),
+        fixed_by=picker.get("fixed_by", ""), exclusions=exclusions)
+    actions = offered_actions(owner_handoff.REASONS.get(reason), vendor, candidates,
+                              pinned=picker.get("pinned", False), local=local)
+    if not actions:
+        handoff()
+        return None
+    snapshot = (f"Decision point: {reason}. Repository {env.repo.gh_repo}, item #{item}.\n"
+                f"Failed vendor: {vendor or 'none'}; role: {role}.\nOutcome: {detail}\n")
+    result = handoff(snapshot=snapshot, observed_actions=actions,
+                     revalidate=lambda: fingerprint is not None and fingerprint_matches(
+                         {"fingerprint": fingerprint}, binding()))
+    if getattr(result, "action", "handoff") == "handoff":
+        return None
+    try:
+        record = persist_grant(env, result, role=role, failed_vendor=vendor, exclusions=exclusions,
+                               budget=budget or {}, fingerprint=fingerprint, episode=episode,
+                               item=item, reason=reason)
+        return resolve(env, record, binding, local=local, **picker)
+    except (RecoveryUnreadable, Exhausted) as error:
+        handoff(text=str(error))
+        return None

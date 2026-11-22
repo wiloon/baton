@@ -13,8 +13,8 @@ import re
 import subprocess
 import time
 
-from . import advisor, after_merge, agents, checks as check_section, dispatch, fix, handoff as owner_handoff, md, names, pick, pr as pr_helpers, pr_contract, prompts, recovery, spec, vendors
-from .common import Deferred, Exhausted, git, push, strip_markers
+from . import advisor, after_merge, agents, checks as check_section, dispatch, fix, handoff as owner_handoff, md, names, pr as pr_helpers, pr_contract, prompts, recovery, spec, vendors
+from .common import Deferred, git, push, strip_markers
 
 REPLY_CAP = 60000
 RESUME_NOTE = ("This worktree already holds earlier work on this issue (an earlier run stopped early). "
@@ -136,11 +136,20 @@ def finish_opening(tick, intent, path):
         else:
             target.mkdir()  # an older run may have no screenshots
     state = str(tick.state)
-    vendors.record_author(state, pr, vendor)
-    if agents.ADAPTERS[vendor].RECORDS_AUTHOR_MODEL:
-        vendors.record_author_model(state, pr, vendor, intent["model"])
-    if not vendors.state_path(state, pr, "contrib").exists():
-        vendors.record_contrib(state, pr, vendor, intent["wt"], intent["base"])
+    attempts = intent.get("attempts")
+    if attempts is None:
+        vendors.record_author(state, pr, vendor)
+        if agents.ADAPTERS[vendor].RECORDS_AUTHOR_MODEL:
+            vendors.record_author_model(state, pr, vendor, intent["model"])
+        if not vendors.state_path(state, pr, "contrib").exists():
+            vendors.record_contrib(state, pr, vendor, intent["wt"], intent["base"])
+    else:
+        for attempt in attempts:
+            author, model, start, end = attempt
+            if agents.ADAPTERS[author].RECORDS_AUTHOR_MODEL:
+                vendors.record_author_model(state, pr, author, model)
+            vendors.record_author(state, pr, author)
+            vendors.record_contrib(state, pr, author, intent["wt"], start, end, once=True)
     Path(f"/tmp/baton-dev-{issue}.pr.md").unlink(missing_ok=True)
     tick.active["issue"] = ""
     if (tick.state / f"review-pending-{pr}").exists():
@@ -235,6 +244,39 @@ def run_dev_worker(tick, issue, dev_vendor, wt, branch, body, base, plan, payloa
     return fail, outcome, out
 
 
+def worker_failure(fail, outcome):
+    if not fail:
+        return ""
+    if fail.startswith("blocked"):
+        return "dev_blocked"
+    return "dev_result_invalid" if outcome.startswith("RESULT: ready") else "dev_run_failed"
+
+
+def issue_binding(wt, issue, branch, payload):
+    current = recovery.issue_fingerprint(wt, issue, base=git(wt, "rev-parse", "origin/main"))
+    if current["branch"] != branch or not current["clean"] or not current["local_head"] or not current["base"]:
+        return None
+    comments = [comment for comment in payload["comments"]
+                if not comment["body"].startswith("<!-- baton-note by=")]
+    current["issue_evidence"] = recovery.feedback_digest(json.dumps(
+        [payload["title"], payload["body"], comments], sort_keys=True))
+    return current
+
+
+def live_issue_binding(tick, env, wt, issue, branch):
+    fresh, _ = spec.read_issue(env, issue, recovery=True)
+    if fresh is None:
+        return None
+    labels = {label.get("name") for label in fresh["labels"]}
+    if "ready-for-agent" in labels:
+        if not tick.owner_ready(issue):
+            return None
+    elif tick.force_issue != str(issue) and not {"claude-found", "needs-triage"} <= labels:
+        return None
+    return issue_binding(wt, issue, branch, fresh)
+
+
+
 def run(tick, issue):
     env, repo = tick.env.with_runtime(issue=str(issue)), tick.gh_repo
     branch, wt = names.for_issue(tick.wt_root, issue)
@@ -263,85 +305,106 @@ def run(tick, issue):
             tick.notify(f"#{issue}: spec accepted but no plan comment found", url)
             return 1
     if (verdict := spec.VERDICT.match(plan)) and verdict[1] == "accept":
-        # Publishing a spec acceptance can outlive the spec worktree and its local outcome.
         advisor.finish_episode(env, "issue", issue, "accept")
     resume_note, ok = setup_worktree(tick, wt, branch, issue)
     if not ok:
         return 1
-    Path(body).unlink(missing_ok=True)
-    dev_vendor = tick.pick_vendor("dev", "contrib", tick.all_vendors(), issue=issue)
+    base = git(wt, "rev-parse", "origin/main")
+    picker = dict(mode="contrib", candidates=tick.all_vendors(), issue=issue)
+    binding = lambda: live_issue_binding(tick, env, wt, issue, branch)
+    pending = recovery.resume(
+        env, issue, issue, lambda reason: reason.startswith("dev_") and reason != "dev_verify_failed",
+        binding, lambda text: stop(tick, issue, "dev_run_failed", f"#{issue} needs you", text), **picker)
+    if pending is None:
+        pending = recovery.resume(
+            env, issue, issue, lambda reason: reason == "dev_verify_failed", binding,
+            lambda text: stop(tick, issue, "dev_verify_failed", f"#{issue} needs you", text), local=True)
+    if pending is False:
+        return 80
+    attempts = list(pending[0]["remaining_budget"].get("attempts", ())) if pending else []
+    dev_vendor = pending[1] if pending else tick.pick_vendor("dev", "contrib", tick.all_vendors(), issue=issue)
+
+    def ask(reason, title, detail, *, budget=None, local=False):
+        return recovery.request(
+            env, issue, issue, reason, "dev", dev_vendor, detail,
+            issue_binding(wt, issue, branch, payload), binding,
+            lambda text=detail, **kw: stop(tick, issue, reason, title, text, **kw),
+            budget={"attempts": attempts, **(budget or {})}, local=local, **picker)
+
+    def implement():
+        start = git(wt, "rev-parse", "HEAD")
+        Path(body).unlink(missing_ok=True)
+        session.run_process(["rm", "-rf", shots])
+        os.makedirs(shots)
+        note = resume_note
+        if pending and pending[0]["reason"] == "dev_task_invalid":
+            note += "\nCorrect the task relation in the PR description. Retain the existing commits."
+            note += f" Validation error: {pending[0]['remaining_budget'].get('validation_error', '')}"
+        fail, outcome, out = run_dev_worker(tick, issue, dev_vendor, wt, branch, body, base, plan, payload,
+                                            note, hooks, env)
+        attempts.append([dev_vendor, out.get("model") or "unknown", start, git(wt, "rev-parse", "HEAD")])
+        reason = worker_failure(fail, outcome)
+        if reason:
+            return reason, fail
+        try:
+            pr_body(check_section.canonicalize(Path(body).read_text()), issue)
+        except ValueError as error:
+            return "dev_task_invalid", str(error)
+        return "", ""
+
     pr_helpers.gh("issue", "edit", issue, "-R", repo, "--add-label", "agent-wip")
     tick.notify(f"#{issue} started ({dev_vendor})", url)
-    base = git(wt, "rev-parse", "origin/main")
-    session.run_process(["rm", "-rf", shots])
-    os.makedirs(shots)
-    fail, outcome, out = run_dev_worker(tick, issue, dev_vendor, wt, branch, body, base, plan, payload, resume_note, hooks, env)
-    dev_model = out.get("model") or "unknown"
-    if fail:
-        reason = "dev_blocked" if fail.startswith("blocked") else "dev_result_invalid" if outcome.startswith("RESULT: ready") else "dev_run_failed"
-        if reason == "dev_blocked":
-            return stop(tick, issue, reason, f"#{issue}: {dev_vendor} stopped", f"{fail} {url}")
-        fingerprint = recovery.issue_fingerprint(wt, issue, branch=branch, base=base)
-        status = recovery.verify_status(repairs_used=0, max_repairs=0, failure=fail)
-        snapshot = (f"Decision point: {reason}. Repository {repo}, issue #{issue}.\n"
-                    f"Failed vendor: {dev_vendor}; role: dev.\nOutcome: {status}\n"
-                    "Actions: retry_step = one more implementer attempt with the same vendor; "
-                    "retry_step_other_vendor = one attempt with an eligible alternate; "
-                    "handoff = the owner takes the issue.\n")
-        offered = ("retry_step", "retry_step_other_vendor")
-        result = stop(tick, issue, reason, f"#{issue}: {dev_vendor} stopped", f"{fail} {url}",
-                      snapshot=snapshot, observed_actions=offered,
-                      revalidate=lambda: recovery.fingerprint_matches(
-                          {"fingerprint": fingerprint},
-                          recovery.issue_fingerprint(wt, issue, branch=branch, base=base)))
-        if result == 80:
-            return 80
-        recovery.persist_grant(env, result, role="dev", failed_vendor=dev_vendor, exclusions=[dev_vendor],
-                               budget={"step": "dev"}, fingerprint=fingerprint, episode=str(issue), item=str(issue), reason=reason)
-        if result.action == "retry_step_other_vendor":
-            try:
-                dev_vendor = pick.choose(env, "dev", dev_vendor, "contrib", pick.all_vendors(env), issue=issue, exclude=dev_vendor)
-            except Exhausted as exhausted:
-                return stop(tick, issue, reason, f"#{issue}: {dev_vendor} stopped", exhausted.reason or fail)
-        fail, outcome, out = run_dev_worker(tick, issue, dev_vendor, wt, branch, body, base, plan, payload, resume_note, hooks, env)
-        if fail:
-            return stop(tick, issue, reason, f"#{issue}: {dev_vendor} stopped", f"{fail} {url}")
-        dev_model = out.get("model") or "unknown"
-        recovery.clear(env, issue, issue)
+    verification = pending and pending[0]["reason"] == "dev_verify_failed"
+    if not verification:
+        while True:
+            reason, fail = implement()
+            if not reason:
+                break
+            title = f"#{issue}: {dev_vendor} stopped"
+            if reason == "dev_blocked" or pending:
+                return stop(tick, issue, reason, title, f"{fail} {url}")
+            budget = {"validation_error": fail} if reason == "dev_task_invalid" else {}
+            pending = ask(reason, title, f"{fail} {url}", budget=budget)
+            if not pending:
+                return 80
+            _, dev_vendor = pending
+    else:
+        budget = pending[0]["remaining_budget"]
+        Path(body).write_text(budget["body"])
 
     verifier = fix.Runner(env, hooks)
     verifier.gate_applies = not is_partial(Path(body).read_text(), issue)
-    rc, failure, rounds = verifier.verify(str(wt), base, dev_vendor, "issue", issue)
+    start = git(wt, "rev-parse", "HEAD")
+    if verification:
+        rc, failure, rounds = verifier.verify_retry(str(wt), base, dev_vendor, "issue", issue,
+                                                    repairs=budget["verify_repairs"], repairs_before=budget["repairs_used"])
+    else:
+        rc, failure, rounds = verifier.verify(str(wt), base, dev_vendor, "issue", issue)
+    end = git(wt, "rev-parse", "HEAD")
+    if end != start:
+        attempts.append([dev_vendor, "unknown", start, end])
     if rc != 0:
-        vs = recovery.verify_status(repairs_used=rounds, max_repairs=int(env.config.scheduling.max_verify_fixes or 2),
-                                    failure=failure)
-        fingerprint = recovery.issue_fingerprint(wt, issue, branch=branch, base=base)
-        snapshot = (f"Decision point: dev_verify_failed. Repository {repo}, issue #{issue}.\n"
-                    f"Failed vendor: {dev_vendor}; role: dev.\nOutcome: {vs}\n"
-                    "Actions: retry_step = one more local verification within the same repair budget; "
-                    "handoff = the owner takes the issue.\n")
-        result = stop(tick, issue, "dev_verify_failed", f"#{issue}: local CI verification failed", url,
-                      snapshot=snapshot, observed_actions=("retry_step",),
-                      revalidate=lambda: recovery.fingerprint_matches(
-                          {"fingerprint": fingerprint},
-                          recovery.issue_fingerprint(wt, issue, branch=branch, base=base)))
-        if result == 80:
+        retry = None
+        reason = "dev_verify_failed"
+        title = f"#{issue}: local CI verification failed"
+        max_repairs = int(env.config.scheduling.max_verify_fixes or 2)
+        if not verification:
+            remaining = max(0, max_repairs - rounds)
+            retry = ask(reason, title, recovery.verify_status(repairs_used=rounds, max_repairs=max_repairs,
+                                                              failure=failure),
+                        budget={"verify_repairs": remaining, "repairs_used": rounds,
+                                "body": Path(body).read_text()}, local=True)
+            if retry:
+                rc, failure, rounds = verifier.verify_retry(str(wt), base, dev_vendor, "issue", issue,
+                                                            repairs=remaining, repairs_before=rounds)
+                head = git(wt, "rev-parse", "HEAD")
+                if head != end:
+                    attempts.append([dev_vendor, "unknown", end, head])
+        if rc:
             pr_helpers.gh("issue", "comment", issue, "-R", repo, "--body",
                           f"<!-- baton-note by={dev_vendor} -->\nLocal CI verification failed before push after {rounds} of "
-                          f"{env.config.scheduling.max_verify_fixes or 2} fix rounds. Nothing was pushed.\n\n{failure[:REPLY_CAP]}")
-            return 80
-        remaining = max(0, int(env.config.scheduling.max_verify_fixes or 2) - rounds)
-        recovery.persist_grant(env, result, role="dev", failed_vendor=dev_vendor, exclusions=[dev_vendor],
-                               budget={"verify_repairs": remaining}, fingerprint=fingerprint, episode=str(issue),
-                               item=str(issue), reason="dev_verify_failed")
-        rc, failure, rounds = verifier.verify(str(wt), base, dev_vendor, "issue", issue, repairs=remaining,
-                                              repairs_before=rounds)
-        recovery.clear(env, issue, issue)
-        if rc != 0:
-            pr_helpers.gh("issue", "comment", issue, "-R", repo, "--body",
-                          f"<!-- baton-note by={dev_vendor} -->\nLocal CI verification failed before push after retry. "
-                          f"Nothing was pushed.\n\n{failure[:REPLY_CAP]}")
-            return stop(tick, issue, "dev_verify_failed", f"#{issue}: local CI verification failed", url)
+                          f"{max_repairs} fix rounds. Nothing was pushed.\n\n{failure[:REPLY_CAP]}")
+            return 80 if not verification and not retry else stop(tick, issue, reason, title, url)
     if not push(wt, branch, upstream=True, signoff=tick.env.repo.signoff):
         stop(tick, issue, "dev_push_failed", f"#{issue}: pushing {dev_vendor}'s branch failed",
              f"{branch} is committed in {wt}. {url}")
@@ -354,10 +417,15 @@ def run(tick, issue):
                     f"Review the completion field in {body}. {url}")
     if verifier.gate_result:
         text += f"\n\n## E2E gate\n{verifier.gate_result}, on {git(wt, 'rev-parse', '--short', 'HEAD')}. The runner ran this."
+    if rounds:
+        for attempt in attempts:
+            if attempt[0] == dev_vendor:
+                attempt[1] = "unknown"
     intent = {"issue": str(issue), "branch": branch, "wt": str(wt), "base": base,
               "head": git(wt, "rev-parse", "HEAD"), "vendor": dev_vendor,
-              "model": dev_model if rounds == 0 else "unknown", "pr": ""}
+              "model": attempts[-1][1], "attempts": attempts, "pr": ""}
     save_opening(opening_path(tick, issue), intent)
+    recovery.clear(env, issue, issue)
     created = pr_helpers.gh("pr", "create", "-R", repo, "--head", branch, "--base", "main", "--title", lines[0], "--body", text)
     if created.returncode != 0:
         # A lost GitHub response may still have created the PR; leave the intent to reconcile.

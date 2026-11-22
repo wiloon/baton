@@ -317,7 +317,7 @@ def _category1(env, reason, entry, *, kind, number, title, text, hooks, remove, 
 
 def perform(env, reason, *, kind, number, title, text, hooks, remove=(), item="", episode="",
             snapshot="", revalidate=None, after_labels=None, observed_actions=None,
-            transient=False, continuation=None, resume=False):
+            transient=False, continuation=None, resume=False, fallback=False):
     """Validate REASON, apply its rule or advisor action, and on handoff run labels/telemetry/notify.
 
     KIND is "pr" or "issue". REMOVE is labels to drop before adding ready-for-human. AFTER_LABELS
@@ -325,6 +325,7 @@ def perform(env, reason, *, kind, number, title, text, hooks, remove=(), item=""
     than handoff are returned for the caller to execute; handoff side effects have already run.
     For eligible category-1 reads, TRANSIENT schedules a deferred attempt and RESUME consumes
     a due attempt (RETRY) or waits (DEFER). Review lookup also accepts a missing expected comment.
+    FALLBACK lets the caller apply its normal rule when no grant is made.
     Raises UnknownReason before any side effect when REASON is not in the table.
     """
     entry = REASONS.get(reason)
@@ -333,6 +334,8 @@ def perform(env, reason, *, kind, number, title, text, hooks, remove=(), item=""
     episode = str(episode or item or number)
 
     def finish(decision=None):
+        if fallback:
+            return Result(HANDOFF, decision, False)
         return _finish(env, reason, entry, kind=kind, number=number, title=title, text=text, hooks=hooks,
                        remove=remove, item=item, episode=episode, after_labels=after_labels,
                        decision=decision)

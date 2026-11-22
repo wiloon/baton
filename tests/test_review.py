@@ -1169,8 +1169,6 @@ def advised(loop, monkeypatch):
     from baton.config import Advisor
     monkeypatch.setenv(advisor.KEY, "sk-" + "t" * 24)   # built, so no scanner reads a key
     monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="live"))
-    monkeypatch.setattr(advisor, "enabled", lambda e: True)
-    monkeypatch.setattr(review.Review, "seed", lambda self: True)
     loop.advice, loop.advice_calls = [], []
 
     def call(cfg, key, snapshot, actions, **_):
@@ -1181,9 +1179,10 @@ def advised(loop, monkeypatch):
 
     def view(pr, fields):
         if "headRefOid" in fields:
-            data = {"state": "OPEN", "headRefOid": sh(loop.wt, "git", "rev-parse", "HEAD")}
-            if "baseRefName" in fields:
-                data["baseRefName"] = loop.gh.pr.get("baseRefName") or "main"
+            data = real_view(pr, fields) or {}
+            data.setdefault("baseRefName", "main")
+            data.setdefault("headRefOid", sh(loop.wt, "git", "rev-parse", "HEAD"))
+            data.setdefault("labels", [])
             return data
         return real_view(pr, fields)
 
@@ -1588,6 +1587,57 @@ def test_a_live_alternate_vendor_retry_picks_another_reviewer(advised, monkeypat
     assert advised.merged == [PR] and not advised.labelled("ready-for-human")
 
 
+def test_a_pinned_cursor_reviewer_cannot_switch_vendors(advised, monkeypatch):
+    from baton import advisor
+
+    advised.gh.set(headRefName="owner/issue-1", author={"login": "owner"})
+    advised.reviews[:] = ["RESULT: failed boom"]
+
+    def advise(cfg, key, snapshot, actions, **kwargs):
+        assert actions == ("handoff", "retry_step")
+        return {"action": "retry_step_other_vendor", "reason": "switch", "evidence": []}, {}
+
+    monkeypatch.setattr(advisor, "call_deepseek", advise)
+    assert advised.run(fixer="pool", reviewer="cursor") == 0
+    assert [run["vendor"] for run in advised.agents] == ["cursor"]
+    assert advised.labelled("ready-for-human")
+
+
+@pytest.mark.parametrize("action, vendors", [
+    ("retry_step", ["claude", "claude"]),
+    ("retry_step_other_vendor", ["claude", "codex"]),
+])
+def test_a_screenshot_retry_dispatches_the_granted_vendor(advised, action, vendors):
+    advised.reviews[:] = ["pass"]
+    advised.screens[:] = ["RESULT: failed boom", "pass"]
+    advised.advice = [{"action": action, "reason": "try the screenshot review again",
+                       "evidence": ["Decision point: screenshot_run_failed"]}]
+    assert screen_run(advised, reviewer="claude") == 0
+    assert [a["vendor"] for a in advised.agents if a["role"] == "screenshot_review"] == vendors
+    assert advised.merged == [PR]
+
+
+def test_screenshot_retry_refuses_changed_evidence(advised, monkeypatch):
+    from baton import advisor
+
+    shots = shoot(advised, "01-check-390.png")
+    advised.reviews[:] = ["pass"]
+    advised.screens[:] = ["RESULT: failed boom"]
+    advised.advice = [{"action": "retry_step", "reason": "try again",
+                       "evidence": ["Decision point: screenshot_run_failed"]}]
+    call = advisor.call_deepseek
+
+    def replace_evidence(*args, **kwargs):
+        path = shots / "01-check-390.png"
+        path.write_bytes(path.read_bytes() + b"changed")
+        return call(*args, **kwargs)
+
+    monkeypatch.setattr(advisor, "call_deepseek", replace_evidence)
+    assert screen_run(advised, reviewer="claude") == 0
+    assert roles(advised) == ["review", "screenshot_review"]
+    assert advised.labelled("ready-for-human") and not advised.merged
+
+
 def test_a_spent_review_retry_hands_off_on_the_same_reason(advised):
     advised.reviews[:] = ["RESULT: failed boom", "RESULT: failed again"]
     advised.advice = [{"action": "retry_step", "reason": "one more try",
@@ -1595,6 +1645,35 @@ def test_a_spent_review_retry_hands_off_on_the_same_reason(advised):
     assert advised.run(fixer="cursor", reviewer="claude") == 0
     assert [a["vendor"] for a in advised.agents if a["role"] == "review"] == ["claude", "claude"]
     assert advised.labelled("ready-for-human") and advised.merged == []
+    assert len(advised.advice_calls) == 1
+
+
+def test_a_blocked_review_alternate_resumes_before_dispatch(advised, monkeypatch):
+    from baton import advisor, recovery
+    from baton.common import Deferred
+
+    call = advisor.call_deepseek
+
+    def blocked(*args, **kwargs):
+        rest(advised, "codex", 60)
+        return call(*args, **kwargs)
+
+    def check_saved():
+        env = session.resolve(advised.env)
+        record = recovery.load(env, "297", PR)
+        assert record["action"] == "retry_step_other_vendor"
+        assert record["failed_vendor"] == "claude" and record["selected_vendor"] == "codex"
+
+    monkeypatch.setattr(advisor, "call_deepseek", blocked)
+    advised.reviews[:] = ["RESULT: failed boom", "pass"]
+    advised.advice = [{"action": "retry_step_other_vendor", "reason": "try another reviewer",
+                       "evidence": ["Decision point: review_run_failed"]}]
+    with pytest.raises(Deferred, match="codex"):
+        advised.run(fixer="cursor", reviewer="claude")
+    Path(advised.env["STATE"], "codex-cooldown-until").unlink()
+    advised.after["review"] = check_saved
+    assert advised.run(fixer="cursor", reviewer="claude") == 0
+    assert [a["vendor"] for a in advised.agents if a["role"] == "review"] == ["claude", "codex"]
     assert len(advised.advice_calls) == 1
 
 
@@ -1618,20 +1697,22 @@ def test_fingerprint_mismatch_on_pending_review_recovery_hands_off(loop, monkeyp
     from baton import session
     monkeypatch.setenv(advisor.KEY, "sk-" + "r" * 24)
     monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="live"))
-    remote = {"state": "OPEN", "headRefOid": "a" * 40, "baseRefName": "main"}
+    remote = {"state": "OPEN", "headRefOid": "a" * 40, "baseRefName": "main", "headRefName": "cursor/issue-297",
+              "body": "Refs #297", "comments": [], "labels": [], "reviews": []}
     monkeypatch.setattr(review.pr_helpers, "view", lambda pr, fields: dict(remote))
     env = session.resolve(loop.env)
     from baton import hooks as telemetry
     hooks = telemetry.from_env(env, issue="297", pr=PR)
     recovery.persist(env, {
         "action": "retry_step", "failed_vendor": "claude", "exclusions": ["claude"],
-        "remaining_budget": {}, "fingerprint": recovery.pr_fingerprint(str(loop.wt), PR, remote_head="a" * 40, base="main"),
+        "remaining_budget": {}, "fingerprint": recovery.worker_fingerprint(str(loop.wt), PR, round_s="1"),
         "role": "reviewer", "episode": "297", "item": str(PR), "reason": "review_run_failed", "decision_id": "x",
         "dispatched": False,
     })
+    grant = advisor.grant_path(env, "review_run_failed", PR)
+    grant.parent.mkdir(parents=True, exist_ok=True)
+    grant.write_text("x\n")
     remote["headRefOid"] = "b" * 40
     r = review.Review(env, hooks, PR, loop.wt, issue="297")
-    r.values = {"round": "1"}
-    from baton import handoff as owner_handoff
-    action, _ = r.recover_worker("review_run_failed", "t", "detail", "claude")
-    assert action == owner_handoff.HANDOFF
+    assert r.loop("", fixer="cursor", reviewer="claude") == 0
+    assert loop.labelled("ready-for-human") and not loop.agents

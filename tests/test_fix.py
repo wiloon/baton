@@ -1012,7 +1012,7 @@ def advised_fix(run, monkeypatch):
     from baton.config import Advisor
     monkeypatch.setenv(advisor.KEY, "sk-" + "f" * 24)
     monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="live"))
-    run.fake_gh.set(state="OPEN")
+    run.fake_gh.set(state="OPEN", baseRefName="main", headRefOid=run.remote_head(), comments=[], labels=[], reviews=[])
     run.advice, run.advice_calls = [], []
 
     def call(cfg, key, snapshot, actions, **_):
@@ -1031,8 +1031,121 @@ def test_a_live_retry_step_re_runs_a_failed_fix(advised_fix):
     assert len(advised_fix.agent_calls) == 2
     assert len(advised_fix.advice_calls) == 1
     assert "fix_run_failed" in advised_fix.advice_calls[0][0]
-    from baton import recovery
-    assert recovery.LOG_EXCERPT_MARKER not in advised_fix.advice_calls[0][0]
+
+
+def test_a_live_alternate_does_not_rerun_the_failed_fixer(advised_fix):
+    advised_fix.advice = [{"action": "retry_step_other_vendor", "reason": "try another fixer",
+                           "evidence": ["Decision point: fix_run_failed"]}]
+    advised_fix.agent({"outcome": "RESULT: failed boom", "commit": True},
+                      {"outcome": "RESULT: fixed", "commit": True, "reply": "RESULT: fixed"})
+    assert advised_fix.fix("claude")["rc"] == 0
+    assert [call[0] for call in advised_fix.agent_calls] == ["claude", "codex"]
+    assert set((advised_fix.root / "state" / f"pr-{PR}-authors").read_text().split()) == {"claude", "codex"}
+
+
+def test_alternate_fixer_uses_the_cursor_adapter(advised_fix, monkeypatch):
+    monkeypatch.setenv("VENDOR_POOL", "claude")
+    advised_fix.advice = [{"action": "retry_step_other_vendor", "reason": "try Cursor",
+                           "evidence": ["Decision point: fix_run_failed"]}]
+    advised_fix.agent({"outcome": "RESULT: failed boom", "commit": False},
+                      cursor_plan("RESULT: fixed", commit=True))
+    result = advised_fix.fix("claude")
+    assert result["rc"] == 0 and result["fixer"] == "cursor"
+    assert [call[0] for call in advised_fix.agent_calls] == ["claude", "cursor"]
+    assert "cursor-fix" in advised_fix.agent_calls[1][2]
+
+
+def test_a_verification_retry_after_deferral_uses_the_saved_budget(advised_fix, monkeypatch):
+    from baton.common import Deferred
+
+    advised_fix.verify_script("lint broke", "lint broke", "lint broke", "pass")
+    advised_fix.advice = [{"action": "retry_step", "reason": "flaky local check",
+                           "evidence": ["Decision point: fix_verify_failed"]}]
+    advised_fix.agent({"commit": True}, {"commit": True}, {"commit": True})
+    verify = fix.Runner.verify
+
+    def defer_retry(self, *args, **kwargs):
+        if kwargs.get("repairs") == 0 and len(advised_fix.agent_calls) == 3 and not defer_retry.used:
+            defer_retry.used = True
+            raise Deferred("claude", "short block")
+        return verify(self, *args, **kwargs)
+
+    defer_retry.used = False
+    monkeypatch.setattr(fix.Runner, "verify", defer_retry)
+    assert advised_fix.fix()["rc"] == 75
+    assert advised_fix.fix()["rc"] == 0
+    assert len(advised_fix.agent_calls) == 3
+    assert len(advised_fix.advice_calls) == 1
+
+
+@pytest.mark.parametrize("reason", ["fix_no_commit", "fix_task_invalid"])
+def test_cursor_retry_replaces_the_saved_request(advised_fix, monkeypatch, reason):
+    advised_fix.advice = [{"action": "retry_step", "reason": "correct the request",
+                           "evidence": [f"Decision point: {reason}"]}]
+    if reason == "fix_task_invalid":
+        calls = iter([(2, False, "invalid task relation"), (0, False, "")])
+        monkeypatch.setattr(fix.pr_helpers, "apply_task", lambda *a, **k: next(calls))
+        attempt = cursor_plan("TASK: partial\nRESULT: fixed", commit=False)
+    else:
+        attempt = cursor_plan("RESULT: fixed", request=BODY, commit=False)
+    advised_fix.agent(attempt, cursor_plan("RESULT: fixed", commit=True))
+    assert advised_fix.fix("cursor")["rc"] == 0
+    assert [call[0] for call in advised_fix.agent_calls] == ["cursor", "cursor"]
+    if reason == "fix_task_invalid":
+        assert "Validation error: invalid task relation" in next(
+            (p.read_text() for p in (advised_fix.root / "ctx").glob(f"pr-{PR}-cursor-fix-*.md")
+             if "Validation error" in p.read_text()), "")
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_observe_records_a_recommendation_without_rerunning(advised_fix, monkeypatch, enabled):
+    from baton import advisor
+    from baton.config import Advisor
+
+    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="observe"))
+    if not enabled:
+        from dataclasses import replace
+
+        from baton import session
+        configured = session.resolve(os.environ)
+        opted_out = replace(configured, repo=replace(configured.repo, advisor=False))
+        args = type("Args", (), {"pr": PR, "wt": str(advised_fix.worktree), "fixer": "claude",
+                                  "source": "reviewer", "head": ""})
+    advised_fix.advice = [{"action": "retry_step", "reason": "transient",
+                           "evidence": ["Decision point: fix_run_failed"]}]
+    advised_fix.agent({"outcome": "RESULT: failed boom", "commit": False})
+    result = advised_fix.fix() if enabled else fix.run("pr", args, opted_out, "feedback")
+    assert result["rc"] == 1 and advised_fix.labelled()
+    assert len(advised_fix.agent_calls) == 1
+    assert len(advised_fix.advice_calls) == int(enabled)
+
+
+@pytest.mark.parametrize("failure", ["unreadable PR", "changed PR head", "provider error", "invalid reply"])
+def test_fix_retry_requires_fresh_pr_state_and_valid_advice(advised_fix, monkeypatch, failure):
+    from baton import advisor
+
+    if failure == "unreadable PR":
+        monkeypatch.setattr(fix.pr_helpers, "view", lambda *a, **k: None)
+    advised_fix.advice = [{"action": "retry_step", "reason": "transient",
+                           "evidence": ["Decision point: fix_run_failed"]}]
+    if failure == "changed PR head":
+        original = advisor.call_deepseek
+
+        def new_head(*args, **kwargs):
+            advised_fix.fake_gh.set(headRefOid="b" * 40)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(advisor, "call_deepseek", new_head)
+    if failure in ("provider error", "invalid reply"):
+        def invalid(*args, **kwargs):
+            advised_fix.advice_calls.append((args[2], args[3]))
+            if failure == "provider error":
+                raise OSError("provider unavailable")
+            return {"action": "retry_step", "reason": None, "evidence": "bad"}, {}
+        monkeypatch.setattr(advisor, "call_deepseek", invalid)
+    advised_fix.agent({"outcome": "RESULT: failed boom", "commit": False})
+    assert advised_fix.fix()["rc"] == 1 and advised_fix.labelled()
+    assert len(advised_fix.agent_calls) == len(advised_fix.advice_calls) == 1
 
 
 def test_a_live_verify_retry_rechecks_within_the_same_budget(advised_fix):
@@ -1046,6 +1159,7 @@ def test_a_live_verify_retry_rechecks_within_the_same_budget(advised_fix):
     assert advised_fix.fix()["rc"] == 0 and not advised_fix.labelled()
     assert len(advised_fix.advice_calls) == 1
     assert "fix_verify_failed" in advised_fix.advice_calls[0][0]
+    assert "repairs 2 of 2" in advised_fix.advice_calls[0][0]
     assert advised_fix.advice_calls[0][1] == ("handoff", "retry_step")
 
 
@@ -1059,5 +1173,3 @@ def test_verify_still_red_with_zero_remaining_rechecks_once(run):
                                         repairs=0, repairs_before=2)
     assert (rc, failure, rounds) == (1, "lint broke", 2)
     assert run.agent_calls == []
-
-

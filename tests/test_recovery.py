@@ -30,16 +30,17 @@ def _record(**changes):
 
 
 def test_verify_status_omits_raw_log_tail():
-    failure = "step failed\nLast 200 lines:\n" + recovery.LOG_EXCERPT_MARKER + " secret log"
-    with pytest.raises(ValueError):
-        recovery.verify_status(repairs_used=2, max_repairs=2, failure=failure)
-    text = recovery.verify_status(repairs_used=1, max_repairs=2, failure="lint broke\nmore")
-    assert recovery.LOG_EXCERPT_MARKER not in text
+    marker = "ADVISOR_VERIFY_LOG_EXCERPT_MARKER"
+    failure = f"lint broke\nLast 200 lines:\n{marker} secret log"
+    text = recovery.verify_status(repairs_used=1, max_repairs=2, failure=failure)
+    assert marker not in text
+    assert "secret log" not in text
+    assert "lint broke" in text
     assert "Last 200 lines" not in text
     assert "repairs 1 of 2" in text
 
 
-def test_recovery_persists_before_dispatch_and_survives_reload(env):
+def test_recovery_record_survives_reload(env):
     recovery.persist(env, _record())
     loaded = recovery.load(env, "9", "3")
     assert loaded["action"] == "retry_step" and loaded["failed_vendor"] == "claude"
