@@ -65,7 +65,7 @@ def test_a_category_4_reason_hands_off_with_no_advisor_call(env, monkeypatch):
     assert result.action == handoff.HANDOFF and result.handed_off
     assert labelled == [("pr", "1", ())] and calls == []
     assert events == [("handoff", "auto_merge_off", "--reason", "auto_merge_off")]
-    assert notes == [("PR #1 review passed", "auto-merge is off")]
+    assert notes == [("PR #1 review passed", "auto-merge is off Reason auto_merge_off (category 4).")]
     assert handoff.REASONS["auto_merge_off"].category == 4
 
 

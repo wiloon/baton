@@ -346,6 +346,7 @@ class Tick:
         for n, path in names.worktrees(self.wt_root):
             wt = str(path)
             if self.state_of("issue", n) == "CLOSED":
+                advisor.finish_episode(self.env, "issue", n, "closed")
                 merge.remove_worktree(self.repo_dir, wt)
                 Path(f"{wt}.pr.md").unlink(missing_ok=True)
                 session.run_process(["rm", "-rf", str(self.ctx / f"issue-{n}-shots")])
@@ -356,6 +357,7 @@ class Tick:
             wt = wt.rstrip("/")
             n = os.path.basename(wt).removeprefix("spec-")
             if self.state_of("issue", n) == "CLOSED":
+                advisor.finish_episode(self.env, "issue", n, "closed")
                 merge.remove_worktree(self.repo_dir, wt)
                 self.sweep(n)
                 self.log(f"cleaned up spec worktree for closed #{n}")
@@ -364,9 +366,15 @@ class Tick:
             n = os.path.basename(wt).removeprefix("pr-")
             state = self.state_of("pr", n)
             if state in ("MERGED", "CLOSED"):
+                advisor.finish_episode(self.env, "pr", n, state.lower())
                 merge.remove_worktree(self.repo_dir, wt)
                 self.sweep(n)
                 self.log(f"cleaned up worktree for {state} PR #{n}")
+        # A PR reviewed in its issue's worktree has no pr-N worktree; finish its episode by number.
+        for n in advisor.pending_items(self.env, "pr"):
+            state = self.state_of("pr", n)
+            if state in ("MERGED", "CLOSED"):
+                advisor.finish_episode(self.env, "pr", n, state.lower())
         # Screenshot state can outlive a worktree (including Cursor issue worktrees).
         for shots in sorted(glob.glob(str(self.ctx / "pr-*-shots"))):
             if os.path.isdir(shots):
@@ -463,6 +471,7 @@ class Tick:
             return 0
         self.active["pr"] = str(pr)
         if state != "OPEN":
+            advisor.finish_episode(self.env, "pr", pr, state.lower())
             path.unlink(missing_ok=True)
             return 0
         rc = self.review_loop(pr, saved.get("wt", ""), saved.get("note", ""), saved.get("fixer", ""),
@@ -553,7 +562,7 @@ class Tick:
             owner_handoff.perform(
                 self.env, "fix_worktree_diverged", kind="pr", number=pr, remove=("agent-fix",),
                 title=f"PR #{pr} needs you", text=f"{wt} has diverged from origin/{head_ref}. {url}",
-                hooks=self.hooks(issue or "0", pr=pr), item=pr, episode=issue or pr)
+                hooks=self.hooks(issue or "0", pr=pr))
             return 80
         feedback_file = self.state / f"owner-fix-feedback-{pr}"
         feedback = feedback_file.read_text() if feedback_file.is_file() else review.human_feedback(self.gh_repo, self.owner, pr)

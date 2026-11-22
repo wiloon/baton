@@ -17,6 +17,8 @@ from baton.fix import fix_pr as fix_pr_run
 from baton.common import Deferred
 from conftest import sh
 
+REAL_MERGE = merge.Merger.merge_or_handoff
+
 BIN = Path(__file__).resolve().parents[1] / "bin"
 PR = 987654
 DEFERRED = {"rc": 75, "status": "quota", "outcome": "", "reply": None, "model": "", "defer": "quota exhausted"}
@@ -1169,6 +1171,66 @@ def test_a_second_limit_hands_off_without_asking_again(advised):
     assert len(advised.fixes) == 2 and advised.merged == [] and advised.labelled("ready-for-human")
     assert len(advised.advice_calls) == 1
     assert any("after 3 review rounds" in line for line in advised.log())
+    assert any("Advisor (DeepSeek) chose extra_round: fixable" in line for line in advised.log())
+
+
+def test_restart_after_a_terminal_handoff_does_not_resume_the_spent_round(advised, monkeypatch):
+    from baton import advisor
+
+    advised.reviews[:] = ["changes", "changes", "changes"]
+    advised.advice = [{"action": "extra_round", "reason": "fixable", "evidence": []}]
+    finish = advisor.finish_episode
+
+    def interrupted(*args):
+        finish(*args)
+        raise InterruptedError("runner stopped after closing the episode")
+
+    with monkeypatch.context() as stopped:
+        stopped.setattr(advisor, "finish_episode", interrupted)
+        with pytest.raises(InterruptedError):
+            advised.run(fixer="cursor")
+    assert advised.labelled("ready-for-human")
+    advised.agents.clear()
+    advised.fixes.clear()
+    advised.advice_calls.clear()
+    advised.reviews[:] = ["pass"]
+    edits_before = len([call for call in advised.gh.calls() if call[:2] == ["pr", "edit"]])
+
+    assert resume_split_review(advised) == 0
+    assert advised.agents == advised.fixes == advised.advice_calls == []
+    assert len([call for call in advised.gh.calls() if call[:2] == ["pr", "edit"]]) == edits_before
+    assert not advised.checkpoint()
+
+
+def test_an_extra_round_remains_open_until_the_merge_gate_hands_off(advised, monkeypatch):
+    from baton import advisor
+    from baton.session import resolve
+
+    monkeypatch.setattr(merge.Merger, "merge_or_handoff", REAL_MERGE)
+    advised.env["AUTO_MERGE"] = "0"
+    advised.reviews[:] = ["changes", "changes", "pass"]
+    advised.advice = [{"action": "extra_round", "reason": "One remaining test", "evidence": []}]
+
+    assert advised.run(fixer="cursor") == 0
+
+    decision, outcome = advisor.read_records(resolve(advised.env))
+    assert decision["executed"] == "extra_round" and outcome["result"] == "handoff"
+    assert decision["decision_id"] == outcome["decision_id"]
+    assert decision["episode"] == outcome["episode"]
+    assert advised.labelled("ready-for-human")
+
+
+def test_a_spent_extra_round_is_not_granted_again_after_a_pass_and_a_requeue(advised):
+    advised.reviews[:] = ["changes", "changes", "pass"]
+    advised.advice = [{"action": "extra_round", "reason": "only a test is missing", "evidence": []}]
+    assert advised.run(fixer="cursor") == 0
+    assert len(advised.fixes) == 2 and advised.merged == [PR]
+
+    # The merge gate queued the PR for review again: a fresh loop gets only the normal budget.
+    advised.reviews[:] = ["changes", "changes", "changes"]
+    assert advised.run(fixer="cursor") == 0
+    assert len(advised.fixes) == 3 and len(advised.advice_calls) == 1
+    assert advised.labelled("ready-for-human")
 
 
 @pytest.mark.parametrize("failure", ["fix", "review"])
@@ -1189,6 +1251,27 @@ def test_a_failed_extra_round_does_not_extend_the_next_review_episode(advised, f
     assert advised.run(fixer="cursor") == 0
     assert len(advised.advice_calls) == 2
     assert len(advised.fixes) == 3 and advised.labelled("ready-for-human")
+
+
+def test_an_unhandled_fix_failure_hands_off_once_and_closes_the_decision(advised, monkeypatch):
+    from baton import advisor
+    from baton import handoff as owner_handoff
+    from baton.session import resolve
+
+    advised.reviews[:] = ["changes", "changes"]
+    advised.fix_plans[:] = [0, 1]   # the second fix fails without handing the PR over
+    advised.advice = [{"action": "extra_round", "reason": "fixable", "evidence": []}]
+    reasons = []
+    perform = owner_handoff.perform
+    monkeypatch.setattr(owner_handoff, "perform",
+                        lambda env, reason, **kw: (reasons.append(reason), perform(env, reason, **kw))[1])
+    assert advised.run(fixer="cursor") == 0
+
+    assert reasons[-1] == "fix_run_unfinished" and reasons.count("fix_run_unfinished") == 1
+    assert advised.labelled("ready-for-human")
+    assert len([line for line in advised.log() if f"PR #{PR} needs you" in line]) == 1
+    decision, outcome = advisor.read_records(resolve(advised.env))
+    assert outcome["result"] == "handoff" and outcome["decision_id"] == decision["decision_id"]
 
 
 def test_an_advised_handoff_says_why(advised):

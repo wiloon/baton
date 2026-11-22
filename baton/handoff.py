@@ -6,6 +6,7 @@ terminal handoff performs the label change, telemetry and notification. Callers 
 label removals and stop semantics. Cursor triage and after-merge tracker issues stay outside.
 """
 from dataclasses import dataclass
+from pathlib import Path
 
 from . import advisor, notify, pr as pr_helpers
 
@@ -63,6 +64,7 @@ REASONS = {
     "spec_accept_post_failed": Reason(1, "rule"),
     "fix_checks_refresh_failed": Reason(1, "rule"),
     "fix_task_write_failed": Reason(1, "rule"),
+    "fix_run_unfinished": Reason(1, "rule"),
     "spec_body_edit_failed": Reason(1, "rule"),
     "spec_adr_open_failed": Reason(1, "rule"),
     "dev_push_failed": Reason(1, "rule"),
@@ -94,10 +96,6 @@ REASONS = {
     "spec_questions": Reason(2, "live", ("answer_spec_questions",)),
 }
 
-# Actions the runner already executes live at a decision point (#17 / this slice).
-LIVE_ACTIONS = frozenset({"extra_round"})
-
-
 def capped_mode(global_mode, point_mode):
     """ADR 0008: the global mode is a ceiling on the decision point's mode."""
     if point_mode not in RANK:
@@ -117,8 +115,8 @@ def label_ready(env, kind, number, remove=()):
     return pr_helpers.gh(cmd, "edit", str(number), "-R", env.repo.gh_repo, *opts)
 
 
-def perform(env, reason, *, kind, number, title, text, hooks, remove=(), item="", episode="",
-            snapshot="", revalidate=None, close_outcomes=(), after_labels=None):
+def perform(env, reason, *, kind, number, title, text, hooks, remove=(),
+            snapshot="", revalidate=None, after_labels=None, observed_actions=None):
     """Validate REASON, apply its rule or advisor action, and on handoff run labels/telemetry/notify.
 
     KIND is "pr" or "issue". REMOVE is labels to drop before adding ready-for-human. AFTER_LABELS
@@ -131,33 +129,33 @@ def perform(env, reason, *, kind, number, title, text, hooks, remove=(), item=""
         raise UnknownReason(f"unlisted handoff reason: {reason!r}")
 
     def finish(decision=None):
-        for point in close_outcomes:
-            advisor.outcome(env, point, item, "handoff")
+        if kind == "pr":
+            # Retire the continuation before publishing the handoff or releasing its grant.
+            Path(env.dirs.state, f"review-pending-{number}").unlink(missing_ok=True)
         result = label_ready(env, kind, number, remove=remove)
         if after_labels:
             after_labels(result)
+        advisor.finish_episode(env, kind, number, "handoff")
         hooks.task("handoff", reason, "--reason", reason)
-        body = (text() if callable(text) else text) + (advisor.handoff_note(decision) if decision else "")
+        body = (text() if callable(text) else text) + f" Reason {reason} (category {entry.category})."
+        if decision:
+            body += advisor.handoff_note(decision)
         notify.notify(title, body)
         notify.log(f"handoff {reason} category={entry.category}")
         return Result(HANDOFF, decision, True)
 
-    # Category 1 and 4 never call the advisor. Category 2/3 may, when the effective mode allows
-    # and this slice already executes the offered action (extra_round). Other recoveries fall
-    # through to the rule (handoff) until a later slice wires them.
-    if entry.category in (1, 4) or not entry.actions:
+    # The observation caller supplies only the actions the current evidence supports.
+    observing = entry.mode == "observe" and observed_actions is not None
+    if entry.category in (1, 4) or (not observing and "extra_round" not in entry.actions):
         return finish()
-
-    offered = tuple(a for a in entry.actions if a in LIVE_ACTIONS)
-    if not offered or advisor.granted(env, reason, item):
-        return finish()
-
+    offered = tuple(a for a in entry.actions if a in observed_actions) if observing else ("extra_round",)
     cfg = advisor.settings(env)
     mode = capped_mode(cfg.mode if advisor.enabled(env) else "off", entry.mode)
-    if mode == "off":
-        return finish()
-    decision = advisor.advise(env, reason, item, snapshot, offered, episode=episode or str(item),
-                             revalidate=revalidate, rule=HANDOFF, mode=mode)
+    if mode == "off":   # still explain an earlier recovery of this episode
+        return finish(advisor.saved_attempt(env, reason, number, kind))
+    decision = advisor.advise(env, reason, number, snapshot, offered, task_kind=kind,
+                             revalidate=revalidate, rule=HANDOFF, mode=mode,
+                             category=entry.category if observing else None)
     if decision.action == HANDOFF:
         return finish(decision)
     return Result(decision.action, decision, False)

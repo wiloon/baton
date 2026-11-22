@@ -258,7 +258,7 @@ class Spec:
                 "points and these changes, and read code only to verify a resolution or text the revision added.")
 
     # --- small steps ---
-    def handoff(self, why, reason="spec_review_run_failed", *, snapshot="", revalidate=None):
+    def handoff(self, why, reason="spec_review_run_failed", *, snapshot="", revalidate=None, observed_actions=None):
         """The owner takes over; the loop resumes once they answer on the issue and remove
         ready-for-human. Returns the shared-entry Result (#125)."""
         from . import handoff as owner_handoff
@@ -275,8 +275,8 @@ class Spec:
             self.env, reason, kind="issue", number=self.issue, remove=("agent-wip",),
             title=f"#{self.issue}: spec needs you",
             text=lambda: f"{message[0]} {self.url}",
-            hooks=self.hooks, item=self.issue, episode=self.issue,
-            snapshot=snapshot, revalidate=revalidate, close_outcomes=("spec_limit",),
+            hooks=self.hooks,
+            snapshot=snapshot, revalidate=revalidate, observed_actions=observed_actions,
             after_labels=after_labels)
 
     def post(self, body, failed):
@@ -459,7 +459,7 @@ class Spec:
         merge.remove_worktree(self.repo_dir, self.wt)
         round_m = re.search(r"round (\d+): accept", verdict)
         notify.notify(f"#{n}: spec accepted (round {round_m.group(1) if round_m else '?'})", self.url)
-        advisor.outcome(self.env, "spec_limit", n, "accept")
+        advisor.finish_episode(self.env, "issue", n, "accept")
         self.finish()
         return "accept"
 
@@ -467,23 +467,23 @@ class Spec:
         """CI + shared merge helper for an open ADR PR, then publish the verdict once MERGED."""
         n, who = self.issue, reviewer or "the reviewer"
         merger = merge.Merger(self.env, self.hooks, pr, n)
-        if not merger.ci_green(30):
-            self.handoff(f"{who} accepted, but CI on the ADR PR #{pr} is not green.",
-                         "spec_adr_ci_before_merge_not_green")
+        ci_message = f"{who} accepted, but CI on the ADR PR #{pr} is not green."
+
+        def stop(why, reason, **status):
+            self.handoff(why, reason, **merger.observation(reason, acceptance=verdict, **status))
             return "stop"
+
+        if not merger.ci_green(30):
+            return stop(ci_message, "spec_adr_ci_before_merge_not_green", ci_failed=True)
         result = merger.merge_with_updates(30)
         if not result.get("ok"):
             if result.get("reason") == "ci_after_update_not_green":
-                self.handoff(f"{who} accepted, but CI on the ADR PR #{pr} is not green.",
-                             "spec_adr_ci_after_update_not_green")
-            else:
-                self.handoff(f"{who} accepted, but merging the ADR PR #{pr} failed.{result.get('detail') or ''}",
-                             "spec_adr_merge_failed")
-            return "stop"
+                return stop(ci_message, "spec_adr_ci_after_update_not_green", ci_failed=True)
+            return stop(f"{who} accepted, but merging the ADR PR #{pr} failed.{result.get('detail') or ''}",
+                        "spec_adr_merge_failed", failure=result.get("reason") or "")
         if self.pr_state(pr) != "MERGED":
-            self.handoff(f"{who} accepted, but ADR PR #{pr} is still open after the merge attempt.",
-                         "spec_adr_merge_unconfirmed")
-            return "stop"
+            return stop(f"{who} accepted, but ADR PR #{pr} is still open after the merge attempt.",
+                        "spec_adr_merge_unconfirmed")
         notify.notify(f"#{n}: ADR PR #{pr} merged", f"https://github.com/{self.repo}/pull/{pr}")
         return self.publish_accept(verdict)
 
@@ -501,8 +501,10 @@ class Spec:
             self.handoff(f"ADR PR #{pr} was closed without merging; acceptance stays pending.", "spec_adr_closed")
             return False
         if state != "OPEN":
+            reason = "spec_adr_state_invalid"
+            merger = merge.Merger(self.env, self.hooks, pr, self.issue)
             self.handoff(f"ADR PR #{pr} state is unreadable ({state}); acceptance stays pending.",
-                         "spec_adr_state_invalid")
+                         reason, **merger.observation(reason, acceptance=verdict))
             return False
         return self.merge_adr_and_publish(pr, verdict) == "accept"
 
