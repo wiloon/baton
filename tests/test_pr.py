@@ -390,17 +390,30 @@ def test_why_is_the_last_stderr_lines():
     assert pr.why(subprocess.CompletedProcess([], 1, "", "")) == ""
 
 
-def test_why_redacts_github_tokens_from_stderr(gh, monkeypatch):
+def test_why_redacts_github_tokens_from_stderr(gh, child_token):
     import subprocess
-    from baton import session
     ghp = "ghp_" + ("a" * 40)
-    opaque = "opaque-gh-token-value-xyz"
-    monkeypatch.setenv("GH_TOKEN", opaque)
-    # Rebuild the bound session so tools picks up GH_TOKEN.
-    sess = session.resolve()
-    sess.tools["GH_TOKEN"] = opaque
-    stderr = f"auth failed token={ghp} also {opaque}\nmore\ntrail\n"
+    stderr = f"auth failed token={ghp} also {child_token}\nmore\ntrail\n"
     got = pr.why(subprocess.CompletedProcess([], 1, "", stderr))
-    assert ghp not in got and opaque not in got
-    assert "[redacted]" in got
-    assert "auth failed" in got or "trail" in got
+    assert got == " (gh: auth failed token=[redacted] also [redacted] | more | trail)"
+
+
+def test_why_redacts_before_truncating_to_the_tail(gh, monkeypatch):
+    import subprocess
+    pem = "-----BEGIN KEY-----\nabcdefgh\nijklmnop\n-----END KEY-----"
+    monkeypatch.setenv("SOME_API_SECRET", pem)
+    got = pr.why(subprocess.CompletedProcess([], 1, "", f"x\n{pem}\ntail\n"))
+    assert "BEGIN KEY" not in got and "abcdefgh" not in got and "ijklmnop" not in got
+    assert "tail" in got
+
+
+def test_why_withholds_stderr_when_secret_lookup_raises(gh, child_token, monkeypatch):
+    import subprocess
+    from baton import advisor
+
+    def boom(env):
+        raise IsADirectoryError("secret env file")
+    monkeypatch.setattr(advisor, "secret_values", boom)
+    got = pr.why(subprocess.CompletedProcess([], 1, "", f"denied {child_token}\n"))
+    assert got == " (gh: [stderr withheld: redaction failed])"
+    assert pr.why(subprocess.CompletedProcess([], 1, "", "")) == ""

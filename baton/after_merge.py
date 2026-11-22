@@ -131,7 +131,7 @@ def file_bug(pr, src, text):
     created, applied = create_issue(
         repo(), title=bug[:120], labels=labels,
         body=f"{text}\n\nFound while working on {src}, outside its scope.",
-        allow_unlabelled=True, context=f"PR #{pr}")
+        allow_unlabelled=True, context=f"PR #{pr}: side bug")
     if created.returncode != 0:
         log(f"PR #{pr}: filing a side bug failed: {bug}{why(created)}")
         return None
@@ -233,7 +233,7 @@ def follow_ups(pr, issue):
     text = text.encode()[:ISSUE_BODY_MAX].decode(errors="ignore").rstrip("\n")
     created, applied = create_issue(
         repo(), title=f"Follow-ups from #{pr}: {title[:110]}", labels=("follow-up",), body=text,
-        allow_unlabelled=True, context=f"PR #{pr}")
+        allow_unlabelled=True, context=f"PR #{pr}: follow-ups")
     if created.returncode != 0:
         log(f"PR #{pr}: filing the follow-up issue failed{why(created)}")
         return
@@ -330,7 +330,7 @@ def owner_actions(pr, issue):
                 f"so they are here instead (principle P-3). From {src}.\n\n{failed}")
         created, applied = create_issue(
             repo(), title=f"Before the next release: owner actions from #{pr}",
-            labels=("ready-for-human",), body=body, allow_unlabelled=True, context=f"PR #{pr}")
+            labels=("ready-for-human",), body=body, allow_unlabelled=True, context=f"PR #{pr}: owner actions")
         if created.returncode != 0:
             log(f"PR #{pr}: owner actions lost, Linear and GitHub both failed{why(created)}: {failed}")
         else:
@@ -446,7 +446,7 @@ def deferred_checks(pr, issue):
             f"a new one.\n\n{section}")
     created, _applied = create_issue(
         repo(), title=TRACKER, labels=("ready-for-human",), body=body,
-        allow_unlabelled=False, context=f"PR #{pr}")
+        allow_unlabelled=False, context=f"PR #{pr}: deferred checks")
     if created.returncode == 0:
         return
     if missing_requested_labels(created, ("ready-for-human",)):

@@ -63,15 +63,19 @@ def why(result):
     text = getattr(result, "stderr", "") or ""
     from . import advisor  # notify imports this module; keep redact off the import cycle
     values = set()
+    withheld = False
     try:
-        current = session.resolve()
-        values |= advisor.secret_values(current)
-        for name, value in (current.tools or {}).items():
-            if value and len(value) >= 8 and (advisor.SECRET_NAME.search(name) or name in (
-                    "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN")):
+        for name, value in (session.resolve().tools or {}).items():
+            if value and len(value) >= 8 and advisor.SECRET_NAME.search(name):
                 values.add(value)
     except Exception:
-        pass
+        withheld = True
+    try:
+        values |= advisor.secret_values(session.resolve())
+    except Exception:
+        withheld = True
+    if withheld:
+        return " (gh: [stderr withheld: redaction failed])" if text.strip() else ""
     text = advisor.redact(text, values)
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     return f" (gh: {' | '.join(lines[-STDERR_LINES:])})" if lines else ""

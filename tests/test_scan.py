@@ -131,15 +131,22 @@ def test_file_scan_creates_both_missing_labels_then_files(gh, tmp_path):
     assert [c[2] for c in gh.calls() if c[:2] == ["label", "create"]] == ["claude-found", "needs-triage"]
 
 
-def test_file_scan_keeps_the_draft_when_a_label_stays_missing(gh, tmp_path):
+@pytest.mark.parametrize("failing", [("claude-found",), ("needs-triage",), ("claude-found", "needs-triage")])
+def test_file_scan_keeps_the_draft_when_either_label_stays_missing(gh, tmp_path, failing):
     gh.set_labels()
-    gh.fail("label-create")
+    for name in failing:
+        gh.fail(f"label-create-{name}")
     base = draft({"STATE": str(tmp_path / "state")})
     assert scan.file_scan({"STATE": str(tmp_path / "state"), "LOGS": str(tmp_path / "logs"),
                            "GH_REPO": "owner/app"}, base) is False
     assert Path(f"{base}.md").exists()
     assert gh.created() == []
-    assert "gh issue create failed" in Path(tmp_path, "logs", "runner.log").read_text()
+    assert set(gh.labels()) == {"claude-found", "needs-triage"} - set(failing)
+    assert sum(1 for c in gh.calls() if c[:2] == ["issue", "create"]) == 2   # labelled, one retry
+    log = Path(tmp_path, "logs", "runner.log").read_text()
+    for name in failing:
+        assert f"label create '{name}' failed" in log
+    assert "gh issue create failed" in log
 
 
 # --- strip_wrapping_fence ---------------------------------------------------------------------

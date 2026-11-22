@@ -146,15 +146,19 @@ elif args[:2] == ["issue", "view"] and "title" in args[args.index("--json") + 1]
 elif args[:2] == ["issue", "view"]:
     print(json.dumps({"labels": [{"name": n} for n in pr.get("issue_labels", {}).get(args[2], [])]}))
 elif args[:2] == ["issue", "comment"]:
-    sys.exit(1 if fails("issue-comment") else 0)
+    if fails("issue-comment"):
+        if (root / "issue-comment-stderr").exists():
+            print((root / "issue-comment-stderr").read_text(), file=sys.stderr, end="")
+        sys.exit(1)
+    sys.exit(0)
 elif args[:2] == ["label", "create"]:
     name = args[2]
     labels = json.loads((root / "labels.json").read_text())
-    if fails("label-create"):
+    if fails("label-create") or fails(f"label-create-{name}"):
         err = (root / "label-create-stderr").read_text() if (root / "label-create-stderr").exists() else f"failed to create label '{name}'"
         print(err, file=sys.stderr)
         sys.exit(1)
-    if name in labels:
+    if name in labels and "--force" not in args:
         print(f"label '{name}' already exists; use --force to recreate", file=sys.stderr)
         sys.exit(1)
     meta = pr.get("label_meta", {}).get(name, {})
@@ -385,3 +389,15 @@ def typed_legacy_test_inputs(request, monkeypatch):
         return session.Session(config, rt, env, home, env.get('MATT_SKILLS_DIR',''),
                                tuple(Path(v) for v in env.get('CODEX_CACHE_DIRS','').split()), repo, dirs)
     monkeypatch.setattr(session, 'resolve', resolve)
+
+
+@pytest.fixture
+def child_token(monkeypatch):
+    """A token only the bound session's child environment holds; the process env lacks it."""
+    from baton import session
+    opaque = "child-env-gh-token-secret"
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    current = session.resolve()
+    current.tools["GH_TOKEN"] = opaque
+    monkeypatch.setattr(session, "resolve", lambda value=None: current)
+    return opaque

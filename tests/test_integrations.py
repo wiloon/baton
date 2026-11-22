@@ -101,6 +101,11 @@ def test_the_environment_alone_needs_no_file(tmp_path):
     assert credentials.load(tmp_path / "missing.env", KEYS, {}) == {}
 
 
+def test_a_directory_as_the_file_is_a_credential_error(tmp_path):
+    with pytest.raises(credentials.CredentialError, match="cannot be read"):
+        credentials.load(tmp_path, KEYS, {})
+
+
 @pytest.mark.parametrize("mode", [0o640, 0o604, 0o644])
 def test_a_file_others_can_read_is_refused_without_its_contents(tmp_path, mode):
     path = private(tmp_path / "t.env", "TELEGRAM_BOT_TOKEN=leaked\n")
