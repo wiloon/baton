@@ -349,11 +349,12 @@ class Review:
             "outcome": outcome, "run_id": self.hooks.last_run_id(),
         }
 
-    def check_comment_post(self, binding, round, reviewer, *, sending):
+    def check_comment_post(self, binding, round, reviewer, *, sending, marker="baton-review",
+                           step="review"):
         data, status = self.read_post_inputs(once=True)
         if status != "ok":
             return status
-        if (self.values.get("step") != "review" or self.binding_fields.get("verdict_round") != str(round)
+        if (self.values.get("step") != step or self.binding_fields.get("verdict_round") != str(round)
                 or (round, reviewer, self.owner) != (binding["round"], binding["reviewer"], binding["author"])
                 or git(self.wt, "rev-parse", "HEAD") != binding["head"]
                 or (data["headRefOid"], data["baseRefName"], data["linked_issue"]) !=
@@ -369,7 +370,7 @@ class Review:
             trusted = (row["author"] or {}).get("login") == binding["author"]
             if row["body"] == binding["body"]:
                 matches.append(trusted)
-            elif trusted and row["body"].startswith("<!-- baton-review round="):
+            elif trusted and row["body"].startswith(f"<!-- {marker} round="):
                 return "changed"
         if not matches:
             return "absent"
@@ -381,21 +382,29 @@ class Review:
         return (self.binding_fields.get("post_waiting") or self.binding_fields.get("post_outcome")
                 or str(self.pr) in owner_handoff.review_post_episodes(self.env))
 
-    def post_review_comment(self, round, reviewer, binding=None):
-        """Save before sending, or consume a due attempt before reconciling the saved write."""
-        pr, episode, reason = str(self.pr), self.issue or self.pr, owner_handoff.REVIEW_POST
+    def screenshot_post_pending(self):
+        waiting = self.binding_fields.get("post_waiting")
+        return (waiting == owner_handoff.SCREENSHOT_POST
+                or (self.values.get("step") == "screenshot" and bool(self.binding_fields.get("post_outcome")))
+                or str(self.pr) in owner_handoff.comment_post_episodes(self.env, owner_handoff.SCREENSHOT_POST))
+
+    def post_comment(self, round, reviewer, binding, *, reason, kind, marker, step, fail_label,
+                     digest_field, on_landed=None):
+        """Save before sending, or consume a due attempt before reconciling the saved write (#151)."""
+        pr, episode = str(self.pr), self.issue or self.pr
         title = f"PR #{pr} comment post failed"
-        text = f"Posting the review comment of round {round} failed. {self.url}"
+        text = f"Posting the {fail_label} of round {round} failed. {self.url}"
 
         def stop(message):
             self.handoff(reason, title, f"{text} {message}")
-            return self.failed(ALREADY, "RESULT: failed posting review")
+            return self.failed(ALREADY, f"RESULT: failed posting {fail_label}")
 
         initial = binding is not None
         completed = self.binding_fields.get("post_outcome")
-        if completed and (not completed.startswith(REVIEWED) or self.values.get("step") != "review"
+        digest = self.binding_fields.get(digest_field, "")
+        if completed and (not completed.startswith(REVIEWED) or self.values.get("step") != step
                           or self.binding_fields.get("verdict_round") != str(round)
-                          or not re.fullmatch(r"[0-9a-f]{64}", self.binding_fields.get("verdict_digest", ""))):
+                          or not re.fullmatch(r"[0-9a-f]{64}", digest)):
             return stop("The saved verdict is invalid.")
         try:
             pending = owner_handoff.load_retry(self.env, episode, reason, pr)
@@ -417,12 +426,16 @@ class Review:
             if result.action == owner_handoff.DEFER:
                 return DEFERRED_POST
             if result.action != owner_handoff.RETRY:
-                return self.failed(ALREADY, "RESULT: failed posting review")
+                return self.failed(ALREADY, f"RESULT: failed posting {fail_label}")
             binding = result.continuation
+            reviewer = binding["reviewer"]
 
         def finish():
-            self.save_binding(post_outcome=binding["outcome"], verdict_digest=binding["digest"])
-            self.hooks.verdict("review", binding["reviewer"], binding["head"], binding["round"],
+            fields = {"post_outcome": binding["outcome"], digest_field: binding["digest"]}
+            self.save_binding(**fields)
+            if on_landed:
+                on_landed(binding)
+            self.hooks.verdict(kind, binding["reviewer"], binding["head"], binding["round"],
                                binding["outcome"], binding["body"], run_id=binding["run_id"])
             owner_handoff.clear_retry(self.env, episode, reason, pr)
             self.save_binding(post_waiting="")
@@ -431,7 +444,7 @@ class Review:
         if completed:
             if pending is not None:
                 binding = pending["continuation"]
-                if (completed, self.binding_fields.get("verdict_digest")) != (binding["outcome"], binding["digest"]):
+                if (completed, digest) != (binding["outcome"], binding["digest"]):
                     return stop("The saved verdict differs from its post.")
                 owner_handoff.clear_retry(self.env, episode, reason, pr)
             self.save_binding(post_waiting="")
@@ -439,7 +452,8 @@ class Review:
 
         def reconcile(*, sending=False):
             nonlocal status
-            status = self.check_comment_post(binding, round, reviewer, sending=sending)
+            status = self.check_comment_post(binding, round, reviewer, sending=sending,
+                                             marker=marker, step=step)
             return status
 
         status = reconcile(sending=initial)
@@ -467,6 +481,20 @@ class Review:
                                              "due": now + owner_handoff.DELAYS[attempts]})
                 return DEFERRED_POST
         return stop(f"Reconciliation: {status}." + (pr_helpers.why(posted) if posted is not None else ""))
+
+    def post_review_comment(self, round, reviewer, binding=None):
+        """Save before sending, or consume a due attempt before reconciling the saved write."""
+        return self.post_comment(
+            round, reviewer, binding, reason=owner_handoff.REVIEW_POST, kind="review",
+            marker="baton-review", step="review", fail_label="review comment",
+            digest_field="verdict_digest")
+
+    def post_screenshot_comment(self, round, reviewer=None, binding=None):
+        """Save before sending a screenshot review, or resume a due attempt (#151)."""
+        return self.post_comment(
+            round, reviewer, binding, reason=owner_handoff.SCREENSHOT_POST, kind="screenshot_review",
+            marker="baton-screenshot-review", step="screenshot", fail_label="screenshot review",
+            digest_field="screenshot_digest")
 
     def read_pr(self, more, *, once=False):
         fields = f"{self.REVISION_FIELDS},{more}"
@@ -776,13 +804,15 @@ class Review:
                         if vendor == "codex" and "codex" in vendors.review_excluded(self.state, pr, self.fixed_by) else "")
                 review_note = f"Review mode: {mode} (codex/{model}).\n\n" if mode else ""
                 posted_body = f"<!-- baton-screenshot-review round={round} by={vendor} -->\n{review_note}{body}"
-                posted = pr_helpers.gh("pr", "comment", str(pr), "-R", self.repo, "--body", posted_body)
-                if posted.returncode != 0:
-                    outcome = self.failed("screenshot_comment_post_failed", "RESULT: failed posting screenshot review")
-                else:
-                    self.capture_feedback(posted_body, "screenshot_digest")
-            else:
-                outcome = self.failed("screenshot_run_failed", "RESULT: failed no screenshot review artifact")
+                data, status = self.read_post_inputs()
+                if status == "paused":
+                    return DEFERRED_POST
+                if not data or data["headRefOid"] != head:
+                    return self.failed("screenshot_comment_post_failed",
+                                       "RESULT: failed reading the PR revision for screenshot review")
+                binding = self.comment_post_binding(posted_body, round, outcome, vendor, head, data)
+                return self.post_screenshot_comment(round, vendor, binding)
+            outcome = self.failed("screenshot_run_failed", "RESULT: failed no screenshot review artifact")
         self.hooks.verdict("screenshot_review", vendor, head, round, outcome, out["reply"] or "", str(review_file))
         return outcome
 
@@ -844,6 +874,7 @@ class Review:
         else:
             self.binding_fields = {}
         pending_post = self.post_pending()
+        screenshot_post = self.screenshot_post_pending()
         cfg = self.env.config
         if (not pending_post and reviewer != "pool"
                 and (reviewer not in cfg.declared() or not cfg.allows(reviewer, "reviewer"))):
@@ -871,7 +902,9 @@ class Review:
             self.save()
             if step in ("review", "screenshot") or pending_post:
                 verdict = code_verdict
-                if step == "review" or pending_post:
+                if screenshot_post:
+                    pending_post = False
+                elif step == "review" or pending_post:
                     self.fail_reason = ""
                     if pending_post:
                         outcome = self.post_review_comment(round, reviewer)
@@ -897,31 +930,39 @@ class Review:
                         return 0
                     verdict = "pass" if outcome.startswith("REVIEW: pass") else "changes"
                     self.binding_fields["post_outcome"] = self.values["post_outcome"] = ""
-                if step == "screenshot" or self.screenshot_enabled(reviewer):
+                if screenshot_post or step == "screenshot" or self.screenshot_enabled(reviewer):
                     body = pr_helpers.body(pr)
                     # If the body read fails on resume, keep the checks saved with the code verdict.
-                    if body is not None:
+                    if body is not None and not screenshot_post:
                         if check_section.items(body):
                             checks = check_section.read(body)
                         else:
                             checks = ""
-                if checks:
+                if checks or screenshot_post:
                     step = "screenshot"
                     code_verdict = verdict
                     self.values.update(step=step, code_verdict=code_verdict, screenshot_checks=checks)
                     self.save()
                     self.fail_reason = ""
-                    try:
-                        outcome = self.run_screenshot_review(round, checks)
-                    except Exhausted as exhausted:
-                        outcome = self.failed("screenshot_reviewer_unavailable",
-                                              exhausted.reason or "No screenshot reviewer available.")
+                    if screenshot_post:
+                        outcome = self.post_screenshot_comment(round)
+                        screenshot_post = False
+                    else:
+                        try:
+                            outcome = self.run_screenshot_review(round, checks)
+                        except Exhausted as exhausted:
+                            outcome = self.failed("screenshot_reviewer_unavailable",
+                                                  exhausted.reason or "No screenshot reviewer available.")
+                    if outcome == DEFERRED_POST:
+                        return 75
                     if not outcome.startswith(REVIEWED):
-                        self.handoff(self.fail_reason or "screenshot_run_failed", f"PR #{pr} screenshot review failed",
-                                     f"{outcome} {self.url}")
+                        if self.fail_reason != ALREADY:
+                            self.handoff(self.fail_reason or "screenshot_run_failed",
+                                         f"PR #{pr} screenshot review failed", f"{outcome} {self.url}")
                         self.drop()
                         return 0
                     screenshot = "1"
+                    self.binding_fields["post_outcome"] = self.values["post_outcome"] = ""
                     if outcome.startswith("REVIEW: changes"):
                         verdict = "changes"
                 if verdict == "pass":

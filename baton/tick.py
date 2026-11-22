@@ -490,9 +490,13 @@ class Tick:
         episode = saved.get("ISSUE") or pr
         if post_episodes and (saved.get("pr") != pr or not saved.get("wt") or post_episodes != {episode}):
             self.active["pr"] = pr
+            reason = next((name for name in owner_handoff.COMMENT_POSTS
+                           if pr in owner_handoff.comment_post_episodes(self.env, name)),
+                          owner_handoff.REVIEW_POST)
             for key in post_episodes:
-                owner_handoff.clear_retry(self.env, key, owner_handoff.REVIEW_POST, pr)
-            owner_handoff.perform(self.env, owner_handoff.REVIEW_POST, kind="pr", number=pr, item=pr,
+                for name in owner_handoff.COMMENT_POSTS:
+                    owner_handoff.clear_retry(self.env, key, name, pr)
+            owner_handoff.perform(self.env, reason, kind="pr", number=pr, item=pr,
                                   episode=episode, title=f"PR #{pr} comment post failed",
                                   text="The saved comment post has no matching review checkpoint.",
                                   hooks=self.hooks(saved.get("ISSUE", ""), pr))

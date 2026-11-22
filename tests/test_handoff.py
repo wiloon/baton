@@ -309,7 +309,7 @@ def test_damage_to_a_waiting_review_hands_off_once(env, monkeypatch, damage):
 def test_every_category_1_reason_is_rule_mode_with_retry_budget():
     assert handoff.RETRY_REASONS == {
         "review_comment_missing", "spec_comments_read_failed", "spec_pending_adr_read_failed",
-        "review_comment_post_failed",
+        "review_comment_post_failed", "screenshot_comment_post_failed",
     }
     for reason in handoff.RETRY_REASONS:
         entry = handoff.REASONS[reason]
@@ -321,6 +321,8 @@ def test_every_category_1_reason_is_rule_mode_with_retry_budget():
     ("spec_comments_read_failed", {}),
     ("spec_pending_adr_read_failed", {"step": "discovery"}),
     ("review_comment_post_failed", post_binding("1")),
+    ("screenshot_comment_post_failed",
+     post_binding("1", body="<!-- baton-screenshot-review round=1 by=claude -->\npass")),
 ])
 def test_each_category_1_reason_defers_then_hands_off_through_perform(env, monkeypatch, reason, binding):
     """Every replayed read or comment post shares the same budget: no advisor, two later attempts, then handoff."""

@@ -31,10 +31,13 @@ READY = "ready-for-human"
 DELAYS = (60, 300)
 MAX_ATTEMPTS = len(DELAYS)
 clock = time.time
-# Category-1 reads and code-review comment posts share the budget.
+# Category-1 reads and review/screenshot comment posts share the budget.
 REVIEW_POST = "review_comment_post_failed"
+SCREENSHOT_POST = "screenshot_comment_post_failed"
+COMMENT_POSTS = frozenset({REVIEW_POST, SCREENSHOT_POST})
 RETRY_REASONS = frozenset({
-    "review_comment_missing", "spec_comments_read_failed", "spec_pending_adr_read_failed", REVIEW_POST,
+    "review_comment_missing", "spec_comments_read_failed", "spec_pending_adr_read_failed",
+    *COMMENT_POSTS,
 })
 
 # Categories: 1 rule-decided, 2 judgement, 3 needs investigation, 4 owner-only.
@@ -166,12 +169,13 @@ def body_digest(body):
     return hashlib.sha256(body.encode()).hexdigest()
 
 
-def _comment_post_valid(item, binding):
-    """The code-review verdict and the inputs it was produced from (#151)."""
+def _comment_post_valid(item, binding, *, marker):
+    """A trusted review or screenshot comment and the inputs it was produced from (#151)."""
     body = binding.get("body")
     reviewer, round = binding.get("reviewer"), binding.get("round")
     if (reviewer not in ("claude", "codex", "cursor") or type(round) is not int or round <= 0
-            or not isinstance(body, str) or not body.startswith(f"<!-- baton-review round={round} by={reviewer} -->\n")):
+            or not isinstance(body, str)
+            or not body.startswith(f"<!-- {marker} round={round} by={reviewer} -->\n")):
         return False
     try:
         if binding.get("digest") != body_digest(body):
@@ -207,7 +211,9 @@ def _binding_valid(reason, item, binding):
                 and isinstance(binding.get("adr_head"), str)
                 and (binding["adr_head"] == "" or bool(re.fullmatch(r"[0-9a-f]{40}", binding["adr_head"]))))
     if reason == REVIEW_POST:
-        return _comment_post_valid(item, binding)
+        return _comment_post_valid(item, binding, marker="baton-review")
+    if reason == SCREENSHOT_POST:
+        return _comment_post_valid(item, binding, marker="baton-screenshot-review")
     return (binding.get("pr") == item and type(binding.get("round")) is int and binding["round"] > 0
             and all(isinstance(binding.get(key), str) for key in
                     ("head", "base", "digest", "issue", "screenshot_digest"))
@@ -261,15 +267,23 @@ def prepare_retry(env, episode, reason, item, binding):
     return pending
 
 
-def review_post_episodes(env):
-    """Find code-review operations by PR number, even if their review checkpoint is missing."""
+def comment_post_episodes(env, reason=None):
+    """Find review or screenshot comment-post operations by PR number."""
+    reasons = (reason,) if reason else tuple(COMMENT_POSTS)
     found = {}
-    for path in Path(env.dirs.state).glob(f"handoff-*-{REVIEW_POST}.json"):
-        match = re.fullmatch(rf"handoff-(?:waiting|retry)-([0-9]+)(?:-([0-9]+))?-{REVIEW_POST}\.json", path.name)
-        if match:
-            episode, item = match.groups()
-            found.setdefault(item or episode, set()).add(episode)
+    for name in reasons:
+        for path in Path(env.dirs.state).glob(f"handoff-*-{name}.json"):
+            match = re.fullmatch(rf"handoff-(?:waiting|retry)-([0-9]+)(?:-([0-9]+))?-{re.escape(name)}\.json",
+                                 path.name)
+            if match:
+                episode, item = match.groups()
+                found.setdefault(item or episode, set()).add(episode)
     return found
+
+
+def review_post_episodes(env):
+    """Find code-review or screenshot comment-post operations by PR number."""
+    return comment_post_episodes(env)
 
 
 def _clear_path(path):
