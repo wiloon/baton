@@ -39,8 +39,10 @@ of it once verified as only a clean merge of the base branch. A new head alone i
 The update itself names the validated head as a condition, so GitHub refuses it and leaves the
 branch untouched if someone pushed first. GitHub applies an update asynchronously, so an
 unchanged head can't confirm that an update did not land. After an inconclusive response the
-runner never resends that update. It waits a bounded time for a head that passes the same
-verification and otherwise hands off. Other merge recovery keeps its decision point.
+runner never resends that update. It waits for a head that passes the same verification and
+otherwise hands off. One deadline, saved before the update is sent, bounds the request, that wait
+and every call in it. A restart doesn't extend the deadline, and an answer that arrives after it
+validates nothing. Other merge recovery keeps its decision point.
 
 After a fix, a rejected or failed PR description request is a recoverable runner outcome. A
 failed request that can be resumed may first use the safe retry budget. If it still can't be
@@ -127,3 +129,5 @@ advisor action per reason and task episode, and a recurrence after that action g
   checking the result afterwards can't undo an update to a head the runner never validated.
 - Issue #151 (spec round 4, owner answer): never resend an ADR branch update after an inconclusive
   response, because a queued update leaves the old head visible and absence can't be confirmed.
+- Issue #151 (spec round 5): give each ADR branch update one saved deadline that also bounds its
+  calls, because a stalled call or a restart could otherwise postpone the handoff without limit.
