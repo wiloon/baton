@@ -271,6 +271,16 @@ def test_a_pending_review_of_a_closed_pr_ends_its_advisor_episode(ctx, granted_r
     assert granted_round.ask("review_limit", 11, "after the reopen").extra_round and len(granted_round.calls) == 3
 
 
+def test_cleanup_ends_a_closed_prs_episode_with_no_pr_worktree(ctx, granted_round):
+    """#156 review: a PR reviewed in its issue's worktree (no pr-N dir, checkpoint dropped by the
+    pass) still gets its spent grant released when it closes while the issue stays open."""
+    ctx.gh.answers["pr view"] = "CLOSED\n"
+    ctx.gh.answers["issue view"] = "OPEN\n"
+    ctx.make().cleanup()
+    assert not granted_round.advisor.granted(granted_round.env, "review_limit", 11)
+    assert granted_round.ask("review_limit", 11, "after the reopen").extra_round and len(granted_round.calls) == 3
+
+
 def test_closing_an_issue_ends_its_spec_episode(ctx, granted_round):
     (Path(ctx.env["WT_ROOT"]) / "spec-9").mkdir(parents=True)
     ctx.gh.answers["issue view"] = "CLOSED\n"

@@ -46,6 +46,7 @@ class Runner:
         self.max_verify = int(env.config.scheduling.max_verify_fixes or 2)
         self.pr, self.reply, self.gate_result = pr, "", ""
         self.gate_applies = True   # dev.run clears it for a partial slice
+        self.handed_off = False    # set once handoff() labels the PR; callers tell it apart from rc 1
         self.hooks = hooks or telemetry.from_env(env, issue=env.runtime.issue, pr=pr, round=round)
 
     # --- the owner handoff every gate shares ---
@@ -55,6 +56,7 @@ class Runner:
         owner_handoff.perform(
             self.env, reason, kind="pr", number=pr,
             title=title, text=text, hooks=self.hooks)
+        self.handed_off = True
         return 1
 
     def comment(self, pr, body, failed=""):

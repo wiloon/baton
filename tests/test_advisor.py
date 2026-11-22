@@ -273,3 +273,36 @@ def test_the_request_and_recorded_version_follow_the_category(adv, monkeypatch, 
     assert advisor.handoff_note(advisor.Decision("handoff")) == ""
     failed = advisor.Decision("handoff", failure="HTTP 500", called=True)
     assert "no decision (HTTP 500)" in advisor.handoff_note(failed)
+
+
+def test_malformed_message_content_keeps_the_envelope_usage(adv, monkeypatch):
+    """#156 review: usage from a valid envelope survives unparseable message content (HTTP boundary)."""
+    import io
+    import json
+
+    class Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    usage = {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+    monkeypatch.setattr(advisor, "call_deepseek", REAL_CALL)
+    monkeypatch.setattr(advisor.urllib.request, "urlopen", lambda request, timeout=0: Response(
+        json.dumps({"choices": [{"message": {"content": "not json {"}}], "usage": usage}).encode()))
+    d = advisor.advise(adv.env, "merge_failed", 41, "snap", ("retry_step",), category=3, mode="observe")
+    assert d.action == "handoff" and "malformed reply" in d.failure
+    assert adv.records()[0]["usage"] == usage
+
+
+def test_an_outcome_after_a_torn_line_without_newline_stays_readable(adv):
+    """#156 review: an append after a truncated record keeps the record boundary."""
+    adv.replies = [EXTRA]
+    advisor.advise(adv.env, "review_limit", 42, "s", ("extra_round",), revalidate=lambda: True)
+    with open(advisor.records_path(adv.env), "ab") as file:
+        file.write(b'{"kind": "decision", "reason": "tor')   # truncated, no trailing newline
+    advisor.finish_episode(adv.env, "pr", 42, "handoff")
+    kinds = [r["kind"] for r in adv.records()]
+    assert kinds[0] == "decision" and "outcome" in kinds
+    assert not advisor.granted(adv.env, "review_limit", 42)

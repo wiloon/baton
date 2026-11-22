@@ -370,6 +370,11 @@ class Tick:
                 merge.remove_worktree(self.repo_dir, wt)
                 self.sweep(n)
                 self.log(f"cleaned up worktree for {state} PR #{n}")
+        # A PR reviewed in its issue's worktree has no pr-N worktree; finish its episode by number.
+        for n in advisor.pending_items(self.env, "pr"):
+            state = self.state_of("pr", n)
+            if state in ("MERGED", "CLOSED"):
+                advisor.finish_episode(self.env, "pr", n, state.lower())
         # Screenshot state can outlive a worktree (including Cursor issue worktrees).
         for shots in sorted(glob.glob(str(self.ctx / "pr-*-shots"))):
             if os.path.isdir(shots):

@@ -198,6 +198,17 @@ def test_a_ci_repair_that_already_handed_off_makes_no_provider_call_and_no_secon
     assert not run.merged()
 
 
+def test_a_ci_repair_that_fails_without_a_handoff_is_handed_off_by_the_merge_gate(run, repair, observing,
+                                                                                  monkeypatch):
+    monkeypatch.setattr(merge.fix, "fix_pr", lambda runner, pr, wt, fixer, source, feedback, head="": 1)
+    run.gh.set(state="OPEN")
+    run.gh.watches((1, ""))
+    run.go()
+
+    assert sum(c[:2] == ["pr", "edit"] and "ready-for-human" in c for c in run.gh.calls()) == 1
+    assert not run.merged() and len(observing) == 1   # the gate's own CI handoff point, consulted once
+
+
 def grant_extra_round(run, monkeypatch):
     monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="live"))
     monkeypatch.setenv(advisor.KEY, "fake-advisor-key")
@@ -610,8 +621,12 @@ def repair(run, monkeypatch):
     monkeypatch.setattr(merge.Merger, "ci_fix_round", REAL_CI_FIX_ROUND)
     run.fixes, run.fix_rc = [], 0
 
+    run.fix_hands_off = True
+
     def fix_pr(runner, pr, wt, fixer, source, feedback, head=""):
         run.fixes.append({"fixer": fixer, "source": source, "feedback": feedback, "round": runner.round})
+        if run.fix_rc and run.fix_hands_off:
+            runner.handed_off = True
         return run.fix_rc
     monkeypatch.setattr(merge.fix, "fix_pr", fix_pr)
     monkeypatch.setattr(ci.time, "sleep", lambda s: None)
@@ -645,6 +660,13 @@ def test_a_repair_that_cannot_run_hands_the_head_off_without_marking_it(repair):
 def test_a_repair_that_hands_the_pr_over_still_marks_the_head(repair):
     repair.fix_rc = 1
     assert repair.merger().ci_fix_round(str(repair.wt)) == merge.HANDED_OFF
+    assert Path(repair.env["STATE"], f"ci-fix-{PR}-{HEAD}").exists()
+
+
+def test_a_repair_failure_without_a_handoff_is_not_taken_for_one(repair):
+    """rc 1 with no handoff (e.g. recording authorship failed) must not end the merge gate silently."""
+    repair.fix_rc, repair.fix_hands_off = 1, False
+    assert repair.merger().ci_fix_round(str(repair.wt)) == 1
     assert Path(repair.env["STATE"], f"ci-fix-{PR}-{HEAD}").exists()
 
 

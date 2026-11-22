@@ -152,7 +152,8 @@ class Merger:
             fixer = pick.choose(self.env, "fixer", "agent", "contrib", pick.all_vendors(self.env), pr=str(pr),
                                 issue=self.issue)
             notify.log(f"PR #{pr}: code-only CI failure on {head}; one repair round by {fixer}")
-            rc = fix.fix_pr(fix.Runner(self.env, self.hooks, pr, "ci"), pr, wt, fixer, "CI code checks", found["feedback"])
+            runner = fix.Runner(self.env, self.hooks, pr, "ci")
+            rc = fix.fix_pr(runner, pr, wt, fixer, "CI code checks", found["feedback"])
         except Deferred:
             rc = 75
         if rc == 75:
@@ -160,7 +161,9 @@ class Merger:
             return 1
         Path(self.state, f"ci-fix-{pr}-{head}").touch()   # one repair round for this PR head, even across ticks
         if rc != 0:
-            return HANDED_OFF   # fix_pr already handed the PR off; no second handoff or advisor call
+            # Only a real handoff by the repair run ends here; any other failure (e.g. recording
+            # authorship) falls through to the merge gate's own CI handoff.
+            return HANDED_OFF if runner.handed_off else 1
         self.hooks.task("ci_fix", f"pr:{pr}:{head}", "--agent", fixer, "--head-sha", head)
         return 0
 

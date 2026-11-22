@@ -108,6 +108,13 @@ def records_path(env):
     return Path(str(env.config.paths.state), "advisor", "decisions.jsonl")
 
 
+class MalformedReply(ValueError):
+    """A reply envelope whose message content is unusable; carries the usage the call consumed."""
+    def __init__(self, error, usage):
+        super().__init__(str(error))
+        self.cause, self.usage = error, usage
+
+
 def grant_path(env, point, item):
     return Path(str(env.dirs.state), "advisor", f"granted-{point}-{item}")
 
@@ -119,8 +126,13 @@ def granted(env, point, item):
 def append(env, record):
     path = records_path(env)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a") as file:
-        file.write(json.dumps(record, ensure_ascii=False) + "\n")
+    with open(path, "a+b") as file:
+        file.seek(0, 2)
+        if file.tell():   # a torn last record without its newline must not swallow this one
+            file.seek(-1, 2)
+            if file.read(1) != b"\n":
+                file.write(b"\n")
+        file.write((json.dumps(record, ensure_ascii=False) + "\n").encode())
 
 
 def read_records(env, *, strict=False):
@@ -203,8 +215,12 @@ def call_deepseek(cfg, key, snapshot, actions, *, category=None):
                                               "Authorization": f"Bearer {key}"})
     with urllib.request.urlopen(request, timeout=cfg.timeout_seconds) as response:
         data = json.loads(response.read().decode())
-    content = data["choices"][0]["message"]["content"]
-    return json.loads(content), data.get("usage") or {}
+    usage = (data.get("usage") or {}) if isinstance(data, dict) else {}
+    try:
+        content = data["choices"][0]["message"]["content"]
+        return json.loads(content), usage
+    except (ValueError, KeyError, IndexError, TypeError) as error:
+        raise MalformedReply(error, usage) from error
 
 
 def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=None, rule=HANDOFF, mode=None,
@@ -249,13 +265,16 @@ def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=No
               "model": cfg.model, "prompt_version": OBSERVATION_PROMPT_VERSION if category else PROMPT_VERSION,
               "mode": effective, "rule": rule}
     advised, reason, evidence, usage = "", "", [], {}
+
+    def counted(metadata):
+        return {k: count for k, count in metadata.items()
+                if k in ("prompt_tokens", "completion_tokens", "total_tokens") and isinstance(count, int)}
     try:
         if key:
             options = {"category": category} if category else {}
             reply, metadata = call_deepseek(cfg, key, text, actions, **options)
             if isinstance(metadata, dict):   # the call consumed these tokens even if the reply is rejected
-                usage = {k: count for k, count in metadata.items()
-                         if k in ("prompt_tokens", "completion_tokens", "total_tokens") and isinstance(count, int)}
+                usage = counted(metadata)
             if category:
                 if (not isinstance(reply, dict) or not isinstance(reply.get("action"), str)
                         or not isinstance(reply.get("reason"), str)
@@ -273,6 +292,10 @@ def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=No
         failure = f"HTTP {error.code}"
     except (urllib.error.URLError, TimeoutError, OSError) as error:
         failure = f"unavailable: {type(error).__name__}"
+    except MalformedReply as error:   # the envelope arrived, so its usage still counts
+        if isinstance(error.usage, dict):
+            usage = counted(error.usage)
+        failure = f"malformed reply: {type(error.cause).__name__}: {redact(str(error), values)[:120]}"
     except (ValueError, KeyError, IndexError, TypeError, AttributeError, RuntimeError) as error:
         failure = f"malformed reply: {type(error).__name__}: {redact(str(error), values)[:120]}"
     executed = rule
@@ -300,6 +323,26 @@ def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=No
     notify.log(f"advisor {point} #{item}: advised={advised or '-'} executed={executed}"
                + (f" failure={failure}" if failure else ""))
     return Decision(executed, reason, tuple(evidence), advised, failure, True)
+
+
+def pending_items(env, task_kind):
+    """Items of TASK_KIND in this repository with unfinished decisions or a held grant (#156:
+    reconciled by item, not by whichever worktree last held the task)."""
+    env = session.resolve(env)
+    pending = {}
+    for record in read_records(env):
+        if (record.get("repo"), record.get("task_kind")) != (env.repo.gh_repo, task_kind):
+            continue
+        key = (str(record.get("item")), record.get("decision_id"))
+        if record.get("kind") == "outcome":
+            pending.pop(key, None)
+        elif record.get("kind") == "decision" and record.get("decision_id"):
+            pending[key] = True
+    items = {item for item, _ in pending}
+    legacy = "spec_limit" if task_kind == "issue" else "review_limit"
+    for path in Path(str(env.dirs.state), "advisor").glob(f"granted-{legacy}-*"):
+        items.add(path.name.removeprefix(f"granted-{legacy}-"))
+    return sorted(i for i in items if i.isdigit())
 
 
 def finish_episode(env, task_kind, item, result):
