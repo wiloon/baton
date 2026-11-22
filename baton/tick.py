@@ -654,7 +654,8 @@ class Tick:
         return found
 
     def resume_spec(self, issue):
-        self.spec_loop(issue)
+        if self.spec_loop(issue):
+            return dev.run(self, issue)   # an accept after a resumed post goes straight to dev
         return 80
 
     def pick_issue(self):

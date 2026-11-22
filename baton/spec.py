@@ -227,6 +227,7 @@ class Spec:
         self.branch = f"docs/spec-issue-{issue}"
         self.pr, self.base, self.adr_head = "", "origin/main", ""
         self.extra = 1 if advisor.granted(self.env, "spec_limit", self.issue) else 0
+        self.fresh_payload = None
 
     def path(self, name):
         return Path(self.state, f"{name}-{self.issue}")
@@ -361,46 +362,61 @@ class Spec:
         return False
 
     def read_post_inputs(self, *, once=False, ignore_pause=False):
-        """Issue body, labels and complete comment history for a spec comment post (#151)."""
+        """Issue body, labels and complete comment history for a spec comment post (#151).
+
+        Status "retry" is a transient unreadable lookup (it uses the retry budget); "failed" is a
+        permanent or malformed answer (a direct handoff)."""
         request = pr_helpers.call if once else pr_helpers.gh
         result = request("issue", "view", self.issue, "-R", self.repo, "--json", "state,body,labels")
         if result.returncode != 0:
-            return None, "retry"
+            return None, "retry" if pr_helpers.transient(result) else "failed"
         try:
             data = json.loads(result.stdout)
             if not isinstance(data, dict) or data.get("state") not in ("OPEN", "CLOSED"):
-                return None, "retry"
+                return None, "failed"
             if data["state"] != "OPEN":
                 return None, "superseded"
             if not isinstance(data.get("body"), str):
-                return None, "retry"
+                return None, "failed"
             labels = data.get("labels")
             if not isinstance(labels, list) or any(not isinstance(label, dict) or not isinstance(label.get("name"), str)
                                                    for label in labels):
-                return None, "retry"
+                return None, "failed"
             # A fresh round already claimed the issue; only a wait/resume must honour the pause.
             if not ignore_pause and any(label.get("name") == "ready-for-human" for label in labels):
                 return None, "paused"
         except (TypeError, ValueError):
-            return None, "retry"
+            return None, "failed"
         result = request("api", f"repos/{self.repo}/issues/{self.issue}/comments", "--paginate", "--slurp")
         if result.returncode != 0:
-            return None, "retry"
+            return None, "retry" if pr_helpers.transient(result) else "failed"
         try:
             pages = json.loads(result.stdout)
             if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
-                return None, "retry"
+                return None, "failed"
             rows = [row for page in pages for row in page]
             if any(type(row["id"]) is not int or row["id"] <= 0
                    or (row["user"] is not None and not isinstance(row["user"]["login"], str))
                    or not isinstance(row["body"], str) for row in rows):
-                return None, "retry"
+                return None, "failed"
             if len({row["id"] for row in rows}) != len(rows):
-                return None, "retry"
+                return None, "failed"
             data["comments"] = [{**row, "author": row["user"]} for row in rows]
         except (KeyError, TypeError, ValueError):
-            return None, "retry"
+            return None, "failed"
         return data, "ok"
+
+    def read_inputs_budgeted(self):
+        """The pre-worker read of the post inputs: (data, "ok"), (None, "superseded") for a closed
+        issue, or (None, "stop") once a handoff happened. A transient failure uses the read budget."""
+        def read():
+            data, status = self.read_post_inputs(ignore_pause=True)
+            return ({}, False) if status == "superseded" else (data, status == "retry")
+
+        data = self.retry_read(read, "Could not read inputs for the spec comment.", "spec_comments_read_failed")
+        if data is None:
+            return None, "stop"
+        return (data, "ok") if data else (None, "superseded")
 
     def owner_feedback_digest(self, comments):
         rows = [
@@ -410,27 +426,32 @@ class Spec:
         ]
         return owner_handoff.body_digest(json.dumps(sorted(rows)))
 
-    def comment_post_binding(self, body, round, reviewer, inputs, *, next_step, reply, max_rounds,
-                             mode_note, limit_why):
+    def body_key(self, text):
+        return owner_handoff.body_digest(text.strip())
+
+    def comment_post_binding(self, body, round, reviewer, inputs, *, next_step, reply, max_rounds, limit_why,
+                             issue_body=None):
         return {
             "issue": self.issue, "pr": self.pr or "", "round": round, "reviewer": reviewer,
             "author": self.env.owner, "body": body, "digest": owner_handoff.body_digest(body),
-            "issue_body": owner_handoff.body_digest(inputs["body"]),
+            "issue_body": self.body_key(inputs["body"] if issue_body is None else issue_body),
             "adr_head": self.adr_head or "",
             "feedback": self.owner_feedback_digest(inputs["comments"]),
             "comment_ids": [row["id"] for row in inputs["comments"]],
-            "next": next_step, "reply": reply, "max_rounds": max_rounds, "mode_note": mode_note,
-            "limit_why": limit_why, "run_id": self.hooks.last_run_id(),
+            "next": next_step, "reply": reply, "max_rounds": max_rounds, "limit_why": limit_why,
         }
 
-    def check_comment_post(self, binding, *, sending, marker):
+    def check_comment_post(self, binding, *, sending):
         data, status = self.read_post_inputs(once=True)
         if status != "ok":
             return status
+        adr, transient = self.discover_adr(pr_helpers.call, ("-R", self.repo))
+        if adr is None:
+            return "retry" if transient else "failed"
         if (binding["issue"] != self.issue
-                or owner_handoff.body_digest(data["body"]) != binding["issue_body"]
-                or (self.adr_head or "") != binding["adr_head"]
-                or (self.pr or "") != binding["pr"]
+                or self.body_key(data["body"]) != binding["issue_body"]
+                or adr.get("headRefOid", "") != binding["adr_head"]
+                or str(adr.get("number", "")) != binding["pr"]
                 or self.owner_feedback_digest(data["comments"]) != binding["feedback"]):
             return "changed"
         boundary = set(binding["comment_ids"])
@@ -439,9 +460,11 @@ class Spec:
             if row["id"] in boundary:
                 continue
             trusted = (row["author"] or {}).get("login") == binding["author"]
+            if trusted and row["body"].startswith("<!-- baton-verdict: accept"):
+                return "accepted"
             if row["body"] == binding["body"]:
                 matches.append(trusted)
-            elif trusted and row["body"].startswith(f"<!-- {marker} round="):
+            elif trusted and row["body"].startswith(("<!-- baton-spec-review round=", "<!-- baton-spec-reply round=")):
                 return "changed"
         if not matches:
             return "absent"
@@ -449,16 +472,19 @@ class Spec:
             return "changed"
         return "landed" if matches == [True] else "ambiguous"
 
-    def post_comment(self, reason, binding, *, initial):
-        """Save before sending a spec comment, or consume a due attempt before reconciling (#151)."""
-        n, marker = self.issue, ("baton-spec-review" if reason == owner_handoff.SPEC_REVIEW_POST
-                                 else "baton-spec-reply")
+    def post_comment(self, reason, binding, *, initial, claim=None, context=None):
+        """Save before sending a spec comment, or consume a due attempt before reconciling (#151).
+
+        On a resume CLAIM (labels, worktree) runs only once the attempt is due and the issue is neither
+        paused, closed, changed nor accepted."""
+        n = self.issue
         label = "spec review" if reason == owner_handoff.SPEC_REVIEW_POST else "spec reply"
-        title = f"#{n} {label} comment post failed"
-        text = f"Posting the {label} of round {binding['round'] if binding else '?'} failed. {self.url}"
+
+        def text():
+            return f"Posting the {label} of round {binding['round'] if binding else '?'} failed. {self.url}"
 
         def stop(message):
-            self.handoff(f"{text} {message}", reason)
+            self.handoff(f"{text()} {message}", reason)
             return "stop"
 
         try:
@@ -472,7 +498,9 @@ class Spec:
             if pending is None:
                 return stop("The worker inputs could not be saved.")
         else:
-            result = self.handoff(text, reason, resume=True)
+            if pending is not None:
+                binding = pending["continuation"]
+            result = self.handoff(text(), reason, resume=True)
             if result.action == owner_handoff.DEFER:
                 raise Deferred("handoff-retry", reason, lends_slot=False)
             if result.action != owner_handoff.RETRY:
@@ -481,34 +509,56 @@ class Spec:
             # Keep the pre-resume attempts: resume already consumed one on disk (#151).
 
         def finish():
-            owner_handoff.clear_retry(self.env, n, reason)
             if reason == owner_handoff.SPEC_REVIEW_POST:
-                context = Path(self.ctx, f"issue-{n}-spec-post.md")
-                context.write_text("")
-                if not self.at_limit(binding["round"], binding["max_rounds"], binding["reviewer"],
-                                     binding["reply"], context, binding["limit_why"]):
-                    return "stop"
+                if binding["round"] >= binding["max_rounds"] + self.extra:
+                    if context is not None:
+                        path = Path(context)
+                    else:
+                        # A resume has no round context: rebuild it from a fresh read of the issue.
+                        payload = self.issue_payload()
+                        if payload is None:
+                            return "stop"
+                        self.fresh_payload = payload
+                        path = Path(self.ctx, f"issue-{n}-spec-post.md")
+                        path.write_text(review.issue_context(self.env, n, data=payload))
+                    if not self.at_limit(binding["round"], binding["max_rounds"], binding["reviewer"],
+                                         binding["reply"], path, binding["limit_why"]):
+                        owner_handoff.clear_retry(self.env, n, reason)
+                        return "stop"
+                owner_handoff.clear_retry(self.env, n, reason)
                 return "changes"
             if binding["next"] == "human":
                 self.handoff(f"{binding['reviewer']} has questions only you can answer. "
                              "Reply on the issue, then remove ready-for-human.", "spec_questions")
+                owner_handoff.clear_retry(self.env, n, reason)
                 return "stop"
+            owner_handoff.clear_retry(self.env, n, reason)
             return "revised"
 
         def reconcile(*, sending=False):
             nonlocal status
-            status = self.check_comment_post(binding, sending=sending, marker=marker)
+            status = self.check_comment_post(binding, sending=sending)
             return status
+
+        def claimed():
+            return initial or claim is None or claim()
 
         status = reconcile(sending=initial)
         posted = None
         if status == "absent":
+            if not claimed():
+                return "stop"
             posted = pr_helpers.gh("issue", "comment", n, "-R", self.repo, "--body", binding["body"],
                                    reconcile=reconcile)
             if posted.returncode == 0:
                 return finish()
         if status == "landed":
+            if not claimed():
+                return "stop"
             return finish()
+        if status == "accepted":
+            owner_handoff.clear_retry(self.env, n, reason)
+            return "stop"
         if status == "superseded":
             owner_handoff.clear_retry(self.env, n, reason)
             advisor.finish_episode(self.env, "issue", n, "superseded")
@@ -623,12 +673,10 @@ class Spec:
     def review_round(self, round, max_rounds, context, listed):
         """"accept", "changes" or "stop" (the owner or a failure took over)."""
         n, wt, env = self.issue, self.wt, self.env
-        inputs, status = self.read_post_inputs(ignore_pause=True)
-        if status == "superseded":
-            return "stop"
+        inputs, status = self.read_inputs_budgeted()
         if status != "ok":
-            self.handoff("Could not read inputs for the spec review comment.",
-                         owner_handoff.SPEC_REVIEW_POST)
+            if status == "superseded":
+                notify.log(f"#{n}: issue closed during spec review; nothing posted")
             return "stop"
         adr_note = "No ADR has been revised yet."
         if git(wt, "rev-list", "origin/main..HEAD"):
@@ -665,18 +713,17 @@ class Spec:
                     f"{mode_note}{reply[:REPLY_CAP]}")
             binding = self.comment_post_binding(
                 body, round, reviewer, inputs, next_step="revise", reply=points, max_rounds=max_rounds,
-                mode_note=mode_note,
                 limit_why=(f"{reviewer} accepted, but the issue body breaks the runner's rules "
                            f"after {round} spec rounds."))
-            return self.post_comment(owner_handoff.SPEC_REVIEW_POST, binding, initial=True)
+            return self.post_comment(owner_handoff.SPEC_REVIEW_POST, binding, initial=True, context=context)
         if outcome.startswith("SPEC: changes"):
             body = (f"<!-- baton-spec-review round={round} by={reviewer} -->\n"
                     f"## Spec review ({reviewer}), round {round}\n\n{mode_note}{reply[:REPLY_CAP]}")
             binding = self.comment_post_binding(
                 body, round, reviewer, inputs, next_step="revise", reply=reply[:REPLY_CAP],
-                max_rounds=max_rounds, mode_note=mode_note,
+                max_rounds=max_rounds,
                 limit_why=f"{reviewer} still has points after {round} spec rounds.")
-            return self.post_comment(owner_handoff.SPEC_REVIEW_POST, binding, initial=True)
+            return self.post_comment(owner_handoff.SPEC_REVIEW_POST, binding, initial=True, context=context)
         if outcome.startswith("SPEC: reject"):
             self.gh("issue", "comment", n, "--body", f"<!-- baton-note by={reviewer} -->\n"
                     f"## Spec review ({reviewer}), round {round}: reject\n\n{reply[:REPLY_CAP]}")
@@ -707,9 +754,10 @@ class Spec:
             pass
         return None, True
 
-    def discover_adr(self):
+    def discover_adr(self, request=None, extra=()):
         fields = "number,headRefName,headRefOid,baseRefName,isCrossRepository,headRepository,headRepositoryOwner"
-        result = self.gh("pr", "list", "--state", "open", "--head", self.branch, "--limit", "100", "--json", fields)
+        result = (request or self.gh)("pr", "list", "--state", "open", "--head", self.branch, "--limit", "100",
+                                      "--json", fields, *extra)
         if result.returncode != 0:
             return None, pr_helpers.transient(result)
         try:
@@ -841,9 +889,17 @@ class Spec:
         return self.publish_accept(verdict)
 
     # --- the reviser's round ---
-    def revise_round(self, round, context, listed):
+    def revise_round(self, round, context, listed, max_rounds=None):
         """"revised" or "stop" (the owner or a failure took over)."""
         n, wt, env = self.issue, self.wt, self.env
+        if max_rounds is None:
+            max_rounds = max(int(env.config.scheduling.max_spec_rounds or 3), round + 1)
+        # The post binds these inputs: read them before the paid run so a failed read loses no work.
+        inputs, status = self.read_inputs_budgeted()
+        if status != "ok":
+            if status == "superseded":
+                notify.log(f"#{n}: issue closed during spec revision; nothing run")
+            return "stop"
         out_base = f"/tmp/baton-spec-{n}-{round}"
         for stale in Path("/tmp").glob(f"baton-spec-{n}-{round}.*"):
             stale.unlink()
@@ -889,8 +945,10 @@ class Spec:
             why = f" A command was denied ({denied[0]}): check the spec role's permissions." if denied else ""
             self.handoff(f"{reviser} spec run failed: {outcome}{why}", "spec_revision_run_failed")
             return "stop"
+        applied = None
         if body.is_file() and body.stat().st_size:
             body.write_text(check_section.canonicalize(strip_markers(body.read_text())).rstrip("\n") + "\n")
+            applied = body.read_text()
             edited = self.gh("issue", "edit", n, "--body-file", str(body))
             if edited.returncode != 0:
                 self.handoff(f"Applying {reviser} revised issue body failed ({body}).{pr_helpers.why(edited)}",
@@ -925,21 +983,16 @@ class Spec:
         # Capture after the reviser's own writes: the post binds the body and ADR head it left (#151).
         if self.pr:
             self.adr_head = git(wt, "rev-parse", "HEAD") or self.adr_head
-        inputs, status = self.read_post_inputs(ignore_pause=True)
-        if status == "superseded":
-            return "stop"
-        if status != "ok":
-            self.handoff("Could not read inputs for the spec reply comment.", owner_handoff.SPEC_REPLY_POST)
-            return "stop"
         body = (f"<!-- baton-spec-reply round={round}{human} by={reviser} -->\n"
                 f"## Spec reply ({reviser}), round {round}\n{adr}\n{mode_note}{text}")
         binding = self.comment_post_binding(
             body, round, reviser, inputs, next_step="human" if human else "review",
-            reply=text, max_rounds=1, mode_note=mode_note, limit_why="n/a")
-        outcome = self.post_comment(owner_handoff.SPEC_REPLY_POST, binding, initial=True)
-        for leftover in Path("/tmp").glob(f"baton-spec-{n}-{round}.*"):
-            leftover.unlink()
-        return outcome
+            reply=text, max_rounds=max_rounds, limit_why="n/a", issue_body=applied)
+        try:
+            return self.post_comment(owner_handoff.SPEC_REPLY_POST, binding, initial=True)
+        finally:
+            for leftover in Path("/tmp").glob(f"baton-spec-{n}-{round}.*"):
+                leftover.unlink()
 
     # --- the loop ---
     def waiting_comment_post(self):
@@ -985,22 +1038,26 @@ class Spec:
         if resume_post:
             post_reason, pending = resume_post
             binding = pending["continuation"]
-            self.pr, self.adr_head = binding["pr"], binding["adr_head"]
-            if git(self.repo_dir, "rev-parse", "-q", "--verify", f"origin/{self.branch}") is not None:
-                self.base = f"origin/{self.branch}"
-            if not self.worktree():
-                notify.log(f"spec worktree for #{n} failed")
-                return False
-            self.gh("issue", "edit", n, "--remove-label", "ready-for-human", "--add-label", "agent-wip")
-            outcome = self.post_comment(post_reason, None, initial=False)
+
+            def claim():
+                if git(self.repo_dir, "rev-parse", "-q", "--verify", f"origin/{self.branch}") is not None:
+                    self.base = f"origin/{self.branch}"
+                if not self.worktree():
+                    notify.log(f"spec worktree for #{n} failed")
+                    return False
+                self.gh("issue", "edit", n, "--remove-label", "ready-for-human", "--add-label", "agent-wip")
+                return True
+
+            outcome = self.post_comment(post_reason, None, initial=False, claim=claim)
             if outcome == "changes":
                 step, round = "revise", binding["round"]
             elif outcome == "revised":
                 step, round = "review", binding["round"] + 1
             else:
                 return outcome == "accept"
-            max_rounds = max(int(env.config.scheduling.max_spec_rounds or 3), round + 1, binding["max_rounds"])
-            issue_payload = self.issue_payload()
+            # The loop's own limit, restored unchanged: a deferral must not raise it (#151).
+            max_rounds = binding["max_rounds"]
+            issue_payload, self.fresh_payload = self.fresh_payload or self.issue_payload(), None
             if issue_payload is None:
                 return False
         else:
@@ -1047,7 +1104,7 @@ class Spec:
                     step = "revise"
                 else:
                     return result == "accept"
-            elif self.revise_round(round, context, issue_payload["comments"]) != "revised":
+            elif self.revise_round(round, context, issue_payload["comments"], max_rounds) != "revised":
                 return False
             else:
                 step, round = "review", round + 1

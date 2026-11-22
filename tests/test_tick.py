@@ -1890,10 +1890,13 @@ def test_tick_resumes_pending_adr_even_with_agent_wip_and_no_vendor(ctx, monkeyp
     pending = f"<!-- baton-spec-accept-pending pr=77 head={'a' * 40} -->\n{verdict}"
 
     def read_issue(args):
+        posted = [{"author": {"login": "owner"}, "body": body_of(call)} for call in ctx.gh.ran("issue", "comment")]
         return {"title": "Plan", "body": "Body", "state": "OPEN", "labels": ready["labels"], "comments": [
-            {"author": {"login": "owner"}, "body": pending}]}
+            {"author": {"login": "owner"}, "body": pending}, *posted]}
 
     def read_pr(args):
+        if "state,headRefOid" not in args:   # dev's own look-up after the resumed accept
+            return {}
         reads.append(now)
         if len(reads) == 1:
             return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
@@ -1901,6 +1904,8 @@ def test_tick_resumes_pending_adr_even_with_agent_wip_and_no_vendor(ctx, monkeyp
 
     ctx.gh.answers.update({"issue view": read_issue, "pr view": read_pr})
     monkeypatch.setattr(tick.Tick, "pick_vendor", lambda *a, **k: pytest.fail("acceptance needs no worker"))
+    started = []
+    monkeypatch.setattr(dev, "setup_worktree", lambda *a: started.append(a) or ("", False))
     ctx.make().run()
     assert reads == [1_000]
     ready["labels"].append({"name": "agent-wip"})
@@ -1913,3 +1918,4 @@ def test_tick_resumes_pending_adr_even_with_agent_wip_and_no_vendor(ctx, monkeyp
     ctx.make().run()
     assert reads == [1_000, 1_060]
     assert [body_of(call) for call in ctx.gh.ran("issue", "comment")] == [verdict]
+    assert len(started) == 1   # the accept went straight on to dev, not back to the queue

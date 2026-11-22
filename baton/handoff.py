@@ -224,8 +224,7 @@ def _spec_comment_post_valid(item, binding, *, reason):
             and isinstance(boundary, list) and all(type(value) is int and value > 0 for value in boundary)
             and len(set(boundary)) == len(boundary)
             and all(isinstance(binding.get(key), str) for key in
-                    ("author", "issue_body", "adr_head", "feedback", "reply", "mode_note", "limit_why",
-                     "run_id", "pr"))
+                    ("author", "issue_body", "adr_head", "feedback", "reply", "limit_why", "pr"))
             and bool(binding["author"]) and bool(binding["limit_why"])
             and bool(re.fullmatch(r"[0-9a-f]{64}", binding["issue_body"]))
             and bool(re.fullmatch(r"[0-9a-f]{64}", binding["feedback"]))
