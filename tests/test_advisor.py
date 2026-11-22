@@ -288,6 +288,8 @@ def test_the_request_and_recorded_version_follow_the_category(adv, monkeypatch, 
     monkeypatch.setattr(advisor.urllib.request, "urlopen", urlopen)
     advisor.advise(adv.env, "merge_failed", 6, "snap", ("retry_step",), category=category, mode="observe")
     system = sent[0]["messages"][0]["content"]
+    # advise() accepts only substrings of the snapshot, so every category must ask for exactly that.
+    assert "copied character for character" in system and "quote or reference" not in system
     assert (needle in system) if needle else ("For a CI judgement" not in system and "merge investigation" not in system)
     assert adv.records()[0]["prompt_version"] == version
     assert advisor.handoff_note(advisor.Decision("handoff")) == ""
