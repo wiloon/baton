@@ -147,7 +147,7 @@ def test_secrets_never_reach_the_request_or_the_record(adv, monkeypatch):
     snapshot = ("ghp_" + "a" * 36 + "\nAuthorization: Bearer abc.def.ghi\nhttps://user:pw@example.com/x\n"
                 "api_key=zzz-secret\nsk-" + "b" * 30 + "\nplanted-env-secret-value\n"
                 + f"key {KEY}\n123456789:" + "c" * 35)
-    adv.replies = [{"action": "handoff", "reason": f"saw {KEY}", "evidence": ["planted-env-secret-value"]}]
+    adv.replies = [{"action": "handoff", "reason": f"saw {KEY}", "evidence": ["key [redacted]"]}]
     advisor.advise(adv.env, "review_limit", 8, snapshot, ("extra_round",))
     sent = adv.calls[0]["snapshot"]
     for secret in ("ghp_aaaa", "abc.def.ghi", "user:pw", "zzz-secret", "sk-bbbb", "planted-env-secret-value", KEY,
@@ -155,6 +155,9 @@ def test_secrets_never_reach_the_request_or_the_record(adv, monkeypatch):
         assert secret not in sent, secret
     stored = Path(advisor.records_path(adv.env)).read_text()
     assert KEY not in stored and "planted-env-secret-value" not in stored
+    [record] = adv.records()
+    assert record["failure"] == "" and record["advised"] == "handoff"
+    assert record["reason"] == "saw [redacted]" and record["evidence"] == ["key [redacted]"]
     log = Path(os.environ["LOGS"], "runner.log")
     assert not log.exists() or KEY not in log.read_text()
 

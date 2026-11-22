@@ -1232,6 +1232,21 @@ def test_the_advisor_grants_one_more_spec_round_that_ends_in_accept(advised):
     assert "ready-for-human" not in advised.gh.labels
 
 
+@pytest.mark.parametrize("reason, evidence", [(None, []), ("one wording point left", "§¶")])
+def test_malformed_advice_hands_off_at_the_spec_limit(advised, reason, evidence):
+    changes = {**CHANGES, "reply": "Explain § and ¶.\nSPEC: changes"}
+    advised.script = [changes, reviser(), changes, reviser(), changes, reviser(), ACCEPT]
+    advised.gh.labels.discard("ready-for-human")
+    advised.advice = [{"action": "extra_round", "reason": reason, "evidence": evidence}]
+
+    assert advised.run() is False
+
+    [snapshot] = advised.advice_calls
+    assert "§ and ¶" in snapshot and "§¶" not in snapshot
+    assert "ready-for-human" in advised.gh.labels
+    assert len(advised.runs) == 5
+
+
 def test_dev_reconciles_an_interrupted_spec_acceptance_after_worktree_removal(advised, monkeypatch):
     from baton import advisor, dev, tick
 

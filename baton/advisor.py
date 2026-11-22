@@ -292,19 +292,19 @@ def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=No
                         or not isinstance(reply.get("evidence"), list)):
                     raise ValueError("expected action and reason strings and an evidence array")
             raw_action = str(reply.get("action", ""))
-            raw_reason = str(reply.get("reason", ""))
-            raw_evidence = [str(quote) for quote in (reply.get("evidence") or [])]
+            raw_reason = reply.get("reason")
+            raw_evidence = reply.get("evidence", [])
+            if not category and (not isinstance(raw_reason, str) or not raw_reason.strip()):
+                raise ValueError("expected a nonblank reason string")
+            if not isinstance(raw_evidence, list):
+                raise ValueError("expected an evidence array")
+            if any(not isinstance(quote, str) for quote in raw_evidence):
+                raise ValueError("evidence is outside the sent snapshot")
             # JSON escapes can decode to lone surrogates. Reject them before keeping any provider text.
             for value in (raw_action, raw_reason, *raw_evidence):
                 value.encode("utf-8")
-            if category:
-                if any(not isinstance(quote, str) or not quote or quote not in text for quote in reply["evidence"]):
-                    raise ValueError("evidence is outside the sent snapshot")
-            else:   # the #17 contract plus two stricter checks (#125)
-                if not raw_reason.strip():
-                    raise ValueError("reply has no reason")
-                if any(not quote or quote not in text for quote in raw_evidence):
-                    raise ValueError("evidence is outside the sent snapshot")
+            if any(not quote or quote not in text for quote in raw_evidence):
+                raise ValueError("evidence is outside the sent snapshot")
             advised = raw_action
             if advised not in actions:
                 advised = redact(advised, values)

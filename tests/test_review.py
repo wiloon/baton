@@ -1164,6 +1164,20 @@ def test_the_advisor_grants_one_more_round_and_the_pr_merges(advised):
     assert any("advisor granted one more round" in line for line in advised.log())
 
 
+@pytest.mark.parametrize("reason, evidence", [(None, []), ("only a test is missing", "§¶")])
+def test_malformed_advice_hands_off_at_the_review_limit(advised, reason, evidence):
+    advised.reviews[:] = ["changes", "changes", "pass"]
+    advised.review_text = "Add a test for § and ¶."
+    advised.advice = [{"action": "extra_round", "reason": reason, "evidence": evidence}]
+
+    assert advised.run(fixer="cursor") == 0
+
+    [snapshot] = advised.advice_calls
+    assert "§ and ¶" in snapshot and "§¶" not in snapshot
+    assert advised.labelled("ready-for-human") and not advised.merged
+    assert len(advised.fixes) == 1 and len(advised.agents) == 2
+
+
 def test_a_second_limit_hands_off_without_asking_again(advised):
     advised.reviews[:] = ["changes", "changes", "changes"]
     advised.advice = [{"action": "extra_round", "reason": "fixable", "evidence": []}]
