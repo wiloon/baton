@@ -761,9 +761,7 @@ class Spec:
             pending = f"<!-- baton-spec-accept-pending pr={pr} head={self.adr_head} -->\n{verdict}"
             if not self.post(pending, f"posting pending acceptance for ADR PR #{pr} failed",
                              "spec_pending_accept_post_failed"):
-                self.handoff(f"{reviewer} accepted, but posting pending acceptance failed.",
-                             "spec_pending_accept_post_failed")
-                return "stop"
+                return "stop"   # post() already handed off once
             return self.merge_adr_and_publish(pr, verdict, reviewer=reviewer)
         return self.publish_accept(verdict)
 

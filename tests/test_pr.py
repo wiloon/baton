@@ -377,6 +377,12 @@ def test_a_pr_create_that_landed_returns_the_existing_pr(scripted):
     assert [c[:2] for c in fake.calls] == [("pr", "create"), ("pr", "list")]
 
 
+def test_a_landed_merge_is_recognized_after_a_transient_state_read(scripted):
+    fake = scripted((1, "", "HTTP 503: Service Unavailable"), (1, "", "HTTP 502: Bad Gateway"), (0, "MERGED\n", ""))
+    assert pr.gh("pr", "merge", "5", "-R", "o/r", "--squash").returncode == 0
+    assert [c[:2] for c in fake.calls] == [("pr", "merge"), ("pr", "view"), ("pr", "view")]
+
+
 def test_a_comment_that_did_not_land_is_posted_again(scripted):
     fake = scripted((1, "", "TLS handshake timeout"), (0, json.dumps({"comments": [{"body": "older"}]}), ""), (0, "", ""))
     assert pr.gh("pr", "comment", "5", "-R", "o/r", "--body", "<!-- baton-x -->\nhi").returncode == 0

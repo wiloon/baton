@@ -359,6 +359,12 @@ class Review:
             self.handoff(reason, title, message)
             return self.failed(ALREADY, "RESULT: failed posting review")
 
+        def settled(result):
+            # A handoff that already labelled and notified is terminal: do not hand off twice.
+            if result.handed_off:
+                return self.failed(ALREADY, "RESULT: failed posting review")
+            return stop()
+
         try:
             pending = owner_handoff.load_retry(self.env, episode, reason, pr)
         except owner_handoff.RetryUnreadable as exc:
@@ -384,7 +390,7 @@ class Review:
                 return stop()
             self.save_binding(post_waiting=reason)
             result = self.handoff(reason, title, text, transient=True, continuation=binding)
-            return DEFERRED_POST if result.action == owner_handoff.DEFER else stop()
+            return DEFERRED_POST if result.action == owner_handoff.DEFER else settled(result)
 
         if data["state"] != "OPEN":
             owner_handoff.clear_retry(self.env, episode, reason, pr)
@@ -413,7 +419,7 @@ class Review:
             if presence is None:
                 self.save_binding(post_waiting=reason)
                 result = self.handoff(reason, title, text, transient=True, continuation=binding)
-                return DEFERRED_POST if result.action == owner_handoff.DEFER else stop()
+                return DEFERRED_POST if result.action == owner_handoff.DEFER else settled(result)
 
         if binding is None:
             binding = self.comment_post_binding(body, round, outcome, data)
@@ -437,7 +443,7 @@ class Review:
             return stop(f"{text}{pr_helpers.why(posted)}")
         self.save_binding(post_waiting=reason)
         result = self.handoff(reason, title, text + pr_helpers.why(posted), transient=True, continuation=binding)
-        return DEFERRED_POST if result.action == owner_handoff.DEFER else stop()
+        return DEFERRED_POST if result.action == owner_handoff.DEFER else settled(result)
 
     def read_pr(self, more):
         fields = f"{self.REVISION_FIELDS},{more}"

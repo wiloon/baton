@@ -115,7 +115,8 @@ def _landed(args, input):
             return UNREADABLE, None
         return (LANDED, subprocess.CompletedProcess(["gh", *args], 0, url + "\n", "")) if url else (ABSENT, None)
     if args[:2] == ("pr", "merge") and len(args) > 2:
-        state = call("pr", "view", args[2], *scope, "--json", "state", "--jq", ".state")
+        # A merge keeps the read backoff it always had (a transient lookup retries).
+        state = gh("pr", "view", args[2], *scope, "--json", "state", "--jq", ".state")
         if state.returncode != 0:
             return UNREADABLE, None
         if state.stdout.strip() == "MERGED":

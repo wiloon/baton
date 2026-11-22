@@ -1443,6 +1443,33 @@ def test_a_lost_review_comment_response_is_recognized_without_a_second_write(loo
     assert not list(Path(loop.env["STATE"]).glob("handoff-retry-*"))
 
 
+def test_an_exhausted_review_comment_post_hands_off_exactly_once(loop, monkeypatch):
+    from subprocess import CompletedProcess
+    from baton import handoff
+
+    clock = {"now": 1_000}
+    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
+    monkeypatch.setattr(review.pr_helpers, "sleep", lambda *_: None)
+    notices, call = [], review.pr_helpers.call
+    monkeypatch.setattr(review.notify, "notify", lambda title, text: notices.append(title))
+
+    def always_down(*args, **kwargs):
+        if args[:2] == ("pr", "comment"):
+            return CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return call(*args, **kwargs)
+
+    monkeypatch.setattr(review.pr_helpers, "call", always_down)
+    code = 75
+    for _ in range(5):
+        if code != 75:
+            break
+        code = loop.run(fixer="cursor", reviewer="claude")
+        clock["now"] += 400
+    assert code == 0 and not loop.fixes
+    labels = [c for c in loop.gh.calls() if c[:2] == ["pr", "edit"] and "--add-label" in c and "ready-for-human" in c]
+    assert len(labels) == 1 and len(notices) == 1
+
+
 @pytest.mark.parametrize("change", ["head", "description"])
 def test_a_changed_input_during_comment_post_deferral_hands_off(loop, monkeypatch, change):
     from subprocess import CompletedProcess
