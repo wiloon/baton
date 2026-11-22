@@ -298,7 +298,7 @@ class Tick:
         if self.scan_cmd:
             return self.scan_command()
         self.file_merged_follow_ups()
-        if (self.force_pr and not self.code_review_post_pending(self.force_pr)
+        if (self.force_pr and not self.comment_post_pending(self.force_pr)
                 and not self.is_agent_branch(self.force_pr)):
             print("python -m baton pr N takes an agent/issue-N PR; for the owner's own PR use python -m baton review N", file=sys.stderr)
             return 2
@@ -457,7 +457,7 @@ class Tick:
     def pending_reviews(self):
         """Even after its trigger label was removed, or after Cursor opened a PR: re-enter at the
         saved review/fix step."""
-        posts = owner_handoff.review_post_episodes(self.env)
+        posts = owner_handoff.comment_post_episodes(self.env)
         paths = set(self.state.glob("review-pending-*"))
         paths.update(self.state / f"review-pending-{pr}" for pr in posts)
         for path in sorted(paths):
@@ -467,8 +467,8 @@ class Tick:
                 return done
         return None
 
-    def code_review_post_pending(self, pr):
-        if pr in owner_handoff.review_post_episodes(self.env):
+    def comment_post_pending(self, pr):
+        if pr in owner_handoff.comment_post_episodes(self.env):
             return True
         saved = checkpoint.read(self.state / f"review-pending-{pr}") or {}
         return bool(saved.get("post_waiting") or saved.get("post_outcome"))
@@ -480,7 +480,7 @@ class Tick:
         if (self.force_pr or self.force_review) and pr != self.force_pr + self.force_review:
             return 0
         if post_episodes is None:
-            post_episodes = owner_handoff.review_post_episodes(self.env).get(pr, set())
+            post_episodes = owner_handoff.comment_post_episodes(self.env).get(pr, set())
         try:
             saved = checkpoint.read(path) or {}
         except (OSError, ValueError):
@@ -490,9 +490,13 @@ class Tick:
         episode = saved.get("ISSUE") or pr
         if post_episodes and (saved.get("pr") != pr or not saved.get("wt") or post_episodes != {episode}):
             self.active["pr"] = pr
+            reason = next((name for name in owner_handoff.COMMENT_POSTS
+                           if pr in owner_handoff.comment_post_episodes(self.env, name)),
+                          owner_handoff.REVIEW_POST)
             for key in post_episodes:
-                owner_handoff.clear_retry(self.env, key, owner_handoff.REVIEW_POST, pr)
-            owner_handoff.perform(self.env, owner_handoff.REVIEW_POST, kind="pr", number=pr, item=pr,
+                for name in owner_handoff.COMMENT_POSTS:
+                    owner_handoff.clear_retry(self.env, key, name, pr)
+            owner_handoff.perform(self.env, reason, kind="pr", number=pr, item=pr,
                                   episode=episode, title=f"PR #{pr} comment post failed",
                                   text="The saved comment post has no matching review checkpoint.",
                                   hooks=self.hooks(saved.get("ISSUE", ""), pr))
@@ -524,7 +528,7 @@ class Tick:
         if not pr:
             listed = self.gh_json("pr", "list", "-R", self.gh_repo, "--state", "open", "--label", "agent-review",
                                   "--limit", "20", "--json", "number") or []
-            pr = str(min((p["number"] for p in listed if not self.code_review_post_pending(str(p["number"]))),
+            pr = str(min((p["number"] for p in listed if not self.comment_post_pending(str(p["number"]))),
                          default=""))
         if not pr:
             return None
@@ -578,7 +582,7 @@ class Tick:
             listed = self.gh_json("pr", "list", "-R", self.gh_repo, "--state", "open", "--label", "agent-fix",
                                   "--limit", "20", "--json", "number,headRefName") or []
             listed = sorted((p for p in listed if names.issue_of(p["headRefName"])
-                             and not self.code_review_post_pending(str(p["number"]))), key=lambda p: p["number"])
+                             and not self.comment_post_pending(str(p["number"]))), key=lambda p: p["number"])
             pr, head_ref = (str(listed[0]["number"]), listed[0]["headRefName"]) if listed else ("", "")
         if not pr:
             return None
