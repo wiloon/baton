@@ -130,7 +130,8 @@ def observing(run, monkeypatch):
 
 
 @pytest.mark.parametrize("after_update", [False, True])
-@pytest.mark.parametrize("outcome", ["pending", "timeout", "red", "mixed", "changed", "settled", "malformed"])
+@pytest.mark.parametrize("outcome", ["pending", "timeout", "timeout_settled", "timeout_red", "red", "mixed", "changed",
+                                     "settled", "malformed"])
 def test_ci_advisor_offers_only_an_exact_head_pending_or_timed_out_poll(run, observing, monkeypatch,
                                                                       after_update, outcome):
     checked_head = NEW if after_update else OLD
@@ -140,6 +141,8 @@ def test_ci_advisor_offers_only_an_exact_head_pending_or_timed_out_poll(run, obs
         "red": [{"status": "COMPLETED", "conclusion": "FAILURE"}],
         "mixed": [{"status": "IN_PROGRESS"}, {"state": "ERROR"}],
         "settled": [{"status": "COMPLETED", "conclusion": "SUCCESS"}],
+        "timeout_settled": [{"status": "COMPLETED", "conclusion": "SUCCESS"}],
+        "timeout_red": [{"status": "COMPLETED", "conclusion": "FAILURE"}],
         "malformed": [{"status": "COMPLETED"}, {"state": "PENDING"}],
     }.get(outcome)
     run.gh.set(state="OPEN", headRefOid=OLD, mergeStateStatus="BEHIND" if after_update else "CLEAN",
@@ -156,7 +159,7 @@ def test_ci_advisor_offers_only_an_exact_head_pending_or_timed_out_poll(run, obs
         return boundary(*args, **kwargs)
 
     monkeypatch.setattr(pr_helpers, "call", github)
-    run.gh.watches(*([(0, "")] if after_update else []), (124 if outcome == "timeout" else 1, ""))
+    run.gh.watches(*([(0, "")] if after_update else []), (124 if outcome.startswith("timeout") else 1, ""))
     run.go()
 
     record, terminal = advisor.read_records(run.merger().env)
@@ -166,7 +169,7 @@ def test_ci_advisor_offers_only_an_exact_head_pending_or_timed_out_poll(run, obs
     assert record["mode"] == "observe" and record["executed"] == "handoff"
     assert terminal["decision_id"] == record["decision_id"] and terminal["result"] == "handoff"
     assert record["usage"] == {"total_tokens": 11}
-    retry = outcome in ("pending", "timeout")
+    retry = outcome in ("pending", "timeout", "timeout_settled")
     assert ("retry_step" in sent[1]) == retry
     assert record["advised"] == ("retry_step" if retry else "handoff")
     if retry:
@@ -179,6 +182,45 @@ def test_ci_advisor_offers_only_an_exact_head_pending_or_timed_out_poll(run, obs
     assert sum(c[:2] == ["pr", "checks"] for c in calls) == (2 if after_update else 1)
     assert sum(c[:2] == ["pr", "update-branch"] for c in calls) == int(after_update)
     assert not any(c[:2] == ["run", "rerun"] for c in calls)
+
+
+def test_a_ci_repair_that_already_handed_off_makes_no_provider_call_and_no_second_handoff(run, repair, observing,
+                                                                                       monkeypatch):
+    def handing_off(runner, pr, wt, fixer, source, feedback, head=""):
+        return runner.handoff(pr, "fix_needs_info", f"PR #{pr} has questions", "needs you")
+    monkeypatch.setattr(merge.fix, "fix_pr", handing_off)
+    run.gh.set(state="OPEN")
+    run.gh.watches((1, ""))
+    run.go()
+
+    assert observing == []
+    assert sum(c[:2] == ["pr", "edit"] and "ready-for-human" in c for c in run.gh.calls()) == 1
+    assert not run.merged()
+
+
+def grant_extra_round(run, monkeypatch):
+    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="live"))
+    monkeypatch.setenv(advisor.KEY, "fake-advisor-key")
+    monkeypatch.setattr(advisor, "call_deepseek", lambda *a, **k: (
+        {"action": "extra_round", "reason": "r", "evidence": []}, {}))
+    merger = run.merger()
+    granted = advisor.advise(merger.env, "review_limit", PR, "snap", ("extra_round",), revalidate=lambda: True)
+    assert granted.extra_round and advisor.granted(merger.env, "review_limit", PR)
+    return merger
+
+
+def test_a_runner_merge_after_an_extra_round_records_merged_and_releases_the_grant(run, monkeypatch):
+    merger = grant_extra_round(run, monkeypatch)
+    run.go()
+    assert run.merged() and not advisor.granted(merger.env, "review_limit", PR)
+    assert [r["result"] for r in advisor.read_records(merger.env) if r["kind"] == "outcome"] == ["merged"]
+
+
+def test_an_owner_merge_records_merged_and_releases_the_grant(run, monkeypatch):
+    merger = grant_extra_round(run, monkeypatch)
+    merger.finish_merged_task()
+    assert not advisor.granted(merger.env, "review_limit", PR)
+    assert [r["result"] for r in advisor.read_records(merger.env) if r["kind"] == "outcome"] == ["merged"]
 
 
 @pytest.mark.parametrize("state", ["OPEN", "MERGED", "CLOSED", None])
@@ -202,11 +244,13 @@ def test_merge_observation_discards_evidence_outside_the_sent_snapshot(run, obse
     run.gh.set(state="OPEN", mergeStateStatus="CLEAN", headRefOid=OLD, merge_results=[1],
                body="Long description\n" + "Source context. " * 1000 + "\nTruncated claim\n\n" + CLEAN)
     monkeypatch.setattr(advisor, "call_deepseek", lambda *args, **kwargs: (
-        {"action": "retry_step", "reason": "One more read", "evidence": ["Truncated claim"]}, {}))
+        {"action": "retry_step", "reason": "One more read", "evidence": ["Truncated claim"]},
+        {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}))
     run.go()
 
     decision, outcome = advisor.read_records(run.merger().env)
     assert "outside the sent snapshot" in decision["failure"]
+    assert decision["usage"] == {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
     assert decision["evidence"] == [] and decision["executed"] == outcome["result"] == "handoff"
     assert run.labelled("ready-for-human")
 
@@ -600,7 +644,7 @@ def test_a_repair_that_cannot_run_hands_the_head_off_without_marking_it(repair):
 
 def test_a_repair_that_hands_the_pr_over_still_marks_the_head(repair):
     repair.fix_rc = 1
-    assert repair.merger().ci_fix_round(str(repair.wt)) == 1
+    assert repair.merger().ci_fix_round(str(repair.wt)) == merge.HANDED_OFF
     assert Path(repair.env["STATE"], f"ci-fix-{PR}-{HEAD}").exists()
 
 

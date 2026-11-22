@@ -241,6 +241,44 @@ def test_a_pending_review_resumes_from_its_checkpoint(ctx):
     assert not ctx.scans   # an item ended the tick
 
 
+@pytest.fixture
+def granted_round(ctx, monkeypatch):
+    """A spent advisor extra round for PR #11 and for the spec of issue #9; the next ask is a new call."""
+    from baton import advisor
+    from baton.config import Advisor
+    calls = []
+    monkeypatch.setenv(advisor.KEY, "sk-" + "t" * 24)
+    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="live"))
+    monkeypatch.setattr(advisor, "call_deepseek", lambda *a, **k: (
+        calls.append(a) or {"action": "extra_round", "reason": "fixable", "evidence": []}, {}))
+    tick_env = ctx.make().env
+
+    def ask(point, item, snapshot):
+        return advisor.advise(tick_env, point, item, snapshot, ("extra_round",), revalidate=lambda: True)
+    assert ask("review_limit", 11, "first").extra_round and ask("spec_limit", 9, "first").extra_round
+    assert not ask("review_limit", 11, "second").called
+    return SimpleNamespace(calls=calls, ask=ask, env=tick_env, advisor=advisor)
+
+
+@pytest.mark.parametrize("state", ["CLOSED", "MERGED"])
+def test_a_pending_review_of_a_closed_pr_ends_its_advisor_episode(ctx, granted_round, state):
+    checkpoint(ctx)
+    ctx.gh.answers["pr view"] = f"{state}\n"
+    ctx.make().pending_reviews()
+    assert [r["result"] for r in granted_round.advisor.read_records(granted_round.env) if r["kind"] == "outcome"
+            ] == [state.lower()]
+    # Reopened: a new episode may ask once more.
+    assert granted_round.ask("review_limit", 11, "after the reopen").extra_round and len(granted_round.calls) == 3
+
+
+def test_closing_an_issue_ends_its_spec_episode(ctx, granted_round):
+    (Path(ctx.env["WT_ROOT"]) / "spec-9").mkdir(parents=True)
+    ctx.gh.answers["issue view"] = "CLOSED\n"
+    ctx.make().cleanup()
+    assert not granted_round.advisor.granted(granted_round.env, "spec_limit", 9)
+    assert granted_round.ask("spec_limit", 9, "after the reopen").extra_round and len(granted_round.calls) == 3
+
+
 def test_a_pending_review_of_a_merged_pr_is_dropped(ctx):
     checkpoint(ctx)
     ctx.gh.answers["pr view"] = "MERGED\n"
@@ -923,10 +961,10 @@ def test_a_second_tick_finishes_a_deferred_description_edit(ctx, worktree, monke
     monkeypatch.setattr(review.Review, "review_vendor", lambda self, reviewer: "claude")
     monkeypatch.setattr(review.Review, "run_review", lambda *args: "REVIEW: pass")
     if route == "switch-review":
-        monkeypatch.setattr(review.advisor, "granted", lambda *args: True)
         monkeypatch.setattr(review.Review, "run_review", lambda *args: "REVIEW: changes")
     if resumes_review:
-        checkpoint(ctx, pr=pr, step="fix", wt=str(worktree.wt), ISSUE="297", fix_head=remote_before)
+        checkpoint(ctx, pr=pr, step="fix", wt=str(worktree.wt), ISSUE="297", fix_head=remote_before,
+                   extra="1" if route == "switch-review" else "")
         monkeypatch.setattr(tick.Tick, "review_loop", ORIGINAL_REVIEW_LOOP)
 
     assert ctx.make().run() == 0, ctx.log()

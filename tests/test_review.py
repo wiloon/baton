@@ -1192,6 +1192,19 @@ def test_an_extra_round_remains_open_until_the_merge_gate_hands_off(advised, mon
     assert advised.labelled("ready-for-human")
 
 
+def test_a_spent_extra_round_is_not_granted_again_after_a_pass_and_a_requeue(advised):
+    advised.reviews[:] = ["changes", "changes", "pass"]
+    advised.advice = [{"action": "extra_round", "reason": "only a test is missing", "evidence": []}]
+    assert advised.run(fixer="cursor") == 0
+    assert len(advised.fixes) == 2 and advised.merged == [PR]
+
+    # The merge gate queued the PR for review again: a fresh loop gets only the normal budget.
+    advised.reviews[:] = ["changes", "changes", "changes"]
+    assert advised.run(fixer="cursor") == 0
+    assert len(advised.fixes) == 3 and len(advised.advice_calls) == 1
+    assert advised.labelled("ready-for-human")
+
+
 @pytest.mark.parametrize("failure", ["fix", "review"])
 def test_a_failed_extra_round_does_not_extend_the_next_review_episode(advised, failure):
     advised.reviews[:] = ["changes", "changes"]

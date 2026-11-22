@@ -506,6 +506,7 @@ class Review:
         round, step, fix_head = 1, "review", ""
         code_verdict = screenshot = ""   # the round's code verdict, and "1" when it had a screenshot review
         checks = ""
+        extra = 0   # the advisor's one extra round (#17), kept in the checkpoint of the episode it was granted for
         saved = checkpoint.read(self.checkpoint)
         if saved:
             note, fixer, reviewer = saved.get("note", ""), saved.get("fixer", ""), saved.get("reviewer", "")
@@ -513,6 +514,7 @@ class Review:
             step, fix_head = saved.get("step") or "review", saved.get("fix_head", "")
             code_verdict, screenshot = saved.get("code_verdict", ""), saved.get("screenshot", "")
             checks = saved.get("screenshot_checks", "")
+            extra = 1 if saved.get("extra") == "1" else 0
             self.fixed_by, self.issue = saved.get("fixed_by", ""), saved.get("ISSUE", "")
         cfg = self.env.config
         if reviewer not in ("pool",) and (reviewer not in cfg.declared() or not cfg.allows(reviewer, "reviewer")):
@@ -520,7 +522,6 @@ class Review:
         if self.seed():
             self.seed_contrib()
         self.label("--remove-label", "ready-for-human")
-        extra = 1 if advisor.granted(self.env, "review_limit", pr) else 0   # granted by the advisor (#17)
         while True:
             self.hooks.round = round
             if round == 1:
@@ -534,7 +535,8 @@ class Review:
                             "Don't read the full PR diff, AGENTS.md or the principles again unless a fix commit needs them."
                             if fix_head else ""))
             self.values = dict(note=note, fixer=fixer, reviewer=reviewer, round=round, step=step, fix_head=fix_head,
-                               code_verdict=code_verdict, screenshot=screenshot, screenshot_checks=checks)
+                               code_verdict=code_verdict, screenshot=screenshot, screenshot_checks=checks,
+                               extra="1" if extra else "")
             self.save()
             if step in ("review", "screenshot"):
                 verdict = code_verdict
@@ -594,6 +596,7 @@ class Review:
                         snapshot=snap, revalidate=check)
                     if result.action == "extra_round":
                         extra = 1
+                        self.values["extra"] = "1"
                         notify.log(f"PR #{pr}: advisor granted one more round: {result.decision.reason}")
                     else:
                         self.drop()

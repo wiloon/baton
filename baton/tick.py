@@ -346,6 +346,7 @@ class Tick:
         for n, path in names.worktrees(self.wt_root):
             wt = str(path)
             if self.state_of("issue", n) == "CLOSED":
+                advisor.finish_episode(self.env, "issue", n, "closed")
                 merge.remove_worktree(self.repo_dir, wt)
                 Path(f"{wt}.pr.md").unlink(missing_ok=True)
                 session.run_process(["rm", "-rf", str(self.ctx / f"issue-{n}-shots")])
@@ -356,6 +357,7 @@ class Tick:
             wt = wt.rstrip("/")
             n = os.path.basename(wt).removeprefix("spec-")
             if self.state_of("issue", n) == "CLOSED":
+                advisor.finish_episode(self.env, "issue", n, "closed")
                 merge.remove_worktree(self.repo_dir, wt)
                 self.sweep(n)
                 self.log(f"cleaned up spec worktree for closed #{n}")
@@ -364,6 +366,7 @@ class Tick:
             n = os.path.basename(wt).removeprefix("pr-")
             state = self.state_of("pr", n)
             if state in ("MERGED", "CLOSED"):
+                advisor.finish_episode(self.env, "pr", n, state.lower())
                 merge.remove_worktree(self.repo_dir, wt)
                 self.sweep(n)
                 self.log(f"cleaned up worktree for {state} PR #{n}")
@@ -463,6 +466,7 @@ class Tick:
             return 0
         self.active["pr"] = str(pr)
         if state != "OPEN":
+            advisor.finish_episode(self.env, "pr", pr, state.lower())
             path.unlink(missing_ok=True)
             return 0
         rc = self.review_loop(pr, saved.get("wt", ""), saved.get("note", ""), saved.get("fixer", ""),

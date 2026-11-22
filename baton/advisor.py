@@ -126,7 +126,7 @@ def append(env, record):
 def read_records(env, *, strict=False):
     path = records_path(env)
     try:
-        lines = path.read_text().splitlines()
+        lines = path.read_text(errors="replace").splitlines()   # a torn multibyte append stays readable
     except FileNotFoundError:
         return []
     except OSError:
@@ -253,6 +253,9 @@ def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=No
         if key:
             options = {"category": category} if category else {}
             reply, metadata = call_deepseek(cfg, key, text, actions, **options)
+            if isinstance(metadata, dict):   # the call consumed these tokens even if the reply is rejected
+                usage = {k: count for k, count in metadata.items()
+                         if k in ("prompt_tokens", "completion_tokens", "total_tokens") and isinstance(count, int)}
             if category:
                 if (not isinstance(reply, dict) or not isinstance(reply.get("action"), str)
                         or not isinstance(reply.get("reason"), str)
@@ -266,9 +269,6 @@ def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=No
                 failure = f"action outside the allowed set: {advised[:60]!r}"
             reason = redact(str(reply.get("reason", "")), values)[:600]
             evidence = [redact(str(e), values)[:300] for e in (reply.get("evidence") or [])][:5]
-            if isinstance(metadata, dict):
-                usage = {k: count for k, count in metadata.items()
-                         if k in ("prompt_tokens", "completion_tokens", "total_tokens") and isinstance(count, int)}
     except urllib.error.HTTPError as error:
         failure = f"HTTP {error.code}"
     except (urllib.error.URLError, TimeoutError, OSError) as error:
@@ -302,15 +302,13 @@ def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=No
     return Decision(executed, reason, tuple(evidence), advised, failure, True)
 
 
-def finish_episode(env, task_kind, item, result, *, point=None):
+def finish_episode(env, task_kind, item, result):
     """Correlate the terminal disposition with each decision and release the spent grants."""
     env = session.resolve(env)
     legacy = "spec_limit" if task_kind == "issue" else "review_limit"
-    points = {point or legacy}
+    points = {legacy}
     try:
         for decision in pending_decisions(env, task_kind, item):
-            if point and decision["point"] != point:
-                continue
             append(env, {**{key: decision[key] for key in ("point", "repo", "task_kind", "item", "episode", "decision_id")},
                          "kind": "outcome", "ts": int(time.time()), "result": result})
             points.add(decision["point"])
@@ -320,17 +318,15 @@ def finish_episode(env, task_kind, item, result, *, point=None):
         notify.log(f"advisor {task_kind} #{item}: could not finish episode ({type(error).__name__})")
 
 
-def outcome(env, point, item, result):
-    """Record the disposition of a single decision point."""
-    finish_episode(env, "issue" if point.startswith("spec_") else "pr", item, result, point=point)
-
-
 def handoff_note(decision):
     """One line for the handoff text: what the advisor chose and why."""
     if not (decision.called or decision.previous):
         return ""
     if decision.failure and not decision.advised:
         return f" Advisor (DeepSeek): no decision ({decision.failure})."
+    if decision.advised not in ("", HANDOFF) and not decision.failure:
+        note = f" Advisor (DeepSeek) recommended {decision.advised}, not executed (observation)"
+        return note + (f": {decision.reason}." if decision.reason else ".")
     note = f" Advisor (DeepSeek) chose {decision.advised or 'nothing'}"
     if decision.reason:
         note += f": {decision.reason}"
@@ -373,14 +369,17 @@ def digest(env, now=None):
                      + (f" (advised {r.get('advised')})" if r.get("advised") and r.get("advised") != r.get("executed") else "")
                      + (f" [failure: {r.get('failure')}]" if r.get("failure") else "")
                      + f", outcome {end}. {r.get('reason', '')[:160]}")
-    extra = [r for r in reported if r.get("executed") == "extra_round"]
-    won = sum(outcomes.get(identity(r)) in ("pass", "accept", "merged") for r in extra)
-    recommended = Counter(r["advised"] for r in decisions if r.get("advised") and not r.get("failure"))
+    extra = [r for r in decisions if r.get("executed") == "extra_round"]
+    won = sum(outcomes.get(identity(r)) in ("merged", "accept") for r in extra)
+    earlier = len(reported) - len(decisions)
+    recommended = Counter(r["advised"] for r in decisions if r.get("advised")
+                          and (not r.get("failure") or str(r["failure"]).startswith("stale snapshot")))
     executed = Counter(r["executed"] for r in decisions if r.get("executed"))
     counts = [f"{action}: recommended {recommended[action]}, executed {executed[action]}"
               for action in sorted(recommended.keys() | executed.keys())]
     tokens = sum((r.get("usage") or {}).get("total_tokens", 0) for r in decisions)
     text = (f"{len(decisions)} decision(s), {tokens} total tokens. "
-            f"Extra rounds granted {len(extra)}, ended in pass/accept {won}.\n" + "\n".join(counts + lines))
+            f"Extra rounds granted {len(extra)}, ended merged/accepted {won}. "
+            f"{earlier} earlier decision(s) closed in this window.\n" + "\n".join(counts + lines))
     notify.notify("Advisor digest", text[:3500])
     return text

@@ -36,6 +36,9 @@ def remove_worktree(repo_dir, wt):
     return session.run_process(["git", "-C", repo_dir, "branch", "-D", branch], stdout=subprocess.DEVNULL).returncode == 0
 
 
+HANDED_OFF = 2
+
+
 def checks_status(rollup):
     """Classify GitHub's check runs and commit status contexts for the observed head."""
     if not isinstance(rollup, list) or not rollup or any(not isinstance(check, dict) for check in rollup):
@@ -96,7 +99,7 @@ class Merger:
             same_head = bool(checked_head and checked_head == head
                              and (not self.merge_head or checked_head == self.merge_head))
             retry = same_head and state == "OPEN" and (
-                status == "pending" or (rc == 124 and status == "unavailable"))
+                status == "pending" or (rc == 124 and status != "failed"))
             context.append(f"CI wait head: {checked_head}; exit: {rc}; poll budget: {minutes} minutes.")
         else:
             # A reconciliation read is safe for a merged or ambiguous PR as well. An ordinary
@@ -138,7 +141,8 @@ class Merger:
     def ci_fix_round(self, wt):
         """One repair for a failed code-check head (#243). baton.ci decides: infrastructure
         and ambiguous failures, and a head repaired once already, are left for the owner.
-        Returns 0 when a repair was pushed. A repair that cannot run now hands the head off."""
+        Returns 0 when a repair was pushed, HANDED_OFF when the repair run already handed the PR to
+        the owner, and 1 when no repair is possible. A repair that cannot run now hands the head off."""
         pr = self.pr
         found = ci.classify(str(pr), self.state, list(self.env.repo.ci_fixable_checks))
         if found is None or not re.fullmatch(r"[a-f0-9]{40,64}", found["head"]):
@@ -156,7 +160,7 @@ class Merger:
             return 1
         Path(self.state, f"ci-fix-{pr}-{head}").touch()   # one repair round for this PR head, even across ticks
         if rc != 0:
-            return rc
+            return HANDED_OFF   # fix_pr already handed the PR off; no second handoff or advisor call
         self.hooks.task("ci_fix", f"pr:{pr}:{head}", "--agent", fixer, "--head-sha", head)
         return 0
 
@@ -354,7 +358,10 @@ class Merger:
                 notify.send_shots(pr, note="Checks for you" if left is None else "", left=owed)
             return
         if not self.ci_green(45):
-            if self.ci_fix_round(wt) != 0 or not self.ci_green(45):
+            repaired = self.ci_fix_round(wt)
+            if repaired == HANDED_OFF:
+                return
+            if repaired != 0 or not self.ci_green(45):
                 reason = "ci_before_merge_not_green"
                 self.handoff(reason, f"PR #{pr}: CI not green",
                              f"Review passed but CI failed or timed out. {url}",
