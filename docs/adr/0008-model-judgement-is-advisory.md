@@ -34,7 +34,9 @@ survives a restart. It repeats a write only after confirming that the write did 
 its inputs are unchanged. A landed write counts as done and superseded work is dropped. Anything
 else goes to handoff, except the description requests below. The saved merge of an accepted
 spec's ADR PR qualifies, because it repeats a merge the runner already decided on and checks
-acceptance and CI again. Other merge recovery keeps its decision point.
+acceptance and CI again. That merge is pinned to the accepted head, or to the runner's own update
+of it once verified as only a clean merge of the base branch. A new head alone is no such proof.
+Other merge recovery keeps its decision point.
 
 After a fix, a rejected or failed PR description request is a recoverable runner outcome. A
 failed request that can be resumed may first use the safe retry budget. If it still can't be
@@ -115,3 +117,5 @@ advisor action per reason and task episode, and a recurrence after that action g
 - Issue #151: define a safe retry, so category-1 replay can't duplicate a write or act on changed
   inputs. Place the saved ADR merge write under that rule, separate from advisor merge recovery,
   and state that #141's exception also covers failed description requests, per the owner.
+- Issue #151 (spec round 2): require proof that an updated ADR head is the runner's clean update,
+  so a concurrent push can't become the head that the merge pins.
