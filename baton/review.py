@@ -246,58 +246,11 @@ class Review:
     def label(self, *options):
         pr_helpers.gh("pr", "edit", str(self.pr), "-R", self.repo, *options)
 
-    def handoff(self, reason, title, text, *, snapshot="", revalidate=None, observed_actions=None):
+    def handoff(self, reason, title, text, *, snapshot="", revalidate=None):
         """Terminal owner handoff through the shared entry (#125). Returns the entry Result."""
         return owner_handoff.perform(
             self.env, reason, kind="pr", number=self.pr,
-            title=title, text=text, hooks=self.hooks, snapshot=snapshot, revalidate=revalidate,
-            observed_actions=observed_actions)
-
-    def worker_recovery(self, reason, vendor, detail, *, role="reviewer", pinned=False):
-        """Snapshot and offered live actions for a worker or investigation failure (#125)."""
-        entry = owner_handoff.REASONS.get(reason)
-        if not entry or entry.mode != "live" or not entry.actions:
-            return {}
-        head = git(self.wt, "rev-parse", "HEAD") or ""
-        offered = []
-        if "retry_step" in entry.actions:
-            offered.append("retry_step")
-        if "retry_step_other_vendor" in entry.actions and not pinned:
-            if any(other != vendor for other in self.vendors()):
-                offered.append("retry_step_other_vendor")
-        if not offered:
-            return {}
-        actions = ("retry_step = one more attempt with the same vendor when still eligible; "
-                   "retry_step_other_vendor = one attempt with an eligible alternate; "
-                   "handoff = the owner takes the PR.")
-        snapshot = (f"Decision point: {reason}. Repository {self.repo}, PR #{self.pr}, issue {self.issue}.\n"
-                    f"Failed vendor: {vendor}; role: {role}; worktree HEAD: {head}.\n"
-                    f"Outcome: {detail}\nActions: {actions}\n")
-
-        def still_current():
-            data = pr_helpers.view(self.pr, "headRefOid,state")
-            return bool(data) and data.get("state") == "OPEN" and data.get("headRefOid") == head
-        return {"snapshot": snapshot, "revalidate": still_current, "observed_actions": tuple(offered)}
-
-    def recover_worker(self, reason, title, detail, vendor, *, role="reviewer", pinned=False):
-        """Ask the advisor at a live worker failure; return (action, vendor) for the caller to run."""
-        recovery = self.worker_recovery(reason, vendor, detail, role=role, pinned=pinned)
-        result = self.handoff(reason, title, f"{detail} {self.url}", **recovery)
-        if result.action == owner_handoff.HANDOFF:
-            return result.action, vendor
-        if result.action == "retry_step_other_vendor":
-            try:
-                vendor = pick.choose(self.env, role, vendor, "review" if role.endswith("reviewer") else "contrib",
-                                     self.vendors(), pr=str(self.pr), exclude=vendor, issue=self.issue,
-                                     fixed_by=self.fixed_by)
-            except Exhausted as exhausted:
-                self.handoff("reviewer_unavailable" if role == "reviewer" else reason,
-                             title, exhausted.reason or detail)
-                return owner_handoff.HANDOFF, vendor
-            notify.log(f"PR #{self.pr}: advisor granted alternate {role} {vendor}: {result.decision.reason}")
-        else:
-            notify.log(f"PR #{self.pr}: advisor granted retry of {role} ({vendor}): {result.decision.reason}")
-        return result.action, vendor
+            title=title, text=text, hooks=self.hooks, snapshot=snapshot, revalidate=revalidate)
 
     def render(self, template, **pairs):
         return prompts.render(self.self_dir / template, list(pairs.items()), env=self.env)
@@ -450,13 +403,10 @@ class Review:
                 and not agents.ADAPTERS[reviewer].SKIP_SCREENSHOT_AFTER_REVIEW
                 and "owner" not in vendors.review_excluded(self.state, self.pr))
 
-    def screenshot_vendor(self, exclude=""):
+    def screenshot_vendor(self):
         """Claude or Codex, by the code review's exclusions; Cursor never looks at screenshots."""
-        forced = self.values.get("screenshot_reviewer")
-        if forced:
-            return forced
         return pick.choose(self.env, "screenshot_reviewer", "", "review", self.vendors(), pr=str(self.pr),
-                           issue=self.issue, fixed_by=self.fixed_by, exclude=exclude or self.values.get("recovery_exclude", ""))
+                           issue=self.issue, fixed_by=self.fixed_by)
 
     def shots_step(self, shots):
         """The screenshot reviewer's look at the manual-check screenshots (#50): every valid PNG,
@@ -476,7 +426,6 @@ class Review:
         self.hooks.round = round
         head = git(wt, "rev-parse", "HEAD") or ""
         vendor = self.screenshot_vendor()
-        self.last_screenshot_vendor = vendor
         cfg = self.env.config
         if vendor not in cfg.declared() or not cfg.allows(vendor, "screenshot_reviewer"):
             return self.failed("screenshot_reviewer_role_denied", "RESULT: failed screenshot reviewer not role-allowed")
@@ -603,21 +552,12 @@ class Review:
                     self.save()
                     self.fail_reason = ""
                     outcome = self.run_review(round, rnote, reviewer)
-                    while not outcome.startswith(REVIEWED):
-                        if self.fail_reason == ALREADY:   # a refusal handed off where it was decided
-                            self.drop()
-                            return 0
-                        reason = self.fail_reason or "review_run_failed"
-                        action, reviewer = self.recover_worker(
-                            reason, f"PR #{pr} review failed ({reviewer})", outcome, reviewer,
-                            pinned=reviewer == "cursor")
-                        if action == owner_handoff.HANDOFF:
-                            self.drop()
-                            return 0
-                        self.values["reviewer"] = reviewer
-                        self.save()
-                        self.fail_reason = ""
-                        outcome = self.run_review(round, rnote, reviewer)
+                    if not outcome.startswith(REVIEWED):
+                        if self.fail_reason != ALREADY:   # a refusal handed off where it was decided
+                            self.handoff(self.fail_reason or "review_run_failed", f"PR #{pr} review failed ({reviewer})",
+                                         f"{outcome} {self.url}")
+                        self.drop()
+                        return 0
                     verdict = "pass" if outcome.startswith("REVIEW: pass") else "changes"
                 if step == "screenshot" or self.screenshot_enabled(reviewer):
                     body = pr_helpers.body(pr)
@@ -638,30 +578,11 @@ class Review:
                     except Exhausted as exhausted:
                         outcome = self.failed("screenshot_reviewer_unavailable",
                                               exhausted.reason or "No screenshot reviewer available.")
-                    while not outcome.startswith(REVIEWED):
-                        reason = self.fail_reason or "screenshot_run_failed"
-                        if reason in ("screenshot_reviewer_unavailable", "screenshot_reviewer_role_denied",
-                                      "screenshot_independence_denied"):
-                            self.handoff(reason, f"PR #{pr} screenshot review failed", f"{outcome} {self.url}")
-                            self.drop()
-                            return 0
-                        failed_vendor = getattr(self, "last_screenshot_vendor", "")
-                        action, other = self.recover_worker(
-                            reason, f"PR #{pr} screenshot review failed", outcome, failed_vendor,
-                            role="screenshot_reviewer")
-                        if action == owner_handoff.HANDOFF:
-                            self.drop()
-                            return 0
-                        if action == "retry_step_other_vendor":
-                            self.values["screenshot_reviewer"] = other
-                            self.save()
-                        self.fail_reason = ""
-                        try:
-                            outcome = self.run_screenshot_review(round, checks)
-                        except Exhausted as exhausted:
-                            outcome = self.failed("screenshot_reviewer_unavailable",
-                                                  exhausted.reason or "No screenshot reviewer available.")
-                        self.values.pop("screenshot_reviewer", None)
+                    if not outcome.startswith(REVIEWED):
+                        self.handoff(self.fail_reason or "screenshot_run_failed", f"PR #{pr} screenshot review failed",
+                                     f"{outcome} {self.url}")
+                        self.drop()
+                        return 0
                     screenshot = "1"
                     if outcome.startswith("REVIEW: changes"):
                         verdict = "changes"

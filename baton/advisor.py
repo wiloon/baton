@@ -207,16 +207,10 @@ def call_deepseek(cfg, key, snapshot, actions, *, category=None):
     system = SYSTEM
     if category == 2:
         system += ("\nFor a CI judgement, retry_step means one bounded status poll of existing checks on the "
-                   "specified head. It cannot repair a check, rerun a job, update a branch or merge a PR."
-                   "\nFor a worker failure, retry_step means one more attempt of the same step with the same "
-                   "vendor when still eligible; retry_step_other_vendor means one attempt with an eligible "
-                   "alternate for that role. Neither invents new work or bypasses round limits.")
+                   "specified head. It cannot repair a check, rerun a job, update a branch or merge a PR.")
     elif category == 3:
         system += ("\nFor merge investigation, retry_step means reading and reconciling the existing PR state "
-                   "once. An open PR would have to pass all ordinary gates before any further merge attempt."
-                   "\nFor a local investigation, retry_step means one more attempt of the failed local step "
-                   "(author seeding, verification, or worktree preparation) without resetting its budget. "
-                   "Preserve local work; do not force destructive cleanup.")
+                   "once. An open PR would have to pass all ordinary gates before any further merge attempt.")
     if category:
         system += "\nReturn evidence as verbatim quotes from the supplied snapshot, or an empty array."
     body = json.dumps({

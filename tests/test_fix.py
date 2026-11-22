@@ -285,9 +285,9 @@ def test_needs_info_and_failure_go_to_the_owner(run, outcome, title, reason, mon
     from baton import fix as fix_mod
     original = fix_mod.Runner.handoff
 
-    def record(self, pr, code, ttl, text, **recovery):
+    def record(self, pr, code, ttl, text):
         seen.append(code)
-        return original(self, pr, code, ttl, text, **recovery)
+        return original(self, pr, code, ttl, text)
 
     monkeypatch.setattr(fix_mod.Runner, "handoff", record)
     run.agent({"outcome": outcome, "commit": False})
@@ -442,12 +442,7 @@ def test_an_invalid_description_request_keeps_the_body_and_still_pushes_the_comm
 def _codes(monkeypatch):
     seen = []
     original = fix.Runner.handoff
-
-    def record(self, pr, code, title, text, **recovery):
-        seen.append(code)
-        return original(self, pr, code, title, text, **recovery)
-
-    monkeypatch.setattr(fix.Runner, "handoff", record)
+    monkeypatch.setattr(fix.Runner, "handoff", lambda self, pr, code, title, text: (seen.append(code), original(self, pr, code, title, text))[1])
     return seen
 
 
@@ -1007,46 +1002,3 @@ def test_without_screenshot_review_the_fix_prompt_names_no_screenshots_dir(run):
     run.agent(dict(CHECKED))
     run.fix("claude")
     assert f"pr-{PR}-shots" not in run.prompts[0]
-
-
-# --- live worker retries (#125) --------------------------------------------------------------
-
-@pytest.fixture
-def advised_fix(run, monkeypatch):
-    from baton import advisor
-    from baton.config import Advisor
-    monkeypatch.setenv(advisor.KEY, "sk-" + "f" * 24)
-    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="live"))
-    run.fake_gh.set(state="OPEN")
-    run.advice, run.advice_calls = [], []
-
-    def call(cfg, key, snapshot, actions, **_):
-        run.advice_calls.append((snapshot, actions))
-        return run.advice.pop(0), {}
-    monkeypatch.setattr(advisor, "call_deepseek", call)
-    return run
-
-
-def test_a_live_retry_step_re_runs_a_failed_fix(advised_fix):
-    advised_fix.advice = [{"action": "retry_step", "reason": "transient worker failure",
-                            "evidence": ["Decision point: fix_run_failed"]}]
-    advised_fix.agent({"outcome": "RESULT: failed boom", "commit": False},
-                        {"outcome": "RESULT: fixed", "commit": True, "reply": "RESULT: fixed"})
-    assert advised_fix.fix()["rc"] == 0 and not advised_fix.labelled()
-    assert len(advised_fix.agent_calls) == 2
-    assert len(advised_fix.advice_calls) == 1
-    assert "fix_run_failed" in advised_fix.advice_calls[0][0]
-
-
-def test_a_live_verify_retry_rechecks_within_the_same_budget(advised_fix):
-    # max_verify_fixes=2: three red checks exhaust repairs, then the advisor retry rechecks once.
-    advised_fix.verify_script("lint broke", "lint broke", "lint broke", "pass")
-    advised_fix.advice = [{"action": "retry_step", "reason": "flaky local check",
-                            "evidence": ["Decision point: fix_verify_failed"]}]
-    advised_fix.agent({"commit": True, "reply": "RESULT: fixed"},
-                        {"outcome": "RESULT: fixed", "commit": True},
-                        {"outcome": "RESULT: fixed", "commit": True})
-    assert advised_fix.fix()["rc"] == 0 and not advised_fix.labelled()
-    assert len(advised_fix.advice_calls) == 1
-    assert "fix_verify_failed" in advised_fix.advice_calls[0][0]
-    assert advised_fix.advice_calls[0][1] == ("handoff", "retry_step")
