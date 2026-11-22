@@ -151,18 +151,21 @@ def details(pr, owner, cursor_login):
     data = view(pr, "headRefName,author,isCrossRepository,state,isDraft,body,closingIssuesReferences")
     if data is None:
         raise ValueError(f"cannot read PR #{pr}")
+    issue, completion = linked_task(data, session.resolve().repo.gh_repo)
+    return {"branch": data.get("headRefName", ""), "route": pr_contract.route(data, owner, cursor_login),
+            "issue": issue, "completion": completion}
+
+
+def linked_task(data, repo):
     issue, completion = pr_contract.relation(data)
     if not issue:
-        repo = session.resolve().repo.gh_repo.lower()
-        closing = []
         for ref in data.get("closingIssuesReferences") or ():
             repository = ref.get("repository") or {}
             ref_owner = repository.get("owner") or {}
-            if ref.get("number") and f'{ref_owner.get("login", "")}/{repository.get("name", "")}'.lower() == repo:
-                closing.append(str(ref["number"]))
-        issue = closing[0] if closing else ""
-    return {"branch": data.get("headRefName", ""), "route": pr_contract.route(data, owner, cursor_login),
-            "issue": issue, "completion": completion}
+            name = f'{ref_owner.get("login", "")}/{repository.get("name", "")}'
+            if ref.get("number") and name.casefold() == repo.casefold():
+                return str(ref["number"]), completion
+    return issue, completion
 
 
 def relation(pr):

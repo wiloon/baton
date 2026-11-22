@@ -11,9 +11,12 @@ consumed before it runs so a restart cannot reset the budget. Permanent failures
 hand off. Deferrals yield the tick without sleeping (#151).
 """
 import json
+import re
+import stat
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from uuid import uuid4
 
 from . import advisor, notify
 from . import pr as pr_helpers
@@ -132,60 +135,106 @@ def capped_mode(global_mode, point_mode):
     return point_mode if RANK[point_mode] <= RANK[global_mode] else global_mode
 
 
-def retry_path(env, episode, reason):
-    """Repository state keyed by task episode and reason (#151 category-1 budget)."""
-    return Path(str(env.dirs.state)) / f"handoff-retry-{episode}-{reason}.json"
+def operation_path(env, episode, reason, item, prefix):
+    episode, item = str(episode), str(item or episode)
+    key = episode if item == episode else f"{episode}-{item}"
+    return Path(str(env.dirs.state)) / f"handoff-{prefix}-{key}-{reason}.json"
 
 
-def _validate_retry(data, path):
-    """Raise RetryUnreadable when DATA is missing fields, mistyped or out of range."""
-    if not isinstance(data, dict):
-        raise RetryUnreadable(f"invalid retry record {path.name}")
-    if "attempts" not in data or "due" not in data or "continuation" not in data:
-        raise RetryUnreadable(f"incomplete retry record {path.name}")
-    attempts, due, continuation = data["attempts"], data["due"], data["continuation"]
+def retry_path(env, episode, reason, item=""):
+    return operation_path(env, episode, reason, item, "retry")
+
+
+def waiting_path(env, episode, reason, item=""):
+    return operation_path(env, episode, reason, item, "waiting")
+
+
+def _read_record(path):
+    try:
+        if not stat.S_ISREG(path.lstat().st_mode):
+            raise RetryUnreadable(f"retry path is not a file {path.name}")
+        data = json.loads(path.read_text())
+        if not isinstance(data, dict):
+            raise RetryUnreadable(f"invalid retry record {path.name}")
+        return data
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise RetryUnreadable(f"unreadable retry record {path.name}") from exc
+
+
+def _binding_valid(reason, item, binding):
+    if not isinstance(binding, dict):
+        return False
+    if reason == "spec_comments_read_failed":
+        return binding == {}
+    if reason == "spec_pending_adr_read_failed":
+        if binding == {"step": "discovery"}:
+            return True
+        return (binding.get("step") == "acceptance"
+                and isinstance(binding.get("pr"), str) and binding["pr"].isdecimal()
+                and isinstance(binding.get("verdict"), str) and bool(binding["verdict"])
+                and isinstance(binding.get("issue_body"), str)
+                and isinstance(binding.get("adr_head"), str)
+                and (binding["adr_head"] == "" or bool(re.fullmatch(r"[0-9a-f]{40}", binding["adr_head"]))))
+    return (binding.get("pr") == item and type(binding.get("round")) is int and binding["round"] > 0
+            and all(isinstance(binding.get(key), str) for key in
+                    ("head", "base", "digest", "issue", "screenshot_digest"))
+            and bool(binding["base"]) and bool(re.fullmatch(r"[0-9a-f]{40}", binding["head"]))
+            and bool(re.fullmatch(r"[0-9a-f]{64}", binding["digest"]))
+            and (binding["issue"] == "" or binding["issue"].isdecimal())
+            and (binding["screenshot_digest"] == "" or bool(re.fullmatch(r"[0-9a-f]{64}", binding["screenshot_digest"]))))
+
+
+def load_retry(env, episode, reason, item=""):
+    """Return a waiting operation's budget, or raise if either saved record is damaged or missing."""
+    episode, item = str(episode), str(item or episode)
+    path = retry_path(env, episode, reason, item)
+    data = _read_record(path)
+    waiting = _read_record(waiting_path(env, episode, reason, item))
+    if data is None and waiting is None:
+        return None
+    if not isinstance(data, dict) or not isinstance(waiting, dict):
+        raise RetryUnreadable(f"incomplete retry operation {path.name}")
+    binding = data.get("continuation")
+    expected = {"episode": episode, "item": item, "reason": reason, "continuation": binding}
+    if waiting != expected or any(data.get(key) != value for key, value in expected.items()):
+        raise RetryUnreadable(f"mismatched retry operation {path.name}")
+    if not _binding_valid(reason, item, binding):
+        raise RetryUnreadable(f"invalid continuation in {path.name}")
+    attempts, due, scheduled = data.get("attempts"), data.get("due"), data.get("scheduled")
     if type(attempts) is not int or not (0 <= attempts <= MAX_ATTEMPTS):
         raise RetryUnreadable(f"out-of-range attempts in {path.name}")
-    if type(due) is not int or due < 0:
+    if (type(due) is not int or type(scheduled) is not int or not 0 <= scheduled <= int(clock())
+            or due != scheduled + DELAYS[min(attempts, MAX_ATTEMPTS - 1)]):
         raise RetryUnreadable(f"out-of-range due in {path.name}")
-    if not isinstance(continuation, dict):
-        raise RetryUnreadable(f"invalid continuation in {path.name}")
     return data
 
 
-def load_retry(env, episode, reason):
-    """Return the saved retry dict, None when absent, or raise RetryUnreadable when corrupt."""
-    path = retry_path(env, episode, reason)
-    if not path.exists():
-        return None
-    if not path.is_file():
-        raise RetryUnreadable(f"retry path is not a file {path.name}")
+def restore_retry(env, episode, reason, item, pending):
+    """Keep a due attempt waiting when the authoritative read reports an owner pause."""
+    atomic_json(retry_path(env, episode, reason, item), pending)
+
+
+def _clear_path(path):
     try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError) as exc:
-        raise RetryUnreadable(f"unreadable retry record {path.name}") from exc
-    return _validate_retry(data, path)
-
-
-def save_retry(env, episode, reason, data):
-    atomic_json(retry_path(env, episode, reason), data)
-
-
-def clear_retry(env, episode, reason):
-    path = retry_path(env, episode, reason)
-    if path.is_dir():
-        path.rmdir()
-    else:
         path.unlink(missing_ok=True)
+    except IsADirectoryError:
+        path.rename(path.with_name(f"damaged-{uuid4().hex}-{path.name}"))
 
 
-def clear_episode(env, episode):
-    """Drop every pending category-1 retry of EPISODE (a terminal handoff ends them all)."""
-    for path in Path(str(env.dirs.state)).glob(f"handoff-retry-{episode}-*.json"):
-        if path.is_dir():
-            path.rmdir()
-        else:
-            path.unlink(missing_ok=True)
+def clear_retry(env, episode, reason, item=""):
+    for path in (retry_path(env, episode, reason, item), waiting_path(env, episode, reason, item)):
+        try:
+            _clear_path(path)
+        except OSError as exc:
+            notify.log(f"could not clear {path.name}: {exc}")
+
+
+def clear_episode(env, episode, item=""):
+    """Drop this item's pending operations when handoff ends its episode."""
+    for reason in RETRY_REASONS:
+        clear_retry(env, episode, reason, item)
 
 
 def label_ready(env, kind, number, remove=()):
@@ -201,7 +250,7 @@ def label_ready(env, kind, number, remove=()):
 def _finish(env, reason, entry, *, kind, number, title, text, hooks, remove, item, episode, close_outcomes,
             after_labels, decision=None):
     """The one terminal handoff: outcomes, labels, telemetry, notify, log."""
-    clear_episode(env, episode)
+    clear_episode(env, episode, item or number)
     for point in close_outcomes:
         advisor.outcome(env, point, item, "handoff")
     result = label_ready(env, kind, number, remove=remove)
@@ -218,6 +267,8 @@ def _category1(env, reason, entry, *, kind, number, title, text, hooks, remove, 
                close_outcomes, after_labels, transient, continuation, resume):
     """Rule-decided recovery: schedule, consume a due attempt, or hand off (#151)."""
     now = int(clock())
+    item = str(item or number)
+    path = retry_path(env, episode, reason, item)
 
     def finish():
         return _finish(env, reason, entry, kind=kind, number=number, title=title, text=text, hooks=hooks,
@@ -225,7 +276,7 @@ def _category1(env, reason, entry, *, kind, number, title, text, hooks, remove, 
                        after_labels=after_labels)
 
     try:
-        pending = load_retry(env, episode, reason)
+        pending = load_retry(env, episode, reason, item)
     except RetryUnreadable as exc:
         notify.log(f"handoff-retry {reason} unreadable episode={episode}: {exc}")
         return finish()
@@ -238,8 +289,8 @@ def _category1(env, reason, entry, *, kind, number, title, text, hooks, remove, 
         attempts = pending["attempts"] + 1
         updated = {**pending, "attempts": attempts}
         if attempts < MAX_ATTEMPTS:
-            updated["due"] = now + DELAYS[attempts]
-        save_retry(env, episode, reason, updated)
+            updated.update(scheduled=now, due=now + DELAYS[attempts])
+        atomic_json(path, updated)
         notify.log(f"handoff-retry {reason} attempt={attempts}/{MAX_ATTEMPTS} episode={episode}")
         return Result(RETRY, handed_off=False, continuation=updated.get("continuation"))
 
@@ -249,27 +300,17 @@ def _category1(env, reason, entry, *, kind, number, title, text, hooks, remove, 
         return finish()
 
     if pending is not None:
-        # Failed after a consumed attempt; keep the next deadline already saved at consume time.
-        delay = DELAYS[pending["attempts"]]
-        save_retry(env, episode, reason, {
-            **pending,
-            "due": now + delay,
-            "continuation": continuation or pending.get("continuation") or {},
-        })
-        notify.log(f"handoff-retry {reason} scheduled in {delay}s attempt={pending['attempts']}/{MAX_ATTEMPTS} "
-                   f"episode={episode}")
-        return Result(DEFER, handed_off=False, continuation=continuation)
+        return Result(DEFER, handed_off=False, continuation=pending["continuation"])
 
+    binding = continuation if continuation is not None else {}
+    if not _binding_valid(reason, item, binding):
+        return finish()
+    waiting = {"reason": reason, "episode": episode, "item": item, "continuation": binding}
     delay = DELAYS[0]
-    save_retry(env, episode, reason, {
-        "attempts": 0,
-        "due": now + delay,
-        "continuation": continuation or {},
-        "reason": reason,
-        "episode": episode,
-    })
+    atomic_json(waiting_path(env, episode, reason, item), waiting)
+    atomic_json(path, {**waiting, "attempts": 0, "scheduled": now, "due": now + delay})
     notify.log(f"handoff-retry {reason} scheduled in {delay}s attempt=0/{MAX_ATTEMPTS} episode={episode}")
-    return Result(DEFER, handed_off=False, continuation=continuation)
+    return Result(DEFER, handed_off=False, continuation=binding)
 
 
 def perform(env, reason, *, kind, number, title, text, hooks, remove=(), item="", episode="",

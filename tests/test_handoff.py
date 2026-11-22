@@ -160,6 +160,11 @@ def test_category_1_permanent_failure_hands_off_immediately(env, monkeypatch):
     assert handoff.load_retry(env, "7", "spec_comments_read_failed") is None
 
 
+def review_binding(pr):
+    return {"pr": pr, "round": 1, "head": "a" * 40, "base": "main", "digest": "b" * 64,
+            "issue": "9", "screenshot_digest": ""}
+
+
 def test_category_1_retry_waits_until_due_then_consumes_an_attempt(env, monkeypatch):
     hooks, _ = _hooks()
     monkeypatch.setattr(handoff, "label_ready", lambda *a, **k: MagicMock(returncode=0))
@@ -169,26 +174,26 @@ def test_category_1_retry_waits_until_due_then_consumes_an_attempt(env, monkeypa
     first = handoff.perform(
         env, "review_comment_missing", kind="pr", number="3", title="t", text="x",
         hooks=hooks, item="3", episode="9", transient=True,
-        continuation={"round": 1})
+        continuation=review_binding("3"))
     assert first.action == handoff.DEFER
     clock["now"] = 1_059
     early = handoff.perform(
         env, "review_comment_missing", kind="pr", number="3", title="t", text="x",
         hooks=hooks, item="3", episode="9", resume=True)
     assert early.action == handoff.DEFER
-    assert handoff.load_retry(env, "9", "review_comment_missing")["attempts"] == 0
+    assert handoff.load_retry(env, "9", "review_comment_missing", "3")["attempts"] == 0
     clock["now"] = 1_060
     due = handoff.perform(
         env, "review_comment_missing", kind="pr", number="3", title="t", text="x",
         hooks=hooks, item="3", episode="9", resume=True)
-    assert due.action == handoff.RETRY and due.continuation == {"round": 1}
-    assert handoff.load_retry(env, "9", "review_comment_missing")["attempts"] == 1
+    assert due.action == handoff.RETRY and due.continuation == review_binding("3")
+    assert handoff.load_retry(env, "9", "review_comment_missing", "3")["attempts"] == 1
     # A tick that stopped after consuming the attempt still observes the next delay.
     restarted = handoff.perform(
         env, "review_comment_missing", kind="pr", number="3", title="t", text="x",
         hooks=hooks, item="3", episode="9", resume=True)
     assert restarted.action == handoff.DEFER
-    assert handoff.load_retry(env, "9", "review_comment_missing")["attempts"] == 1
+    assert handoff.load_retry(env, "9", "review_comment_missing", "3")["attempts"] == 1
 
 
 @pytest.mark.parametrize("restart", [False, True])
@@ -243,17 +248,64 @@ def test_a_terminal_handoff_clears_every_pending_retry_of_the_episode(env, monke
     monkeypatch.setattr(handoff.notify, "notify", lambda *a, **k: None)
     common = {"kind": "pr", "number": "1", "title": "t", "text": "x", "hooks": hooks, "item": "1", "episode": "ep"}
     handoff.perform(env, "spec_comments_read_failed", transient=True, continuation={}, **common)
-    handoff.perform(env, "spec_pending_adr_read_failed", transient=True, continuation={"pr": "77"}, **common)
+    handoff.perform(env, "spec_pending_adr_read_failed", transient=True, continuation={"step": "discovery"}, **common)
     assert handoff.perform(env, "fix_run_failed", **common).action == handoff.HANDOFF
-    assert handoff.load_retry(env, "ep", "spec_comments_read_failed") is None
-    assert handoff.load_retry(env, "ep", "spec_pending_adr_read_failed") is None
+    assert handoff.load_retry(env, "ep", "spec_comments_read_failed", "1") is None
+    assert handoff.load_retry(env, "ep", "spec_pending_adr_read_failed", "1") is None
+
+
+def test_review_retries_for_two_prs_on_one_issue_are_independent(env, monkeypatch):
+    hooks, _ = _hooks()
+    monkeypatch.setattr(handoff, "clock", lambda: 1_000)
+    monkeypatch.setattr(handoff, "label_ready", lambda *a, **k: MagicMock(returncode=0))
+    monkeypatch.setattr(handoff.notify, "notify", lambda *a, **k: None)
+    reason = "review_comment_missing"
+
+    def fail(pr, transient):
+        return handoff.perform(env, reason, kind="pr", number=pr, title="t", text="x", hooks=hooks,
+                               item=pr, episode="9", transient=transient, continuation=review_binding(pr))
+
+    assert fail("3", True).action == fail("4", True).action == handoff.DEFER
+    assert fail("3", False).action == handoff.HANDOFF
+    assert handoff.load_retry(env, "9", reason, "3") is None
+    assert handoff.load_retry(env, "9", reason, "4")["continuation"] == review_binding("4")
+
+
+@pytest.mark.parametrize("damage", ["reason", "episode", "deadline", "binding"])
+def test_damage_to_a_waiting_review_hands_off_once(env, monkeypatch, damage):
+    import json
+
+    hooks, events = _hooks()
+    monkeypatch.setattr(handoff, "clock", lambda: 1_000)
+    monkeypatch.setattr(handoff, "label_ready", lambda *a, **k: MagicMock(returncode=0))
+    monkeypatch.setattr(handoff.notify, "notify", lambda *a, **k: None)
+    reason = "review_comment_missing"
+    common = {"kind": "pr", "number": "3", "title": "t", "text": "x", "hooks": hooks,
+              "item": "3", "episode": "9"}
+    assert handoff.perform(env, reason, transient=True, continuation=review_binding("3"), **common).action == handoff.DEFER
+    path = handoff.retry_path(env, "9", reason, "3")
+    saved = json.loads(path.read_text())
+    if damage == "deadline":
+        saved.update(due=100_060, scheduled=100_000)
+    elif damage == "binding":
+        del saved["continuation"]["digest"]
+        checkpoint = handoff.waiting_path(env, "9", reason, "3")
+        checkpoint.write_text(json.dumps({key: saved[key] for key in ("reason", "episode", "item", "continuation")}))
+    else:
+        saved[damage] = "different"
+    path.write_text(json.dumps(saved))
+    assert handoff.perform(env, reason, resume=True, **common).action == handoff.HANDOFF
+    assert events == [("handoff", reason, "--reason", reason)]
+    assert handoff.load_retry(env, "9", reason, "3") is None
 
 
 def test_every_category_1_reason_is_rule_mode_with_retry_budget():
-    for entry in handoff.REASONS.values():
-        if entry.category != 1:
-            continue
-        assert entry.mode == "rule" and entry.actions == ()
+    assert handoff.RETRY_REASONS == {
+        "review_comment_missing", "spec_comments_read_failed", "spec_pending_adr_read_failed",
+    }
+    for reason in handoff.RETRY_REASONS:
+        entry = handoff.REASONS[reason]
+        assert (entry.category, entry.mode, entry.actions) == (1, "rule", ())
 
 
 @pytest.mark.parametrize("reason", ["review_comment_missing", "spec_comments_read_failed",
@@ -268,21 +320,23 @@ def test_each_category_1_reason_defers_then_hands_off_through_perform(env, monke
                         lambda *a, **k: labelled.append(1) or MagicMock(returncode=0))
     monkeypatch.setattr(handoff.notify, "notify", lambda *a, **k: None)
     monkeypatch.setattr(handoff.advisor, "advise", lambda *a, **k: calls.append(1) or handoff.advisor.Decision("handoff"))
+    binding = {"review_comment_missing": review_binding("1"), "spec_comments_read_failed": {},
+               "spec_pending_adr_read_failed": {"step": "discovery"}}[reason]
     assert handoff.perform(env, reason, kind="pr", number="1", title="t", text="x",
                            hooks=hooks, item="1", episode="ep", transient=True,
-                           continuation={"op": reason}).action == handoff.DEFER
+                           continuation=binding).action == handoff.DEFER
     clock["now"] = 1_060
     assert handoff.perform(env, reason, kind="pr", number="1", title="t", text="x",
                            hooks=hooks, item="1", episode="ep", resume=True).action == handoff.RETRY
     assert handoff.perform(env, reason, kind="pr", number="1", title="t", text="x",
                            hooks=hooks, item="1", episode="ep", transient=True,
-                           continuation={"op": reason}).action == handoff.DEFER
+                           continuation=binding).action == handoff.DEFER
     clock["now"] = 1_360
     assert handoff.perform(env, reason, kind="pr", number="1", title="t", text="x",
                            hooks=hooks, item="1", episode="ep", resume=True).action == handoff.RETRY
     done = handoff.perform(env, reason, kind="pr", number="1", title="t", text="x",
                            hooks=hooks, item="1", episode="ep", transient=True,
-                           continuation={"op": reason})
+                           continuation=binding)
     assert done.handed_off and labelled == [1] and calls == []
 
 
@@ -340,7 +394,8 @@ def test_a_malformed_retry_record_hands_off_without_defaults(env, monkeypatch, p
     assert handoff.load_retry(env, "7", "spec_comments_read_failed") is None
 
 
-def test_a_non_file_retry_path_hands_off(env, monkeypatch, tmp_path):
+@pytest.mark.parametrize("damage", ["directory", "dangling link"])
+def test_a_non_file_retry_path_hands_off(env, monkeypatch, tmp_path, damage):
     """A retry path that exists but is not a regular file fails closed (#151)."""
     labelled = []
     hooks, _ = _hooks()
@@ -349,7 +404,11 @@ def test_a_non_file_retry_path_hands_off(env, monkeypatch, tmp_path):
                         lambda *a, **k: labelled.append(1) or MagicMock(returncode=0))
     monkeypatch.setattr(handoff.notify, "notify", lambda *a, **k: None)
     path = handoff.retry_path(env, "7", "spec_comments_read_failed")
-    path.mkdir()
+    if damage == "directory":
+        path.mkdir()
+        (path / "child").write_text("damaged retry")
+    else:
+        path.symlink_to(tmp_path / "missing")
     with pytest.raises(handoff.RetryUnreadable):
         handoff.load_retry(env, "7", "spec_comments_read_failed")
     done = handoff.perform(env, "spec_comments_read_failed", kind="issue", number="7", title="t", text="x",

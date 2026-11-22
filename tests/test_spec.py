@@ -74,7 +74,10 @@ class FakeGH:
                 return subprocess.CompletedProcess(args, 1, "", "boom")
             self.comments.append({"author": {"login": self.owner}, "body": body})
         elif head == "pr list":
-            out = self.adr_pr
+            out = json.dumps([{"number": int(self.adr_pr), "headRefName": f"docs/spec-issue-{N}",
+                               "baseRefName": "main", "headRefOid": self.head_oid, "isCrossRepository": False,
+                               "headRepository": {"name": "app"}, "headRepositoryOwner": {"login": "owner"}}]
+                             if self.adr_pr else [])
         elif head == "pr create":
             self.adr_pr = "77"
             out = "https://github.com/owner/app/pull/77\n"
@@ -165,7 +168,7 @@ def test_the_state_is_the_latest_spec_comment_of_the_owner(loop):
         {"author": {"login": "stranger"}, "body": "<!-- baton-spec-reply round=9 by=claude -->"},
         {"author": {"login": "owner"}, "body": "<!-- baton-spec-reply round=1 human by=claude -->\ny"}]
     assert spec.spec_state(env, N) == ("reply-human", 1)
-    assert spec.last_by(env, N, "review") == "codex" and spec.last_by(env, N, "reply") == "claude"
+    assert spec.last_by(loop.gh.comments, "owner", "review") == "codex" and spec.last_by(loop.gh.comments, "owner", "reply") == "claude"
 
 
 def test_the_plan_is_the_latest_verdict_of_the_owner_or_cursor(loop):
@@ -305,7 +308,7 @@ def test_adr_edits_are_pushed_as_a_docs_pr_that_merges_on_accept(loop):
     assert loop.run() is True
     assert loop.gh.ran("pr", "create", "--head", f"docs/spec-issue-{N}", "--base", "main")
     assert any(c[:3] == ["pr", "merge", "77"] and "--merge" in c for c in loop.gh.calls)
-    assert loop.gh.posted("<!-- baton-spec-accept-pending pr=77 -->")
+    assert loop.gh.posted("<!-- baton-spec-accept-pending pr=77")
     reply, = loop.gh.posted("<!-- baton-spec-reply round=1 by=")
     assert "\nADR revisions: #77\n" in reply
     assert "docs PR #77" in loop.runs[2]["prompt"]
@@ -316,7 +319,7 @@ def test_an_accept_with_a_red_adr_pr_goes_to_the_owner(loop):
     loop.ci = False
     assert loop.run() is False
     assert "ready-for-human" in loop.gh.labels and not loop.gh.posted("<!-- baton-verdict: accept")
-    assert loop.gh.posted("<!-- baton-spec-accept-pending pr=77 -->")
+    assert loop.gh.posted("<!-- baton-spec-accept-pending pr=77")
     assert not any(c[:2] == ["pr", "merge"] for c in loop.gh.calls)
 
 
@@ -596,9 +599,9 @@ def test_same_vendor_denial_retry_publishes_only_the_verified_attempt(loop, monk
         return rc
 
     monkeypatch.setattr(claude_cli, "run_cli", cli)
-    assert s.review_round(1, 6, context) == "changes"
+    assert s.review_round(1, 6, context, loop.gh.comments) == "changes"
     original_body = loop.gh.body
-    assert s.revise_round(1, context) == "revised"
+    assert s.revise_round(1, context, loop.gh.comments) == "revised"
     reply, = loop.gh.posted("<!-- baton-spec-reply")
     assert reply.endswith("Verified reply")
     assert loop.gh.body == original_body
@@ -652,7 +655,7 @@ def test_claude_spec_revision_verifies_main_session_models(loop, monkeypatch, sp
         return 0
 
     monkeypatch.setattr(claude_cli, "run_cli", cli)
-    assert s.review_round(round, 6, path) == "changes"
+    assert s.review_round(round, 6, path, loop.gh.comments) == "changes"
     assert spec.last_model(env, N, "review", round) == ("unknown" if scenario == "unknown review" else review_model)
     if scenario == "short block":
         Path(env.config.paths.state, "codex-cooldown-until").write_text(str(int(time.time()) + 60))
@@ -667,10 +670,10 @@ def test_claude_spec_revision_verifies_main_session_models(loop, monkeypatch, sp
     if scenario in ("shared", "inherited", "short block", "unknown review", "five-hour quota"):
         reason = "waiting for codex" if scenario in ("short block", "five-hour quota") else "no vendor can run now"
         with pytest.raises(Deferred, match=reason):
-            s.revise_round(round, path)
+            s.revise_round(round, path, loop.gh.comments)
         assert calls == ["opus"]
     else:
-        assert s.revise_round(round, path) == ("revised" if publish else "stop")
+        assert s.revise_round(round, path, loop.gh.comments) == ("revised" if publish else "stop")
         assert calls == (["sonnet", "opus"] if round == 2 else ["opus", "sonnet"])
     replies = loop.gh.posted("<!-- baton-spec-reply")
     if publish:
@@ -732,7 +735,7 @@ def test_codex_spec_fallback_verifies_actual_model_at_cli(loop, monkeypatch, spe
         return 0
 
     monkeypatch.setattr(codex_cli, "run_cli", cli)
-    run = (lambda: s.revise_round(2, path)) if revision else (lambda: s.review_round(2, 6, path))
+    run = (lambda: s.revise_round(2, path, loop.gh.comments)) if revision else (lambda: s.review_round(2, 6, path, loop.gh.comments))
     if scenario in ("prior unknown", "prior identical", "short block"):
         with pytest.raises(Deferred):
             run()
@@ -904,7 +907,7 @@ def test_a_closed_adr_pr_hands_off_without_a_verdict(loop):
     loop.gh.pr_state = "CLOSED"
     assert loop.run() is False
     assert "ready-for-human" in loop.gh.labels and not loop.gh.posted("<!-- baton-verdict: accept")
-    assert loop.gh.posted("<!-- baton-spec-accept-pending pr=77 -->")  # still pending
+    assert loop.gh.posted("<!-- baton-spec-accept-pending pr=77")  # still pending
 
 
 def test_verdict_write_failure_after_merge_retries_without_another_merge(loop):
@@ -965,7 +968,7 @@ def test_three_behind_updates_on_the_spec_path_hand_off_with_merge_failed(loop, 
     assert loop.run() is False
     assert len([c for c in loop.gh.calls if c[:2] == ["pr", "update-branch"]]) == 3
     assert "ready-for-human" in loop.gh.labels and not loop.gh.posted("<!-- baton-verdict: accept")
-    assert loop.gh.posted("<!-- baton-spec-accept-pending pr=77 -->")
+    assert loop.gh.posted("<!-- baton-spec-accept-pending pr=77")
     assert any("merging the ADR PR #77 failed" in text for text in notes)
 
 
@@ -1069,12 +1072,85 @@ def test_an_unreadable_adr_pr_state_defers_then_hands_off_with_the_pending_comme
     assert loop.gh.posted(PENDING) and "ready-for-human" in loop.gh.labels
 
 
+@pytest.mark.parametrize("changed", [False, True])
+def test_acceptance_waits_through_issue_transport_failure_and_checks_the_saved_head(loop, monkeypatch, changed):
+    now = _spec_clock(monkeypatch)
+    resume_pending(loop, monkeypatch)
+    loop.gh.labels.clear()
+    loop.gh.comments[0]["body"] = f"{PENDING} head={'a' * 40} -->\n{VERDICT_BODY}"
+    original = spec.pr_helpers.gh
+    reads = {"pr": 0, "issue": 0}
+
+    def gh(*args, **kwargs):
+        if args[:2] in (("issue", "view"), ("pr", "view")):
+            reads[args[0]] += 1
+            if (args[0] == "pr" and now["now"] == 1_000 or args[0] == "issue" and now["now"] == 1_060):
+                return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(spec.pr_helpers, "gh", gh)
+    with pytest.raises(Deferred, match="spec_pending_adr_read_failed"):
+        loop.run()
+    assert reads == {"pr": 1, "issue": 1}
+    before = len(loop.gh.calls)
+    now["now"] = 1_059
+    with pytest.raises(Deferred, match="spec_pending_adr_read_failed"):
+        loop.run()
+    assert len(loop.gh.calls) == before
+    now["now"] = 1_060
+    with pytest.raises(Deferred, match="spec_pending_adr_read_failed"):
+        loop.run()
+    assert not loop.gh.posted(ACCEPTED) and "ready-for-human" not in loop.gh.labels
+    assert reads == {"pr": 1, "issue": 2}
+    loop.gh.head_oid = ("b" if changed else "a") * 40
+    loop.gh.pr_state = "MERGED"
+    now["now"] = 1_360
+    assert loop.run() == (not changed)
+    assert reads == {"pr": 2, "issue": 3}
+    assert bool(loop.gh.posted(ACCEPTED)) == (not changed)
+
+
+def test_next_spec_round_waits_for_a_fresh_payload_after_posting(loop, monkeypatch):
+    now = _spec_clock(monkeypatch)
+    gh = spec.pr_helpers.gh
+    loop.gh.labels.clear()
+    loop.script = [CHANGES, reviser(), ACCEPT]
+
+    def unavailable_after_post(*args, **kwargs):
+        if args[:2] == ("issue", "view") and "title,body,comments" in args and now["now"] < 1_060:
+            if loop.gh.posted("<!-- baton-spec-review"):
+                return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return gh(*args, **kwargs)
+
+    monkeypatch.setattr(spec.pr_helpers, "gh", unavailable_after_post)
+    with pytest.raises(Deferred, match="spec_comments_read_failed"):
+        loop.run()
+    assert [run["role"] for run in loop.runs] == ["spec_review"]
+    now["now"] = 1_060
+    assert loop.run() is True
+    assert [run["role"] for run in loop.runs] == ["spec_review", "spec", "spec_review"]
+    assert loop.runs[0]["vendor"] != loop.runs[1]["vendor"]
+
+
 def test_unreadable_issue_comments_hand_off_instead_of_starting_a_review(loop):
     loop.gh.labels = {"needs-triage"}   # the handoff must add ready-for-human, not find it there
     loop.gh.flaky["issue view"] = [("HTTP 401: Bad credentials", False)]
     assert loop.run() is False
     assert loop.runs == [] and not loop.gh.ran("pr", "create")
     assert not loop.gh.posted(ACCEPTED) and "ready-for-human" in loop.gh.labels
+
+
+def test_incomplete_issue_payload_hands_off_before_worker(loop, monkeypatch):
+    gh = spec.pr_helpers.gh
+
+    def incomplete(*args, **kwargs):
+        if args[:2] == ("issue", "view") and "title,body,comments" in args:
+            return subprocess.CompletedProcess(args, 0, "{}", "")
+        return gh(*args, **kwargs)
+
+    monkeypatch.setattr(spec.pr_helpers, "gh", incomplete)
+    assert loop.run() is False
+    assert loop.runs == [] and "ready-for-human" in loop.gh.labels
 
 
 def _spec_clock(monkeypatch):
@@ -1121,6 +1197,41 @@ def test_a_recovered_spec_read_clears_its_saved_retry(loop, monkeypatch):
     assert loop.run() is True
     assert loop.runs and loop.runs[0]["role"] == "spec_review"
     assert not list(Path(loop.env["STATE"]).glob("handoff-retry-*spec_comments_read_failed*"))
+
+
+@pytest.mark.parametrize("matches", ["local", "fork", "ambiguous"])
+def test_spec_run_recovers_adr_discovery_and_checks_identity(loop, monkeypatch, matches):
+    clock = _spec_clock(monkeypatch)
+    loop.gh.labels.clear()
+    loop.script = [ACCEPT]
+    adr = {"number": 77, "headRefName": f"docs/spec-issue-{N}", "baseRefName": "main",
+           "headRefOid": "a" * 40, "headRepository": {"name": "app"},
+           "headRepositoryOwner": {"login": "owner"}, "isCrossRepository": False}
+    results = {"local": [adr], "fork": [{**adr, "isCrossRepository": True,
+                                        "headRepositoryOwner": {"login": "fork"}}],
+               "ambiguous": [adr, {**adr, "number": 78}]}
+    original = spec.pr_helpers.gh
+    reads = []
+
+    def gh(*args, **kwargs):
+        if args[:2] == ("pr", "list"):
+            reads.append(clock["now"])
+            if len(reads) == 1:
+                return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+            return subprocess.CompletedProcess(args, 0, json.dumps(results[matches]), "")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(spec.pr_helpers, "gh", gh)
+    entry = lambda: spec.run(SimpleNamespace(issue=N), loop.env)
+    assert entry()["rc"] == 75 and loop.runs == []
+    clock["now"] = 1_059
+    assert entry()["rc"] == 75 and reads == [1_000]
+    clock["now"] = 1_060
+    assert entry()["rc"] == (1 if matches == "ambiguous" else 0)
+    assert reads == [1_000, 1_060]
+    assert bool(loop.runs) == (matches != "ambiguous")
+    assert bool(merges(loop)) == (matches == "local")
+    assert bool(loop.gh.posted(ACCEPTED)) == (matches != "ambiguous")
 
 
 def accept_now(loop, monkeypatch):

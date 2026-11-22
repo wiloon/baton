@@ -103,6 +103,7 @@ class Tick:
         self.lock_file = None
         self.exec = os.execv
         self.active = {}
+        self.recovered_issues = {}
         self.fetch_failed = False
 
     # --- logging, GitHub and git --------------------------------------------------------
@@ -460,13 +461,15 @@ class Tick:
         pr = saved.get("pr", "")
         if (self.force_pr or self.force_review) and pr != self.force_pr + self.force_review:
             return 0
-        state = self.state_of("pr", pr)
-        if state not in ("OPEN", "MERGED", "CLOSED"):
-            return 0
+        if saved.get("step") != "fix" or not (saved.get("reviewed_head") or saved.get("feedback_waiting")):
+            state = self.state_of("pr", pr)
+            if state not in ("OPEN", "MERGED", "CLOSED"):
+                return 0
+            if state != "OPEN":
+                self.active["pr"] = str(pr)
+                path.unlink(missing_ok=True)
+                return 0
         self.active["pr"] = str(pr)
-        if state != "OPEN":
-            path.unlink(missing_ok=True)
-            return 0
         rc = self.review_loop(pr, saved.get("wt", ""), saved.get("note", ""), saved.get("fixer", ""),
                               saved.get("reviewer", ""), issue=saved.get("ISSUE", ""))
         return 75 if rc == 75 else 80
@@ -591,19 +594,52 @@ class Tick:
         return 75 if rc == 75 else 80
 
     # --- pick work: an issue for the pipeline ------------------------------------------------------
+    def pending_specs(self):
+        """Resume durable spec reads before new work can be blocked by admission or labels."""
+        found = {}
+        for reason in ("spec_comments_read_failed", "spec_pending_adr_read_failed"):
+            for prefix in ("waiting", "retry"):
+                for path in self.state.glob(f"handoff-{prefix}-*-{reason}.json"):
+                    issue = path.name.removeprefix(f"handoff-{prefix}-").removesuffix(f"-{reason}.json")
+                    if issue.isdecimal():
+                        found[issue] = reason
+        return found
+
+    def resume_spec(self, issue):
+        self.spec_loop(issue)
+        return 80
+
     def pick_issue(self):
         """Trusted authors' issues or external issues explicitly labelled ready-for-agent,
         with a plan comment: the latest
         accept/revise verdict from Claude's triage, from Cursor, or posted for Cursor (the spec
         review posts one when Cursor accepts). python -m baton N takes any ready-for-agent issue, or a
         claude-found one awaiting triage (any milestone)."""
-        issue = ""
-        if self.force_issue:
-            issue = self.forced_issue()
-        elif self.force_pr or self.force_review:
+        if self.force_pr or self.force_review:
             return None
-        else:
-            issue = self.next_issue()
+        pending = self.pending_specs()
+        for issue in sorted(pending, key=int):
+            if self.force_issue and self.force_issue != issue:
+                continue
+            data = self.gh_json("issue", "view", issue, "-R", self.gh_repo, "--json", "state,labels")
+            if not isinstance(data, dict) or data.get("state") not in ("OPEN", "CLOSED"):
+                continue
+            if data["state"] == "CLOSED":
+                owner_handoff.clear_episode(self.env, issue)
+                continue
+            labels = data.get("labels")
+            if not isinstance(labels, list) or any(not isinstance(label, dict) or label.get("name") == "ready-for-human"
+                                                  for label in labels):
+                continue
+            if pending[issue] == "spec_pending_adr_read_failed":
+                done = self.after_item(self.item(lambda: self.resume_spec(issue)))
+            else:
+                done = self.after_item(self.item(lambda: dev.run(self, issue)))
+            if done is not None:
+                return done
+        if self.force_issue and self.force_issue in pending:
+            return None
+        issue = self.forced_issue() if self.force_issue else self.next_issue()
         if not issue:
             return None
         return self.after_item(self.item(lambda: dev.run(self, issue)))
@@ -710,51 +746,32 @@ class Tick:
             self.log(f"{len(pending)} issue(s) still waiting on review (agent-wip), cap {cap}, {len(deferred)} deferred, "
                      f"{limit}; not starting new work: " + "; ".join(why))
             return ""
+        waiting = self.pending_specs()
         for n in self.candidates():
-            if any(names.issue_of(b) == str(n) for b in branches):
+            if str(n) in waiting or any(names.issue_of(b) == str(n) for b in branches):
                 continue   # already has a PR
             # These issues can be at different steps: one whose next step no vendor can run now must
             # not block another (revision needs a pool vendor).
             issue = str(n)
-            # A pending comments retry must not be bypassed by accept_pending / cursor_plan /
-            # spec_state (each would read again during the 60s/300s wait). When due, one gated
-            # read selects plan, role and round from the same payload Spec.loop will use (#151).
             try:
-                pending = owner_handoff.load_retry(self.env, issue, "spec_comments_read_failed")
-            except owner_handoff.RetryUnreadable:
-                spec.Spec(self.env, self.hooks(issue), issue).handoff(
-                    "Could not read the saved comments retry.", "spec_comments_read_failed")
+                payload = spec.Spec(self.env, self.hooks(issue), issue).issue_payload()
+            except Deferred as deferred:
+                self.defer(deferred.vendor, deferred.reason)
                 continue
-            if pending is not None:
-                try:
-                    payload = spec.Spec(self.env, self.hooks(issue), issue).retry_read(
-                        lambda: spec.read_issue(self.env, issue),
-                        "Could not read issue comments to select the next step.",
-                        "spec_comments_read_failed")
-                except Deferred as deferred:
-                    self.defer(deferred.vendor, deferred.reason)
-                    continue
-                if payload is None:
-                    continue
-                recovered = getattr(self, "recovered_issues", None)
-                if recovered is None:
-                    self.recovered_issues = recovered = {}
-                recovered[issue] = payload
-                role = spec.role_from(payload.get("comments") or [], self.env)
-            elif spec.accept_pending(self.env, issue) or spec.cursor_plan(self.env, issue):
-                # Pending ADR acceptance needs a later tick to finish the merge; treat it as
-                # ready for the implementation role's vendor pool so it is not blocked when
-                # only a spec reviewer/reviser is unavailable (#122).
-                role = "dev"
-            else:
-                role = spec.pending_role(spec.spec_state(self.env, issue)[0])
+            if payload is None:
+                continue
+            if spec.accept_pending(self.env, issue, listed=payload["comments"]):
+                self.recovered_issues[issue] = payload
+                return issue
+            role = spec.role_from(payload["comments"], self.env)
             candidates = list(self.env.config.pool()) if role == "reviser" else self.all_vendors()
             try:
                 self.pick_vendor(role, "contrib", candidates, issue=issue)
             except Deferred as deferred:
                 self.defer(deferred.vendor, deferred.reason)
                 continue
-            return str(n)
+            self.recovered_issues[issue] = payload
+            return issue
         return ""
 
     def candidates(self):
