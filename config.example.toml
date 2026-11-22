@@ -229,6 +229,9 @@ cap = 0.90
 max_minutes = 150
 fallback_models = ["claude_fast", "claude_strong"]
 quota_probe_model = "claude_probe"
+# Optional override of [quota] quota_five_hour_max for this vendor's 5-hour window (same fraction
+# rules as cap). Omit to use the global default. Only vendors that report a 5-hour window are gated.
+# five_hour_max = 1.0
 
 [vendors.codex]
 adapter = "codex"
@@ -238,6 +241,8 @@ cap = 0.95
 max_minutes = 60
 fallback_models = ["codex_prev", "codex_strong"]
 cache_dirs = ["~/.local/share/pnpm", "~/.local/state/pnpm", "~/.cache/pnpm", "~/.cache/node/corepack", "~/.cache/node-compile-cache", "~/.cache/ms-playwright", "~/.cache/go-build", "~/go/pkg/mod", "~/.cache/go-tmp", "~/.cache/uv"]
+# Optional: same fraction rules as cap; falls back to [quota] quota_five_hour_max when omitted.
+# five_hour_max = 1.0
 
 [vendors.cursor]
 adapter = "cursor"
@@ -245,9 +250,12 @@ roles = ["dev", "fixer", "reviewer", "spec_reviewer", "retrospective"]
 quota = "extra"
 cap = 0.95
 max_minutes = 60
+# Optional: accepted and stored, but Cursor reports only a weekly window today, so the 5-hour gate
+# does not apply to admission.
+# five_hour_max = 1.0
 
 [quota]
-# No vendor runs while its 5-hour window is at least this full.
+# Default 5-hour gate for vendors that report a 5-hour window and omit vendors.<id>.five_hour_max.
 quota_five_hour_max = 0.9
 # A quota snapshot older than this is refreshed (by a one-turn probe run) before a pick relies on it.
 quota_stale_minutes = 30

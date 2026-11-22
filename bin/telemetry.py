@@ -710,11 +710,11 @@ def quota_metrics(state, config, emit, now):
     """
     if config is None:
         return
-    five_cap = config.quota.quota_five_hour_max
     stale_minutes = config.quota.quota_stale_minutes
     for vendor in config.declared():
         labels = '{agent="' + vendor + '"}'
         gate, blocked, states = 0, 0, []
+        five_cap = config.quota.five_hour_max_of(vendor)
         try:
             snap = read(state / ('quota-' + vendor + '.json'))
             if not isinstance(snap, dict) or not isinstance(snap.get('windows', {}), dict):

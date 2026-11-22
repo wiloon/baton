@@ -335,10 +335,11 @@ def preference_order(vendors, prefer=()):
     return [*first, *(v for v in vendors if v not in first)]
 
 
-def pick(vendors, snapshots, caps, five_hour_max, now, current=None, prefer=()):
+def pick(vendors, snapshots, caps, five_hour_maxes, now, current=None, prefer=()):
     scored, parts = {}, []
     for vendor in vendors:
-        score, reason = assess(snapshots.get(vendor), caps.get(vendor, 0.95), five_hour_max, now)
+        score, reason = assess(snapshots.get(vendor), caps.get(vendor, 0.95),
+                               five_hour_maxes[vendor], now)
         if reason:
             parts.append(f"{vendor}=blocked({reason})")
         else:
@@ -387,9 +388,9 @@ def main(argv):
                 prefer = args[1].split()
             args = args[2:]
         caps = {v: cfg.cap(v) for v in args}
+        limits = {v: cfg.quota.five_hour_max_of(v) for v in args}
         chosen, summary = pick(args, {v: load(state, v) for v in args}, caps,
-                               float(cfg.quota.quota_five_hour_max), now, current,
-                               prefer)
+                               limits, now, current, prefer)
         print(chosen or "")
         print(summary)
         return 0 if chosen else 1
