@@ -28,10 +28,27 @@ actions. For a problem that needs investigation, it may recommend one retry of t
 step or a handoff. The decision records can justify a separate follow-up for a backend with
 read-only tools behind the same interface if these retries frequently fail.
 
-After a fix, a rejected PR description request is a recoverable runner outcome. The runner
-reports why it rejected the request and uses the usual evidence of progress to decide whether
-review can continue. Review and merge preflight still check the live PR. This case needs no
-advisor decision or handoff of its own.
+A safe retry is a rule. For a GitHub read or write that failed in transit, or an expected comment
+that is not visible yet, the runner may replay the saved operation within a bounded budget that
+survives a restart. It repeats a write only after confirming that the write did not land and that
+its inputs are unchanged. A landed write counts as done and superseded work is dropped. Anything
+else goes to handoff, except the description requests below. The saved merge of an accepted
+spec's ADR PR qualifies, because it repeats a merge the runner already decided on and checks
+acceptance and CI again. That merge is pinned to the accepted head, or to the runner's own update
+of it once verified as only a clean merge of the base branch. A new head alone is no such proof.
+The update itself names the validated head as a condition, so GitHub refuses it and leaves the
+branch untouched if someone pushed first. GitHub applies an update asynchronously, so an
+unchanged head can't confirm that an update did not land. After an inconclusive response the
+runner never resends that update. It waits for a head that passes the same verification and
+otherwise hands off. One deadline, saved before the update is sent, bounds the request, that wait
+and every call in it. A restart doesn't extend the deadline, and an answer that arrives after it
+validates nothing. Other merge recovery keeps its decision point.
+
+After a fix, a rejected or failed PR description request is a recoverable runner outcome. A
+failed request that can be resumed may first use the safe retry budget. If it still can't be
+applied, the runner discards it, reports why, and uses the usual evidence of progress to decide
+whether review can continue. Review and merge preflight still check the live PR. This case needs
+no advisor decision or handoff of its own.
 
 Every advisor call starts a fresh session, and no conversation carries over to the next call.
 Continuity lives in state files, GitHub and the decision record. Each call appends a **decision
@@ -103,3 +120,14 @@ advisor action per reason and task episode, and a recurrence after that action g
   boundary when only the advisor is enabled.
 - Issue #141: let the normal progress rule and preflight handle rejected description requests
   after a fix, so a bad replacement does not send a valid fix to the owner.
+- Issue #151: define a safe retry, so category-1 replay can't duplicate a write or act on changed
+  inputs. Place the saved ADR merge write under that rule, separate from advisor merge recovery,
+  and state that #141's exception also covers failed description requests, per the owner.
+- Issue #151 (spec round 2): require proof that an updated ADR head is the runner's clean update,
+  so a concurrent push can't become the head that the merge pins.
+- Issue #151 (spec round 3): make the ADR branch update conditional on the validated head, because
+  checking the result afterwards can't undo an update to a head the runner never validated.
+- Issue #151 (spec round 4, owner answer): never resend an ADR branch update after an inconclusive
+  response, because a queued update leaves the old head visible and absence can't be confirmed.
+- Issue #151 (spec round 5): give each ADR branch update one saved deadline that also bounds its
+  calls, because a stalled call or a restart could otherwise postpone the handoff without limit.
