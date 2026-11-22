@@ -150,6 +150,7 @@ class Vendor:
     quota: str  # pool|extra
     cap: float
     max_minutes: int
+    five_hour_max: float | None = None
     fallback_models: tuple[str, ...] = ()
     cache_dirs: tuple[Path, ...] = ()
     quota_probe_model: str = ""
@@ -198,12 +199,23 @@ class Quota:
     quota_probe_retry_minutes: int = 5
     quota_probe_max_retry_minutes: int = 60
     same_vendor_wait_max_minutes: int = 360
+    five_hour_maxes: tuple[tuple[str, float | None], ...] = ()
 
     def cap_of(self, vendor):
         caps = dict(self.caps)
         if vendor not in caps:
             raise ConfigError(f"quota: no cap configured for vendor {vendor}")
         return caps[vendor]
+
+    def five_hour_max_of(self, vendor):
+        caps = dict(self.caps)
+        if vendor not in caps:
+            raise ConfigError(f"quota: no five_hour_max configured for vendor {vendor}")
+        overrides = dict(self.five_hour_maxes)
+        if vendor not in overrides:
+            return self.quota_five_hour_max
+        value = overrides[vendor]
+        return self.quota_five_hour_max if value is None else value
 
 
 @dataclass(frozen=True)
@@ -472,13 +484,18 @@ def _load_vendors(raw, directory, home, aliases):
         max_minutes = entry.get("max_minutes")
         if type(max_minutes) is not int or max_minutes <= 0:
             raise ConfigError(f"{label}.max_minutes: expected a positive integer")
+        five_hour_max = entry.get("five_hour_max")
+        if five_hour_max is not None:
+            if type(five_hour_max) not in (int, float) or not 0 < five_hour_max <= 1:
+                raise ConfigError(f"{label}.five_hour_max: expected a fraction at most 1")
+            five_hour_max = float(five_hour_max)
         supported = agents.ADAPTERS[adapter].SUPPORTED_ROLES
         if unsupported := set(roles) - supported:
             raise ConfigError(f"{label}.roles: adapter {adapter} does not support "
                               f"{', '.join(sorted(unsupported))}")
         if quota == "pool" and "seven_day" not in agents.ADAPTERS[adapter].QUOTA_WINDOWS:
             raise ConfigError(f"{label}.quota: pool vendors need a weekly quota window")
-        extra = set(entry) - {"adapter", "roles", "quota", "cap", "max_minutes",
+        extra = set(entry) - {"adapter", "roles", "quota", "cap", "max_minutes", "five_hour_max",
                               "fallback_models", "cache_dirs", "quota_probe_model"}
         if extra:
             raise ConfigError(f"{label}: unknown fields: {', '.join(sorted(extra))}")
@@ -503,7 +520,7 @@ def _load_vendors(raw, directory, home, aliases):
         if cli.PROBE_SENDS_MODEL:
             probe = _model_alias(probe, aliases, f"{label}.quota_probe_model")
         vendors.append(Vendor(vendor_id, adapter, tuple(roles), quota, float(cap), max_minutes,
-                              fallback, cache, probe))
+                              five_hour_max, fallback, cache, probe))
     if len({v.id for v in vendors}) != len(vendors):
         raise ConfigError("vendors: each vendor id may be configured once")
     return tuple(vendors)
@@ -627,10 +644,11 @@ def load(path: str | Path, *, home: Path | None = None) -> Config:
     sections["retrospectives"] = replace(sections.get("retrospectives", Retrospectives()), **retro_models)
     pool, extra = tuple(v.id for v in vendors if v.quota == "pool"), tuple(v.id for v in vendors if v.quota == "extra")
     caps = tuple((v.id, v.cap) for v in vendors)
+    five_hour_maxes = tuple((v.id, v.five_hour_max) for v in vendors)
     q = sections["quota"]
     sections["quota"] = Quota(q.quota_five_hour_max, q.quota_stale_minutes, caps, pool, extra,
                               q.quota_probe_retry_minutes, q.quota_probe_max_retry_minutes,
-                              q.same_vendor_wait_max_minutes)
+                              q.same_vendor_wait_max_minutes, five_hour_maxes)
     if not isinstance(data['repos'], list) or not data['repos']:
         raise ConfigError("repos: expected at least one [[repos]] entry")
     repos = tuple(_section("repos", Repo, entry, source.parent, home) for entry in data['repos'])

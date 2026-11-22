@@ -303,7 +303,7 @@ def _quota_horizon(state, vendor, now):
     if quota.stale(state, vendor, now, int(config.quota_stale_minutes)):
         return vendor_policy.SHORT
     return quota.horizon(quota.load(state, vendor), config.cap_of(vendor),
-                         config.quota_five_hour_max, now) or vendor_policy.SHORT
+                         config.five_hour_max_of(vendor), now) or vendor_policy.SHORT
 
 
 def _waiting_for_cross_vendor(fallback, runnable, blocked, horizons, slot_blockers):
@@ -345,7 +345,7 @@ def selection_details(state, pool, candidates, chosen, role, *, area="", now=Non
     for vendor in dict.fromkeys(candidates):
         snap = quota.load(state, vendor)
         cap = config.cap_of(vendor)
-        score, blocked = quota.assess(snap, cap, config.quota_five_hour_max, now)
+        score, blocked = quota.assess(snap, cap, config.five_hour_max_of(vendor), now)
         week, reset = quota._used(snap, 'seven_day', now)
         week_text = f'{week:.1%}' if week is not None else 'unknown'
         reset_text = f'{max(0, reset - now)}s' if reset is not None else 'unknown'

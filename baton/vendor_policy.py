@@ -66,11 +66,12 @@ def availability(state, settings, vendor, now, *, strict=False, leased=False):
     if not quota.fresh(state, vendor, now, settings.quota_stale_minutes):
         return Availability('quota_stale', 'quota observations stale or unavailable', True, SHORT)
     cap = settings.cap_of(vendor)
-    _, blocked = quota.assess(snap, cap, settings.quota_five_hour_max, now)
+    five = settings.five_hour_max_of(vendor)
+    _, blocked = quota.assess(snap, cap, five, now)
     if not blocked:
         return Availability()
     return Availability('quota_exhausted', blocked,
-                        horizon=quota.horizon(snap, cap, settings.quota_five_hour_max, now))
+                        horizon=quota.horizon(snap, cap, five, now))
 
 
 def choose(state, settings, pool, candidates, now, *, prefer=(), current='', extras=False):
@@ -81,12 +82,13 @@ def choose(state, settings, pool, candidates, now, *, prefer=(), current='', ext
     candidates = list(dict.fromkeys(candidates))
     snapshots = {v: quota.load(state, v) for v in candidates}
     caps = {v: settings.cap_of(v) for v in candidates}
+    limits = {v: settings.five_hour_max_of(v) for v in candidates}
     if not extras:
-        return quota.pick(candidates, snapshots, caps, settings.quota_five_hour_max, now, current, prefer)
+        return quota.pick(candidates, snapshots, caps, limits, now, current, prefer)
     pooled = [v for v in candidates if v in pool]
-    best, summary = quota.pick(pooled, snapshots, caps, settings.quota_five_hour_max, now, current, prefer)
+    best, summary = quota.pick(pooled, snapshots, caps, limits, now, current, prefer)
     eligible = [v for v in candidates if not quota.assess(
-        snapshots[v], caps[v], settings.quota_five_hour_max, now)[1]]
+        snapshots[v], caps[v], limits[v], now)[1]]
     ordered = quota.preference_order(eligible, prefer)
     chosen = next((v for v in ordered if v not in pool or v == best), None)
     return chosen, summary
