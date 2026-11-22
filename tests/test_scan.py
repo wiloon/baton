@@ -119,6 +119,29 @@ def test_a_failed_filing_keeps_the_draft(env, monkeypatch):
     assert Path(f"{base}.md").exists() and "gh issue create failed" in Path(env["LOGS"], "runner.log").read_text()
 
 
+def test_file_scan_creates_both_missing_labels_then_files(gh, tmp_path):
+    gh.set_labels()
+    base = draft({"STATE": str(tmp_path / "state")})
+    assert scan.file_scan({"STATE": str(tmp_path / "state"), "LOGS": str(tmp_path / "logs"),
+                           "GH_REPO": "owner/app"}, base) is True
+    [issue] = gh.created()
+    assert issue["labels"] == ["claude-found", "needs-triage"]
+    assert set(gh.labels()) >= {"claude-found", "needs-triage"}
+    assert not Path(f"{base}.md").exists()
+    assert [c[2] for c in gh.calls() if c[:2] == ["label", "create"]] == ["claude-found", "needs-triage"]
+
+
+def test_file_scan_keeps_the_draft_when_a_label_stays_missing(gh, tmp_path):
+    gh.set_labels()
+    gh.fail("label-create")
+    base = draft({"STATE": str(tmp_path / "state")})
+    assert scan.file_scan({"STATE": str(tmp_path / "state"), "LOGS": str(tmp_path / "logs"),
+                           "GH_REPO": "owner/app"}, base) is False
+    assert Path(f"{base}.md").exists()
+    assert gh.created() == []
+    assert "gh issue create failed" in Path(tmp_path, "logs", "runner.log").read_text()
+
+
 # --- strip_wrapping_fence ---------------------------------------------------------------------
 
 @pytest.mark.parametrize("text, want", [

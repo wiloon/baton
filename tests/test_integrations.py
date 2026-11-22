@@ -204,7 +204,9 @@ def test_without_linear_owner_actions_go_to_a_github_issue(bound, monkeypatch):
     bound()
     fake = GH({"pr view": "## Before release\n- Rotate the webhook secret\n",
                "issue create": "https://github.com/acme/app/issues/9\n"})
+    from baton import pr as pr_mod
     monkeypatch.setattr(after_merge, "gh", fake)
+    monkeypatch.setattr(pr_mod, "gh", fake)   # create_issue recovers labels through pr.gh
     monkeypatch.setattr(after_merge.urllib.request, "urlopen", no_network)
     monkeypatch.setattr(after_merge, "pr_body", lambda pr: "## Before release\n- Rotate the webhook secret\n")
     after_merge.owner_actions(5, "7")

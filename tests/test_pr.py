@@ -388,3 +388,19 @@ def test_why_is_the_last_stderr_lines():
     result = subprocess.CompletedProcess([], 1, "", "a\n\nb\nc\nHTTP 502: Bad Gateway\n")
     assert pr.why(result) == " (gh: b | c | HTTP 502: Bad Gateway)"
     assert pr.why(subprocess.CompletedProcess([], 1, "", "")) == ""
+
+
+def test_why_redacts_github_tokens_from_stderr(gh, monkeypatch):
+    import subprocess
+    from baton import session
+    ghp = "ghp_" + ("a" * 40)
+    opaque = "opaque-gh-token-value-xyz"
+    monkeypatch.setenv("GH_TOKEN", opaque)
+    # Rebuild the bound session so tools picks up GH_TOKEN.
+    sess = session.resolve()
+    sess.tools["GH_TOKEN"] = opaque
+    stderr = f"auth failed token={ghp} also {opaque}\nmore\ntrail\n"
+    got = pr.why(subprocess.CompletedProcess([], 1, "", stderr))
+    assert ghp not in got and opaque not in got
+    assert "[redacted]" in got
+    assert "auth failed" in got or "trail" in got

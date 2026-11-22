@@ -19,7 +19,7 @@ import urllib.request
 
 from . import checks as check_section, credentials, md, notify as notifier
 from .notify import log, notify
-from .pr import body as pr_body, gh, view
+from .pr import body as pr_body, create_issue, gh, missing_requested_labels, view, why
 
 REF = re.compile(r"([A-Za-z0-9_./-]+\.[A-Za-z0-9]+):([0-9]+)(?:[-–]([0-9]+))?")
 HUNK = re.compile(r"\+[0-9]+(,[0-9]+)?")
@@ -127,12 +127,19 @@ def open_bug_keys():
 def file_bug(pr, src, text):
     """The new issue's number, or None when gh failed."""
     bug = text.split("\n", 1)[0].split(" — ", 1)[0]
-    url = stdout("issue", "create", "-R", repo(), "--label", "needs-triage", "--title", bug[:120],
-                 "--body", f"{text}\n\nFound while working on {src}, outside its scope.")
-    if url is None:
-        log(f"PR #{pr}: filing a side bug failed: {bug}")
+    labels = ("needs-triage",)
+    created, applied = create_issue(
+        repo(), title=bug[:120], labels=labels,
+        body=f"{text}\n\nFound while working on {src}, outside its scope.",
+        allow_unlabelled=True, context=f"PR #{pr}")
+    if created.returncode != 0:
+        log(f"PR #{pr}: filing a side bug failed: {bug}{why(created)}")
         return None
-    notify(f"PR #{pr}: filed a side bug", url)
+    url = created.stdout.rstrip("\n")
+    if not applied:
+        notify(f"PR #{pr}: filed a side bug without label needs-triage — apply it", url)
+    else:
+        notify(f"PR #{pr}: filed a side bug", url)
     return url.rsplit("/", 1)[-1]
 
 
@@ -224,12 +231,17 @@ def follow_ups(pr, issue):
             + (f"\n## Review nits\n\n{nits}\n" if nits else "")
             + (f"\n## Noted while implementing or reviewing\n\n{other}" if other else "") + "\n")
     text = text.encode()[:ISSUE_BODY_MAX].decode(errors="ignore").rstrip("\n")
-    url = stdout("issue", "create", "-R", repo(), "--label", "follow-up",
-                 "--title", f"Follow-ups from #{pr}: {title[:110]}", "--body", text)
-    if url is not None:
-        notify(f"PR #{pr}: follow-ups filed", url)
+    created, applied = create_issue(
+        repo(), title=f"Follow-ups from #{pr}: {title[:110]}", labels=("follow-up",), body=text,
+        allow_unlabelled=True, context=f"PR #{pr}")
+    if created.returncode != 0:
+        log(f"PR #{pr}: filing the follow-up issue failed{why(created)}")
+        return
+    url = created.stdout.rstrip("\n")
+    if not applied:
+        notify(f"PR #{pr}: follow-ups filed without label follow-up — apply follow-up before work starts", url)
     else:
-        log(f"PR #{pr}: filing the follow-up issue failed")
+        notify(f"PR #{pr}: follow-ups filed", url)
 
 
 # --- P-3: owner actions in Linear ------------------------------------------------------
@@ -314,14 +326,20 @@ def owner_actions(pr, issue):
             log(f"PR #{pr}: commenting the Linear links failed")
         notify(f"PR #{pr}: owner actions in Linear", links)
     if failed:
-        url = stdout("issue", "create", "-R", repo(), "--label", "ready-for-human",
-                     "--title", f"Before the next release: owner actions from #{pr}",
-                     "--body", f"{'Filing these in Linear failed' if use_linear else 'Linear is not configured'}, "
-                               f"so they are here instead (principle P-3). From {src}.\n\n{failed}")
-        if url is not None:
-            notify(f"PR #{pr}: owner actions" + (" (Linear failed)" if use_linear else ""), url)
+        body = (f"{'Filing these in Linear failed' if use_linear else 'Linear is not configured'}, "
+                f"so they are here instead (principle P-3). From {src}.\n\n{failed}")
+        created, applied = create_issue(
+            repo(), title=f"Before the next release: owner actions from #{pr}",
+            labels=("ready-for-human",), body=body, allow_unlabelled=True, context=f"PR #{pr}")
+        if created.returncode != 0:
+            log(f"PR #{pr}: owner actions lost, Linear and GitHub both failed{why(created)}: {failed}")
         else:
-            log(f"PR #{pr}: owner actions lost, Linear and GitHub both failed: {failed}")
+            url = created.stdout.rstrip("\n")
+            kind = "owner actions" + (" (Linear failed)" if use_linear else "")
+            if not applied:
+                notify(f"PR #{pr}: {kind} without label ready-for-human — apply it", url)
+            else:
+                notify(f"PR #{pr}: {kind}", url)
     done.touch()
 
 
@@ -419,14 +437,21 @@ def deferred_checks(pr, issue):
         return
     done.touch()   # before writing: a half-written section is logged, never written twice
     if tracker:
-        ok = gh("issue", "comment", tracker, "-R", repo(), "--body", section).returncode == 0
-    else:
-        ok = stdout("issue", "create", "-R", repo(), "--label", "ready-for-human", "--title", TRACKER, "--body",
-                    "Checks of PRs that merged without the owner's look (`manual_checks = \"defer\"`). "
-                    "Try them in one pass, tick what works, then close this issue; the next such PR opens "
-                    f"a new one.\n\n{section}") is not None
-    if not ok:
-        log(f"PR #{pr}: deferred checks lost: {items}")
+        commented = gh("issue", "comment", tracker, "-R", repo(), "--body", section)
+        if commented.returncode != 0:
+            log(f"PR #{pr}: deferred checks lost{why(commented)}: {items}")
+        return
+    body = ("Checks of PRs that merged without the owner's look (`manual_checks = \"defer\"`). "
+            "Try them in one pass, tick what works, then close this issue; the next such PR opens "
+            f"a new one.\n\n{section}")
+    created, _applied = create_issue(
+        repo(), title=TRACKER, labels=("ready-for-human",), body=body,
+        allow_unlabelled=False, context=f"PR #{pr}")
+    if created.returncode == 0:
+        return
+    if missing_requested_labels(created, ("ready-for-human",)):
+        done.unlink(missing_ok=True)   # confirmed pre-write rejection: retry after labels exist
+    log(f"PR #{pr}: deferred checks lost{why(created)}: {items}")
 
 
 def main(argv=None):
