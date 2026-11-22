@@ -369,7 +369,7 @@ def close_legacy(env, point, item, result):
         if (record.get("kind") == "decision" and not record.get("decision_id") and record.get("snapshot_sha") == held
                 and (record.get("repo"), record.get("point"), record.get("item")) == (env.repo.gh_repo, point, str(item))):
             append(env, {"kind": "outcome", "ts": int(time.time()), "point": point, "repo": env.repo.gh_repo,
-                         "item": str(item), "result": result})
+                         "item": str(item), "result": result, "snapshot_sha": held})
             return
 
 
@@ -422,27 +422,40 @@ def digest(env, now=None):
     records = read_records(env)
     recent = [r for r in records if int(r.get("ts", 0)) > last]
     decisions = [r for r in recent if r.get("kind") == "decision"]
-    closed = {r.get("decision_id") for r in recent if r.get("kind") == "outcome" and r.get("decision_id")}
+
+    def keys(record):
+        """A decision id; else a legacy record's (repo, point, item) with its snapshot hash, then without."""
+        if record.get("decision_id"):
+            return [record["decision_id"]]
+        base = (record.get("repo"), record.get("point"), record.get("item"))
+        return [base + (record["snapshot_sha"],), base] if record.get("snapshot_sha") else [base]
+
+    closed = {keys(r)[0] for r in recent if r.get("kind") == "outcome"}
     reported = [r for r in records if r.get("kind") == "decision"
-                and (int(r.get("ts", 0)) > last or r.get("decision_id") in closed)]
+                and (int(r.get("ts", 0)) > last or any(k in closed for k in keys(r)))]
     stamp.parent.mkdir(parents=True, exist_ok=True)
     stamp.write_text(f"{now}\n")
     if not reported:
         return ""
 
-    def identity(record):
-        return record.get("decision_id") or (record.get("repo"), record.get("point"), record.get("item"))
+    outcomes = {}
+    for r in records:
+        if r.get("kind") == "outcome":
+            outcomes[keys(r)[0]] = r["result"]
 
-    outcomes = {identity(r): r["result"] for r in records if r.get("kind") == "outcome"}
+    def outcome_of(record):
+        found = [outcomes[k] for k in keys(record) if k in outcomes]
+        return found[0] if found else None
+
     lines = []
     for r in reported:
-        end = outcomes.get(identity(r), "pending")
+        end = outcome_of(r) or "pending"
         lines.append(f"- {r.get('repo')} {r.get('point')} #{r.get('item')}: {r.get('executed')}"
                      + (f" (advised {r.get('advised')})" if r.get("advised") and r.get("advised") != r.get("executed") else "")
                      + (f" [failure: {r.get('failure')}]" if r.get("failure") else "")
                      + f", outcome {end}. {r.get('reason', '')[:160]}")
     extra = [r for r in decisions if r.get("executed") == "extra_round"]
-    won = sum(outcomes.get(identity(r)) in ("merged", "accept") for r in extra)
+    won = sum(outcome_of(r) in ("merged", "accept") for r in extra)
     earlier = len(reported) - len(decisions)
     recommended = Counter(r["advised"] for r in decisions if r.get("advised")
                           and (not r.get("failure") or str(r["failure"]).startswith("stale snapshot")))

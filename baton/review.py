@@ -632,7 +632,7 @@ class Review:
                 return 75
             if rc != 0:
                 if not runner.handed_off:   # e.g. authorship recording failed: the owner still needs one handoff
-                    runner.handoff(pr, "fix_task_write_failed", f"PR #{pr} needs you",
+                    runner.handoff(pr, "fix_run_unfinished", f"PR #{pr} needs you",
                                    f"The fix run of round {round} failed before a handoff. {self.url}")
                 self.drop()
                 return 0

@@ -363,6 +363,33 @@ def test_a_pre_upgrade_grant_gets_its_outcome_at_the_terminal_handoff(adv):
     assert "outcome handoff" in adv.notes[-1][1]
 
 
+def test_a_legacy_closure_in_a_later_digest_window_matches_its_own_decision(adv):
+    """#156 round 2: the outcome carries the snapshot hash, so it reaches a decision reported earlier
+    and never attaches to another legacy decision of the same item."""
+    import json
+
+    def legacy(sha, ts, executed):
+        return {"kind": "decision", "ts": ts, "point": "review_limit", "repo": "owner/app", "item": "45",
+                "episode": "x", "snapshot_sha": sha, "actions": ["handoff", "extra_round"], "advised": executed,
+                "executed": executed, "rule": "handoff", "reason": "r", "failure": ""}
+
+    first, second = "a" * 64, "b" * 64
+    path = advisor.records_path(adv.env)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(legacy(first, 1_000_000_001, "handoff")) + "\n" + json.dumps(legacy(second, 1_000_000_002, "extra_round")) + "\n")
+    advisor.grant_path(adv.env, "review_limit", 45).parent.mkdir(parents=True, exist_ok=True)
+    advisor.grant_path(adv.env, "review_limit", 45).write_text(f"{second}\n")
+    advisor.digest(adv.env, now=1_000_100_000)
+    assert "outcome pending" in adv.notes[-1][1]
+
+    advisor.finish_episode(adv.env, "pr", 45, "handoff")
+    outcome = adv.records()[-1]
+    assert outcome["snapshot_sha"] == second
+    advisor.digest(adv.env, now=10**10)
+    lines = [line for line in adv.notes[-1][1].splitlines() if line.startswith("- ")]
+    assert len(lines) == 1 and "extra_round" in lines[0] and "outcome handoff" in lines[0]
+
+
 def test_a_mode_change_after_a_grant_still_explains_the_earlier_recovery(adv, monkeypatch):
     from baton import handoff
 

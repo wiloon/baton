@@ -1225,15 +1225,21 @@ def test_a_failed_extra_round_does_not_extend_the_next_review_episode(advised, f
     assert len(advised.fixes) == 3 and advised.labelled("ready-for-human")
 
 
-def test_an_unhandled_fix_failure_hands_off_once_and_closes_the_decision(advised):
+def test_an_unhandled_fix_failure_hands_off_once_and_closes_the_decision(advised, monkeypatch):
     from baton import advisor
+    from baton import handoff as owner_handoff
     from baton.session import resolve
 
     advised.reviews[:] = ["changes", "changes"]
     advised.fix_plans[:] = [0, 1]   # the second fix fails without handing the PR over
     advised.advice = [{"action": "extra_round", "reason": "fixable", "evidence": []}]
+    reasons = []
+    perform = owner_handoff.perform
+    monkeypatch.setattr(owner_handoff, "perform",
+                        lambda env, reason, **kw: (reasons.append(reason), perform(env, reason, **kw))[1])
     assert advised.run(fixer="cursor") == 0
 
+    assert reasons[-1] == "fix_run_unfinished" and reasons.count("fix_run_unfinished") == 1
     assert advised.labelled("ready-for-human")
     assert len([line for line in advised.log() if f"PR #{PR} needs you" in line]) == 1
     decision, outcome = advisor.read_records(resolve(advised.env))

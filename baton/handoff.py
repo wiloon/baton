@@ -63,6 +63,7 @@ REASONS = {
     "spec_accept_post_failed": Reason(1, "rule"),
     "fix_checks_refresh_failed": Reason(1, "rule"),
     "fix_task_write_failed": Reason(1, "rule"),
+    "fix_run_unfinished": Reason(1, "rule"),
     "spec_body_edit_failed": Reason(1, "rule"),
     "spec_adr_open_failed": Reason(1, "rule"),
     "dev_push_failed": Reason(1, "rule"),
