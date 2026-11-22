@@ -206,8 +206,9 @@ def test_pending_prs_are_counted_per_repository(two, monkeypatch):
                                        "milestone": {"title": "Now"}}],
         ("", "api repos/acme/shop/issues/7/events?per_page=100", ""): [[
             {"id": 1, "event": "labeled", "actor": {"login": "alice"}, "label": {"name": "ready-for-agent"}}]],
+        ("acme/shop", "issue view", ""): {"title": "T", "body": "B", "comments": [
+            {"author": {"login": "alice"}, "body": "<!-- baton-verdict: accept -->\nPlan"}]},
     }))
-    monkeypatch.setattr(tick.spec, "cursor_plan", lambda env, n: "plan")
     monkeypatch.setattr(tick.Tick, "pick_vendor", lambda self, *a, **k: "claude")
     app, shop = ticks()
     with tick.session_bound(app.env):

@@ -9,7 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from baton import agents, analyst_pool, config, dispatch, pick, quota, review, scan, session, tick, vendors
-from conftest import full_text
+from conftest import full_text, sh
 
 
 def write_config(tmp_path, text):
@@ -232,7 +232,8 @@ def test_saved_reviewer_is_reselected_after_losing_role(gh, worktree, tmp_path, 
                 "SELF_DIR": str(Path(__file__).resolve().parents[1] / "bin"),
                 "WT_ROOT": str(tmp_path / "worktrees"), "REPO_DIR": str(worktree.repo),
                 "MAX_REVIEW_ROUNDS": "2", "STATE": str(state), "HOME": str(tmp_path)})
-    gh.set(headRefName="issue-297", author={"login": "owner"})
+    gh.set(headRefName="issue-297", author={"login": "owner"}, state="OPEN", baseRefName="main",
+           headRefOid=sh(worktree.wt, "git", "rev-parse", "HEAD"), body="Refs #297", comments=[])
     agents = []
     monkeypatch.setattr(pick.settle, "probe", lambda *a: None)
     monkeypatch.setattr(review.dispatch, "dispatch", lambda vendor, role, *r, **k: agents.append((vendor, role)) or {

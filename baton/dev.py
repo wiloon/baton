@@ -13,7 +13,7 @@ import re
 import subprocess
 import time
 
-from . import advisor, after_merge, agents, checks as check_section, dispatch, fix, md, names, pr as pr_helpers, pr_contract, prompts, spec, vendors
+from . import advisor, after_merge, agents, checks as check_section, dispatch, fix, handoff as owner_handoff, md, names, pr as pr_helpers, pr_contract, prompts, spec, vendors
 from .common import Deferred, git, push, strip_markers
 
 REPLY_CAP = 60000
@@ -56,10 +56,9 @@ def setup_worktree(tick, wt, branch, issue):
     return "", True
 
 
-def context_file(tick, issue, branch, plan):
+def context_file(tick, issue, branch, plan, data):
     """The issue, the agreed plan and the slices already merged, for the prompt."""
     path = tick.ctx / f"issue-{issue}-dev-{time.strftime('%Y%m%d-%H%M%S')}.md"
-    data = tick.gh_json("issue", "view", issue, "-R", tick.gh_repo, "--json", "title,body") or {}
     merged = tick.gh("pr", "list", "-R", tick.gh_repo, "--state", "merged", "--head", branch, "--json", "number,title,body")
     path.write_text(f"<issue>\n# {data.get('title', '')}\n\n{data.get('body', '')}\n</issue>\n\n<plan>\n{plan}\n</plan>\n"
                     f"<completed-slices>\n{merged or ''}</completed-slices>\n")
@@ -221,12 +220,22 @@ def run(tick, issue):
     url = f"https://github.com/{repo}/issues/{issue}"
     tick.active["issue"] = issue
     hooks = tick.hooks(issue)
-    plan = spec.cursor_plan(env, issue)
+    runner = spec.Spec(env, hooks, issue)
+    payload = tick.recovered_issues.pop(str(issue), None)
+    if payload is None:
+        payload = runner.issue_payload()
+    if payload is None:
+        return 80
+    plan = spec.cursor_plan(env, issue, listed=payload["comments"])
     if not plan:
+        tick.recovered_issues[str(issue)] = payload
         if not tick.spec_loop(issue):
             return 80
         session.run_process(["git", "-C", tick.repo_dir, "fetch", "-q", "--prune", "origin"])
-        plan = spec.cursor_plan(env, issue)
+        payload = runner.issue_payload()
+        if payload is None:
+            return 80
+        plan = spec.cursor_plan(env, issue, listed=payload["comments"])
         if not plan:
             tick.notify(f"#{issue}: spec accepted but no plan comment found", url)
             return 1
@@ -241,7 +250,7 @@ def run(tick, issue):
     pr_helpers.gh("issue", "edit", issue, "-R", repo, "--add-label", "agent-wip")
     tick.notify(f"#{issue} started ({dev_vendor})", url)
     base = git(wt, "rev-parse", "origin/main")
-    ctx = context_file(tick, issue, branch, plan)
+    ctx = context_file(tick, issue, branch, plan, payload)
     session.run_process(["rm", "-rf", shots])
     os.makedirs(shots)
     prompt = prompts.render(tick.self_dir / "dev-prompt.md", [

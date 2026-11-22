@@ -14,6 +14,7 @@ Prints JSON for the bash caller, which keeps `defer_vendor` (it exits the item's
 
 from . import session
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -56,16 +57,10 @@ def paginated(args):
     return out
 
 
-@session.scoped
-def issue_context(env, issue):
-    """The issue and its comments: only the owner's, Cursor's and the agents' are kept."""
-    env = session.resolve(env)
-    owner, limit = env.owner, int(env.config.scheduling.review_context_max_chars or 20000)
-    login_re = env.config.scheduling.cursor_login_re or r"^(app/cursor|cursor(\[bot\])?)$"
-    result = pr_helpers.gh("issue", "view", str(issue), "-R", env.repo.gh_repo, "--json", "title,body,comments")
-    if result.returncode != 0:
+def issue_context_from(issue, data, owner, login_re, limit):
+    """Format an already-fetched issue payload; empty when DATA is missing."""
+    if not data:
         return ""
-    data = json.loads(result.stdout)
     lines = [f'<issue number="{issue}">\n# {jq_str(data.get("title"))}\n\n{cut(data.get("body"), limit)}\n</issue>']
     for comment in data.get("comments") or ():
         login = (comment.get("author") or {}).get("login") or ""
@@ -75,7 +70,27 @@ def issue_context(env, issue):
 
 
 @session.scoped
-def review_context(env, pr, issue):
+def issue_context(env, issue, data=None):
+    """The issue and its comments: only the owner's, Cursor's and the agents' are kept.
+
+    DATA skips the GitHub read when the caller already fetched title, body and comments (#151).
+    """
+    env = session.resolve(env)
+    owner, limit = env.owner, int(env.config.scheduling.review_context_max_chars or 20000)
+    login_re = env.config.scheduling.cursor_login_re or r"^(app/cursor|cursor(\[bot\])?)$"
+    if data is None:
+        result = pr_helpers.gh("issue", "view", str(issue), "-R", env.repo.gh_repo, "--json", "title,body,comments")
+        if result.returncode != 0:
+            return ""
+        try:
+            data = json.loads(result.stdout)
+        except (ValueError, TypeError):
+            return ""
+    return issue_context_from(issue, data, owner, login_re, limit)
+
+
+@session.scoped
+def review_context(env, pr, issue, data=None):
     """The issue, then the PR with its comments, reviews and inline comments. Context files
     keep only the comments that count (public repo: others dropped); each body is cut."""
     env = session.resolve(env)
@@ -85,10 +100,12 @@ def review_context(env, pr, issue):
     def kept(login):
         return login == owner or bool(re.search(login_re, login))
     text = issue_context(env, issue) if re.fullmatch(r"\d+", str(issue or "")) else ""
-    result = pr_helpers.gh("pr", "view", str(pr), "-R", repo, "--json", "title,body,comments,reviews")
+    if data is None:
+        result = pr_helpers.gh("pr", "view", str(pr), "-R", repo, "--json", "title,body,comments,reviews")
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
     lines = []
-    if result.returncode == 0:
-        data = json.loads(result.stdout)
+    if data is not None:
         lines.append(f'<pr number="{pr}">\n# {jq_str(data.get("title"))}\n\n{cut(data.get("body"), limit)}\n</pr>')
         for review in data.get("reviews") or ():
             login = (review.get("author") or {}).get("login") or ""
@@ -134,11 +151,25 @@ def nit_rule(repo, issue):
 def agent_comment(repo, owner, pr, marker, round):
     """The body of the owner-authored comment with MARKER (baton-review or baton-screenshot-review)
     for that round, the latest one; "" when there is none."""
+    return read_agent_comment(repo, owner, pr, marker, round)[0]
+
+
+def read_agent_comment(repo, owner, pr, marker, round):
+    """Return the comment and whether an unavailable comment is worth another read (#151)."""
     result = pr_helpers.gh("pr", "view", str(pr), "-R", repo, "--json", "comments")
     if result.returncode != 0:
-        return ""
+        return "", pr_helpers.transient(result)
+    try:
+        comments = json.loads(result.stdout).get("comments") or ()
+    except (AttributeError, ValueError, TypeError):
+        return "", False
+    body = marked_comment(comments, owner, marker, round)
+    return body, not body
+
+
+def marked_comment(comments, owner, marker, round):
     prefix = f"<!-- {marker} round={round} "
-    bodies = [c.get("body") or "" for c in json.loads(result.stdout).get("comments") or ()
+    bodies = [c.get("body") or "" for c in comments
               if (c.get("author") or {}).get("login") == owner and (c.get("body") or "").startswith(prefix)]
     return bodies[-1].rstrip("\n") if bodies else ""
 
@@ -235,6 +266,7 @@ class Review:
         self.url = f"https://github.com/{self.repo}/pull/{pr}"
         self.checkpoint = Path(self.state, f"review-pending-{pr}")
         self.values = {}
+        self.binding_fields = {}
         self.fail_reason = ""   # the handoff reason of the last failed run; ALREADY when it handed off itself
 
     def failed(self, reason, outcome):
@@ -246,11 +278,118 @@ class Review:
     def label(self, *options):
         pr_helpers.gh("pr", "edit", str(self.pr), "-R", self.repo, *options)
 
-    def handoff(self, reason, title, text, *, snapshot="", revalidate=None):
-        """Terminal owner handoff through the shared entry (#125). Returns the entry Result."""
+    def handoff(self, reason, title, text, *, snapshot="", revalidate=None, transient=False,
+                continuation=None, resume=False):
+        """Owner handoff or category-1 retry through the shared entry (#125, #151)."""
         return owner_handoff.perform(
             self.env, reason, kind="pr", number=self.pr,
-            title=title, text=text, hooks=self.hooks, snapshot=snapshot, revalidate=revalidate)
+            title=title, text=text, hooks=self.hooks, item=self.pr, episode=self.issue,
+            snapshot=snapshot, revalidate=revalidate,
+            transient=transient, continuation=continuation, resume=resume)
+
+    BINDING_FIELDS = ("reviewed_head", "base_branch", "reviewed_issue", "verdict_digest",
+                      "verdict_round", "screenshot_digest", "feedback_waiting")
+    REVISION_FIELDS = "headRefOid,baseRefName,headRefName,state,body,closingIssuesReferences"
+
+    def read_pr(self, more):
+        fields = f"{self.REVISION_FIELDS},{more}"
+        result = pr_helpers.gh("pr", "view", str(self.pr), "-R", self.repo, "--json", fields)
+        if result.returncode != 0:
+            return None, pr_helpers.transient(result)
+        try:
+            data = json.loads(result.stdout)
+            if not isinstance(data, dict) or data.get("state") not in ("OPEN", "MERGED", "CLOSED"):
+                return None, False
+            if data["state"] == "OPEN":
+                if (not re.fullmatch(r"[0-9a-f]{40}", data["headRefOid"])
+                        or not isinstance(data["baseRefName"], str) or not data["baseRefName"]
+                        or not isinstance(data["headRefName"], str) or not isinstance(data["body"], str)
+                        or not isinstance(data["comments"], list)):
+                    return None, False
+                if any(not isinstance(comment, dict) or not isinstance(comment.get("body"), str)
+                       or not isinstance(comment.get("author") or {}, dict) for comment in data["comments"]):
+                    return None, False
+                data["linked_issue"] = pr_helpers.linked_task(data, self.repo)[0]
+            return data, False
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return None, False
+
+    def save_binding(self, **fields):
+        self.binding_fields.update(fields)
+        self.values.update(fields)
+        self.save()
+
+    def capture_feedback(self, body, field):
+        self.save_binding(**{field: hashlib.sha256(body.encode()).hexdigest()})
+
+    def binding_from_checkpoint(self, round, screenshot):
+        fields = self.binding_fields
+        issue = fields.get("reviewed_issue")
+        digest = fields.get("verdict_digest", "")
+        shots = fields.get("screenshot_digest", "") if screenshot else ""
+        if (fields.get("verdict_round") != str(round) or not fields.get("reviewed_head")
+                or not fields.get("base_branch") or not issue or not digest or screenshot and not shots):
+            return None
+        return {"pr": str(self.pr), "round": round, "head": fields["reviewed_head"],
+                "base": fields["base_branch"], "digest": digest, "issue": "" if issue == "none" else issue,
+                "screenshot_digest": shots}
+
+    def fixer_feedback(self, round, screenshot, fix_head):
+        """Gate feedback reads and verify the revision and both runner-posted bodies."""
+        pr = str(self.pr)
+        episode = self.issue or pr
+        reason = "review_comment_missing"
+        title = f"PR #{pr} review comment missing"
+        text = f"A review comment of round {round} is unavailable. {self.url}"
+
+        def stop(message=text):
+            self.handoff(reason, title, message)
+            return "", 0
+
+        try:
+            pending = owner_handoff.load_retry(self.env, episode, reason, pr)
+        except owner_handoff.RetryUnreadable as exc:
+            notify.log(f"PR #{pr}: review feedback retry unreadable: {exc}")
+            return stop()
+        binding = self.binding_from_checkpoint(round, screenshot)
+        marker = self.binding_fields.get("feedback_waiting")
+        if ((marker and not pending) or (pending and pending["continuation"] != binding)
+                or (marker and marker != f"{episode}/{pr}/{reason}")):
+            return stop()
+        if pending:
+            result = self.handoff(reason, title, text, resume=True)
+            if result.action != owner_handoff.RETRY:
+                return "", 75 if result.action == owner_handoff.DEFER else 0
+
+        data, retryable = self.read_pr("comments,labels")
+        if data:
+            if data["state"] != "OPEN":
+                owner_handoff.clear_retry(self.env, episode, reason, pr)
+                return "", 0
+            if any(label.get("name") == "ready-for-human" for label in data.get("labels") or ()):
+                if pending:
+                    owner_handoff.restore_retry(self.env, episode, reason, pr, pending)
+                return "", 75
+            if not binding or (data["headRefOid"], data["baseRefName"], data["linked_issue"], fix_head) != (
+                    binding["head"], binding["base"], binding["issue"], binding["head"]):
+                return stop(f"PR #{pr} revision or linked issue changed; the saved feedback cannot be applied. {self.url}")
+            code = marked_comment(data["comments"], self.owner, "baton-review", round)
+            shots = marked_comment(data["comments"], self.owner, "baton-screenshot-review", round) if screenshot else ""
+            if (code and hashlib.sha256(code.encode()).hexdigest() != binding["digest"]
+                    or shots and hashlib.sha256(shots.encode()).hexdigest() != binding["screenshot_digest"]):
+                return stop(f"PR #{pr} feedback differs from the runner-posted verdict. {self.url}")
+            if code and (not screenshot or shots):
+                owner_handoff.clear_retry(self.env, episode, reason, pr)
+                self.save_binding(feedback_waiting="")
+                cap = int(self.env.config.scheduling.review_context_max_chars or 20000)
+                return (combined_feedback(code, shots, cap) if screenshot else code), None
+            retryable = True
+
+        if binding is None or not retryable:
+            return stop()
+        self.save_binding(feedback_waiting=f"{episode}/{pr}/{reason}")
+        result = self.handoff(reason, title, text, transient=True, continuation=binding)
+        return "", 75 if result.action == owner_handoff.DEFER else 0
 
     def render(self, template, **pairs):
         return prompts.render(self.self_dir / template, list(pairs.items()), env=self.env)
@@ -323,10 +462,11 @@ class Review:
         if not outcome.startswith(REVIEWED):
             return outcome, reply
         posted = "\n".join(line for line in strip_markers(reply).split("\n") if not MARKER_LINE.match(line)).rstrip("\n")
-        comment = pr_helpers.gh("pr", "comment", str(pr), "-R", self.repo, "--body",
-                                f"<!-- baton-review round={round} by=cursor -->\n{posted[:REPLY_CAP]}")
+        body = f"<!-- baton-review round={round} by=cursor -->\n{posted[:REPLY_CAP]}"
+        comment = pr_helpers.gh("pr", "comment", str(pr), "-R", self.repo, "--body", body)
         if comment.returncode != 0:
             return self.failed("review_comment_post_failed", "RESULT: failed posting Cursor's review"), reply
+        self.capture_feedback(body, "verdict_digest")
         return outcome, reply
 
     def run_review(self, round, note, reviewer=None):
@@ -356,7 +496,12 @@ class Review:
             skill = ("Review the diff yourself, following AGENTS.md; no Claude plugins or hooks are available, "
                      "so don't read the `code-review` skill.")
         context = Path(self.ctx, f"pr-{pr}-review-{round}-{time.strftime('%Y%m%d-%H%M%S')}.md")
-        text = review_context(self.env, pr, self.issue)
+        data, _ = self.read_pr("title,comments,reviews")
+        if not data or data["state"] != "OPEN":
+            return self.failed("review_comment_missing", "RESULT: failed reading the PR revision for review")
+        self.save_binding(reviewed_head=head, base_branch=data["baseRefName"], reviewed_issue=data["linked_issue"] or "none",
+                          verdict_round=str(round), verdict_digest="", screenshot_digest="", feedback_waiting="")
+        text = review_context(self.env, pr, data["linked_issue"], data=data)
         try:
             pr_helpers.preflight(pr)
         except ValueError as error:
@@ -387,10 +532,12 @@ class Review:
         if outcome.startswith(REVIEWED):
             if review_file.is_file() and review_file.stat().st_size:
                 body = strip_markers(review_file.read_text()).rstrip("\n")
-                posted = pr_helpers.gh("pr", "comment", str(pr), "-R", self.repo, "--body",
-                                       f"<!-- baton-review round={round} by={reviewer} -->\n{review_note}{body}")
+                posted_body = f"<!-- baton-review round={round} by={reviewer} -->\n{review_note}{body}"
+                posted = pr_helpers.gh("pr", "comment", str(pr), "-R", self.repo, "--body", posted_body)
                 if posted.returncode != 0:
                     outcome = self.failed("review_comment_post_failed", "RESULT: failed posting review")
+                else:
+                    self.capture_feedback(posted_body, "verdict_digest")
             else:
                 outcome = self.failed("review_run_failed", "RESULT: failed no review artifact")
         self.hooks.verdict("review", reviewer, head, round, outcome, out["reply"] or "", str(review_file))
@@ -454,10 +601,12 @@ class Review:
                 mode = (vendors.codex_review_mode(self.state, pr, model)
                         if vendor == "codex" and "codex" in vendors.review_excluded(self.state, pr, self.fixed_by) else "")
                 review_note = f"Review mode: {mode} (codex/{model}).\n\n" if mode else ""
-                posted = pr_helpers.gh("pr", "comment", str(pr), "-R", self.repo, "--body",
-                                       f"<!-- baton-screenshot-review round={round} by={vendor} -->\n{review_note}{body}")
+                posted_body = f"<!-- baton-screenshot-review round={round} by={vendor} -->\n{review_note}{body}"
+                posted = pr_helpers.gh("pr", "comment", str(pr), "-R", self.repo, "--body", posted_body)
                 if posted.returncode != 0:
                     outcome = self.failed("screenshot_comment_post_failed", "RESULT: failed posting screenshot review")
+                else:
+                    self.capture_feedback(posted_body, "screenshot_digest")
             else:
                 outcome = self.failed("screenshot_run_failed", "RESULT: failed no screenshot review artifact")
         self.hooks.verdict("screenshot_review", vendor, head, round, outcome, out["reply"] or "", str(review_file))
@@ -516,12 +665,18 @@ class Review:
             checks = saved.get("screenshot_checks", "")
             extra = 1 if saved.get("extra") == "1" else 0
             self.fixed_by, self.issue = saved.get("fixed_by", ""), saved.get("ISSUE", "")
+            self.binding_fields = {k: saved.get(k, "") for k in
+                                   self.BINDING_FIELDS}
+        else:
+            self.binding_fields = {}
         cfg = self.env.config
         if reviewer not in ("pool",) and (reviewer not in cfg.declared() or not cfg.allows(reviewer, "reviewer")):
             reviewer = "pool"
-        if self.seed():
+        resuming_fix = step == "fix"
+        if not resuming_fix and self.seed():
             self.seed_contrib()
-        self.label("--remove-label", "ready-for-human")
+        if not saved:
+            self.label("--remove-label", "ready-for-human")
         while True:
             self.hooks.round = round
             if round == 1:
@@ -536,7 +691,7 @@ class Review:
                             if fix_head else ""))
             self.values = dict(note=note, fixer=fixer, reviewer=reviewer, round=round, step=step, fix_head=fix_head,
                                code_verdict=code_verdict, screenshot=screenshot, screenshot_checks=checks,
-                               extra="1" if extra else "")
+                               extra="1" if extra else "", **self.binding_fields)
             self.save()
             if step in ("review", "screenshot"):
                 verdict = code_verdict
@@ -607,18 +762,14 @@ class Review:
             self.values.update(step=step, fix_head=fix_head, code_verdict=code_verdict, screenshot=screenshot,
                                screenshot_checks="")
             self.save()
-            if screenshot:
-                # A split review: the fixer reads both comments, or none (an incomplete one is no feedback).
-                code = agent_comment(self.repo, self.owner, pr, "baton-review", round)
-                shots = agent_comment(self.repo, self.owner, pr, "baton-screenshot-review", round)
-                if not (code and shots):
-                    self.handoff("review_comment_missing", f"PR #{pr} review comment missing",
-                                 f"A review comment of round {round} is unavailable. {self.url}")
+            feedback, deferred = self.fixer_feedback(round, bool(screenshot), fix_head)
+            if deferred is not None:
+                if deferred == 0:
                     self.drop()
-                    return 0
-                feedback = combined_feedback(code, shots, int(self.env.config.scheduling.review_context_max_chars or 20000))
-            else:
-                feedback = agent_review(self.repo, self.owner, pr, round)
+                return deferred
+            if resuming_fix and self.seed():
+                self.seed_contrib()
+            resuming_fix = False
             # The next round's reviewer must stay free: a fixed reviewer, or a sole pool vendor.
             pool = self.env.config.quota.vendor_pool
             exclude = "cursor" if reviewer == "cursor" else ("" if len(pool) > 1 else pool[0])

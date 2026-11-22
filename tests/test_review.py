@@ -1,6 +1,7 @@
 """baton.review: the review loop around a real git worktree, the fake `gh` of conftest and
 stubs for the agent runs and the fix run (its own tests: tests/test_fix.py). Ported from the
 review-loop parts of tests/roles.sh and tests/cooldown.sh."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -31,7 +32,9 @@ def loop(gh, worktree, tmp_path, monkeypatch):
            "CURSOR_LOGIN_RE": "^cursor$", "MAX_REVIEW_ROUNDS": "2", "REVIEW_SKILL_MIN_LINES": "300",
            "REVIEW_CONTEXT_MAX_CHARS": "20000", "AUTO_MERGE": "1", "WT_ROOT": str(tmp_path / "worktrees"),
            "REPO_DIR": str(worktree.repo), "MAX_VERIFY_FIXES": "2", "ISSUE": "297"}
-    gh.set(headRefName="cursor/issue-297", author={"login": "cursor"}, title="T", body="Refs #297", comments=[], reviews=[])
+    head = sh(worktree.wt, "git", "rev-parse", "HEAD")
+    gh.set(headRefName="cursor/issue-297", baseRefName="main", author={"login": "cursor"}, title="T",
+           body="Refs #297", comments=[], reviews=[], state="OPEN", headRefOid=head)
     monkeypatch.setenv("CURSOR_BRANCH_RE", "^cursor/")
     monkeypatch.setenv("CURSOR_LOGIN_RE", "^cursor$")
     monkeypatch.setattr(pick.settle, "probe", lambda *args: None)   # never call a real CLI for quota
@@ -84,6 +87,7 @@ def loop(gh, worktree, tmp_path, monkeypatch):
         (Path(wt) / f"fix-{time.monotonic_ns()}.txt").write_text("x\n")
         sh(wt, "git", "add", "-A")
         sh(wt, "git", "commit", "-q", "-m", "fix")
+        gh.set(headRefOid=sh(wt, "git", "rev-parse", "HEAD"))
         vendors.record_author(env["STATE"], pr, fixer)
         return plan
 
@@ -292,11 +296,10 @@ def test_a_deferred_fixer_leaves_a_checkpoint_and_the_resume_goes_straight_to_th
     saved = loop.checkpoint()
     assert (saved["pr"], saved["round"], saved["step"], saved["fixer"], saved["ISSUE"]) == (str(PR), "1", "fix", "cursor", "297")
     assert saved["note"] == "a\nmulti-line 'note'" and saved["wt"] == str(loop.wt)
-    assert Path(loop.env["STATE"], f"review-pending-{PR}").read_bytes() == (
-        f"pr={PR}\nwt={loop.wt}\nnote=$'a\\nmulti-line \\'note\\''\n"
-        f"fixer=cursor\nreviewer=codex\nround=1\nstep=fix\nfix_head={loop.fixes[0]['head']}\n"
-        "fixed_by=''\nISSUE=297\n"
-    ).encode()
+    assert saved["fix_head"] == loop.fixes[0]["head"] and saved["reviewer"] == "codex"
+    # Binding fields are captured when the review posts, before the fix lookup (#151).
+    assert saved.get("reviewed_head") and saved.get("base_branch") == "main"
+    assert saved.get("verdict_round") == "1" and saved.get("verdict_digest")
     assert len(loop.agents) == 1 and not loop.labelled("ready-for-human")
     # Resume: the fix runs again without another review.
     loop.reviews[:] = ["pass"]
@@ -350,15 +353,17 @@ def test_a_checkpoint_the_old_runner_wrote_resumes_at_its_step(loop):
     assert loop.agents[0]["vendor"] == "claude" and loop.merged == [PR]
 
 
-def test_a_checkpoint_mid_fix_from_the_old_runner_keeps_the_fix_range(loop):
+def test_an_old_fix_checkpoint_without_a_binding_hands_off(loop):
     Path(loop.env["STATE"], f"review-pending-{PR}").write_text(
         f"pr={PR}\nwt={loop.wt}\nnote=n\nfixer=cursor\nreviewer=claude\nround=1\nstep=fix\nfix_head=abc1234\n"
         "fixed_by=''\nISSUE=297\n")
+    # The matching marker alone cannot establish what was reviewed.
+    loop.gh.set(comments=[{"author": {"login": "owner"},
+                           "body": "<!-- baton-review round=1 by=claude -->\nfix it"}])
     loop.reviews[:] = ["pass"]
     assert loop.run() == 0
-    assert loop.fixes[0]["head"] == "abc1234" and loop.fixes[0]["fixer"] == "cursor"
-    # Round 2 reviews the fix: it is reviewed by anyone but the fixer.
-    assert "git diff abc1234..HEAD" in loop.agents[0]["prompt"] and loop.merged == [PR]
+    assert not loop.fixes and loop.labelled("ready-for-human")
+    assert not loop.agents and not loop.merged
 
 
 def test_the_checkpoint_the_loop_writes_is_what_bash_sources(loop, tmp_path):
@@ -918,11 +923,18 @@ def test_a_deferred_fix_after_a_split_review_resumes_with_both_comments(loop):
     assert loop.merged == [str(PR)]
 
 
+def saved_feedback(loop, body, round=1, *, fixer="cursor", reviewer="claude"):
+    head = sh(loop.wt, "git", "rev-parse", "HEAD")
+    checkpoint.write(Path(loop.env["STATE"], f"review-pending-{PR}"),
+                     {"pr": PR, "wt": loop.wt, "note": "n", "fixer": fixer, "reviewer": reviewer,
+                      "round": round, "step": "fix", "ISSUE": "297", "fix_head": head,
+                      "reviewed_head": head, "base_branch": "main", "reviewed_issue": "297",
+                      "verdict_round": round, "verdict_digest": hashlib.sha256(body.encode()).hexdigest()})
+    loop.gh.set(comments=[{"author": {"login": "owner"}, "body": body, "createdAt": "2026-10-27T10:00:00Z"}])
+
+
 def test_a_fix_checkpoint_without_screenshot_review_keeps_the_single_comment_path(loop):
-    Path(loop.env["STATE"], f"review-pending-{PR}").write_text(
-        f"pr={PR}\nwt={loop.wt}\nnote=n\nfixer=cursor\nreviewer=claude\nround=1\nstep=fix\nISSUE=297\n")
-    loop.gh.set(comments=[{"author": {"login": "owner"}, "body": "<!-- baton-review round=1 by=claude -->\nonly",
-                           "createdAt": "2026-10-27T10:00:00Z"}])
+    saved_feedback(loop, "<!-- baton-review round=1 by=claude -->\nonly")
     loop.reviews, loop.screens = ["pass"], ["pass"]
     assert screen_run(loop) == 0
     assert roles(loop) == ["review", "screenshot_review"]   # round 2 is a new round: it has its own screenshot review
@@ -931,14 +943,15 @@ def test_a_fix_checkpoint_without_screenshot_review_keeps_the_single_comment_pat
 
 @pytest.mark.parametrize("case", ["run failed", "missing artifact", "comment not posted", "comment missing at fix time"])
 def test_a_screenshot_review_that_fails_goes_to_the_owner_with_neither_fix_nor_merge(loop, monkeypatch, case):
+    from baton import handoff as owner_handoff
     loop.reviews = ["changes" if case == "comment missing at fix time" else "pass"]
     loop.screens = ["pass"]
     handoffs = []
-    handoff = review.Review.handoff
+    real_handoff = review.Review.handoff
 
-    def record_handoff(self, reason, title, text):
+    def record_handoff(self, reason, title, text, **kwargs):
         handoffs.append(reason)
-        handoff(self, reason, title, text)
+        return real_handoff(self, reason, title, text, **kwargs)
 
     monkeypatch.setattr(review.Review, "handoff", record_handoff)
     if case == "run failed":
@@ -949,10 +962,19 @@ def test_a_screenshot_review_that_fails_goes_to_the_owner_with_neither_fix_nor_m
     elif case == "comment not posted":
         loop.after["screenshot_review"] = lambda: loop.gh.fail("comment")
     else:
-        real = review.agent_comment
-        monkeypatch.setattr(review, "agent_comment", lambda repo, owner, pr, marker, round:
-                            "" if "screenshot" in marker else real(repo, owner, pr, marker, round))
-    assert screen_run(loop) == 0
+        real = review.pr_helpers.call
+
+        def hide_screen_comment(*args, **kwargs):
+            result = real(*args, **kwargs)
+            if args[:2] != ("pr", "view") or not any("comments,labels" in arg for arg in args):
+                return result
+            data = json.loads(result.stdout)
+            data["comments"] = [c for c in data["comments"] if not c["body"].startswith("<!-- baton-screenshot-review")]
+            from subprocess import CompletedProcess
+            return CompletedProcess(result.args, result.returncode, json.dumps(data), result.stderr)
+
+        monkeypatch.setattr(review.pr_helpers, "call", hide_screen_comment)
+    rc = screen_run(loop)
     expected = {
         "run failed": "screenshot_run_failed",
         "missing artifact": "screenshot_run_failed",
@@ -960,11 +982,17 @@ def test_a_screenshot_review_that_fails_goes_to_the_owner_with_neither_fix_nor_m
         "comment missing at fix time": "review_comment_missing",
     }[case]
     assert handoffs == [expected]
-    assert loop.labelled("ready-for-human") and not loop.fixes and not loop.merged
-    assert not loop.checkpoint()
+    assert not loop.fixes and not loop.merged
     assert "stale" not in "".join(loop.comments())
-    if case not in ("comment missing at fix time", "comment not posted"):
-        assert not screenshot_comments(loop)
+    if case == "comment missing at fix time":
+        # Bound retry: defer without handoff labels; checkpoint and retry record survive (#151).
+        assert rc == 75 and not loop.labelled("ready-for-human")
+        assert loop.checkpoint()
+        assert owner_handoff.load_retry(session.resolve(loop.env), "297", "review_comment_missing", str(PR))
+    else:
+        assert rc == 0 and loop.labelled("ready-for-human") and not loop.checkpoint()
+        if case != "comment not posted":
+            assert not screenshot_comments(loop)
 
 
 @pytest.mark.parametrize("vendor,models", [
@@ -1054,8 +1082,7 @@ cursor = { model = "cursor_analyst" }
         verify.chmod(0o755)
         paths = replace(paths, self_dir=self_dir)
     env.config = replace(load(source), paths=paths)
-    Path(loop.env["STATE"], f"review-pending-{PR}").write_text(
-        f"pr={PR}\nwt={loop.wt}\nnote=n\nfixer={vendor}\nreviewer=codex\nround={round}\nstep=fix\nISSUE=297\n")
+    saved_feedback(loop, f"<!-- baton-review round={round} by=codex -->\nfix it", round, fixer=vendor, reviewer="codex")
     calls = []
 
     def cli(args, log, minutes, child, **kwargs):
@@ -1149,9 +1176,16 @@ def advised(loop, monkeypatch):
         return loop.advice.pop(0), {}
     monkeypatch.setattr(advisor, "call_deepseek", call)
     real_view = review.pr_helpers.view
-    monkeypatch.setattr(review.pr_helpers, "view", lambda pr, fields: (
-        {"state": "OPEN", "headRefOid": sh(loop.wt, "git", "rev-parse", "HEAD")} if "headRefOid" in fields
-        else real_view(pr, fields)))
+
+    def view(pr, fields):
+        if "headRefOid" in fields:
+            data = {"state": "OPEN", "headRefOid": sh(loop.wt, "git", "rev-parse", "HEAD")}
+            if "baseRefName" in fields:
+                data["baseRefName"] = loop.gh.pr.get("baseRefName") or "main"
+            return data
+        return real_view(pr, fields)
+
+    monkeypatch.setattr(review.pr_helpers, "view", view)
     return loop
 
 
@@ -1374,3 +1408,151 @@ def test_an_agent_screenshot_failure_that_mentions_a_comment_stays_a_run_failure
     loop.screens = ["RESULT: failed the comment was unavailable"]
     assert screen_run(loop) == 0
     _one_handoff(loop, seen, "screenshot_run_failed")
+
+
+def test_a_missing_review_comment_defers_then_recovers_without_a_second_worker(loop, monkeypatch):
+    """review_comment_missing: no early attempt, replay after 60s, one fixer on recovery (#151)."""
+    from baton import handoff
+    clock = {"now": 1_000}
+    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
+    loop.reviews = ["changes", "pass"]
+    hidden = {"on": True}
+    call = review.pr_helpers.call
+    marker = "<!-- baton-review round=1 "
+
+    def hide_until_due(*args, **kwargs):
+        result = call(*args, **kwargs)
+        if args[:2] != ("pr", "view") or not any("comments,labels" in arg for arg in args) or not hidden["on"] or loop.fixes:
+            return result
+        data = json.loads(result.stdout)
+        data["comments"] = [c for c in data["comments"] if not c["body"].startswith(marker)]
+        from subprocess import CompletedProcess
+        return CompletedProcess(result.args, result.returncode, json.dumps(data), result.stderr)
+
+    monkeypatch.setattr(review.pr_helpers, "call", hide_until_due)
+    assert loop.run(fixer="cursor", reviewer="claude") == 75
+    assert not loop.fixes and not loop.labelled("ready-for-human")
+    saved = handoff.load_retry(session.resolve(loop.env), "297", "review_comment_missing", str(PR))
+    assert saved["attempts"] == 0 and saved["continuation"]["base"] == "main"
+    assert saved["continuation"]["head"]
+    clock["now"] = 1_059
+    assert loop.run(fixer="cursor", reviewer="claude") == 75
+    assert not loop.fixes
+    hidden["on"] = False
+    clock["now"] = 1_060
+    loop.gh.set(labels=[{"name": "ready-for-human"}])
+    assert loop.run(fixer="cursor", reviewer="claude") == 75
+    assert not loop.fixes and handoff.load_retry(session.resolve(loop.env), "297", "review_comment_missing", str(PR))[
+        "attempts"] == 0
+    assert len([args for args in loop.gh.calls() if args[:2] == ["pr", "edit"] and "--remove-label" in args
+                and "ready-for-human" in args]) == 1
+    loop.gh.set(labels=[])
+    assert loop.run(fixer="cursor", reviewer="claude") == 0
+    assert len(loop.fixes) == 1 and loop.merged == [PR]
+    assert not list(Path(loop.env["STATE"]).glob("handoff-retry-*"))
+
+
+@pytest.mark.parametrize("change", ["head", "base", "closed"])
+def test_a_head_or_base_change_during_feedback_deferral_stops_the_saved_fix(loop, monkeypatch, change):
+    """A review_comment_missing retry is bound to the reviewed head and base branch (#151)."""
+    from baton import handoff
+    clock = {"now": 1_000}
+    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
+    loop.reviews = ["changes", "pass"]
+    call = review.pr_helpers.call
+    marker = "<!-- baton-review round=1 "
+
+    def hide_comment(*args, **kwargs):
+        result = call(*args, **kwargs)
+        if args[:2] != ("pr", "view") or not any("comments,labels" in arg for arg in args) or loop.fixes:
+            return result
+        data = json.loads(result.stdout)
+        data["comments"] = [c for c in data["comments"] if not c["body"].startswith(marker)]
+        from subprocess import CompletedProcess
+        return CompletedProcess(result.args, result.returncode, json.dumps(data), result.stderr)
+
+    monkeypatch.setattr(review.pr_helpers, "call", hide_comment)
+    assert loop.run(fixer="cursor", reviewer="claude") == 75
+    assert not loop.fixes
+    if change == "head":
+        loop.gh.set(headRefOid="f" * 40)
+    elif change == "base":
+        loop.gh.set(baseRefName="release")
+    else:
+        loop.gh.set(state="CLOSED")
+    clock["now"] = 1_060
+    assert loop.run(fixer="cursor", reviewer="claude") == 0
+    assert not loop.fixes and loop.labelled("ready-for-human") == (change != "closed")
+    assert not list(Path(loop.env["STATE"]).glob("handoff-retry-*"))
+
+
+@pytest.mark.parametrize("change", ["push", "comment", "issue", "screenshot"])
+def test_feedback_must_match_the_revision_and_bodies_the_runner_reviewed(loop, monkeypatch, change):
+    call = review.pr_helpers.call
+    if change == "push":
+        loop.after["review"] = lambda: loop.gh.set(headRefOid="f" * 40)
+    if change == "issue":
+        loop.after["review"] = lambda: loop.gh.set(headRefName="cursor/issue-298", body="Refs #298")
+    if change == "screenshot":
+        loop.gh.set(body="Refs #297\n\n## Checks to verify\n- Check the layout")
+        loop.screens = ["changes"]
+
+    def replace_comment(*args, **kwargs):
+        result = call(*args, **kwargs)
+        if change not in ("comment", "screenshot") or args[:2] != ("pr", "view") or result.returncode:
+            return result
+        fields = args[args.index("--json") + 1].split(",") if "--json" in args else []
+        if "comments" not in fields or "reviews" in fields:
+            return result
+        data = json.loads(result.stdout)
+        marker = "baton-screenshot-review" if change == "screenshot" else "baton-review"
+        for comment in data["comments"]:
+            if comment["body"].startswith(f"<!-- {marker} round=1 "):
+                comment["body"] = f"<!-- {marker} round=1 by=claude -->\nDifferent trusted comment"
+        from subprocess import CompletedProcess
+        return CompletedProcess(result.args, result.returncode, json.dumps(data), result.stderr)
+
+    monkeypatch.setattr(review.pr_helpers, "call", replace_comment)
+    assert loop.run(fixer="cursor", reviewer="claude", SCREENSHOT_REVIEW="1" if change == "screenshot" else "0") == 0
+    assert not loop.fixes and not loop.merged and loop.labelled("ready-for-human")
+
+
+@pytest.mark.parametrize("delete", [False, True])
+def test_review_feedback_transport_waits_and_lost_budget_hands_off_before_lookup(loop, monkeypatch, delete):
+    from subprocess import CompletedProcess
+    from baton import handoff
+
+    now = 1_000
+    monkeypatch.setattr(handoff, "clock", lambda: now)
+    gh = review.pr_helpers.gh
+    reads = []
+
+    def unavailable(*args, **kwargs):
+        if args[:2] == ("pr", "view") and any("comments,labels" in arg for arg in args):
+            reads.append(now)
+            if delete and now == 1_360:
+                raise RuntimeError("stopped after consuming the last attempt")
+            return CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return gh(*args, **kwargs)
+
+    monkeypatch.setattr(review.pr_helpers, "gh", unavailable)
+    assert loop.run(fixer="cursor", reviewer="claude") == 75
+    now = 1_059
+    before = len(loop.gh.calls())
+    assert resume_split_review(loop) == 75
+    assert len(loop.gh.calls()) == before
+    now = 1_060
+    assert resume_split_review(loop) == 75
+    now = 1_360
+    if delete:
+        with pytest.raises(RuntimeError, match="stopped after consuming"):
+            resume_split_review(loop)
+        env = session.resolve(loop.env)
+        path = handoff.retry_path(env, "297", "review_comment_missing", str(PR))
+        assert handoff.load_retry(env, "297", "review_comment_missing", str(PR))["attempts"] == 2
+        path.unlink()
+    assert resume_split_review(loop) == 80
+    assert reads == [1_000, 1_060, 1_360]
+    assert not loop.fixes and loop.labelled("ready-for-human")
+    assert len([args for args in loop.gh.calls() if args[:2] == ["pr", "edit"] and "--add-label" in args
+                and "ready-for-human" in args]) == 1
