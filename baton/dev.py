@@ -13,7 +13,7 @@ import re
 import subprocess
 import time
 
-from . import after_merge, agents, checks as check_section, dispatch, fix, md, names, pr as pr_helpers, pr_contract, prompts, spec, vendors
+from . import after_merge, agents, checks as check_section, dispatch, fix, handoff as owner_handoff, md, names, pr as pr_helpers, pr_contract, prompts, spec, vendors
 from .common import Deferred, git, push, strip_markers
 
 REPLY_CAP = 60000
@@ -221,8 +221,33 @@ def run(tick, issue):
     url = f"https://github.com/{repo}/issues/{issue}"
     tick.active["issue"] = issue
     hooks = tick.hooks(issue)
-    plan = spec.cursor_plan(env, issue)
+    # When a comments retry is pending, gate through Spec before plan selection so the
+    # wait is not bypassed by an ungated cursor_plan read (#151).
+    try:
+        pending = owner_handoff.load_retry(env, issue, "spec_comments_read_failed")
+    except owner_handoff.RetryUnreadable:
+        spec.Spec(env, hooks, issue).handoff(
+            "Could not read the saved comments retry.", "spec_comments_read_failed")
+        return 80
+    recovered = (getattr(tick, "recovered_issues", {}) or {}).pop(str(issue), None)
+    if recovered is not None:
+        plan = spec.cursor_plan(env, issue, listed=recovered.get("comments") or [])
+    elif pending is not None:
+        payload = spec.Spec(env, hooks, issue).retry_read(
+            lambda: spec.read_issue(env, issue),
+            "Could not read issue comments to load the plan.",
+            "spec_comments_read_failed")
+        if payload is None:
+            return 80
+        plan = spec.cursor_plan(env, issue, listed=payload.get("comments") or [])
+        recovered = payload
+    else:
+        plan = spec.cursor_plan(env, issue)
     if not plan:
+        if recovered is not None:
+            if getattr(tick, "recovered_issues", None) is None:
+                tick.recovered_issues = {}
+            tick.recovered_issues[str(issue)] = recovered
         if not tick.spec_loop(issue):
             return 80
         session.run_process(["git", "-C", tick.repo_dir, "fetch", "-q", "--prune", "origin"])

@@ -46,7 +46,8 @@ class FakeGH:
         out, rc = "", 0
         head = " ".join(args[:2])
         if head in self.fails:
-            err = self.update_stderr if head == "pr update-branch" else "boom"
+            err = self.update_stderr if head == "pr update-branch" else (
+                "HTTP 503 boom" if head in ("pr view", "issue view") else "boom")
             return subprocess.CompletedProcess(args, 1, "", err)
         key = head + (" --body-file" if "--body-file" in args else "")
         stderr, landed = self.flaky[key].pop(0) if self.flaky.get(key) else ("", True)
@@ -1053,9 +1054,16 @@ def test_red_ci_after_a_confirmed_adr_update_hands_off_without_merging(loop, mon
     assert not loop.gh.posted(ACCEPTED) and loop.gh.posted(PENDING)
 
 
-def test_an_unreadable_adr_pr_state_hands_off_with_the_pending_comment_kept(loop, monkeypatch):
+def test_an_unreadable_adr_pr_state_defers_then_hands_off_with_the_pending_comment_kept(loop, monkeypatch):
+    clock = _spec_clock(monkeypatch)
     resume_pending(loop, monkeypatch)
     loop.gh.fails.add("pr view")
+    with pytest.raises(Deferred, match="spec_pending_adr_read_failed"):
+        loop.run()
+    clock["now"] = 1_060
+    with pytest.raises(Deferred):
+        loop.run()
+    clock["now"] = 1_360
     assert loop.run() is False
     assert merges(loop) == [] and not loop.gh.posted(ACCEPTED)
     assert loop.gh.posted(PENDING) and "ready-for-human" in loop.gh.labels
@@ -1063,10 +1071,56 @@ def test_an_unreadable_adr_pr_state_hands_off_with_the_pending_comment_kept(loop
 
 def test_unreadable_issue_comments_hand_off_instead_of_starting_a_review(loop):
     loop.gh.labels = {"needs-triage"}   # the handoff must add ready-for-human, not find it there
-    loop.gh.fails.add("issue view")
+    loop.gh.flaky["issue view"] = [("HTTP 401: Bad credentials", False)]
     assert loop.run() is False
     assert loop.runs == [] and not loop.gh.ran("pr", "create")
     assert not loop.gh.posted(ACCEPTED) and "ready-for-human" in loop.gh.labels
+
+
+def _spec_clock(monkeypatch):
+    from baton import handoff
+    clock = {"now": 1_000}
+    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
+    return clock
+
+
+@pytest.mark.parametrize("stderr", ["", "HTTP 401: Bad credentials", "GraphQL: could not resolve issue"])
+def test_an_unclassified_spec_read_failure_hands_off_without_a_retry(loop, stderr):
+    loop.gh.labels = {"needs-triage"}
+    loop.gh.flaky["issue view"] = [(stderr, False)]
+    assert loop.run() is False
+    assert loop.runs == [] and "ready-for-human" in loop.gh.labels
+    assert not list(Path(loop.env["STATE"]).glob("handoff-retry-*"))
+
+
+def test_a_spec_read_that_keeps_failing_replays_twice_then_hands_off_once(loop, monkeypatch):
+    clock = _spec_clock(monkeypatch)
+    loop.gh.labels = {"needs-triage"}
+    loop.gh.fails.add("issue view")
+    with pytest.raises(Deferred, match="spec_comments_read_failed"):
+        loop.run()
+    with pytest.raises(Deferred):   # no early attempt
+        loop.run()
+    assert loop.runs == []
+    clock["now"] = 1_060
+    with pytest.raises(Deferred):
+        loop.run()
+    clock["now"] = 1_360
+    assert loop.run() is False
+    assert "ready-for-human" in loop.gh.labels and loop.runs == []
+
+
+def test_a_recovered_spec_read_clears_its_saved_retry(loop, monkeypatch):
+    clock = _spec_clock(monkeypatch)
+    loop.script = [ACCEPT]
+    loop.gh.fails.add("issue view")
+    with pytest.raises(Deferred, match="spec_comments_read_failed"):
+        loop.run()
+    loop.gh.fails.discard("issue view")
+    clock["now"] = 1_060
+    assert loop.run() is True
+    assert loop.runs and loop.runs[0]["role"] == "spec_review"
+    assert not list(Path(loop.env["STATE"]).glob("handoff-retry-*spec_comments_read_failed*"))
 
 
 def accept_now(loop, monkeypatch):

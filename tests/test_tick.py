@@ -822,13 +822,16 @@ def test_a_github_description_update_failure_does_not_lend_a_slot(ctx, monkeypat
     pr_state(ctx)
     body = "<!-- baton-task issue=5 completion=partial -->\n\nRefs #5\n\n## Manual checks\nnone\n"
     original_view = ctx.gh.answers["pr view"]
+    feedback = "<!-- baton-review round=1 by=claude -->\nfix"
 
     def view_pr(args):
-        fields = args[args.index("--json") + 1]
+        fields = args[args.index("--json") + 1] if "--json" in args else ""
         if fields == "body":
             return body
         if fields == "headRefName,body":
             return {"headRefName": "agent/issue-5", "body": body}
+        if "comments" in fields:
+            return {"comments": [{"author": {"login": "owner"}, "body": feedback}]}
         return original_view(args)
 
     ctx.gh.answers["pr view"] = view_pr
@@ -836,7 +839,7 @@ def test_a_github_description_update_failure_does_not_lend_a_slot(ctx, monkeypat
         subprocess.CompletedProcess(args, 1, "", "boom") if "--body-file" in args else "")
     ctx.path("pr-body-base-11").write_text(body)
     Path(ctx.env["CTX"], "pr-11-body.md").write_text(body + "\n## Summary\nCorrected description.\n")
-    checkpoint(ctx, pr="11", step="fix", wt=str(ctx.repo))
+    checkpoint(ctx, pr="11", step="fix", wt=str(ctx.repo), ISSUE="5")
     monkeypatch.setattr(tick.Tick, "review_loop", ORIGINAL_REVIEW_LOOP)
     monkeypatch.setattr(pick, "choose", lambda *args, **kwargs: "cursor")
     assert ctx.make().pending_reviews() is None
@@ -857,12 +860,19 @@ def test_a_second_tick_finishes_a_deferred_description_edit(ctx, worktree, monke
     agent_calls, verified, reviewed, handoffs = [], [], [], []
     comments = [{"author": {"login": "owner"}, "createdAt": "2026-11-20T00:00:01Z",
                  "body": "Revise the description."}]
+    if resumes_review:
+        comments[0]["body"] = "<!-- baton-review round=1 by=claude -->\nRevise the description."
     remote_before = sh(worktree.origin, "git", "rev-parse", worktree.branch)
 
     def view(args):
         if "--jq" in args:
             return live if args[-1] == ".body" else "OPEN"
-        return {"body": live, "headRefName": worktree.branch, "state": "OPEN", "comments": comments}
+        fields = args[args.index("--json") + 1] if "--json" in args else ""
+        data = {"body": live, "headRefName": worktree.branch, "state": "OPEN", "comments": comments,
+                "headRefOid": remote_before, "baseRefName": "main"}
+        if fields:
+            return {k: data[k] for k in fields.split(",") if k in data}
+        return data
 
     def edit(args):
         nonlocal live, labelled
@@ -924,7 +934,13 @@ def test_a_second_tick_finishes_a_deferred_description_edit(ctx, worktree, monke
     monkeypatch.setattr(review.Review, "run_review", lambda *args: "REVIEW: pass")
     if route == "switch-review":
         monkeypatch.setattr(review.advisor, "granted", lambda *args: True)
-        monkeypatch.setattr(review.Review, "run_review", lambda *args: "REVIEW: changes")
+
+        def review_with_changes(self, round, note, reviewer):
+            comments.append({"author": {"login": "owner"}, "createdAt": "2026-11-20T00:00:02Z",
+                             "body": f"<!-- baton-review round={round} by={reviewer} -->\nRevise the description."})
+            return "REVIEW: changes"
+
+        monkeypatch.setattr(review.Review, "run_review", review_with_changes)
     if resumes_review:
         checkpoint(ctx, pr=pr, step="fix", wt=str(worktree.wt), ISSUE="297", fix_head=remote_before)
         monkeypatch.setattr(tick.Tick, "review_loop", ORIGINAL_REVIEW_LOOP)
@@ -1746,3 +1762,39 @@ def test_dev_writer_without_fixer_role_hands_off_after_zero_repairs(devrun, monk
     assert ("handoff", "dev_verify_failed", "--reason", "dev_verify_failed") in events
     assert not devrun.gh.ran("pr", "create")
     assert "agent/issue-300" not in sh(devrun.repo, "git", "ls-remote", "--heads", "origin")
+
+
+def test_tick_run_counts_comment_reads_across_both_delays(ctx, monkeypatch):
+    """A scheduled comments retry is not re-read by next_issue during the wait (#151)."""
+    from baton import handoff, session
+    clock = {"now": 1_000}
+    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
+    issues(ctx, ready=[issue(12)])
+    views = []
+
+    def issue_view(args):
+        if "--json" in args and "comments" in args[args.index("--json") + 1]:
+            views.append(clock["now"])
+            return subprocess.CompletedProcess(args, 1, "", "HTTP 503 boom")
+        return {"labels": [{"name": "ready-for-agent"}], "author": {"login": "owner"}, "state": "OPEN"}
+
+    ctx.gh.answers["issue view"] = issue_view
+    env = session.resolve(ctx.make().env)
+    handoff.save_retry(env, "12", "spec_comments_read_failed", {
+        "attempts": 0, "due": 1_060, "continuation": {},
+        "reason": "spec_comments_read_failed", "episode": "12",
+    })
+    monkeypatch.setattr(tick.Tick, "pick_vendor", lambda *a, **k: "claude")
+    monkeypatch.setattr(tick.Tick, "spec_loop", lambda self, n: (_ for _ in ()).throw(
+        Deferred("handoff-retry", "spec_comments_read_failed", lends_slot=False)))
+    assert ctx.make().next_issue() == ""
+    assert views == []
+    clock["now"] = 1_060
+    assert ctx.make().next_issue() == ""
+    assert views == [1_060]
+    clock["now"] = 1_060
+    assert ctx.make().next_issue() == ""
+    assert views == [1_060]
+    clock["now"] = 1_360
+    assert ctx.make().next_issue() == ""
+    assert views == [1_060, 1_360]

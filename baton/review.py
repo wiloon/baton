@@ -14,6 +14,7 @@ Prints JSON for the bash caller, which keeps `defer_vendor` (it exits the item's
 
 from . import session
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -56,22 +57,36 @@ def paginated(args):
     return out
 
 
-@session.scoped
-def issue_context(env, issue):
-    """The issue and its comments: only the owner's, Cursor's and the agents' are kept."""
-    env = session.resolve(env)
-    owner, limit = env.owner, int(env.config.scheduling.review_context_max_chars or 20000)
-    login_re = env.config.scheduling.cursor_login_re or r"^(app/cursor|cursor(\[bot\])?)$"
-    result = pr_helpers.gh("issue", "view", str(issue), "-R", env.repo.gh_repo, "--json", "title,body,comments")
-    if result.returncode != 0:
+def issue_context_from(issue, data, owner, login_re, limit):
+    """Format an already-fetched issue payload; empty when DATA is missing."""
+    if not data:
         return ""
-    data = json.loads(result.stdout)
     lines = [f'<issue number="{issue}">\n# {jq_str(data.get("title"))}\n\n{cut(data.get("body"), limit)}\n</issue>']
     for comment in data.get("comments") or ():
         login = (comment.get("author") or {}).get("login") or ""
         if login == owner or re.search(login_re, login):
             lines.append(f'<issue-comment author="{login}">\n{cut(comment.get("body"), limit)}\n</issue-comment>')
     return "".join(f"{line}\n" for line in lines)
+
+
+@session.scoped
+def issue_context(env, issue, data=None):
+    """The issue and its comments: only the owner's, Cursor's and the agents' are kept.
+
+    DATA skips the GitHub read when the caller already fetched title, body and comments (#151).
+    """
+    env = session.resolve(env)
+    owner, limit = env.owner, int(env.config.scheduling.review_context_max_chars or 20000)
+    login_re = env.config.scheduling.cursor_login_re or r"^(app/cursor|cursor(\[bot\])?)$"
+    if data is None:
+        result = pr_helpers.gh("issue", "view", str(issue), "-R", env.repo.gh_repo, "--json", "title,body,comments")
+        if result.returncode != 0:
+            return ""
+        try:
+            data = json.loads(result.stdout)
+        except (ValueError, TypeError):
+            return ""
+    return issue_context_from(issue, data, owner, login_re, limit)
 
 
 @session.scoped
@@ -134,13 +149,24 @@ def nit_rule(repo, issue):
 def agent_comment(repo, owner, pr, marker, round):
     """The body of the owner-authored comment with MARKER (baton-review or baton-screenshot-review)
     for that round, the latest one; "" when there is none."""
+    return read_agent_comment(repo, owner, pr, marker, round)[0]
+
+
+def read_agent_comment(repo, owner, pr, marker, round):
+    """Return the comment and whether an unavailable comment is worth another read (#151)."""
     result = pr_helpers.gh("pr", "view", str(pr), "-R", repo, "--json", "comments")
     if result.returncode != 0:
-        return ""
+        return "", pr_helpers.transient(result)
+    try:
+        comments = json.loads(result.stdout).get("comments") or ()
+    except (AttributeError, ValueError, TypeError):
+        return "", False
     prefix = f"<!-- {marker} round={round} "
-    bodies = [c.get("body") or "" for c in json.loads(result.stdout).get("comments") or ()
+    bodies = [c.get("body") or "" for c in comments
               if (c.get("author") or {}).get("login") == owner and (c.get("body") or "").startswith(prefix)]
-    return bodies[-1].rstrip("\n") if bodies else ""
+    if not bodies:
+        return "", True   # successful lookup missing the expected trusted comment
+    return bodies[-1].rstrip("\n"), False
 
 
 def agent_review(repo, owner, pr, round):
@@ -235,6 +261,7 @@ class Review:
         self.url = f"https://github.com/{self.repo}/pull/{pr}"
         self.checkpoint = Path(self.state, f"review-pending-{pr}")
         self.values = {}
+        self.binding_fields = {}
         self.fail_reason = ""   # the handoff reason of the last failed run; ALREADY when it handed off itself
 
     def failed(self, reason, outcome):
@@ -246,12 +273,110 @@ class Review:
     def label(self, *options):
         pr_helpers.gh("pr", "edit", str(self.pr), "-R", self.repo, *options)
 
-    def handoff(self, reason, title, text, *, snapshot="", revalidate=None):
-        """Terminal owner handoff through the shared entry (#125). Returns the entry Result."""
+    def handoff(self, reason, title, text, *, snapshot="", revalidate=None, transient=False,
+                continuation=None, resume=False):
+        """Owner handoff or category-1 retry through the shared entry (#125, #151)."""
         return owner_handoff.perform(
             self.env, reason, kind="pr", number=self.pr,
             title=title, text=text, hooks=self.hooks, item=self.pr, episode=self.issue,
-            snapshot=snapshot, revalidate=revalidate, close_outcomes=("review_limit",))
+            snapshot=snapshot, revalidate=revalidate, close_outcomes=("review_limit",),
+            transient=transient, continuation=continuation, resume=resume)
+
+    def reviewed_binding(self):
+        """{head, base} of the open PR (base is the branch name), or None when unreadable (#151)."""
+        data = pr_helpers.view(self.pr, "headRefOid,baseRefName,state")
+        if not data or data.get("state") != "OPEN":
+            return None
+        head, base = data.get("headRefOid") or "", data.get("baseRefName") or ""
+        return {"head": head, "base": base} if head and base else None
+
+    def capture_review_binding(self, round, body):
+        """Persist the reviewed revision when the runner posts, before any later lookup (#151)."""
+        binding = self.reviewed_binding()
+        if not binding:
+            return
+        fields = {
+            "reviewed_head": binding["head"],
+            "base_branch": binding["base"],
+            "verdict_digest": hashlib.sha256(body.encode()).hexdigest(),
+            "verdict_round": str(round),
+        }
+        self.binding_fields.update(fields)
+        self.values.update(fields)
+        self.save()
+
+    def binding_from_checkpoint(self, round):
+        """Continuation captured at post time, or None when an older checkpoint never saved it."""
+        head = self.binding_fields.get("reviewed_head") or ""
+        base = self.binding_fields.get("base_branch") or ""
+        digest = self.binding_fields.get("verdict_digest") or ""
+        if not head or not base or self.binding_fields.get("verdict_round") != str(round):
+            return None
+        return {"pr": str(self.pr), "round": round, "head": head, "base": base, "digest": digest,
+                "issue": self.issue or ""}
+
+    def revision_matches(self, saved):
+        """True when SAVED continuation still names this PR's current head and base branch."""
+        binding = self.reviewed_binding()
+        return bool(binding and saved.get("head") == binding["head"] and saved.get("base") == binding["base"])
+
+    def stop_stale_fix(self, reason, title):
+        """Clear a bound retry whose revision moved and hand the PR to the owner."""
+        pr = self.pr
+        episode = self.issue or pr
+        owner_handoff.clear_retry(self.env, episode, reason)
+        result = self.handoff(
+            reason, title,
+            f"PR #{pr} head or base changed (or became unreadable) while waiting for review feedback; "
+            f"not applying the saved fix. {self.url}")
+        return "", 0 if result.handed_off else 75
+
+    def fixer_feedback(self, round, screenshot):
+        """Read the expected trusted feedback, consuming a saved retry before any lookup (#151)."""
+        pr = self.pr
+        episode = self.issue or pr
+        reason = "review_comment_missing"
+        title = f"PR #{pr} review comment missing"
+        text = f"A review comment of round {round} is unavailable. {self.url}"
+        try:
+            pending = owner_handoff.load_retry(self.env, episode, reason)
+        except owner_handoff.RetryUnreadable as exc:
+            notify.log(f"PR #{pr}: review feedback retry unreadable: {exc}")
+            result = self.handoff(reason, title, text)
+            return "", 0 if result.handed_off else 75
+        if pending is not None:
+            saved = pending.get("continuation") or {}
+            if saved.get("pr") != str(pr) or saved.get("round") != round:
+                owner_handoff.clear_retry(self.env, episode, reason)
+                pending = None
+            elif not self.revision_matches(saved):
+                return self.stop_stale_fix(reason, title)
+        if pending is not None:
+            result = self.handoff(reason, title, text, resume=True)
+            if result.action != owner_handoff.RETRY:
+                return "", 75 if result.action == owner_handoff.DEFER else 0
+            saved = result.continuation or pending.get("continuation") or {}
+            if not self.revision_matches(saved):
+                return self.stop_stale_fix(reason, title)
+
+        code, retryable = read_agent_comment(self.repo, self.owner, pr, "baton-review", round)
+        feedback = code
+        if screenshot and code:
+            shots, shot_retryable = read_agent_comment(self.repo, self.owner, pr, "baton-screenshot-review", round)
+            retryable = retryable or shot_retryable
+            cap = int(self.env.config.scheduling.review_context_max_chars or 20000)
+            feedback = combined_feedback(code, shots, cap) if shots else ""
+        if feedback:
+            owner_handoff.clear_retry(self.env, episode, reason)
+            return feedback, None
+
+        continuation = self.binding_from_checkpoint(round)
+        if continuation is None:
+            # Inputs were never captured (an older checkpoint): fail closed, no fresh budget.
+            result = self.handoff(reason, title, text, transient=False)
+            return "", 75 if result.action == owner_handoff.DEFER else 0
+        result = self.handoff(reason, title, text, transient=retryable, continuation=continuation)
+        return "", 75 if result.action == owner_handoff.DEFER else 0
 
     def render(self, template, **pairs):
         return prompts.render(self.self_dir / template, list(pairs.items()), env=self.env)
@@ -324,10 +449,11 @@ class Review:
         if not outcome.startswith(REVIEWED):
             return outcome, reply
         posted = "\n".join(line for line in strip_markers(reply).split("\n") if not MARKER_LINE.match(line)).rstrip("\n")
-        comment = pr_helpers.gh("pr", "comment", str(pr), "-R", self.repo, "--body",
-                                f"<!-- baton-review round={round} by=cursor -->\n{posted[:REPLY_CAP]}")
+        body = f"<!-- baton-review round={round} by=cursor -->\n{posted[:REPLY_CAP]}"
+        comment = pr_helpers.gh("pr", "comment", str(pr), "-R", self.repo, "--body", body)
         if comment.returncode != 0:
             return self.failed("review_comment_post_failed", "RESULT: failed posting Cursor's review"), reply
+        self.capture_review_binding(round, body)
         return outcome, reply
 
     def run_review(self, round, note, reviewer=None):
@@ -388,10 +514,12 @@ class Review:
         if outcome.startswith(REVIEWED):
             if review_file.is_file() and review_file.stat().st_size:
                 body = strip_markers(review_file.read_text()).rstrip("\n")
-                posted = pr_helpers.gh("pr", "comment", str(pr), "-R", self.repo, "--body",
-                                       f"<!-- baton-review round={round} by={reviewer} -->\n{review_note}{body}")
+                posted_body = f"<!-- baton-review round={round} by={reviewer} -->\n{review_note}{body}"
+                posted = pr_helpers.gh("pr", "comment", str(pr), "-R", self.repo, "--body", posted_body)
                 if posted.returncode != 0:
                     outcome = self.failed("review_comment_post_failed", "RESULT: failed posting review")
+                else:
+                    self.capture_review_binding(round, posted_body)
             else:
                 outcome = self.failed("review_run_failed", "RESULT: failed no review artifact")
         self.hooks.verdict("review", reviewer, head, round, outcome, out["reply"] or "", str(review_file))
@@ -455,8 +583,8 @@ class Review:
                 mode = (vendors.codex_review_mode(self.state, pr, model)
                         if vendor == "codex" and "codex" in vendors.review_excluded(self.state, pr, self.fixed_by) else "")
                 review_note = f"Review mode: {mode} (codex/{model}).\n\n" if mode else ""
-                posted = pr_helpers.gh("pr", "comment", str(pr), "-R", self.repo, "--body",
-                                       f"<!-- baton-screenshot-review round={round} by={vendor} -->\n{review_note}{body}")
+                posted_body = f"<!-- baton-screenshot-review round={round} by={vendor} -->\n{review_note}{body}"
+                posted = pr_helpers.gh("pr", "comment", str(pr), "-R", self.repo, "--body", posted_body)
                 if posted.returncode != 0:
                     outcome = self.failed("screenshot_comment_post_failed", "RESULT: failed posting screenshot review")
             else:
@@ -515,6 +643,10 @@ class Review:
             code_verdict, screenshot = saved.get("code_verdict", ""), saved.get("screenshot", "")
             checks = saved.get("screenshot_checks", "")
             self.fixed_by, self.issue = saved.get("fixed_by", ""), saved.get("ISSUE", "")
+            self.binding_fields = {k: saved.get(k, "") for k in
+                                   ("reviewed_head", "base_branch", "verdict_digest", "verdict_round")}
+        else:
+            self.binding_fields = {}
         cfg = self.env.config
         if reviewer not in ("pool",) and (reviewer not in cfg.declared() or not cfg.allows(reviewer, "reviewer")):
             reviewer = "pool"
@@ -535,7 +667,8 @@ class Review:
                             "Don't read the full PR diff, AGENTS.md or the principles again unless a fix commit needs them."
                             if fix_head else ""))
             self.values = dict(note=note, fixer=fixer, reviewer=reviewer, round=round, step=step, fix_head=fix_head,
-                               code_verdict=code_verdict, screenshot=screenshot, screenshot_checks=checks)
+                               code_verdict=code_verdict, screenshot=screenshot, screenshot_checks=checks,
+                               **self.binding_fields)
             self.save()
             if step in ("review", "screenshot"):
                 verdict = code_verdict
@@ -606,18 +739,11 @@ class Review:
             self.values.update(step=step, fix_head=fix_head, code_verdict=code_verdict, screenshot=screenshot,
                                screenshot_checks="")
             self.save()
-            if screenshot:
-                # A split review: the fixer reads both comments, or none (an incomplete one is no feedback).
-                code = agent_comment(self.repo, self.owner, pr, "baton-review", round)
-                shots = agent_comment(self.repo, self.owner, pr, "baton-screenshot-review", round)
-                if not (code and shots):
-                    self.handoff("review_comment_missing", f"PR #{pr} review comment missing",
-                                 f"A review comment of round {round} is unavailable. {self.url}")
+            feedback, deferred = self.fixer_feedback(round, bool(screenshot))
+            if deferred is not None:
+                if deferred == 0:
                     self.drop()
-                    return 0
-                feedback = combined_feedback(code, shots, int(self.env.config.scheduling.review_context_max_chars or 20000))
-            else:
-                feedback = agent_review(self.repo, self.owner, pr, round)
+                return deferred
             # The next round's reviewer must stay free: a fixed reviewer, or a sole pool vendor.
             pool = self.env.config.quota.vendor_pool
             exclude = "cursor" if reviewer == "cursor" else ("" if len(pool) > 1 else pool[0])
