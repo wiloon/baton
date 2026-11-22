@@ -34,7 +34,7 @@ clock = time.time
 # Category-1 reads and review/screenshot comment posts share the budget.
 REVIEW_POST = "review_comment_post_failed"
 SCREENSHOT_POST = "screenshot_comment_post_failed"
-COMMENT_POSTS = frozenset({REVIEW_POST, SCREENSHOT_POST})
+COMMENT_POSTS = (REVIEW_POST, SCREENSHOT_POST)
 RETRY_REASONS = frozenset({
     "review_comment_missing", "spec_comments_read_failed", "spec_pending_adr_read_failed",
     *COMMENT_POSTS,
@@ -269,7 +269,7 @@ def prepare_retry(env, episode, reason, item, binding):
 
 def comment_post_episodes(env, reason=None):
     """Find review or screenshot comment-post operations by PR number."""
-    reasons = (reason,) if reason else tuple(COMMENT_POSTS)
+    reasons = (reason,) if reason else COMMENT_POSTS
     found = {}
     for name in reasons:
         for path in Path(env.dirs.state).glob(f"handoff-*-{name}.json"):
@@ -279,11 +279,6 @@ def comment_post_episodes(env, reason=None):
                 episode, item = match.groups()
                 found.setdefault(item or episode, set()).add(episode)
     return found
-
-
-def review_post_episodes(env):
-    """Find code-review or screenshot comment-post operations by PR number."""
-    return comment_post_episodes(env)
 
 
 def _clear_path(path):

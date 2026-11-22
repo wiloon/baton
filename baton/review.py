@@ -380,7 +380,7 @@ class Review:
 
     def post_pending(self):
         return (self.binding_fields.get("post_waiting") or self.binding_fields.get("post_outcome")
-                or str(self.pr) in owner_handoff.review_post_episodes(self.env))
+                or str(self.pr) in owner_handoff.comment_post_episodes(self.env))
 
     def screenshot_post_pending(self):
         waiting = self.binding_fields.get("post_waiting")
@@ -389,7 +389,7 @@ class Review:
                 or str(self.pr) in owner_handoff.comment_post_episodes(self.env, owner_handoff.SCREENSHOT_POST))
 
     def post_comment(self, round, reviewer, binding, *, reason, kind, marker, step, fail_label,
-                     digest_field, on_landed=None):
+                     digest_field):
         """Save before sending, or consume a due attempt before reconciling the saved write (#151)."""
         pr, episode = str(self.pr), self.issue or self.pr
         title = f"PR #{pr} comment post failed"
@@ -428,13 +428,12 @@ class Review:
             if result.action != owner_handoff.RETRY:
                 return self.failed(ALREADY, f"RESULT: failed posting {fail_label}")
             binding = result.continuation
-            reviewer = binding["reviewer"]
+            if reviewer is None:
+                reviewer = binding["reviewer"]
 
         def finish():
             fields = {"post_outcome": binding["outcome"], digest_field: binding["digest"]}
             self.save_binding(**fields)
-            if on_landed:
-                on_landed(binding)
             self.hooks.verdict(kind, binding["reviewer"], binding["head"], binding["round"],
                                binding["outcome"], binding["body"], run_id=binding["run_id"])
             owner_handoff.clear_retry(self.env, episode, reason, pr)
@@ -782,6 +781,13 @@ class Review:
         if not vendors.screenshot_allowed(self.state, pr, vendor, route.model, self.fixed_by):
             return self.failed("screenshot_independence_denied", "RESULT: failed screenshot reviewer model may be a PR author")
         limit = int(self.env.config.scheduling.review_context_max_chars or 20000)
+        data, status = self.read_post_inputs()
+        if status == "paused":
+            return DEFERRED_POST
+        if not data or data["headRefOid"] != head:
+            return self.failed("screenshot_run_failed", "RESULT: failed reading the PR revision for screenshot review")
+        if check_section.items(data["body"]):
+            checks = check_section.read(data["body"])
         context = Path(self.ctx, f"pr-{pr}-screenshot-review-{round}-{time.strftime('%Y%m%d-%H%M%S')}.md")
         context.write_text(issue_context(self.env, self.issue) if re.fullmatch(r"\d+", str(self.issue or "")) else "")
         review_file = Path(f"/tmp/baton-screenshot-review-{pr}-{round}.md")
@@ -804,12 +810,6 @@ class Review:
                         if vendor == "codex" and "codex" in vendors.review_excluded(self.state, pr, self.fixed_by) else "")
                 review_note = f"Review mode: {mode} (codex/{model}).\n\n" if mode else ""
                 posted_body = f"<!-- baton-screenshot-review round={round} by={vendor} -->\n{review_note}{body}"
-                data, status = self.read_post_inputs()
-                if status == "paused":
-                    return DEFERRED_POST
-                if not data or data["headRefOid"] != head:
-                    return self.failed("screenshot_comment_post_failed",
-                                       "RESULT: failed reading the PR revision for screenshot review")
                 binding = self.comment_post_binding(posted_body, round, outcome, vendor, head, data)
                 return self.post_screenshot_comment(round, vendor, binding)
             outcome = self.failed("screenshot_run_failed", "RESULT: failed no screenshot review artifact")
@@ -879,6 +879,14 @@ class Review:
         if (not pending_post and reviewer != "pool"
                 and (reviewer not in cfg.declared() or not cfg.allows(reviewer, "reviewer"))):
             reviewer = "pool"
+        if screenshot_post and (step != "screenshot" or code_verdict not in ("pass", "changes")):
+            # A damaged screenshot checkpoint fails closed, before the loop rewrites any of it.
+            self.handoff(owner_handoff.SCREENSHOT_POST, f"PR #{pr} comment post failed",
+                         f"The saved screenshot review post has an invalid checkpoint. {self.url}")
+            for key in {self.issue or pr, pr}:
+                owner_handoff.clear_retry(self.env, key, owner_handoff.SCREENSHOT_POST, str(pr))
+            self.drop()
+            return 0
         resuming_fix = step == "fix"
         if not (resuming_fix or pending_post) and self.seed():
             self.seed_contrib()
@@ -930,10 +938,10 @@ class Review:
                         return 0
                     verdict = "pass" if outcome.startswith("REVIEW: pass") else "changes"
                     self.binding_fields["post_outcome"] = self.values["post_outcome"] = ""
-                if screenshot_post or step == "screenshot" or self.screenshot_enabled(reviewer):
+                if not screenshot_post and (step == "screenshot" or self.screenshot_enabled(reviewer)):
                     body = pr_helpers.body(pr)
                     # If the body read fails on resume, keep the checks saved with the code verdict.
-                    if body is not None and not screenshot_post:
+                    if body is not None:
                         if check_section.items(body):
                             checks = check_section.read(body)
                         else:
