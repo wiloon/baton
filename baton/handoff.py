@@ -6,6 +6,7 @@ terminal handoff performs the label change, telemetry and notification. Callers 
 label removals and stop semantics. Cursor triage and after-merge tracker issues stay outside.
 """
 from dataclasses import dataclass
+from pathlib import Path
 
 from . import advisor, notify, pr as pr_helpers
 
@@ -128,6 +129,9 @@ def perform(env, reason, *, kind, number, title, text, hooks, remove=(),
         raise UnknownReason(f"unlisted handoff reason: {reason!r}")
 
     def finish(decision=None):
+        if kind == "pr":
+            # Retire the continuation before publishing the handoff or releasing its grant.
+            Path(env.dirs.state, f"review-pending-{number}").unlink(missing_ok=True)
         result = label_ready(env, kind, number, remove=remove)
         if after_labels:
             after_labels(result)

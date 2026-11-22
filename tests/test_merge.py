@@ -1,6 +1,7 @@
 """baton.merge: the merge or the handoff after a passed review, the CI repair round and the
 task recovery, against a real git worktree and the fake `gh` of conftest. Ported from
 tests/shots.sh, tests/verify.sh and tests/test_pr_lifecycle.py."""
+import io
 import json
 import os
 from pathlib import Path
@@ -276,6 +277,31 @@ def test_a_truncated_provider_response_still_ends_in_one_handoff_and_a_recorded_
     assert outcome["decision_id"] == decision["decision_id"] and outcome["result"] == "handoff"
     assert sum(c[:2] == ["pr", "edit"] and "ready-for-human" in c for c in run.gh.calls()) == 1
     assert sum(c[:2] == ["pr", "merge"] for c in run.gh.calls()) == 1   # the failed attempt only; no retry
+
+
+@pytest.mark.parametrize("field", ["action", "reason", "evidence"])
+def test_a_provider_response_with_an_unpaired_surrogate_hands_off_once(run, observing, monkeypatch, field):
+    reply = {"action": "retry_step", "reason": "Poll once", "evidence": []}
+    reply[field] = ["\ud800"] if field == "evidence" else "\ud800"
+    payload = json.dumps({"choices": [{"message": {"content": json.dumps(reply)}}],
+                          "usage": {"total_tokens": 11}}).encode()
+    urlopen = advisor.urllib.request.urlopen
+    monkeypatch.setattr(advisor, "call_deepseek", REAL_DEEPSEEK)
+    monkeypatch.setattr(advisor.urllib.request, "urlopen", lambda request, **kwargs: (
+        io.BytesIO(payload) if request.full_url.endswith("/chat/completions") else urlopen(request, **kwargs)))
+    run.gh.watches((0, ""))
+    run.gh.set(state="OPEN", mergeStateStatus="CLEAN", headRefOid=OLD, merge_results=[1])
+
+    run.go()
+
+    decision, outcome = advisor.read_records(run.merger().env)
+    assert decision["failure"] == "malformed reply: invalid Unicode text"
+    assert decision["advised"] == decision["reason"] == "" and decision["usage"] == {"total_tokens": 11}
+    assert decision["executed"] == outcome["result"] == "handoff"
+    assert outcome["decision_id"] == decision["decision_id"]
+    assert sum(c[:2] == ["pr", "edit"] and "ready-for-human" in c for c in run.gh.calls()) == 1
+    assert sum(event.startswith("notify ") for event in run.events) == 1
+    assert "malformed reply: invalid Unicode text" in next(iter(run.texts.values()))
 
 
 def test_the_provider_request_carries_only_the_latest_trusted_feedback_of_each_kind(run, observing):

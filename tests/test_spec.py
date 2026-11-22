@@ -1212,6 +1212,7 @@ def test_pending_adr_acceptance_records_observation_and_runs_the_existing_rule(
     assert VERDICT_BODY in snapshot
     assert (record["point"], record["mode"], record["advised"], record["executed"]) == (
         reason, "observe", "retry_step", "handoff")
+    assert "retry_step" in record["actions"] and record["failure"] == ""
     assert terminal["decision_id"] == record["decision_id"] and terminal["result"] == "handoff"
     if "_ci_" in reason:
         assert "30 minutes" in snapshot
@@ -1229,6 +1230,35 @@ def test_the_advisor_grants_one_more_spec_round_that_ends_in_accept(advised):
     assert len(advised.gh.posted("<!-- baton-spec-review")) == 3 and advised.gh.posted("<!-- baton-verdict: accept")
     assert len(advised.advice_calls) == 1 and "spec round limit" in advised.advice_calls[0]
     assert "ready-for-human" not in advised.gh.labels
+
+
+def test_dev_reconciles_an_interrupted_spec_acceptance_after_worktree_removal(advised, monkeypatch):
+    from baton import advisor, dev, tick
+
+    advised.script = [CHANGES, reviser(), CHANGES, reviser(), CHANGES, reviser(), ACCEPT]
+    advised.advice = [{"action": "extra_round", "reason": "one wording point left", "evidence": []}]
+
+    def interrupted(*args):
+        raise InterruptedError("runner stopped before recording acceptance")
+
+    with monkeypatch.context() as stopped:
+        stopped.setattr(advisor, "finish_episode", interrupted)
+        with pytest.raises(InterruptedError):
+            advised.run()
+    assert advised.gh.posted("<!-- baton-verdict: accept")
+    assert "ready-for-agent" in advised.gh.labels
+    assert not Path(advised.env["WT_ROOT"], f"spec-{N}").exists()
+    env = session.resolve(advised.env)
+    assert advisor.granted(env, "spec_limit", N)
+
+    # Stop at the dev worktree boundary so both starts exercise the same published plan.
+    monkeypatch.setattr(dev, "setup_worktree", lambda *args: ("", False))
+    assert dev.run(tick.Tick(env), N) == 1
+    assert dev.run(tick.Tick(env), N) == 1
+
+    decision, outcome = advisor.read_records(env)
+    assert outcome["decision_id"] == decision["decision_id"] and outcome["result"] == "accept"
+    assert not advisor.granted(env, "spec_limit", N)
 
 
 def test_a_second_spec_limit_hands_off_without_asking_again(advised):

@@ -291,14 +291,21 @@ def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=No
                         or not isinstance(reply.get("reason"), str)
                         or not isinstance(reply.get("evidence"), list)):
                     raise ValueError("expected action and reason strings and an evidence array")
+            raw_action = str(reply.get("action", ""))
+            raw_reason = str(reply.get("reason", ""))
+            raw_evidence = [str(quote) for quote in (reply.get("evidence") or [])]
+            # JSON escapes can decode to lone surrogates. Reject them before keeping any provider text.
+            for value in (raw_action, raw_reason, *raw_evidence):
+                value.encode("utf-8")
+            if category:
                 if any(not isinstance(quote, str) or not quote or quote not in text for quote in reply["evidence"]):
                     raise ValueError("evidence is outside the sent snapshot")
-            advised = str(reply.get("action", ""))
+            advised = raw_action
             if advised not in actions:
                 advised = redact(advised, values)
                 failure = f"action outside the allowed set: {advised[:60]!r}"
-            reason = redact(str(reply.get("reason", "")), values)[:600]
-            evidence = [redact(str(e), values)[:300] for e in (reply.get("evidence") or [])][:5]
+            reason = redact(raw_reason, values)[:600]
+            evidence = [redact(quote, values)[:300] for quote in raw_evidence[:5]]
     except urllib.error.HTTPError as error:
         failure = f"HTTP {error.code}"
     except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as error:
@@ -307,6 +314,8 @@ def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=No
         if isinstance(error.usage, dict):
             usage = counted(error.usage)
         failure = f"malformed reply: {type(error.cause).__name__}: {redact(str(error), values)[:120]}"
+    except UnicodeEncodeError:
+        failure = "malformed reply: invalid Unicode text"
     except (ValueError, KeyError, IndexError, TypeError, AttributeError, RuntimeError) as error:
         failure = f"malformed reply: {type(error).__name__}: {redact(str(error), values)[:120]}"
     executed = rule
@@ -414,13 +423,22 @@ def digest(env, now=None):
     now = int(now if now is not None else time.time())
     stamp = Path(str(env.config.paths.state), "advisor", "digest-last")
     try:
-        last = int(stamp.read_text().strip())
+        last, *cursor = map(int, stamp.read_text().split(maxsplit=1))
     except (OSError, ValueError):
-        last = 0
+        last, cursor = 0, []
     if now - last < DIGEST_SECONDS:
         return ""
-    records = read_records(env)
-    recent = [r for r in records if int(r.get("ts", 0)) > last]
+    try:
+        records = read_records(env, strict=True)
+    except OSError:
+        return ""
+    if cursor:
+        consumed = cursor[0]
+        previous, recent = records[:consumed], records[consumed:]
+    else:
+        # Migrate the timestamp-only stamp. Its cutoff second may contain unreported records.
+        previous = [r for r in records if int(r.get("ts", 0)) < last]
+        recent = [r for r in records if int(r.get("ts", 0)) >= last]
     decisions = [r for r in recent if r.get("kind") == "decision"]
 
     def keys(record):
@@ -431,10 +449,11 @@ def digest(env, now=None):
         return [base + (record["snapshot_sha"],), base] if record.get("snapshot_sha") else [base]
 
     closed = {keys(r)[0] for r in recent if r.get("kind") == "outcome"}
-    reported = [r for r in records if r.get("kind") == "decision"
-                and (int(r.get("ts", 0)) > last or any(k in closed for k in keys(r)))]
+    reported = [r for r in previous if r.get("kind") == "decision" and any(k in closed for k in keys(r))] + decisions
     stamp.parent.mkdir(parents=True, exist_ok=True)
-    stamp.write_text(f"{now}\n")
+    next_stamp = stamp.with_suffix(".tmp")
+    next_stamp.write_text(f"{now} {len(records)}\n")
+    next_stamp.replace(stamp)
     if not reported:
         return ""
 

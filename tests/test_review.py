@@ -1174,6 +1174,34 @@ def test_a_second_limit_hands_off_without_asking_again(advised):
     assert any("Advisor (DeepSeek) chose extra_round: fixable" in line for line in advised.log())
 
 
+def test_restart_after_a_terminal_handoff_does_not_resume_the_spent_round(advised, monkeypatch):
+    from baton import advisor
+
+    advised.reviews[:] = ["changes", "changes", "changes"]
+    advised.advice = [{"action": "extra_round", "reason": "fixable", "evidence": []}]
+    finish = advisor.finish_episode
+
+    def interrupted(*args):
+        finish(*args)
+        raise InterruptedError("runner stopped after closing the episode")
+
+    with monkeypatch.context() as stopped:
+        stopped.setattr(advisor, "finish_episode", interrupted)
+        with pytest.raises(InterruptedError):
+            advised.run(fixer="cursor")
+    assert advised.labelled("ready-for-human")
+    advised.agents.clear()
+    advised.fixes.clear()
+    advised.advice_calls.clear()
+    advised.reviews[:] = ["pass"]
+    edits_before = len([call for call in advised.gh.calls() if call[:2] == ["pr", "edit"]])
+
+    assert resume_split_review(advised) == 0
+    assert advised.agents == advised.fixes == advised.advice_calls == []
+    assert len([call for call in advised.gh.calls() if call[:2] == ["pr", "edit"]]) == edits_before
+    assert not advised.checkpoint()
+
+
 def test_an_extra_round_remains_open_until_the_merge_gate_hands_off(advised, monkeypatch):
     from baton import advisor
     from baton.session import resolve

@@ -236,6 +236,23 @@ def test_the_digest_counts_this_windows_grants_and_closures_separately(adv):
     assert "1 earlier decision(s) closed in this window" in text
 
 
+def test_the_next_digest_reports_an_outcome_appended_at_the_previous_cutoff_once(adv, monkeypatch):
+    now = 200000
+    with monkeypatch.context() as clock:
+        clock.setattr(advisor.time, "time", lambda: now)
+        adv.replies = [EXTRA]
+        advisor.advise(adv.env, "review_limit", 30, "s", ("extra_round",), revalidate=lambda: True)
+        assert "outcome pending" in advisor.digest(adv.env)
+        advisor.finish_episode(adv.env, "pr", 30, "merged")
+    assert adv.records()[-1]["ts"] == now
+
+    report = advisor.digest(adv.env, now=now + 86400)
+    assert "0 decision(s)" in report and "1 earlier decision(s) closed" in report
+    assert report.count("outcome merged") == 1
+    assert advisor.digest(adv.env, now=now + 2 * 86400) == ""
+    assert len(adv.notes) == 2
+
+
 def test_the_digest_counts_a_stale_recommendation_as_recommended(adv):
     advisor.append(adv.env, {"kind": "decision", "ts": 100, "point": "review_limit", "repo": "owner/app", "item": "31",
                              "decision_id": "stale", "advised": "extra_round", "executed": "handoff",
