@@ -33,6 +33,7 @@ class FakeGH:
     def __init__(self, owner):
         self.owner, self.calls = owner, []
         self.body, self.comments, self.labels = "Goal\nOld step\n", [], {"needs-triage", "ready-for-human"}
+        self.issue_state = "OPEN"
         self.adr_pr, self.fails = "", set()
         self.flaky = {}   # "issue edit --body-file": [(stderr, landed), ...] failures before it works
         self.pr_state = "OPEN"
@@ -41,6 +42,23 @@ class FakeGH:
         self.update_stderr = "failed to update"
         self.fail_body_substr = ""
         self.keep_open_on_merge = False
+        self._next_comment_id = 1
+
+    def _comment(self, body, author=None):
+        row = {"id": self._next_comment_id, "user": {"login": author or self.owner},
+               "author": {"login": author or self.owner}, "body": body}
+        self._next_comment_id += 1
+        self.comments.append(row)
+        return row
+
+    def _ensure_comment_ids(self):
+        for row in self.comments:
+            if "id" not in row:
+                row["id"] = self._next_comment_id
+                self._next_comment_id += 1
+            author = row.get("author") or row.get("user") or {"login": self.owner}
+            row.setdefault("author", author)
+            row.setdefault("user", author)
 
     def __call__(self, *args, input=None):
         self.calls.append(list(args))
@@ -54,9 +72,17 @@ class FakeGH:
         stderr, landed = self.flaky[key].pop(0) if self.flaky.get(key) else ("", True)
         if not landed:
             return subprocess.CompletedProcess(args, 1, "", stderr)
-        if head == "issue view" and "comments" in args[args.index("--json") + 1]:
+        if args and args[0] == "api" and f"/issues/{N}/comments" in args[1]:
+            self._ensure_comment_ids()
+            out = json.dumps([[{"id": c["id"], "user": c.get("user") or c["author"], "body": c["body"]}
+                               for c in self.comments]])
+        elif head == "issue view" and "comments" in args[args.index("--json") + 1]:
+            self._ensure_comment_ids()
             data = {"title": "T", "body": self.body, "comments": self.comments}
             out = json.dumps(data)
+        elif head == "issue view" and "state,body,labels" in args[args.index("--json") + 1]:
+            out = json.dumps({"state": self.issue_state, "body": self.body,
+                              "labels": [{"name": name} for name in sorted(self.labels)]})
         elif head == "issue view":
             out = self.body + "\n"
         elif head == "issue edit":
@@ -73,7 +99,7 @@ class FakeGH:
             body = args[args.index("--body") + 1]
             if self.fail_body_substr and self.fail_body_substr in body:
                 return subprocess.CompletedProcess(args, 1, "", "boom")
-            self.comments.append({"author": {"login": self.owner}, "body": body})
+            self._comment(body)
         elif head == "pr list":
             out = json.dumps([{"number": int(self.adr_pr), "headRefName": f"docs/spec-issue-{N}",
                                "baseRefName": "main", "headRefOid": self.head_oid, "isCrossRepository": False,
@@ -570,6 +596,8 @@ def live_spec(loop, monkeypatch, source):
     monkeypatch.setattr(session, "resolve", resolve_session)
     monkeypatch.setattr(session, "_active", ContextVar("test_session", default=env))
     monkeypatch.setattr(spec.dispatch, "dispatch", dispatch)
+    # Mid-loop rounds: the issue is already claimed (no ready-for-human pause).
+    loop.gh.labels = {"needs-triage", "agent-wip"}
     s = spec.Spec(env, spec.telemetry.from_env(env, issue=N), N)
     assert s.worktree()
     return s, path
@@ -1469,3 +1497,243 @@ def test_an_advised_spec_handoff_keeps_todays_handoff(advised):
     advised.advice = [{"action": "handoff", "reason": "needs a product decision", "evidence": []}]
     assert advised.run() is False
     assert len(advised.runs) == 5 and "ready-for-human" in advised.gh.labels
+
+
+# --- spec comment posts: category-1 retries (#151) ---------------------------------------------
+
+def test_a_transient_spec_review_comment_post_defers_then_recovers_without_a_second_worker(loop, monkeypatch):
+    """spec_review_comment_post_failed: no early replay, one worker, landed after 60s (#151)."""
+    from baton import handoff
+
+    clock = _spec_clock(monkeypatch)
+    call, posts = spec.pr_helpers.call, []
+    loop.gh.comments = []
+    loop.script = [CHANGES, reviser(), ACCEPT]
+
+    def flaky(*args, input=None, limit=None):
+        if args[:2] == ("issue", "comment"):
+            posts.append(clock["now"])
+            if clock["now"] < 1_060:
+                return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return call(*args, input=input, limit=limit)
+
+    monkeypatch.setattr(spec.pr_helpers, "call", flaky)
+    with pytest.raises(Deferred, match="spec_review_comment_post_failed"):
+        loop.run()
+    assert [run["role"] for run in loop.runs] == ["spec_review"]
+    assert not loop.gh.posted("<!-- baton-spec-review")
+    saved = handoff.load_retry(session.resolve(loop.env), N, "spec_review_comment_post_failed")
+    assert saved["attempts"] == 0 and saved["continuation"]["body"].startswith("<!-- baton-spec-review round=1")
+    clock["now"] = 1_059
+    before = len(posts)
+    with pytest.raises(Deferred, match="spec_review_comment_post_failed"):
+        loop.run()
+    assert len(posts) == before and [run["role"] for run in loop.runs] == ["spec_review"]
+    clock["now"] = 1_060
+    assert loop.run() is True
+    assert [run["role"] for run in loop.runs] == ["spec_review", "spec", "spec_review"]
+    assert 1_000 in posts and 1_060 in posts
+    assert len(loop.gh.posted("<!-- baton-spec-review round=1 by=")) == 1
+    assert not list(Path(loop.env["STATE"]).glob("handoff-*-*spec_review_comment_post_failed.json"))
+
+
+def test_an_exhausted_spec_review_comment_post_hands_off_exactly_once(loop, monkeypatch):
+    clock = _spec_clock(monkeypatch)
+    events, writes = [], []
+    monkeypatch.setattr(spec.telemetry.Telemetry, "task",
+                        lambda self, kind, *args: events.append(args) if kind == "handoff" else None)
+    call = spec.pr_helpers.call
+    loop.gh.comments = []
+    loop.script = [CHANGES]
+
+    def unavailable(*args, input=None, limit=None):
+        if args[:2] == ("issue", "comment"):
+            writes.append(clock["now"])
+            return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return call(*args, input=input, limit=limit)
+
+    monkeypatch.setattr(spec.pr_helpers, "call", unavailable)
+    with pytest.raises(Deferred, match="spec_review_comment_post_failed"):
+        loop.run()
+    clock["now"] = 1_060
+    with pytest.raises(Deferred, match="spec_review_comment_post_failed"):
+        loop.run()
+    clock["now"] = 1_360
+    assert loop.run() is False
+    assert set(writes) == {1_000, 1_060, 1_360}
+    assert [e[0] for e in events] == ["spec_review_comment_post_failed"]
+    assert "ready-for-human" in loop.gh.labels and len(loop.runs) == 1
+    assert not list(Path(loop.env["STATE"]).glob("handoff-*-*spec_review_comment_post_failed.json"))
+
+
+def test_a_lost_spec_review_comment_response_is_recognized_without_a_second_write(loop, monkeypatch):
+    call, writes = spec.pr_helpers.call, []
+    loop.gh.comments = []
+    loop.script = [CHANGES, reviser(), ACCEPT]
+
+    def write_then_fail(*args, input=None, limit=None):
+        if args[:2] == ("issue", "comment") and "<!-- baton-spec-review round=1" in (args[args.index("--body") + 1]
+                                                                                      if "--body" in args else ""):
+            writes.append(1)
+            call(*args, input=input, limit=limit)   # land
+            return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return call(*args, input=input, limit=limit)
+
+    monkeypatch.setattr(spec.pr_helpers, "call", write_then_fail)
+    assert loop.run() is True
+    assert writes == [1] and len(loop.gh.posted("<!-- baton-spec-review round=1 by=")) == 1
+    assert not list(Path(loop.env["STATE"]).glob("handoff-retry-*"))
+
+
+def test_a_changed_issue_body_during_spec_review_post_deferral_hands_off(loop, monkeypatch):
+    clock = _spec_clock(monkeypatch)
+    events = []
+    monkeypatch.setattr(spec.telemetry.Telemetry, "task",
+                        lambda self, kind, *args: events.append(args) if kind == "handoff" else None)
+    call = spec.pr_helpers.call
+    loop.gh.comments = []
+    loop.script = [CHANGES]
+
+    def unavailable(*args, input=None, limit=None):
+        if args[:2] == ("issue", "comment"):
+            return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return call(*args, input=input, limit=limit)
+
+    monkeypatch.setattr(spec.pr_helpers, "call", unavailable)
+    with pytest.raises(Deferred, match="spec_review_comment_post_failed"):
+        loop.run()
+    loop.gh.body = "Goal\nOwner changed the body\n"
+    clock["now"] = 1_060
+    assert loop.run() is False
+    assert [e[0] for e in events] == ["spec_review_comment_post_failed"]
+    assert not list(Path(loop.env["STATE"]).glob("handoff-*-*spec_review_comment_post_failed.json"))
+
+
+def test_a_closed_issue_during_spec_review_post_clears_quietly(loop, monkeypatch):
+    clock = _spec_clock(monkeypatch)
+    events = []
+    monkeypatch.setattr(spec.telemetry.Telemetry, "task",
+                        lambda self, kind, *args: events.append(args) if kind == "handoff" else None)
+    call = spec.pr_helpers.call
+    loop.gh.comments = []
+    loop.script = [CHANGES]
+
+    def unavailable(*args, input=None, limit=None):
+        if args[:2] == ("issue", "comment"):
+            return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return call(*args, input=input, limit=limit)
+
+    monkeypatch.setattr(spec.pr_helpers, "call", unavailable)
+    with pytest.raises(Deferred, match="spec_review_comment_post_failed"):
+        loop.run()
+    loop.gh.issue_state = "CLOSED"
+    clock["now"] = 1_060
+    assert loop.run() is False
+    assert events == [] and "ready-for-human" not in loop.gh.labels
+    assert not list(Path(loop.env["STATE"]).glob("handoff-*-*spec_review_comment_post_failed.json"))
+
+
+def test_a_damaged_spec_review_post_fails_closed(loop, monkeypatch):
+    from baton import handoff
+
+    clock = _spec_clock(monkeypatch)
+    events = []
+    monkeypatch.setattr(spec.telemetry.Telemetry, "task",
+                        lambda self, kind, *args: events.append(args) if kind == "handoff" else None)
+    call = spec.pr_helpers.call
+    loop.gh.comments = []
+    loop.script = [CHANGES]
+
+    def unavailable(*args, input=None, limit=None):
+        if args[:2] == ("issue", "comment"):
+            return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return call(*args, input=input, limit=limit)
+
+    monkeypatch.setattr(spec.pr_helpers, "call", unavailable)
+    with pytest.raises(Deferred, match="spec_review_comment_post_failed"):
+        loop.run()
+    for path in Path(loop.env["STATE"]).glob("handoff-*-*spec_review_comment_post_failed.json"):
+        path.write_text("{not-json")
+    clock["now"] = 1_060
+    assert loop.run() is False
+    assert [e[0] for e in events] == ["spec_review_comment_post_failed"]
+    assert handoff.load_retry(session.resolve(loop.env), N, "spec_review_comment_post_failed") is None
+
+
+def test_a_permanent_spec_review_comment_post_hands_off_directly(loop, monkeypatch):
+    events = []
+    monkeypatch.setattr(spec.telemetry.Telemetry, "task",
+                        lambda self, kind, *args: events.append(args) if kind == "handoff" else None)
+    call = spec.pr_helpers.call
+    loop.gh.comments = []
+    loop.script = [CHANGES]
+
+    def permanent(*args, input=None, limit=None):
+        if args[:2] == ("issue", "comment"):
+            return subprocess.CompletedProcess(args, 1, "", "HTTP 401: Bad credentials")
+        return call(*args, input=input, limit=limit)
+
+    monkeypatch.setattr(spec.pr_helpers, "call", permanent)
+    assert loop.run() is False
+    assert [e[0] for e in events] == ["spec_review_comment_post_failed"]
+    assert not list(Path(loop.env["STATE"]).glob("handoff-retry-*"))
+    assert len(loop.runs) == 1
+
+
+def test_a_transient_spec_reply_post_defers_then_recovers_without_a_second_worker(loop, monkeypatch):
+    """spec_reply_post_failed: no early replay, one reviser, landed after 60s (#151)."""
+    from baton import handoff
+
+    clock = _spec_clock(monkeypatch)
+    call, posts = spec.pr_helpers.call, []
+    loop.gh.comments = []
+    loop.script = [CHANGES, reviser(), ACCEPT]
+
+    def flaky(*args, input=None, limit=None):
+        if args[:2] == ("issue", "comment"):
+            body = args[args.index("--body") + 1] if "--body" in args else ""
+            if "<!-- baton-spec-reply" in body:
+                posts.append(clock["now"])
+                if clock["now"] < 1_060:
+                    return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return call(*args, input=input, limit=limit)
+
+    monkeypatch.setattr(spec.pr_helpers, "call", flaky)
+    with pytest.raises(Deferred, match="spec_reply_post_failed"):
+        loop.run()
+    assert [run["role"] for run in loop.runs] == ["spec_review", "spec"]
+    assert loop.gh.posted("<!-- baton-spec-review") and not loop.gh.posted("<!-- baton-spec-reply")
+    saved = handoff.load_retry(session.resolve(loop.env), N, "spec_reply_post_failed")
+    assert saved["attempts"] == 0 and saved["continuation"]["body"].startswith("<!-- baton-spec-reply round=1")
+    clock["now"] = 1_059
+    before = len(posts)
+    with pytest.raises(Deferred, match="spec_reply_post_failed"):
+        loop.run()
+    assert len(posts) == before and [run["role"] for run in loop.runs] == ["spec_review", "spec"]
+    clock["now"] = 1_060
+    assert loop.run() is True
+    assert [run["role"] for run in loop.runs] == ["spec_review", "spec", "spec_review"]
+    assert set(posts) == {1_000, 1_060}
+    assert len(loop.gh.posted("<!-- baton-spec-reply round=1 by=")) == 1
+    assert not list(Path(loop.env["STATE"]).glob("handoff-*-*spec_reply_post_failed.json"))
+
+
+def test_tick_discovers_a_waiting_spec_comment_post_before_new_work(loop, monkeypatch):
+    from baton import handoff, tick
+
+    clock = _spec_clock(monkeypatch)
+    call = spec.pr_helpers.call
+    loop.gh.comments = []
+    loop.script = [CHANGES]
+
+    def unavailable(*args, input=None, limit=None):
+        if args[:2] == ("issue", "comment"):
+            return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return call(*args, input=input, limit=limit)
+
+    monkeypatch.setattr(spec.pr_helpers, "call", unavailable)
+    with pytest.raises(Deferred, match="spec_review_comment_post_failed"):
+        loop.run()
+    pending = tick.Tick(loop.env).pending_specs()
+    assert pending.get(N) == "spec_review_comment_post_failed"
+    assert handoff.load_retry(session.resolve(loop.env), N, "spec_review_comment_post_failed")["attempts"] == 0

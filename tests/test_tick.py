@@ -28,12 +28,17 @@ class FakeGH:
 
     def __init__(self):
         self.calls, self.answers, self.fails = [], {}, set()
+        self._issue_comments = []
 
     def __call__(self, *args, input=None):
         self.calls.append(list(args))
         head = " ".join(args[:2])
         if head in self.fails:
             return subprocess.CompletedProcess(args, 1, "", "boom")
+        if args[:1] == ("api",) and "/comments" in args[1] and "--slurp" in args:
+            rows = [{"id": c.get("id", i + 1), "user": c.get("user") or c.get("author") or {"login": "owner"},
+                     "body": c.get("body", "")} for i, c in enumerate(self._issue_comments)]
+            return subprocess.CompletedProcess(args, 0, json.dumps([rows]), "")
         answer = self.answers.get(head, "[]" if list(args[1:2]) == ["list"] else "")
         if callable(answer):
             answer = answer(args)
@@ -42,6 +47,11 @@ class FakeGH:
             answer = {"title": "Issue", "body": "Body", **(answer if isinstance(answer, dict) else {}), "comments": [
                 {"author": {"login": "owner"}, "body": "<!-- baton-verdict: accept -->\nPlan"}
             ]}
+        if args[:2] == ("issue", "view") and isinstance(answer, dict) and "comments" in answer:
+            self._issue_comments = list(answer["comments"])
+        if args[:2] == ("issue", "view") and "state,body,labels" in args and isinstance(answer, dict):
+            answer = {"state": answer.get("state", "OPEN"), "body": answer.get("body", "Body"),
+                      "labels": answer.get("labels", [{"name": "ready-for-agent"}])}
         if isinstance(answer, subprocess.CompletedProcess):
             return answer
         if not isinstance(answer, str):
@@ -1843,9 +1853,11 @@ def test_tick_run_counts_comment_reads_across_both_delays(ctx, monkeypatch, forc
             if clock["now"] < 1_360:
                 return subprocess.CompletedProcess(args, 1, "", "HTTP 503 boom")
             return {"title": "Recovered title", "body": "Recovered body", "comments": [
-                {"author": {"login": "owner"}, "body": "<!-- baton-spec-reply round=2 by=claude -->\nRecovered reply"}
+                {"id": 1, "author": {"login": "owner"},
+                 "body": "<!-- baton-spec-reply round=2 by=claude -->\nRecovered reply"}
             ]}
-        return {"labels": [{"name": "ready-for-agent"}], "author": {"login": "owner"}, "state": "OPEN"}
+        return {"labels": [{"name": "ready-for-agent"}], "author": {"login": "owner"},
+                "state": "OPEN", "body": "Recovered body"}
 
     def worker(vendor, role, prompt, tag, *args, **kwargs):
         context, = Path(ctx.env["CTX"]).glob("issue-12-spec-3-review-*.md")

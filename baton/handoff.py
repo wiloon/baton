@@ -31,13 +31,16 @@ READY = "ready-for-human"
 DELAYS = (60, 300)
 MAX_ATTEMPTS = len(DELAYS)
 clock = time.time
-# Category-1 reads and review/screenshot comment posts share the budget.
+# Category-1 reads and comment posts share the budget.
 REVIEW_POST = "review_comment_post_failed"
 SCREENSHOT_POST = "screenshot_comment_post_failed"
+SPEC_REVIEW_POST = "spec_review_comment_post_failed"
+SPEC_REPLY_POST = "spec_reply_post_failed"
 COMMENT_POSTS = (REVIEW_POST, SCREENSHOT_POST)
+SPEC_POSTS = (SPEC_REVIEW_POST, SPEC_REPLY_POST)
 RETRY_REASONS = frozenset({
     "review_comment_missing", "spec_comments_read_failed", "spec_pending_adr_read_failed",
-    *COMMENT_POSTS,
+    *COMMENT_POSTS, *SPEC_POSTS,
 })
 
 # Categories: 1 rule-decided, 2 judgement, 3 needs investigation, 4 owner-only.
@@ -196,6 +199,41 @@ def _comment_post_valid(item, binding, *, marker):
             and (binding["issue"] == "" or binding["issue"].isascii() and binding["issue"].isdecimal()))
 
 
+def _spec_comment_post_valid(item, binding, *, reason):
+    """A trusted spec review or reply comment and the inputs it was produced from (#151)."""
+    body, reviewer, round = binding.get("body"), binding.get("reviewer"), binding.get("round")
+    if reviewer not in ("claude", "codex", "cursor") or type(round) is not int or round <= 0 or not isinstance(body, str):
+        return False
+    if reason == SPEC_REVIEW_POST:
+        if not body.startswith(f"<!-- baton-spec-review round={round} by={reviewer} -->\n"):
+            return False
+        if binding.get("next") != "revise":
+            return False
+    else:
+        if not re.match(rf"<!-- baton-spec-reply round={round}( human)? by={re.escape(reviewer)} -->\n", body):
+            return False
+        if binding.get("next") not in ("review", "human"):
+            return False
+    try:
+        if binding.get("digest") != body_digest(body):
+            return False
+    except UnicodeEncodeError:
+        return False
+    boundary = binding.get("comment_ids")
+    return (binding.get("issue") == item
+            and isinstance(boundary, list) and all(type(value) is int and value > 0 for value in boundary)
+            and len(set(boundary)) == len(boundary)
+            and all(isinstance(binding.get(key), str) for key in
+                    ("author", "issue_body", "adr_head", "feedback", "reply", "mode_note", "limit_why",
+                     "run_id", "pr"))
+            and bool(binding["author"]) and bool(binding["limit_why"])
+            and bool(re.fullmatch(r"[0-9a-f]{64}", binding["issue_body"]))
+            and bool(re.fullmatch(r"[0-9a-f]{64}", binding["feedback"]))
+            and (binding["adr_head"] == "" or bool(re.fullmatch(r"[0-9a-f]{40}", binding["adr_head"])))
+            and (binding["pr"] == "" or binding["pr"].isdecimal())
+            and type(binding.get("max_rounds")) is int and binding["max_rounds"] > 0)
+
+
 def _binding_valid(reason, item, binding):
     if not isinstance(binding, dict):
         return False
@@ -214,6 +252,8 @@ def _binding_valid(reason, item, binding):
         return _comment_post_valid(item, binding, marker="baton-review")
     if reason == SCREENSHOT_POST:
         return _comment_post_valid(item, binding, marker="baton-screenshot-review")
+    if reason in SPEC_POSTS:
+        return _spec_comment_post_valid(item, binding, reason=reason)
     return (binding.get("pr") == item and type(binding.get("round")) is int and binding["round"] > 0
             and all(isinstance(binding.get(key), str) for key in
                     ("head", "base", "digest", "issue", "screenshot_digest"))
