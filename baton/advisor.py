@@ -13,6 +13,7 @@ another call.
 from collections import Counter
 from dataclasses import dataclass
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
@@ -138,7 +139,8 @@ def append(env, record):
 def read_records(env, *, strict=False):
     path = records_path(env)
     try:
-        lines = path.read_text(errors="replace").splitlines()   # a torn multibyte append stays readable
+        # Split on "\n" only: str.splitlines() also breaks at U+2028 and friends, which JSON keeps inside strings.
+        lines = path.read_text(errors="replace").split("\n")   # a torn multibyte append stays readable
     except FileNotFoundError:
         return []
     except OSError:
@@ -179,6 +181,15 @@ def previous_attempt(env, item, point, pending):
     if granted(env, point, item):
         return Decision(HANDOFF, failure="recovery already granted in this episode", previous=True)
     return None
+
+
+def saved_attempt(env, point, item, task_kind):
+    """The earlier recovery of this episode, read locally (no provider call, whatever the mode)."""
+    env = session.resolve(env)
+    try:
+        return previous_attempt(env, item, point, pending_decisions(env, task_kind, item))
+    except OSError:
+        return None
 
 
 def settings(env):
@@ -290,7 +301,7 @@ def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=No
             evidence = [redact(str(e), values)[:300] for e in (reply.get("evidence") or [])][:5]
     except urllib.error.HTTPError as error:
         failure = f"HTTP {error.code}"
-    except (urllib.error.URLError, TimeoutError, OSError) as error:
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as error:
         failure = f"unavailable: {type(error).__name__}"
     except MalformedReply as error:   # the envelope arrived, so its usage still counts
         if isinstance(error.usage, dict):
@@ -345,6 +356,23 @@ def pending_items(env, task_kind):
     return sorted(i for i in items if i.isdigit())
 
 
+def close_legacy(env, point, item, result):
+    """A grant written before decision ids existed holds its decision's snapshot hash: record the
+    outcome in the old (repo, point, item) shape the digest still understands."""
+    try:
+        held = grant_path(env, point, item).read_text().strip()
+    except OSError:
+        return
+    if len(held) != 64:   # a decision id: finish_episode already closed that decision
+        return
+    for record in read_records(env, strict=True):
+        if (record.get("kind") == "decision" and not record.get("decision_id") and record.get("snapshot_sha") == held
+                and (record.get("repo"), record.get("point"), record.get("item")) == (env.repo.gh_repo, point, str(item))):
+            append(env, {"kind": "outcome", "ts": int(time.time()), "point": point, "repo": env.repo.gh_repo,
+                         "item": str(item), "result": result})
+            return
+
+
 def finish_episode(env, task_kind, item, result):
     """Correlate the terminal disposition with each decision and release the spent grants."""
     env = session.resolve(env)
@@ -356,6 +384,7 @@ def finish_episode(env, task_kind, item, result):
                          "kind": "outcome", "ts": int(time.time()), "result": result})
             points.add(decision["point"])
         for reason in points:
+            close_legacy(env, reason, item, result)
             grant_path(env, reason, item).unlink(missing_ok=True)
     except OSError as error:
         notify.log(f"advisor {task_kind} #{item}: could not finish episode ({type(error).__name__})")

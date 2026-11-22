@@ -631,7 +631,9 @@ class Review:
             if rc == 75:
                 return 75
             if rc != 0:
-                advisor.finish_episode(self.env, "pr", pr, "handoff")
+                if not runner.handed_off:   # e.g. authorship recording failed: the owner still needs one handoff
+                    runner.handoff(pr, "fix_task_write_failed", f"PR #{pr} needs you",
+                                   f"The fix run of round {round} failed before a handoff. {self.url}")
                 self.drop()
                 return 0
             self.fixed_by = fixer

@@ -111,6 +111,7 @@ def test_a_repair_that_fails_goes_to_the_owner_without_another_wait(run):
 
 
 REAL_CI_GREEN = merge.Merger.ci_green
+REAL_DEEPSEEK = advisor.call_deepseek
 
 
 @pytest.fixture
@@ -140,6 +141,7 @@ def test_ci_advisor_offers_only_an_exact_head_pending_or_timed_out_poll(run, obs
         "pending": [{"status": "IN_PROGRESS", "conclusion": ""}],
         "red": [{"status": "COMPLETED", "conclusion": "FAILURE"}],
         "mixed": [{"status": "IN_PROGRESS"}, {"state": "ERROR"}],
+        "changed": [{"status": "IN_PROGRESS", "conclusion": ""}],   # as the positive case: only the head differs
         "settled": [{"status": "COMPLETED", "conclusion": "SUCCESS"}],
         "timeout_settled": [{"status": "COMPLETED", "conclusion": "SUCCESS"}],
         "timeout_red": [{"status": "COMPLETED", "conclusion": "FAILURE"}],
@@ -248,6 +250,57 @@ def test_merge_failure_advice_observes_reconciliation_without_retrying(run, obse
     assert sum(c[:2] == ["pr", "merge"] for c in calls) == 1
     assert not any(c[:2] == ["pr", "update-branch"] for c in calls)
     assert run.labelled("ready-for-human")
+
+
+def test_a_truncated_provider_response_still_ends_in_one_handoff_and_a_recorded_failure(run, observing, monkeypatch):
+    import http.client
+
+    class Truncated:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            raise http.client.IncompleteRead(b"{", 50)
+
+    monkeypatch.setattr(advisor, "call_deepseek", REAL_DEEPSEEK)
+    monkeypatch.setattr(advisor.urllib.request, "urlopen", lambda request, timeout=0: Truncated())
+    run.gh.watches((0, ""))
+    run.gh.set(state="OPEN", mergeStateStatus="CLEAN", headRefOid=OLD, merge_results=[1])
+    run.go()
+
+    decision, outcome = advisor.read_records(run.merger().env)
+    assert decision["failure"] == "unavailable: IncompleteRead" and decision["executed"] == "handoff"
+    assert outcome["decision_id"] == decision["decision_id"] and outcome["result"] == "handoff"
+    assert sum(c[:2] == ["pr", "edit"] and "ready-for-human" in c for c in run.gh.calls()) == 1
+    assert sum(c[:2] == ["pr", "merge"] for c in run.gh.calls()) == 1   # the failed attempt only; no retry
+
+
+def test_the_provider_request_carries_only_the_latest_trusted_feedback_of_each_kind(run, observing):
+    def comment(login, body):
+        return {"author": {"login": login}, "body": body}
+
+    run.gh.watches((0, ""))
+    run.gh.set(state="OPEN", mergeStateStatus="CLEAN", headRefOid=OLD, merge_results=[1], comments=[
+        comment("owner", "<!-- baton-review round=1 -->\nOLD-REVIEW"),
+        comment("owner", "<!-- baton-screenshot-review round=1 -->\nOLD-SHOT"),
+        comment("owner", "<!-- baton-fix round=1 -->\nOLD-FIX"),
+        comment("owner", "<!-- baton-review round=2 -->\nNEW-REVIEW"),
+        comment("owner", "<!-- baton-screenshot-review round=2 -->\nNEW-SHOT"),
+        comment("owner", "<!-- baton-fix round=2 -->\nNEW-FIX"),
+        comment("stranger", "<!-- baton-review round=3 -->\nFORGED-REVIEW"),
+        comment("stranger", "<!-- baton-screenshot-review round=3 -->\nFORGED-SHOT"),
+        comment("stranger", "<!-- baton-fix round=3 -->\nFORGED-FIX"),
+    ])
+    run.go()
+
+    [sent] = observing
+    for kept in ("NEW-REVIEW", "NEW-SHOT", "NEW-FIX"):
+        assert sent[0].count(kept) == 1
+    for dropped in ("OLD-REVIEW", "OLD-SHOT", "OLD-FIX", "FORGED"):
+        assert dropped not in sent[0]
 
 
 def test_merge_observation_discards_evidence_outside_the_sent_snapshot(run, observing, monkeypatch):

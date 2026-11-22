@@ -146,8 +146,8 @@ def perform(env, reason, *, kind, number, title, text, hooks, remove=(),
     offered = tuple(a for a in entry.actions if a in observed_actions) if observing else ("extra_round",)
     cfg = advisor.settings(env)
     mode = capped_mode(cfg.mode if advisor.enabled(env) else "off", entry.mode)
-    if mode == "off":
-        return finish()
+    if mode == "off":   # still explain an earlier recovery of this episode
+        return finish(advisor.saved_attempt(env, reason, number, kind))
     decision = advisor.advise(env, reason, number, snapshot, offered, task_kind=kind,
                              revalidate=revalidate, rule=HANDOFF, mode=mode,
                              category=entry.category if observing else None)

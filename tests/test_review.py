@@ -1225,6 +1225,21 @@ def test_a_failed_extra_round_does_not_extend_the_next_review_episode(advised, f
     assert len(advised.fixes) == 3 and advised.labelled("ready-for-human")
 
 
+def test_an_unhandled_fix_failure_hands_off_once_and_closes_the_decision(advised):
+    from baton import advisor
+    from baton.session import resolve
+
+    advised.reviews[:] = ["changes", "changes"]
+    advised.fix_plans[:] = [0, 1]   # the second fix fails without handing the PR over
+    advised.advice = [{"action": "extra_round", "reason": "fixable", "evidence": []}]
+    assert advised.run(fixer="cursor") == 0
+
+    assert advised.labelled("ready-for-human")
+    assert len([line for line in advised.log() if f"PR #{PR} needs you" in line]) == 1
+    decision, outcome = advisor.read_records(resolve(advised.env))
+    assert outcome["result"] == "handoff" and outcome["decision_id"] == decision["decision_id"]
+
+
 def test_an_advised_handoff_says_why(advised):
     advised.reviews[:] = ["changes", "changes"]
     advised.advice = [{"action": "handoff", "reason": "the same design disagreement repeats", "evidence": []}]

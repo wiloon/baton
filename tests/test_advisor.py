@@ -306,3 +306,72 @@ def test_an_outcome_after_a_torn_line_without_newline_stays_readable(adv):
     kinds = [r["kind"] for r in adv.records()]
     assert kinds[0] == "decision" and "outcome" in kinds
     assert not advisor.granted(adv.env, "review_limit", 42)
+
+
+def test_a_truncated_response_is_a_recorded_provider_failure(adv, monkeypatch):
+    """#156 review: IncompleteRead is not an OSError; it must not escape advise()."""
+    import http.client
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            raise http.client.IncompleteRead(b"{", 100)
+
+    monkeypatch.setattr(advisor, "call_deepseek", REAL_CALL)
+    monkeypatch.setattr(advisor.urllib.request, "urlopen", lambda request, timeout=0: Response())
+    d = advisor.advise(adv.env, "merge_failed", 43, "snap", ("retry_step",), category=3, mode="observe")
+    assert d.action == "handoff" and d.failure == "unavailable: IncompleteRead"
+    assert adv.records()[0]["failure"] == "unavailable: IncompleteRead"
+
+
+def test_a_reason_with_unicode_line_separators_survives_a_restart_and_gets_its_outcome(adv):
+    adv.replies = [{"action": "extra_round", "reason": "one two three\x85", "evidence": []}]
+    advisor.advise(adv.env, "review_limit", 44, "s", ("extra_round",), revalidate=lambda: True)
+    [decision] = adv.records()
+    assert decision["reason"] == "one two three\x85"
+    assert len(advisor.pending_decisions(adv.env, "pr", 44)) == 1
+    advisor.finish_episode(adv.env, "pr", 44, "handoff")
+    assert [r["kind"] for r in adv.records()] == ["decision", "outcome"]
+
+
+def test_a_pre_upgrade_grant_gets_its_outcome_at_the_terminal_handoff(adv):
+    """#156 review: #17's decisions have no decision_id or task_kind; the grant holds the snapshot hash."""
+    import hashlib
+    import json
+    digest = hashlib.sha256(b"review_limit\n45\nold snapshot").hexdigest()
+    legacy = {"kind": "decision", "ts": 1, "point": "review_limit", "repo": "owner/app", "item": "45",
+              "episode": "x", "snapshot_sha": digest, "actions": ["handoff", "extra_round"], "advised": "extra_round",
+              "executed": "extra_round", "rule": "handoff", "reason": "r", "failure": ""}
+    path = advisor.records_path(adv.env)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(legacy) + "\n")
+    advisor.grant_path(adv.env, "review_limit", 45).parent.mkdir(parents=True, exist_ok=True)
+    advisor.grant_path(adv.env, "review_limit", 45).write_text(f"{digest}\n")
+
+    advisor.finish_episode(adv.env, "pr", 45, "handoff")
+
+    outcome = adv.records()[-1]
+    assert (outcome["kind"], outcome["point"], outcome["item"], outcome["result"]) == (
+        "outcome", "review_limit", "45", "handoff")
+    assert not advisor.granted(adv.env, "review_limit", 45)
+    advisor.digest(adv.env, now=10**10)
+    assert "outcome handoff" in adv.notes[-1][1]
+
+
+def test_a_mode_change_after_a_grant_still_explains_the_earlier_recovery(adv, monkeypatch):
+    from baton import handoff
+
+    adv.replies = [EXTRA]
+    assert advisor.advise(adv.env, "review_limit", 46, "s", ("extra_round",), revalidate=lambda: True).extra_round
+    adv.mode = "off"
+    monkeypatch.setattr(handoff, "label_ready", lambda *a, **k: type("R", (), {"returncode": 0})())
+    hooks = type("H", (), {"task": lambda self, *a: None})()
+    result = handoff.perform(adv.env, "review_limit", kind="pr", number=46, title="t", text="limit.", hooks=hooks)
+    assert result.action == "handoff" and len(adv.calls) == 1   # only the original grant's call
+    assert "Advisor (DeepSeek) chose extra_round" in adv.notes[-1][1]
+    assert [r["kind"] for r in adv.records()] == ["decision", "outcome"]
