@@ -1002,3 +1002,48 @@ def test_without_screenshot_review_the_fix_prompt_names_no_screenshots_dir(run):
     run.agent(dict(CHECKED))
     run.fix("claude")
     assert f"pr-{PR}-shots" not in run.prompts[0]
+
+
+# --- live worker retries (#125) --------------------------------------------------------------
+
+@pytest.fixture
+def advised_fix(run, monkeypatch):
+    from baton import advisor
+    from baton.config import Advisor
+    monkeypatch.setenv(advisor.KEY, "sk-" + "f" * 24)
+    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="live"))
+    run.fake_gh.set(state="OPEN")
+    run.advice, run.advice_calls = [], []
+
+    def call(cfg, key, snapshot, actions, **_):
+        run.advice_calls.append((snapshot, actions))
+        return run.advice.pop(0), {}
+    monkeypatch.setattr(advisor, "call_deepseek", call)
+    return run
+
+
+def test_a_live_retry_step_re_runs_a_failed_fix(advised_fix):
+    advised_fix.advice = [{"action": "retry_step", "reason": "transient worker failure",
+                           "evidence": ["Decision point: fix_run_failed"]}]
+    advised_fix.agent({"outcome": "RESULT: failed boom", "commit": False},
+                      {"outcome": "RESULT: fixed", "commit": True, "reply": "RESULT: fixed"})
+    assert advised_fix.fix()["rc"] == 0 and not advised_fix.labelled()
+    assert len(advised_fix.agent_calls) == 2
+    assert len(advised_fix.advice_calls) == 1
+    assert "fix_run_failed" in advised_fix.advice_calls[0][0]
+    from baton import recovery
+    assert recovery.LOG_EXCERPT_MARKER not in advised_fix.advice_calls[0][0]
+
+
+def test_a_live_verify_retry_rechecks_within_the_same_budget(advised_fix):
+    from baton import recovery
+    advised_fix.verify_script("lint broke", "lint broke", "lint broke", "pass")
+    advised_fix.advice = [{"action": "retry_step", "reason": "flaky local check",
+                           "evidence": ["Decision point: fix_verify_failed"]}]
+    advised_fix.agent({"commit": True, "reply": "RESULT: fixed"},
+                      {"outcome": "RESULT: fixed", "commit": True},
+                      {"outcome": "RESULT: fixed", "commit": True})
+    assert advised_fix.fix()["rc"] == 0 and not advised_fix.labelled()
+    assert len(advised_fix.advice_calls) == 1
+    assert "fix_verify_failed" in advised_fix.advice_calls[0][0]
+    assert advised_fix.advice_calls[0][1] == ("handoff", "retry_step")

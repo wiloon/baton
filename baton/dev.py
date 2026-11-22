@@ -13,8 +13,8 @@ import re
 import subprocess
 import time
 
-from . import advisor, after_merge, agents, checks as check_section, dispatch, fix, handoff as owner_handoff, md, names, pr as pr_helpers, pr_contract, prompts, spec, vendors
-from .common import Deferred, git, push, strip_markers
+from . import advisor, after_merge, agents, checks as check_section, dispatch, fix, handoff as owner_handoff, md, names, pick, pr as pr_helpers, pr_contract, prompts, recovery, spec, vendors
+from .common import Deferred, Exhausted, git, push, strip_markers
 
 REPLY_CAP = 60000
 RESUME_NOTE = ("This worktree already holds earlier work on this issue (an earlier run stopped early). "
@@ -102,13 +102,16 @@ def is_partial(text, issue):
         return False
 
 
-def stop(tick, issue, reason, title, text):
+def stop(tick, issue, reason, title, text, **recovery_kw):
     """The handoff every gate shares: ready-for-human, a telemetry handoff, a Telegram message."""
     from . import handoff as owner_handoff
-    owner_handoff.perform(
+    result = owner_handoff.perform(
         tick.env, reason, kind="issue", number=issue, remove=("agent-wip",),
-        title=title, text=text, hooks=tick.hooks(issue))
-    return 80
+        title=title, text=text, hooks=tick.hooks(issue), item=str(issue), episode=str(issue), **recovery_kw)
+    if result.handed_off:
+        recovery.clear(tick.env, str(issue), str(issue))
+        return 80
+    return result
 
 
 def opening_path(tick, issue):
@@ -212,6 +215,26 @@ def resume_opening(tick, path):
         return 1
 
 
+def run_dev_worker(tick, issue, dev_vendor, wt, branch, body, base, plan, payload, resume_note, hooks, env):
+    """Implementer dispatch and outcome check; returns fail text or '' when ready."""
+    ctx = context_file(tick, issue, branch, plan, payload)
+    shots = str(tick.ctx / f"issue-{issue}-shots")
+    prompt = prompts.render(tick.self_dir / "dev-prompt.md", [
+        ("VENDOR", dev_vendor), ("ISSUE", issue), ("GH_REPO", tick.gh_repo), ("WORKTREE", str(wt)), ("BRANCH", branch),
+        ("PR_BODY_FILE", body), ("RESUME_NOTE", resume_note), ("CONTEXT_FILE", str(ctx)), ("SHOTS_DIR", shots)], env=env)
+    out = dispatch.dispatch(dev_vendor, "dev", prompt, f"issue-{issue}-dev", str(wt), str(tick.self_dir / "settings.json"), body,
+                            env.with_runtime(shots_dir=shots), hooks)
+    if out["rc"] == 75:
+        raise Deferred(dev_vendor, out["defer"])
+    outcome = out["outcome"]
+    fail = check_result(tick, dev_vendor, outcome, str(wt), base, body)
+    if fail:
+        reply = "\n".join(line for line in strip_markers(out.get("reply") or "").split("\n") if not line.startswith("RESULT: "))
+        pr_helpers.gh("issue", "comment", issue, "-R", tick.gh_repo, "--body",
+                      f"<!-- baton-note by={dev_vendor} -->\n{dev_vendor} stopped: {fail}\n\n{reply[:REPLY_CAP]}")
+    return fail, outcome, out
+
+
 def run(tick, issue):
     env, repo = tick.env.with_runtime(issue=str(issue)), tick.gh_repo
     branch, wt = names.for_issue(tick.wt_root, issue)
@@ -250,34 +273,71 @@ def run(tick, issue):
     pr_helpers.gh("issue", "edit", issue, "-R", repo, "--add-label", "agent-wip")
     tick.notify(f"#{issue} started ({dev_vendor})", url)
     base = git(wt, "rev-parse", "origin/main")
-    ctx = context_file(tick, issue, branch, plan, payload)
     session.run_process(["rm", "-rf", shots])
     os.makedirs(shots)
-    prompt = prompts.render(tick.self_dir / "dev-prompt.md", [
-        ("VENDOR", dev_vendor), ("ISSUE", issue), ("GH_REPO", repo), ("WORKTREE", str(wt)), ("BRANCH", branch),
-        ("PR_BODY_FILE", body), ("RESUME_NOTE", resume_note), ("CONTEXT_FILE", str(ctx)), ("SHOTS_DIR", shots)], env=env)
-    out = dispatch.dispatch(dev_vendor, "dev", prompt, f"issue-{issue}-dev", str(wt), str(tick.self_dir / "settings.json"), body,
-                            env.with_runtime(shots_dir=shots), hooks)
-    if out["rc"] == 75:
-        raise Deferred(dev_vendor, out["defer"])
-    outcome, dev_model = out["outcome"], out.get("model") or "unknown"
-
-    fail = check_result(tick, dev_vendor, outcome, str(wt), base, body)
+    fail, outcome, out = run_dev_worker(tick, issue, dev_vendor, wt, branch, body, base, plan, payload, resume_note, hooks, env)
+    dev_model = out.get("model") or "unknown"
     if fail:
-        reply = "\n".join(line for line in strip_markers(out.get("reply") or "").split("\n") if not line.startswith("RESULT: "))
-        pr_helpers.gh("issue", "comment", issue, "-R", repo, "--body",
-                      f"<!-- baton-note by={dev_vendor} -->\n{dev_vendor} stopped: {fail}\n\n{reply[:REPLY_CAP]}")
         reason = "dev_blocked" if fail.startswith("blocked") else "dev_result_invalid" if outcome.startswith("RESULT: ready") else "dev_run_failed"
-        return stop(tick, issue, reason, f"#{issue}: {dev_vendor} stopped", f"{fail} {url}")
+        if reason == "dev_blocked":
+            return stop(tick, issue, reason, f"#{issue}: {dev_vendor} stopped", f"{fail} {url}")
+        fingerprint = recovery.issue_fingerprint(wt, issue, branch=branch, base=base)
+        status = recovery.verify_status(repairs_used=0, max_repairs=0, failure=fail)
+        snapshot = (f"Decision point: {reason}. Repository {repo}, issue #{issue}.\n"
+                    f"Failed vendor: {dev_vendor}; role: dev.\nOutcome: {status}\n"
+                    "Actions: retry_step = one more implementer attempt with the same vendor; "
+                    "retry_step_other_vendor = one attempt with an eligible alternate; "
+                    "handoff = the owner takes the issue.\n")
+        offered = ("retry_step", "retry_step_other_vendor")
+        result = stop(tick, issue, reason, f"#{issue}: {dev_vendor} stopped", f"{fail} {url}",
+                      snapshot=snapshot, observed_actions=offered,
+                      revalidate=lambda: recovery.fingerprint_matches({"fingerprint": fingerprint}, fingerprint))
+        if result == 80:
+            return 80
+        recovery.persist_grant(env, result, role="dev", failed_vendor=dev_vendor, exclusions=[dev_vendor],
+                               budget={"step": "dev"}, fingerprint=fingerprint, episode=str(issue), item=str(issue), reason=reason)
+        if result.action == "retry_step_other_vendor":
+            try:
+                dev_vendor = pick.choose(env, "dev", dev_vendor, "contrib", pick.all_vendors(env), issue=issue, exclude=dev_vendor)
+            except Exhausted as exhausted:
+                return stop(tick, issue, reason, f"#{issue}: {dev_vendor} stopped", exhausted.reason or fail)
+        fail, outcome, out = run_dev_worker(tick, issue, dev_vendor, wt, branch, body, base, plan, payload, resume_note, hooks, env)
+        if fail:
+            return stop(tick, issue, reason, f"#{issue}: {dev_vendor} stopped", f"{fail} {url}")
+        dev_model = out.get("model") or "unknown"
+        recovery.clear(env, issue, issue)
 
     verifier = fix.Runner(env, hooks)
     verifier.gate_applies = not is_partial(Path(body).read_text(), issue)
     rc, failure, rounds = verifier.verify(str(wt), base, dev_vendor, "issue", issue)
     if rc != 0:
-        pr_helpers.gh("issue", "comment", issue, "-R", repo, "--body",
-                      f"<!-- baton-note by={dev_vendor} -->\nLocal CI verification failed before push after {rounds} of "
-                      f"{env.config.scheduling.max_verify_fixes or 2} fix rounds. Nothing was pushed.\n\n{failure[:REPLY_CAP]}")
-        return stop(tick, issue, "dev_verify_failed", f"#{issue}: local CI verification failed", url)
+        vs = recovery.verify_status(repairs_used=rounds, max_repairs=int(env.config.scheduling.max_verify_fixes or 2),
+                                    failure=failure)
+        fingerprint = recovery.issue_fingerprint(wt, issue, branch=branch, base=base)
+        snapshot = (f"Decision point: dev_verify_failed. Repository {repo}, issue #{issue}.\n"
+                    f"Failed vendor: {dev_vendor}; role: dev.\nOutcome: {vs}\n"
+                    "Actions: retry_step = one more local verification within the same repair budget; "
+                    "handoff = the owner takes the issue.\n")
+        result = stop(tick, issue, "dev_verify_failed", f"#{issue}: local CI verification failed", url,
+                      snapshot=snapshot, observed_actions=("retry_step",),
+                      revalidate=lambda: recovery.fingerprint_matches({"fingerprint": fingerprint}, fingerprint))
+        if result == 80:
+            pr_helpers.gh("issue", "comment", issue, "-R", repo, "--body",
+                          f"<!-- baton-note by={dev_vendor} -->\nLocal CI verification failed before push after {rounds} of "
+                          f"{env.config.scheduling.max_verify_fixes or 2} fix rounds. Nothing was pushed.\n\n{failure[:REPLY_CAP]}")
+            return 80
+        remaining = max(0, int(env.config.scheduling.max_verify_fixes or 2) - rounds)
+        recovery.persist_grant(env, result, role="dev", failed_vendor=dev_vendor, exclusions=[dev_vendor],
+                               budget={"verify_repairs": remaining}, fingerprint=fingerprint, episode=str(issue),
+                               item=str(issue), reason="dev_verify_failed")
+        rc, failure, rounds = verifier.verify(str(wt), base, dev_vendor, "issue", issue, repairs=remaining,
+                                              repairs_before=rounds)
+        recovery.clear(env, issue, issue)
+        if rc != 0:
+            pr_helpers.gh("issue", "comment", issue, "-R", repo, "--body",
+                          f"<!-- baton-note by={dev_vendor} -->\nLocal CI verification failed before push after retry. "
+                          f"Nothing was pushed.\n\n{failure[:REPLY_CAP]}")
+            return stop(tick, issue, "dev_verify_failed", f"#{issue}: local CI verification failed", url)
     if not push(wt, branch, upstream=True, signoff=tick.env.repo.signoff):
         stop(tick, issue, "dev_push_failed", f"#{issue}: pushing {dev_vendor}'s branch failed",
              f"{branch} is committed in {wt}. {url}")

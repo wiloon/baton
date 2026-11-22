@@ -561,15 +561,37 @@ class Tick:
             self.log(f"worktree for PR #{pr} failed")
             return 1
         # Fast-forward only: local commits a failed push left behind are kept and pushed with the fix.
+        from . import handoff as owner_handoff, recovery
         if not (session.run_process(["git", "-C", wt, "checkout", "-q", head_ref]).returncode == 0
                 and session.run_process(["git", "-C", wt, "merge", "-q", "--ff-only", f"origin/{head_ref}"]).returncode == 0):
-            from . import handoff as owner_handoff
-            owner_handoff.perform(
+            fingerprint = recovery.pr_fingerprint(wt, pr, extra={"branch": head_ref})
+            snapshot = (f"Decision point: fix_worktree_diverged. Repository {self.gh_repo}, PR #{pr}.\n"
+                        f"Worktree: {wt}; branch: {head_ref}.\nOutcome: fast-forward merge failed.\n"
+                        "Actions: retry_step = one more worktree preparation when still safe; handoff = the owner takes the PR.\n")
+            result = owner_handoff.perform(
                 self.env, "fix_worktree_diverged", kind="pr", number=pr, remove=("agent-fix",),
                 item=pr, episode=issue or pr,
                 title=f"PR #{pr} needs you", text=f"{wt} has diverged from origin/{head_ref}. {url}",
-                hooks=self.hooks(issue or "0", pr=pr))
-            return 80
+                hooks=self.hooks(issue or "0", pr=pr), snapshot=snapshot, observed_actions=("retry_step",),
+                revalidate=lambda: recovery.worktree_ready(wt, head_ref)[0])
+            if result.handed_off:
+                return 80
+            ready, detail = recovery.worktree_ready(wt, head_ref)
+            if not ready:
+                owner_handoff.perform(
+                    self.env, "fix_worktree_diverged", kind="pr", number=pr, remove=("agent-fix",),
+                    item=pr, episode=issue or pr,
+                    title=f"PR #{pr} needs you", text=f"{wt}: {detail}. {url}",
+                    hooks=self.hooks(issue or "0", pr=pr))
+                return 80
+            if not (session.run_process(["git", "-C", wt, "checkout", "-q", head_ref]).returncode == 0
+                    and session.run_process(["git", "-C", wt, "merge", "-q", "--ff-only", f"origin/{head_ref}"]).returncode == 0):
+                owner_handoff.perform(
+                    self.env, "fix_worktree_diverged", kind="pr", number=pr, remove=("agent-fix",),
+                    item=pr, episode=issue or pr,
+                    title=f"PR #{pr} needs you", text=f"{wt} has diverged from origin/{head_ref}. {url}",
+                    hooks=self.hooks(issue or "0", pr=pr))
+                return 80
         feedback_file = self.state / f"owner-fix-feedback-{pr}"
         feedback = feedback_file.read_text() if feedback_file.is_file() else review.human_feedback(self.gh_repo, self.owner, pr)
         if not feedback.strip():
