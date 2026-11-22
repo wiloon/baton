@@ -877,13 +877,13 @@ class Review:
             # The next round's reviewer must stay free: a fixed reviewer, or a sole pool vendor.
             pool = self.env.config.quota.vendor_pool
             exclude = "cursor" if reviewer == "cursor" else ("" if len(pool) > 1 else pool[0])
-            if not task_recovery.path(self.env, self.issue or pr, pr).exists():
+            if not task_recovery.pending_fix(self.env, self.issue or pr, pr):
                 fixer = pick.choose(self.env, "fixer", fixer, "contrib", self.vendors(), pr=str(pr), exclude=exclude,
                                     issue=self.issue)
             self.values["fixer"] = fixer
             self.save()
             runner = fix.Runner(self.env.with_runtime(fix_followup=round > 1), self.hooks, pr, str(round))
-            runner.retry_exclusions = ["cursor"] if reviewer == "cursor" else []
+            runner.retry_exclusions = exclude.split()
             rc = fix.fix_pr(runner, pr, wt, fixer, f"the reviewer agent (round {round})", feedback, fix_head)
             if rc == 75:
                 return 75

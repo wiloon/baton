@@ -46,11 +46,21 @@ def test_recovery_record_survives_reload(env):
     assert loaded["action"] == "retry_step" and loaded["failed_vendor"] == "claude"
 
 
-def test_fingerprint_mismatch_blocks_resume(env):
+def test_fingerprint_matches_only_equal_inputs(env):
     recovery.persist(env, _record())
     loaded = recovery.load(env, "9", "3")
     assert recovery.fingerprint_matches(loaded, {"local_head": "b" * 40}) is False
     assert recovery.fingerprint_matches(loaded, {"local_head": "a" * 40}) is True
+
+
+def test_only_a_fix_record_counts_as_a_pending_fix(env):
+    assert recovery.pending_fix(env, "9", "3") is False
+    recovery.persist(env, _record(reason="review_run_failed", role="reviewer"))
+    assert recovery.pending_fix(env, "9", "3") is False
+    recovery.persist(env, _record(reason="fix_run_failed"))
+    assert recovery.pending_fix(env, "9", "3") is True
+    recovery.path(env, "9", "3").write_text("{")
+    assert recovery.pending_fix(env, "9", "3") is True
 
 
 def test_terminal_handoff_clears_recovery(env, monkeypatch):

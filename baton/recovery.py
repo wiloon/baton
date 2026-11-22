@@ -71,6 +71,15 @@ def load(env, episode, item):
     return record
 
 
+def pending_fix(env, episode, item):
+    """True when a saved record is a fix retry (or unreadable, so the fix resume can hand it off)."""
+    try:
+        record = load(env, episode, item)
+    except RecoveryUnreadable:
+        return True
+    return bool(record and record["reason"].startswith("fix_"))
+
+
 def persist(env, record):
     if not _valid(record):
         raise ValueError("recovery record missing required fields")
@@ -104,7 +113,7 @@ def clear_item(env, item):
 
 
 def fingerprint_matches(record, current):
-    """A newer binding field must also be present in the saved recovery."""
+    """The saved fingerprint must equal the current binding exactly (extra or missing fields differ)."""
     return bool(current) and record.get("fingerprint") == current
 
 

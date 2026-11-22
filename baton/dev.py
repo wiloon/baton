@@ -276,7 +276,6 @@ def live_issue_binding(tick, env, wt, issue, branch):
     return issue_binding(wt, issue, branch, fresh)
 
 
-
 def run(tick, issue):
     env, repo = tick.env.with_runtime(issue=str(issue)), tick.gh_repo
     branch, wt = names.for_issue(tick.wt_root, issue)
@@ -342,7 +341,11 @@ def run(tick, issue):
             note += f" Validation error: {pending[0]['remaining_budget'].get('validation_error', '')}"
         fail, outcome, out = run_dev_worker(tick, issue, dev_vendor, wt, branch, body, base, plan, payload,
                                             note, hooks, env)
-        attempts.append([dev_vendor, out.get("model") or "unknown", start, git(wt, "rev-parse", "HEAD")])
+        end = git(wt, "rev-parse", "HEAD")
+        if end != start:   # an attempt that wrote nothing is not an author
+            # The first range also covers commits retained from an earlier deferred run.
+            first = (git(wt, "merge-base", "HEAD", "origin/main") or start) if not attempts else start
+            attempts.append([dev_vendor, out.get("model") or "unknown", first, end])
         reason = worker_failure(fail, outcome)
         if reason:
             return reason, fail

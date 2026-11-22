@@ -1716,3 +1716,13 @@ def test_fingerprint_mismatch_on_pending_review_recovery_hands_off(loop, monkeyp
     r = review.Review(env, hooks, PR, loop.wt, issue="297")
     assert r.loop("", fixer="cursor", reviewer="claude") == 0
     assert loop.labelled("ready-for-human") and not loop.agents
+
+
+def test_the_alternate_fixer_cannot_take_the_sole_pool_reviewer(loop, monkeypatch):
+    from baton import fix
+    loop.env["VENDOR_POOL"] = "claude"
+    loop.reviews[:] = ["changes"]
+    seen = []
+    monkeypatch.setattr(fix, "fix_pr", lambda runner, *a, **k: (seen.append(list(runner.retry_exclusions)), 80)[1])
+    loop.run(fixer="cursor")
+    assert seen and "claude" in seen[0]
