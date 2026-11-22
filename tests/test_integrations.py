@@ -101,6 +101,11 @@ def test_the_environment_alone_needs_no_file(tmp_path):
     assert credentials.load(tmp_path / "missing.env", KEYS, {}) == {}
 
 
+def test_a_directory_as_the_file_is_a_credential_error(tmp_path):
+    with pytest.raises(credentials.CredentialError, match="cannot be read"):
+        credentials.load(tmp_path, KEYS, {})
+
+
 @pytest.mark.parametrize("mode", [0o640, 0o604, 0o644])
 def test_a_file_others_can_read_is_refused_without_its_contents(tmp_path, mode):
     path = private(tmp_path / "t.env", "TELEGRAM_BOT_TOKEN=leaked\n")
@@ -204,7 +209,9 @@ def test_without_linear_owner_actions_go_to_a_github_issue(bound, monkeypatch):
     bound()
     fake = GH({"pr view": "## Before release\n- Rotate the webhook secret\n",
                "issue create": "https://github.com/acme/app/issues/9\n"})
+    from baton import pr as pr_mod
     monkeypatch.setattr(after_merge, "gh", fake)
+    monkeypatch.setattr(pr_mod, "gh", fake)   # create_issue recovers labels through pr.gh
     monkeypatch.setattr(after_merge.urllib.request, "urlopen", no_network)
     monkeypatch.setattr(after_merge, "pr_body", lambda pr: "## Before release\n- Rotate the webhook secret\n")
     after_merge.owner_actions(5, "7")

@@ -50,7 +50,7 @@ def adv(tmp_path, monkeypatch):
     return state
 
 
-EXTRA = {"action": "extra_round", "reason": "only tests are missing", "evidence": ["Must fix: add a test"]}
+EXTRA = {"action": "extra_round", "reason": "only tests are missing", "evidence": []}
 
 
 def test_live_extra_round_is_executed_recorded_and_granted_once(adv):
@@ -147,7 +147,7 @@ def test_secrets_never_reach_the_request_or_the_record(adv, monkeypatch):
     snapshot = ("ghp_" + "a" * 36 + "\nAuthorization: Bearer abc.def.ghi\nhttps://user:pw@example.com/x\n"
                 "api_key=zzz-secret\nsk-" + "b" * 30 + "\nplanted-env-secret-value\n"
                 + f"key {KEY}\n123456789:" + "c" * 35)
-    adv.replies = [{"action": "handoff", "reason": f"saw {KEY}", "evidence": ["planted-env-secret-value"]}]
+    adv.replies = [{"action": "handoff", "reason": f"saw {KEY}", "evidence": ["key [redacted]"]}]
     advisor.advise(adv.env, "review_limit", 8, snapshot, ("extra_round",))
     sent = adv.calls[0]["snapshot"]
     for secret in ("ghp_aaaa", "abc.def.ghi", "user:pw", "zzz-secret", "sk-bbbb", "planted-env-secret-value", KEY,
@@ -155,6 +155,9 @@ def test_secrets_never_reach_the_request_or_the_record(adv, monkeypatch):
         assert secret not in sent, secret
     stored = Path(advisor.records_path(adv.env)).read_text()
     assert KEY not in stored and "planted-env-secret-value" not in stored
+    [record] = adv.records()
+    assert record["failure"] == "" and record["advised"] == "handoff"
+    assert record["reason"] == "saw [redacted]" and record["evidence"] == ["key [redacted]"]
     log = Path(os.environ["LOGS"], "runner.log")
     assert not log.exists() or KEY not in log.read_text()
 
@@ -167,7 +170,7 @@ def test_advisor_key_from_env_file_is_redacted(adv, tmp_path, monkeypatch, echo_
     adv.env_file = tmp_path / "deepseek.env"
     adv.env_file.touch(mode=0o600)
     adv.env_file.write_text(f"{advisor.KEY}={key}\n")
-    adv.replies = [{"action": key if echo_in_action else "handoff", "reason": f"saw {key}", "evidence": [key]}]
+    adv.replies = [{"action": key if echo_in_action else "handoff", "reason": f"saw {key}", "evidence": ["[redacted]"]}]
     adv.usage = {"total_tokens": key}
 
     decision = advisor.advise(adv.env, "review_limit", 8, f"snapshot contains {key}", ("extra_round",))
@@ -285,6 +288,8 @@ def test_the_request_and_recorded_version_follow_the_category(adv, monkeypatch, 
     monkeypatch.setattr(advisor.urllib.request, "urlopen", urlopen)
     advisor.advise(adv.env, "merge_failed", 6, "snap", ("retry_step",), category=category, mode="observe")
     system = sent[0]["messages"][0]["content"]
+    # advise() accepts only substrings of the snapshot, so every category must ask for exactly that.
+    assert "copied character for character" in system and "quote or reference" not in system
     assert (needle in system) if needle else ("For a CI judgement" not in system and "merge investigation" not in system)
     assert adv.records()[0]["prompt_version"] == version
     assert advisor.handoff_note(advisor.Decision("handoff")) == ""
@@ -419,3 +424,13 @@ def test_a_mode_change_after_a_grant_still_explains_the_earlier_recovery(adv, mo
     assert result.action == "handoff" and len(adv.calls) == 1   # only the original grant's call
     assert "Advisor (DeepSeek) chose extra_round" in adv.notes[-1][1]
     assert [r["kind"] for r in adv.records()] == ["decision", "outcome"]
+
+
+@pytest.mark.parametrize("reply", [
+    {"action": "extra_round", "reason": "", "evidence": []},
+    {"action": "extra_round", "reason": "only tests are missing", "evidence": ["not in the snapshot"]},
+])
+def test_round_limit_replies_need_a_reason_and_evidence_from_the_snapshot(adv, reply):
+    adv.replies = [reply]
+    d = advisor.advise(adv.env, "review_limit", 31, "Must fix: add a test", ("extra_round",), revalidate=lambda: True)
+    assert d.action == "handoff" and d.failure and not advisor.granted(adv.env, "review_limit", 31)

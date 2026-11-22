@@ -394,3 +394,32 @@ def test_why_is_the_last_stderr_lines():
     result = subprocess.CompletedProcess([], 1, "", "a\n\nb\nc\nHTTP 502: Bad Gateway\n")
     assert pr.why(result) == " (gh: b | c | HTTP 502: Bad Gateway)"
     assert pr.why(subprocess.CompletedProcess([], 1, "", "")) == ""
+
+
+def test_why_redacts_github_tokens_from_stderr(gh, child_token):
+    import subprocess
+    ghp = "ghp_" + ("a" * 40)
+    stderr = f"auth failed token={ghp} also {child_token}\nmore\ntrail\n"
+    got = pr.why(subprocess.CompletedProcess([], 1, "", stderr))
+    assert got == " (gh: auth failed token=[redacted] also [redacted] | more | trail)"
+
+
+def test_why_redacts_before_truncating_to_the_tail(gh, monkeypatch):
+    import subprocess
+    pem = "-----BEGIN KEY-----\nabcdefgh\nijklmnop\n-----END KEY-----"
+    monkeypatch.setenv("SOME_API_SECRET", pem)
+    got = pr.why(subprocess.CompletedProcess([], 1, "", f"x\n{pem}\ntail\n"))
+    assert "BEGIN KEY" not in got and "abcdefgh" not in got and "ijklmnop" not in got
+    assert "tail" in got
+
+
+def test_why_withholds_stderr_when_secret_lookup_raises(gh, child_token, monkeypatch):
+    import subprocess
+    from baton import advisor
+
+    def boom(env):
+        raise IsADirectoryError("secret env file")
+    monkeypatch.setattr(advisor, "secret_values", boom)
+    got = pr.why(subprocess.CompletedProcess([], 1, "", f"denied {child_token}\n"))
+    assert got == " (gh: [stderr withheld: redaction failed])"
+    assert pr.why(subprocess.CompletedProcess([], 1, "", "")) == ""

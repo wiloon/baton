@@ -51,10 +51,82 @@ def transient(result):
     return bool(TRANSIENT.search(stderr))
 
 
+LABEL_MISSING = re.compile(r"could not add label: '([^']+)' not found")
+
+
 def why(result):
-    """gh's last stderr lines as ` (gh: ...)` for a runner.log line or a handoff; '' when it printed none."""
-    lines = [line.strip() for line in (getattr(result, "stderr", "") or "").splitlines() if line.strip()]
+    """gh's last stderr lines as ` (gh: ...)` for a runner.log line or a handoff; '' when it printed none.
+
+    Redacts secrets before splitting and truncating: advisor patterns, secret_values of the
+    session, and token-named values from the effective `gh` subprocess environment.
+    """
+    text = getattr(result, "stderr", "") or ""
+    from . import advisor  # notify imports this module; keep redact off the import cycle
+    values = set()
+    withheld = False
+    try:
+        for name, value in (session.resolve().tools or {}).items():
+            if value and len(value) >= 8 and advisor.SECRET_NAME.search(name):
+                values.add(value)
+    except Exception:
+        withheld = True
+    try:
+        values |= advisor.secret_values(session.resolve())
+    except Exception:
+        withheld = True
+    if withheld:
+        return " (gh: [stderr withheld: redaction failed])" if text.strip() else ""
+    text = advisor.redact(text, values)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
     return f" (gh: {' | '.join(lines[-STDERR_LINES:])})" if lines else ""
+
+
+def missing_requested_labels(result, labels):
+    """Requested label names stderr identifies as missing (GitHub CLI pre-write rejection)."""
+    found = set(LABEL_MISSING.findall(getattr(result, "stderr", "") or ""))
+    return [name for name in labels if name in found]
+
+
+def create_issue(repo, *, title, labels, body=None, body_file=None, allow_unlabelled=False, context=""):
+    """Create an issue with LABELS through gh. Returns (CompletedProcess, applied_labels).
+
+    On a missing-label rejection for a requested label: log why(), run `gh label create` once
+    per requested label without --force, then retry the labelled create once. If that still
+    reports a requested label missing and allow_unlabelled, create without labels. Any other
+    create failure returns at once with no label recovery. applied_labels is the label list on
+    the successful issue (empty after an unlabelled fallback), else ().
+    """
+    from . import notify
+    labels = list(labels)
+    args = ["issue", "create", "-R", repo, "--title", title]
+    if body is not None:
+        args += ["--body", body]
+    if body_file is not None:
+        args += ["--body-file", body_file]
+
+    def with_labels(requested):
+        out = list(args)
+        for name in requested:
+            out += ["--label", name]
+        return out
+
+    result = gh(*with_labels(labels))
+    if result.returncode == 0:
+        return result, tuple(labels)
+    if not missing_requested_labels(result, labels):
+        return result, ()
+    prefix = f"{context}: " if context else ""
+    notify.log(f"{prefix}issue create missing label{why(result)}")
+    for name in labels:
+        created = gh("label", "create", name, "-R", repo)
+        if created.returncode != 0:
+            notify.log(f"{prefix}label create {name!r} failed{why(created)}")
+    result = gh(*with_labels(labels))
+    if result.returncode == 0:
+        return result, tuple(labels)
+    if missing_requested_labels(result, labels) and allow_unlabelled:
+        result = gh(*args)
+    return result, ()
 
 
 def _option(args, name):
