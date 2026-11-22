@@ -566,6 +566,7 @@ class Tick:
             from . import handoff as owner_handoff
             owner_handoff.perform(
                 self.env, "fix_worktree_diverged", kind="pr", number=pr, remove=("agent-fix",),
+                item=pr, episode=issue or pr,
                 title=f"PR #{pr} needs you", text=f"{wt} has diverged from origin/{head_ref}. {url}",
                 hooks=self.hooks(issue or "0", pr=pr))
             return 80

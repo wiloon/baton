@@ -73,7 +73,8 @@ class Merger:
         from . import handoff as owner_handoff
         owner_handoff.perform(
             self.env, reason, kind="pr", number=self.pr,
-            title=title, text=text, hooks=self.hooks, **observation)
+            title=title, text=text, hooks=self.hooks,
+            item=self.pr, episode=self.issue or self.pr, **observation)
 
     def observation(self, reason, *, ci_failed=False, acceptance="", failure=""):
         """Read the current PR for an observation point. An offer never authorizes a write."""
