@@ -389,7 +389,8 @@ class Spec:
                               observed_actions=offered)
         if result.action == owner_handoff.HANDOFF:
             return owner_handoff.HANDOFF, vendor
-        exclusions = [vendor]
+        # Keep the preceding role's vendor excluded (independence) plus the failed attempt.
+        exclusions = [v for v in (last_vendor, vendor) if v]
         budget = dict(budget or {})
         recovery.persist_grant(self.env, result, role=role, failed_vendor=vendor, exclusions=exclusions,
                                budget=budget, fingerprint=fingerprint, episode=episode, item=self.issue, reason=reason)
@@ -602,7 +603,7 @@ class Spec:
                 return "stop"
             action, reviewer = self.recover_worker(
                 f"{reviewer}'s spec review failed: {outcome}", "spec_review_run_failed", reviewer, outcome,
-                round_s=str(round), issue_body=issue_body, listed=listed,
+                round_s=str(round), issue_body=issue_body, listed=listed, last_vendor=last_vendor,
                 other_model=other_model, spec_followup=self.followup(round, reviewer, last_vendor))
             if action == owner_handoff.HANDOFF:
                 return "stop"
@@ -825,7 +826,7 @@ class Spec:
             action, reviser = self.recover_worker(
                 f"{reviser} spec run failed: {outcome}{why}", "spec_revision_run_failed", reviser, outcome,
                 role="reviser", round_s=str(round), issue_body=issue_body, listed=listed,
-                other_model=other_model, spec_followup=claude_followup,
+                last_vendor=last_vendor, other_model=other_model, spec_followup=claude_followup,
                 budget={"denied_spent": denied_spent})
             if action == owner_handoff.HANDOFF:
                 return "stop"
