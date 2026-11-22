@@ -429,13 +429,13 @@ class Review:
             return binding["outcome"]
 
         if completed:
-            if pending is None:
-                self.save_binding(post_waiting="")
-                return completed
-            binding = pending["continuation"]
-            if (completed, self.binding_fields.get("verdict_digest")) != (binding["outcome"], binding["digest"]):
-                return stop("The saved verdict differs from its post.")
-            return finish()
+            if pending is not None:
+                binding = pending["continuation"]
+                if (completed, self.binding_fields.get("verdict_digest")) != (binding["outcome"], binding["digest"]):
+                    return stop("The saved verdict differs from its post.")
+                owner_handoff.clear_retry(self.env, episode, reason, pr)
+            self.save_binding(post_waiting="")
+            return completed
 
         def reconcile(*, sending=False):
             nonlocal status

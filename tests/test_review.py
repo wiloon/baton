@@ -1446,6 +1446,37 @@ def test_a_lost_review_comment_response_is_recognized_without_a_second_write(loo
     assert not list(Path(loop.env["STATE"]).glob("handoff-retry-*"))
 
 
+def test_restart_after_a_landed_review_post_records_one_verdict(loop, monkeypatch):
+    from baton import handoff
+
+    loop.reviews[:] = ["pass"]
+    env = session.resolve(loop.env)
+    retry = handoff.retry_path(env, "297", handoff.REVIEW_POST, str(PR))
+    waiting = handoff.waiting_path(env, "297", handoff.REVIEW_POST, str(PR))
+    verdicts = []
+    monkeypatch.setattr(review.telemetry.Telemetry, "verdict",
+                        lambda self, kind, vendor, head, round, outcome, *_, **kw: verdicts.append(outcome))
+    unlink = Path.unlink
+
+    def interrupt_cleanup(path, *args, **kwargs):
+        if path == retry:
+            raise KeyboardInterrupt
+        return unlink(path, *args, **kwargs)
+
+    with monkeypatch.context() as interrupted:
+        interrupted.setattr(Path, "unlink", interrupt_cleanup)
+        with pytest.raises(KeyboardInterrupt):
+            loop.run(reviewer="claude")
+
+    assert verdicts == ["REVIEW: pass"]
+    assert retry.exists() and waiting.exists()
+    assert tick.Tick(loop.env, argv=("review", str(PR))).run() == 0
+    assert verdicts == ["REVIEW: pass"]
+    assert len(loop.comments()) == len(loop.agents) == 1
+    assert loop.merged == [str(PR)]
+    assert not retry.exists() and not waiting.exists()
+
+
 @pytest.mark.parametrize("pause", [False, True])
 def test_a_waiting_review_post_resumes_through_tick_without_a_reviewer(loop, monkeypatch, pause):
     from subprocess import CompletedProcess
