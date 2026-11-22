@@ -523,24 +523,14 @@ def resume_split_review(loop):
     return runner.pending_review(Path(loop.env["STATE"], f"review-pending-{PR}"))
 
 
-def test_screenshot_eligibility_and_prompt_use_one_body_read(loop, monkeypatch):
-    reads = iter([CHECKS_BODY, None])
-    monkeypatch.setattr(review.pr_helpers, "body", lambda pr: next(reads))
-    loop.reviews, loop.screens = ["pass"], ["pass"]
-    assert screen_run(loop) == 0
-    assert "The library at 390 px and 1280 px." in loop.agents[-1]["prompt"]
-    assert next(reads) is None
-    assert loop.merged == [PR]
-
-
-def test_a_resumed_screenshot_review_preserves_checks_when_the_body_is_unavailable(loop, monkeypatch):
+def test_a_resumed_screenshot_review_uses_the_current_checks(loop):
     loop.reviews, loop.screens = ["pass"], ["defer", "pass"]
     with pytest.raises(Deferred):
         screen_run(loop)
-    monkeypatch.setattr(review.pr_helpers, "body", lambda pr: None)
+    loop.gh.set(body=CHECKS_BODY.replace("390 px and 1280 px", "768 px"))
     assert resume_split_review(loop) == 80
     assert roles(loop) == ["review", "screenshot_review", "screenshot_review"]
-    assert "The library at 390 px and 1280 px." in loop.agents[-1]["prompt"]
+    assert "The library at 768 px." in loop.agents[-1]["prompt"]
     assert loop.merged == [str(PR)] and len(screenshot_comments(loop)) == 1
     assert not loop.checkpoint()
 
@@ -1837,7 +1827,8 @@ def test_a_lost_screenshot_comment_response_is_recognized_without_a_second_write
     assert not list(Path(loop.env["STATE"]).glob("handoff-*-*screenshot_comment_post_failed.json"))
 
 
-def test_an_exhausted_screenshot_comment_post_hands_off_exactly_once(loop, monkeypatch):
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_an_exhausted_screenshot_comment_post_hands_off_exactly_once(loop, monkeypatch, interrupted):
     from subprocess import CompletedProcess
     from baton import handoff
 
@@ -1847,23 +1838,39 @@ def test_an_exhausted_screenshot_comment_post_hands_off_exactly_once(loop, monke
     loop.reviews[:] = ["pass"]
     loop.screens[:] = ["pass"]
     seen, call, writes = _watch(monkeypatch), review.pr_helpers.call, []
+    crashed = False
 
     def always_down(*args, **kwargs):
+        nonlocal crashed
         if args[:2] == ("pr", "comment") and any(
                 isinstance(a, str) and a.startswith("<!-- baton-screenshot-review") for a in args):
             writes.append(clock["now"])
+            if interrupted and clock["now"] == 1_360 and not crashed:
+                crashed = True
+                raise RuntimeError("interrupted during the final comment attempt")
             return CompletedProcess(args, 1, "", "HTTP 503 unavailable")
         return call(*args, **kwargs)
 
     monkeypatch.setattr(review.pr_helpers, "call", always_down)
     assert screen_run(loop) == 75
-    for now, rc in [(1_059, 75), (1_060, 75), (1_359, 75), (1_360, 0)]:
+    for now in (1_059, 1_060, 1_359):
         clock["now"] = now
-        assert tick.Tick({**loop.env, "SCREENSHOT_REVIEW": "1"}, argv=("review", str(PR)),
-                         clock=lambda: clock["now"]).run() == rc
+        assert _tick(loop, clock) == 75
+    clock["now"] = 1_360
+    if interrupted:
+        # A hard stop skips Tick's finally block. Interrupt the same review loop directly.
+        with pytest.raises(RuntimeError, match="interrupted during the final comment attempt"):
+            screen_run(loop)
+        assert not seen["reasons"] and loop.checkpoint()
+        pending = handoff.load_retry(session.resolve(loop.env), "297", handoff.SCREENSHOT_POST, str(PR))
+        assert pending is not None and pending["attempts"] == 2
+    before_restart = writes.copy()
+    assert _tick(loop, clock) == 0
+    if interrupted:
+        assert writes == before_restart
     assert set(writes) == {1_000, 1_060, 1_360} and roles(loop) == ["review", "screenshot_review"]
     _one_handoff(loop, seen, "screenshot_comment_post_failed")
-    assert not loop.fixes and not loop.merged
+    assert not loop.fixes and not loop.merged and not loop.checkpoint()
 
 
 @pytest.mark.parametrize("change", ["head", "description", "owner review", "closed"])
@@ -2159,6 +2166,25 @@ def test_a_change_made_during_the_screenshot_run_hands_off_without_posting(loop,
     assert not loop.checkpoint()
 
 
+@pytest.mark.parametrize("state", ["CLOSED", "MERGED"])
+def test_a_pr_superseded_before_the_screenshot_snapshot_clears_quietly(loop, monkeypatch, state):
+    loop.reviews[:] = ["pass"]
+    seen = _watch(monkeypatch)
+    call = review.pr_helpers.call
+
+    def supersede_after_code_review(*args, **kwargs):
+        result = call(*args, **kwargs)
+        if args[:2] == ("pr", "comment") and "<!-- baton-review round=1 " in args[-1] and result.returncode == 0:
+            loop.gh.set(state=state)
+        return result
+
+    monkeypatch.setattr(review.pr_helpers, "call", supersede_after_code_review)
+    assert screen_run(loop) == 0
+    assert roles(loop) == ["review"] and not loop.fixes and not loop.merged
+    assert not seen["reasons"] and not seen["notices"] and not loop.labelled("ready-for-human")
+    assert not loop.checkpoint()
+
+
 def test_a_pr_closed_during_the_screenshot_run_clears_quietly(loop):
     loop.reviews[:] = ["pass"]
     loop.screens[:] = ["pass"]
@@ -2235,16 +2261,43 @@ def test_a_recovered_screenshot_post_keeps_the_outcome_and_dispatches_one_fixer(
     assert len(screenshot_comments(loop)) == 2   # round 1 recovered, round 2 posted straight
 
 
-def test_a_recovered_passing_screenshot_post_keeps_the_saved_checks_for_the_merge(loop, monkeypatch):
+@pytest.mark.parametrize("checks", ["- The library at 768 px.", "none"])
+def test_the_screenshot_snapshot_controls_the_prompt_and_merge_after_a_body_edit(loop, monkeypatch, checks):
     clock = {"now": 1_000}
     _down_until(loop, monkeypatch, clock, "<!-- baton-screenshot-review")
     loop.reviews[:] = ["pass"]
     loop.screens[:] = ["pass"]
+    call = review.pr_helpers.call
+    edit_pending = False
+
+    def edit_after_code_review(*args, **kwargs):
+        nonlocal edit_pending
+        if edit_pending and args[:2] == ("pr", "view"):
+            edit_pending = False
+            # If there is a separate body read, let it see the old checks before the edit.
+            before_edit = call(*args, **kwargs) if args[-2:] == ("--jq", ".body") else None
+            loop.gh.set(body=f"Refs #297\n\n## Checks to verify\n{checks}\n")
+            if before_edit is not None:
+                return before_edit
+        result = call(*args, **kwargs)
+        if args[:2] == ("pr", "comment") and "<!-- baton-review round=1 " in args[-1] and result.returncode == 0:
+            edit_pending = True
+        return result
+
+    monkeypatch.setattr(review.pr_helpers, "call", edit_after_code_review)
+    if checks == "none":
+        assert screen_run(loop) == 0
+        assert roles(loop) == ["review"] and loop.merge_screenshots == [None]
+        return
+
     assert screen_run(loop) == 75
+    assert "1. The library at 768 px." in loop.agents[-1]["prompt"]
+    assert "390 px" not in loop.agents[-1]["prompt"]
     clock["now"] = 1_060
     assert _tick(loop, clock) == 0
+    assert roles(loop) == ["review", "screenshot_review"]
     [given] = loop.merge_screenshots
-    assert given["checks"] == "- The library at 390 px and 1280 px."
+    assert given["checks"] == checks
     assert given["comment"].startswith("<!-- baton-screenshot-review round=1 by=")
 
 

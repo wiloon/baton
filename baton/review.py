@@ -294,7 +294,7 @@ class Review:
     REVISION_FIELDS = "headRefOid,baseRefName,headRefName,state,body,closingIssuesReferences"
 
     def read_post_inputs(self, *, once=False):
-        """Read the PR and complete comment history used to bind or reconcile a code-review post."""
+        """Read the PR and complete comment history used to bind or reconcile a review comment."""
         data, _ = self.read_pr("title,labels", once=once)
         if data is None:
             return None, "retry"
@@ -767,12 +767,14 @@ class Review:
                 f"Codex: view_image):{listed}\n"
                 "   Compare each with the manual checks above and the issue.")
 
-    def run_screenshot_review(self, round, checks):
+    def run_screenshot_review(self, round, data, checks):
         """One screenshot reviewer run and its comment; returns OUTCOME. Deferred when the reviewer
         cannot run now. It never hands the PR over: the loop does, once, on a failed outcome."""
         pr, wt = self.pr, self.wt
         self.hooks.round = round
         head = git(wt, "rev-parse", "HEAD") or ""
+        if data["headRefOid"] != head:
+            return self.failed("screenshot_run_failed", "RESULT: failed reading the PR revision for screenshot review")
         vendor = self.screenshot_vendor()
         cfg = self.env.config
         if vendor not in cfg.declared() or not cfg.allows(vendor, "screenshot_reviewer"):
@@ -781,13 +783,6 @@ class Review:
         if not vendors.screenshot_allowed(self.state, pr, vendor, route.model, self.fixed_by):
             return self.failed("screenshot_independence_denied", "RESULT: failed screenshot reviewer model may be a PR author")
         limit = int(self.env.config.scheduling.review_context_max_chars or 20000)
-        data, status = self.read_post_inputs()
-        if status == "paused":
-            return DEFERRED_POST
-        if not data or data["headRefOid"] != head:
-            return self.failed("screenshot_run_failed", "RESULT: failed reading the PR revision for screenshot review")
-        if check_section.items(data["body"]):
-            checks = check_section.read(data["body"])
         context = Path(self.ctx, f"pr-{pr}-screenshot-review-{round}-{time.strftime('%Y%m%d-%H%M%S')}.md")
         context.write_text(issue_context(self.env, self.issue) if re.fullmatch(r"\d+", str(self.issue or "")) else "")
         review_file = Path(f"/tmp/baton-screenshot-review-{pr}-{round}.md")
@@ -938,15 +933,24 @@ class Review:
                         return 0
                     verdict = "pass" if outcome.startswith("REVIEW: pass") else "changes"
                     self.binding_fields["post_outcome"] = self.values["post_outcome"] = ""
+                data = None
                 if not screenshot_post and (step == "screenshot" or self.screenshot_enabled(reviewer)):
-                    body = pr_helpers.body(pr)
-                    # If the body read fails on resume, keep the checks saved with the code verdict.
-                    if body is not None:
-                        if check_section.items(body):
-                            checks = check_section.read(body)
-                        else:
-                            checks = ""
-                if checks or screenshot_post:
+                    data, status = self.read_post_inputs()
+                    if status == "paused":
+                        self.values.update(step="screenshot", code_verdict=verdict)
+                        self.save()
+                        return 75
+                    if status == "superseded":
+                        advisor.finish_episode(self.env, "pr", pr, "superseded")
+                        self.drop()
+                        return 0
+                    if status != "ok":
+                        self.handoff("screenshot_run_failed", f"PR #{pr} screenshot review failed",
+                                     f"Reading the PR revision for screenshot review failed. {self.url}")
+                        self.drop()
+                        return 0
+                    checks = (check_section.read(data["body"]) or "") if check_section.items(data["body"]) else ""
+                if screenshot_post or (data is not None and checks):
                     step = "screenshot"
                     code_verdict = verdict
                     self.values.update(step=step, code_verdict=code_verdict, screenshot_checks=checks)
@@ -957,7 +961,7 @@ class Review:
                         screenshot_post = False
                     else:
                         try:
-                            outcome = self.run_screenshot_review(round, checks)
+                            outcome = self.run_screenshot_review(round, data, checks)
                         except Exhausted as exhausted:
                             outcome = self.failed("screenshot_reviewer_unavailable",
                                                   exhausted.reason or "No screenshot reviewer available.")
