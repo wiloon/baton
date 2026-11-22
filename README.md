@@ -191,10 +191,15 @@ When a PR review or a spec review runs out of rounds, the optional routine advis
 a redacted snapshot and the allowed actions (`extra_round` or `handoff`). In `mode = "live"` the
 runner revalidates the state and grants at most one extra round per task; a second limit, a
 failure or an answer outside the set hands off as before, and the handoff text says what the
-advisor chose. `mode = "observe"` records the advice and always hands off; `off` (the default)
+advisor chose. The advisor is also consulted, in observation only, when CI is not green before
+a merge, when a merge fails, and when an ADR PR cannot be merged. Those calls send the PR title,
+description, the latest review and fix comments and, for an ADR, the acceptance text, all
+redacted. The only action offered there is one bounded read-only retry; it appears in the
+handoff text as "recommended, not executed (observation)" and never goes live, so the task is
+always handed off. `mode = "observe"` records the advice and always hands off; `off` (the default)
 makes no call. `[[repos]] advisor = false` keeps a repository's issue and PR text off the
 provider. Decisions go to `<state>/advisor/decisions.jsonl`; once a day a "Advisor digest"
-notification lists them with how the extra rounds ended. `DEEPSEEK_API_KEY` comes from the
+notification lists them with how the extra rounds ended (merged or accepted). `DEEPSEEK_API_KEY` comes from the
 environment or `[advisor] env_file` (mode 0600) and is never passed to agents.
 
 ### Maintenance mode

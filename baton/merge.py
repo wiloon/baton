@@ -23,7 +23,7 @@ import subprocess
 import sys
 import time
 
-from . import after_merge, check_verdicts, checks, ci, fix, hooks as telemetry, names, notify, pick, pr as pr_helpers
+from . import advisor, after_merge, check_verdicts, checks, ci, fix, hooks as telemetry, names, notify, pick, pr as pr_helpers
 from .common import Deferred, git
 
 
@@ -36,6 +36,26 @@ def remove_worktree(repo_dir, wt):
     return session.run_process(["git", "-C", repo_dir, "branch", "-D", branch], stdout=subprocess.DEVNULL).returncode == 0
 
 
+HANDED_OFF = 2
+
+
+def checks_status(rollup):
+    """Classify GitHub's check runs and commit status contexts for the observed head."""
+    if not isinstance(rollup, list) or not rollup or any(not isinstance(check, dict) for check in rollup):
+        return "unavailable"
+    states = [(str(check.get("status") or check.get("state") or "").upper(),
+               str(check.get("conclusion") or "").upper()) for check in rollup]
+    pending = {"PENDING", "QUEUED", "IN_PROGRESS", "REQUESTED", "WAITING", "EXPECTED"}
+    settled = {"SUCCESS", "NEUTRAL", "SKIPPED"}
+    if any((conclusion and conclusion not in settled) or state in {"ERROR", "FAILURE"}
+           for state, conclusion in states):
+        return "failed"
+    if any(state not in pending | settled and (state != "COMPLETED" or not conclusion)
+           for state, conclusion in states):
+        return "unavailable"
+    return "pending" if any(state in pending for state, _ in states) else "settled"
+
+
 class Merger:
     @session.scoped
     def __init__(self, env, hooks, pr, issue=""):
@@ -43,27 +63,77 @@ class Merger:
         self.env, self.hooks, self.pr, self.issue = env, hooks, pr, issue
         self.state, self.ctx, self.repo = str(env.dirs.state), str(env.dirs.ctx), env.repo.gh_repo
         self.url = f"https://github.com/{self.repo}/pull/{pr}"
+        self.last_ci = ("", 0, 0)
+        self.merge_head = ""
 
     def label(self, *options):
         pr_helpers.gh("pr", "edit", str(self.pr), "-R", self.repo, *options)
 
-    def handoff(self, reason, title, text):
+    def handoff(self, reason, title, text, **observation):
         from . import handoff as owner_handoff
         owner_handoff.perform(
             self.env, reason, kind="pr", number=self.pr,
-            title=title, text=text, hooks=self.hooks, item=self.pr, episode=self.issue)
+            title=title, text=text, hooks=self.hooks, **observation)
+
+    def observation(self, reason, *, ci_failed=False, acceptance="", failure=""):
+        """Read the current PR for an observation point. An offer never authorizes a write."""
+        if not advisor.enabled(self.env):
+            return {}
+        try:
+            data = pr_helpers.view(self.pr, "state,headRefOid,baseRefName,mergeStateStatus,statusCheckRollup,"
+                                    "title,body,additions,deletions,changedFiles,comments") or {}
+        except (TypeError, ValueError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        state = data.get("state")
+        head = data.get("headRefOid")
+        status = checks_status(data.get("statusCheckRollup"))
+        context = [
+            f"Decision point: {reason}. Repository {self.repo}, issue {self.issue}, PR {self.pr}.",
+            f"PR state: {state}; current head: {head}; base: {data.get('baseRefName')}.",
+            f"Merge status: {data.get('mergeStateStatus')}; CI status: {status}.",
+        ]
+        if ci_failed:
+            checked_head, rc, minutes = self.last_ci
+            same_head = bool(checked_head and checked_head == head
+                             and (not self.merge_head or checked_head == self.merge_head))
+            retry = same_head and state == "OPEN" and (
+                status == "pending" or (rc == 124 and status != "failed"))
+            context.append(f"CI wait head: {checked_head}; exit: {rc}; poll budget: {minutes} minutes.")
+        else:
+            # A reconciliation read is safe for a merged or ambiguous PR as well. An ordinary
+            # merge could only resume at the same eligible head, after rerunning all gates.
+            retry = state != "CLOSED"
+            context.append(f"Previous merge head: {self.merge_head}; step outcome: {failure or reason}.")
+        context.append(f"Diff size: {data.get('changedFiles')} files, +{data.get('additions')}"
+                       f"/-{data.get('deletions')}.")
+        comments = data.get("comments")
+        comments = comments if isinstance(comments, list) else []
+        for prefix in ("<!-- baton-review ", "<!-- baton-screenshot-review ", "<!-- baton-fix "):
+            feedback = next((c["body"] for c in reversed(comments)
+                             if isinstance(c, dict) and isinstance(c.get("author"), dict)
+                             and c["author"].get("login") == self.env.owner
+                             and isinstance(c.get("body"), str) and c["body"].startswith(prefix)), "")
+            if feedback:
+                context.append(feedback)
+        if acceptance:
+            context.append(acceptance)
+        context.append(f"PR title: {data.get('title') or ''}\n{data.get('body') or ''}")
+        return {"snapshot": "\n\n".join(context), "observed_actions": ("retry_step",) if retry else ()}
 
     # --- CI ---
     def ci_green(self, minutes):
         """CI passed, or the PR triggers no checks (docs-only paths); baton.ci. The result
         goes to the optional CI metadata hook."""
         before = ""
-        if self.hooks.enabled:
+        if self.hooks.enabled or advisor.enabled(self.env):
             result = pr_helpers.gh("pr", "view", str(self.pr), "-R", self.repo, "--json", "headRefOid", "--jq", ".headRefOid",
                                    limit=15)
             before = result.stdout.strip() if result.returncode == 0 else ""
         started = time.monotonic()
         result = ci.green(str(self.pr), minutes)
+        self.last_ci = (before if re.fullmatch(r"[a-f0-9]{40,64}", before) else "", result["rc"], minutes)
         self.hooks.ci(self.pr, result["rc"], before, result["no_checks"],
                       duration_ms=int((time.monotonic() - started) * 1000))
         return result["green"]
@@ -71,7 +141,8 @@ class Merger:
     def ci_fix_round(self, wt):
         """One repair for a failed code-check head (#243). baton.ci decides: infrastructure
         and ambiguous failures, and a head repaired once already, are left for the owner.
-        Returns 0 when a repair was pushed. A repair that cannot run now hands the head off."""
+        Returns 0 when a repair was pushed, HANDED_OFF when the repair run already handed the PR to
+        the owner, and 1 when no repair is possible. A repair that cannot run now hands the head off."""
         pr = self.pr
         found = ci.classify(str(pr), self.state, list(self.env.repo.ci_fixable_checks))
         if found is None or not re.fullmatch(r"[a-f0-9]{40,64}", found["head"]):
@@ -81,7 +152,8 @@ class Merger:
             fixer = pick.choose(self.env, "fixer", "agent", "contrib", pick.all_vendors(self.env), pr=str(pr),
                                 issue=self.issue)
             notify.log(f"PR #{pr}: code-only CI failure on {head}; one repair round by {fixer}")
-            rc = fix.fix_pr(fix.Runner(self.env, self.hooks, pr, "ci"), pr, wt, fixer, "CI code checks", found["feedback"])
+            runner = fix.Runner(self.env, self.hooks, pr, "ci")
+            rc = fix.fix_pr(runner, pr, wt, fixer, "CI code checks", found["feedback"])
         except Deferred:
             rc = 75
         if rc == 75:
@@ -89,7 +161,9 @@ class Merger:
             return 1
         Path(self.state, f"ci-fix-{pr}-{head}").touch()   # one repair round for this PR head, even across ticks
         if rc != 0:
-            return rc
+            # Only a real handoff by the repair run ends here; any other failure (e.g. recording
+            # authorship) falls through to the merge gate's own CI handoff.
+            return HANDED_OFF if runner.handed_off else 1
         self.hooks.task("ci_fix", f"pr:{pr}:{head}", "--agent", fixer, "--head-sha", head)
         return 0
 
@@ -98,6 +172,7 @@ class Merger:
         """Idempotent recovery for a partial slice, including owner merges: keep an open issue
         runnable without reusing a merged branch or worktree next time. False: retry later."""
         pr, state_dir = self.pr, self.state
+        advisor.finish_episode(self.env, "pr", pr, "merged")
         if Path(state_dir, f"task-merged-pr-{pr}").exists():
             return True
         try:
@@ -215,6 +290,7 @@ class Merger:
         updates, match_sha = 0, None
         data = self.pr_merge_state()
         while True:
+            self.merge_head = (data or {}).get("headRefOid") or ""
             status = (data or {}).get("mergeStateStatus")
             if status == "BEHIND":
                 if updates >= 3:
@@ -232,6 +308,7 @@ class Merger:
                             "detail": " branch head did not change after update-branch"}
                 updates += 1
                 match_sha = new_sha
+                self.merge_head = new_sha
                 if not self.ci_green(minutes):
                     return {"ok": False, "reason": "ci_after_update_not_green", "detail": ""}
                 if before_merge is not None:
@@ -284,9 +361,14 @@ class Merger:
                 notify.send_shots(pr, note="Checks for you" if left is None else "", left=owed)
             return
         if not self.ci_green(45):
-            if self.ci_fix_round(wt) != 0 or not self.ci_green(45):
-                self.handoff("ci_before_merge_not_green", f"PR #{pr}: CI not green",
-                             f"Review passed but CI failed or timed out. {url}")
+            repaired = self.ci_fix_round(wt)
+            if repaired == HANDED_OFF:
+                return
+            if repaired != 0 or not self.ci_green(45):
+                reason = "ci_before_merge_not_green"
+                self.handoff(reason, f"PR #{pr}: CI not green",
+                             f"Review passed but CI failed or timed out. {url}",
+                             **self.observation(reason, ci_failed=True))
                 return
         touched = self.owner_paths_touched()
         if touched != []:
@@ -339,7 +421,8 @@ class Merger:
             reason = result.get("reason")
             if reason == "ci_after_update_not_green":
                 self.handoff("ci_after_update_not_green", f"PR #{pr}: CI not green",
-                             f"Review passed but CI failed or timed out after updating the branch. {url}")
+                             f"Review passed but CI failed or timed out after updating the branch. {url}",
+                             **self.observation(reason, ci_failed=True))
                 return
             if reason == "gate":
                 gate = result.get("gate") or {"action": "manual_checks"}
@@ -357,7 +440,8 @@ class Merger:
                 notify.send_shots(pr, note="Checks for you" if left is None else "", left=owed)
                 return
             detail = result.get("detail") or ""
-            self.handoff("merge_failed", f"PR #{pr} merge failed", f"{url}{detail}")
+            self.handoff("merge_failed", f"PR #{pr} merge failed", f"{url}{detail}",
+                         **self.observation("merge_failed", failure=reason))
             return
         if deferred:   # a recheck may have refreshed left against the live body
             if left is None:

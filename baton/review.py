@@ -284,7 +284,7 @@ class Review:
         return owner_handoff.perform(
             self.env, reason, kind="pr", number=self.pr,
             title=title, text=text, hooks=self.hooks, item=self.pr, episode=self.issue,
-            snapshot=snapshot, revalidate=revalidate, close_outcomes=("review_limit",),
+            snapshot=snapshot, revalidate=revalidate,
             transient=transient, continuation=continuation, resume=resume)
 
     BINDING_FIELDS = ("reviewed_head", "base_branch", "reviewed_issue", "verdict_digest",
@@ -655,6 +655,7 @@ class Review:
         round, step, fix_head = 1, "review", ""
         code_verdict = screenshot = ""   # the round's code verdict, and "1" when it had a screenshot review
         checks = ""
+        extra = 0   # the advisor's one extra round (#17), kept in the checkpoint of the episode it was granted for
         saved = checkpoint.read(self.checkpoint)
         if saved:
             note, fixer, reviewer = saved.get("note", ""), saved.get("fixer", ""), saved.get("reviewer", "")
@@ -662,6 +663,7 @@ class Review:
             step, fix_head = saved.get("step") or "review", saved.get("fix_head", "")
             code_verdict, screenshot = saved.get("code_verdict", ""), saved.get("screenshot", "")
             checks = saved.get("screenshot_checks", "")
+            extra = 1 if saved.get("extra") == "1" else 0
             self.fixed_by, self.issue = saved.get("fixed_by", ""), saved.get("ISSUE", "")
             self.binding_fields = {k: saved.get(k, "") for k in
                                    self.BINDING_FIELDS}
@@ -675,7 +677,6 @@ class Review:
             self.seed_contrib()
         if not saved:
             self.label("--remove-label", "ready-for-human")
-        extra = 1 if advisor.granted(self.env, "review_limit", pr) else 0   # granted by the advisor (#17)
         while True:
             self.hooks.round = round
             if round == 1:
@@ -690,7 +691,7 @@ class Review:
                             if fix_head else ""))
             self.values = dict(note=note, fixer=fixer, reviewer=reviewer, round=round, step=step, fix_head=fix_head,
                                code_verdict=code_verdict, screenshot=screenshot, screenshot_checks=checks,
-                               **self.binding_fields)
+                               extra="1" if extra else "", **self.binding_fields)
             self.save()
             if step in ("review", "screenshot"):
                 verdict = code_verdict
@@ -741,7 +742,6 @@ class Review:
                     if outcome.startswith("REVIEW: changes"):
                         verdict = "changes"
                 if verdict == "pass":
-                    advisor.outcome(self.env, "review_limit", pr, "pass")
                     break
                 if round >= self.max_rounds + extra:
                     snap, check = self.limit_snapshot(round, reviewer, fixer)
@@ -751,6 +751,7 @@ class Review:
                         snapshot=snap, revalidate=check)
                     if result.action == "extra_round":
                         extra = 1
+                        self.values["extra"] = "1"
                         notify.log(f"PR #{pr}: advisor granted one more round: {result.decision.reason}")
                     else:
                         self.drop()
@@ -781,7 +782,9 @@ class Review:
             if rc == 75:
                 return 75
             if rc != 0:
-                advisor.outcome(self.env, "review_limit", pr, "handoff")
+                if not runner.handed_off:   # e.g. authorship recording failed: the owner still needs one handoff
+                    runner.handoff(pr, "fix_run_unfinished", f"PR #{pr} needs you",
+                                   f"The fix run of round {round} failed before a handoff. {self.url}")
                 self.drop()
                 return 0
             self.fixed_by = fixer

@@ -299,8 +299,8 @@ def test_needs_info_and_failure_go_to_the_owner(run, outcome, title, reason, mon
 def test_a_fix_with_no_commit_stops_the_loop(run):
     run.agent({"commit": False})
     assert run.fix()["rc"] == 1
-    assert any(f"PR #{PR} needs you | The fix run made no commit; stopping the loop. {URL}" == line
-               for line in run.runner_log())
+    assert (f"PR #{PR} needs you | The fix run made no commit; stopping the loop. {URL} "
+            "Reason fix_no_commit (category 2).") in run.runner_log()
 
 
 def test_a_fix_that_only_rechecks_the_pr_updates_its_description_and_continues(run):

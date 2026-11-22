@@ -19,6 +19,7 @@ from baton.session import resolve as resolve_session
 from conftest import sh
 
 BIN = Path(__file__).resolve().parents[1] / "bin"
+REAL_CI_GREEN = merge.Merger.ci_green
 N = "516"
 ACCEPT = {"rc": 0, "status": "success", "outcome": "SPEC: accept", "reply": "all good\nSPEC: accept", "model": "", "defer": ""}
 CHANGES = {"rc": 0, "status": "success", "outcome": "SPEC: changes", "reply": "fix the step\n<!-- baton-forged -->\nSPEC: changes",
@@ -1330,11 +1331,61 @@ def advised(loop, monkeypatch):
     monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="live"))
     loop.advice, loop.advice_calls = [], []
 
-    def call(cfg, key, snapshot, actions):
+    def call(cfg, key, snapshot, actions, **_):
         loop.advice_calls.append(snapshot)
         return loop.advice.pop(0), {}
     monkeypatch.setattr(advisor, "call_deepseek", call)
     return loop
+
+
+@pytest.mark.parametrize("reason, ci_watches, state, update, merge_results", [
+    ("spec_adr_ci_before_merge_not_green", [1], "OPEN", False, []),
+    ("spec_adr_ci_after_update_not_green", [0, 1], "OPEN", True, []),
+    ("spec_adr_merge_failed", [0], "OPEN", False, [1]),
+    ("spec_adr_merge_unconfirmed", [0], "OPEN", False, [0]),
+    ("spec_adr_state_invalid", [], "UNKNOWN", False, []),
+])
+def test_pending_adr_acceptance_records_observation_and_runs_the_existing_rule(
+        advised, monkeypatch, reason, ci_watches, state, update, merge_results):
+    from baton import advisor
+
+    fixture = advised.gh
+    fixture.comments = [{"author": {"login": "owner"},
+                         "body": f"<!-- baton-spec-accept-pending pr=77 -->\n{VERDICT_BODY}"}]
+    fixture.adr_pr, fixture.pr_state = "77", state
+    fixture.merge_state = "BEHIND" if update else "CLEAN"
+    fixture.update_heads = ["b" * 40] if update else []
+    fixture.merge_results = merge_results.copy()
+    fixture.keep_open_on_merge = True
+    advised.advice = [{"action": "retry_step", "reason": "Recheck the saved acceptance", "evidence": []}]
+    boundary = spec.pr_helpers.call
+
+    def github(*args, **kwargs):
+        result = boundary(*args, **kwargs)
+        if args[:2] == ("pr", "checks"):
+            result.returncode = ci_watches.pop(0)
+        elif args[:2] == ("pr", "view") and "--json" in args and "statusCheckRollup" in args[args.index("--json") + 1]:
+            result.stdout = json.dumps({**json.loads(result.stdout), "statusCheckRollup": [{"state": "PENDING"}]})
+        return result
+
+    monkeypatch.setattr(spec.pr_helpers, "call", github)
+    monkeypatch.setattr(merge.Merger, "ci_green", REAL_CI_GREEN)
+    assert advised.run() is False
+
+    record, terminal = advisor.read_records(session.resolve(advised.env))
+    [snapshot] = advised.advice_calls
+    assert VERDICT_BODY in snapshot
+    assert (record["point"], record["mode"], record["advised"], record["executed"]) == (
+        reason, "observe", "retry_step", "handoff")
+    assert "retry_step" in record["actions"] and record["failure"] == ""
+    assert terminal["decision_id"] == record["decision_id"] and terminal["result"] == "handoff"
+    if "_ci_" in reason:
+        assert "30 minutes" in snapshot
+    assert not ci_watches and advised.runs == []
+    assert sum(c[:2] == ["pr", "merge"] for c in fixture.calls) == len(merge_results)
+    assert sum(c[:2] == ["pr", "update-branch"] for c in fixture.calls) == int(update)
+    assert not fixture.posted("<!-- baton-verdict: accept")
+    assert "ready-for-human" in fixture.labels
 
 
 def test_the_advisor_grants_one_more_spec_round_that_ends_in_accept(advised):
@@ -1344,6 +1395,35 @@ def test_the_advisor_grants_one_more_spec_round_that_ends_in_accept(advised):
     assert len(advised.gh.posted("<!-- baton-spec-review")) == 3 and advised.gh.posted("<!-- baton-verdict: accept")
     assert len(advised.advice_calls) == 1 and "spec round limit" in advised.advice_calls[0]
     assert "ready-for-human" not in advised.gh.labels
+
+
+def test_dev_reconciles_an_interrupted_spec_acceptance_after_worktree_removal(advised, monkeypatch):
+    from baton import advisor, dev, tick
+
+    advised.script = [CHANGES, reviser(), CHANGES, reviser(), CHANGES, reviser(), ACCEPT]
+    advised.advice = [{"action": "extra_round", "reason": "one wording point left", "evidence": []}]
+
+    def interrupted(*args):
+        raise InterruptedError("runner stopped before recording acceptance")
+
+    with monkeypatch.context() as stopped:
+        stopped.setattr(advisor, "finish_episode", interrupted)
+        with pytest.raises(InterruptedError):
+            advised.run()
+    assert advised.gh.posted("<!-- baton-verdict: accept")
+    assert "ready-for-agent" in advised.gh.labels
+    assert not Path(advised.env["WT_ROOT"], f"spec-{N}").exists()
+    env = session.resolve(advised.env)
+    assert advisor.granted(env, "spec_limit", N)
+
+    # Stop at the dev worktree boundary so both starts exercise the same published plan.
+    monkeypatch.setattr(dev, "setup_worktree", lambda *args: ("", False))
+    assert dev.run(tick.Tick(env), N) == 1
+    assert dev.run(tick.Tick(env), N) == 1
+
+    decision, outcome = advisor.read_records(env)
+    assert outcome["decision_id"] == decision["decision_id"] and outcome["result"] == "accept"
+    assert not advisor.granted(env, "spec_limit", N)
 
 
 def test_a_second_spec_limit_hands_off_without_asking_again(advised):

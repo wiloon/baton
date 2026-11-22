@@ -13,7 +13,7 @@ import re
 import subprocess
 import time
 
-from . import after_merge, agents, checks as check_section, dispatch, fix, handoff as owner_handoff, md, names, pr as pr_helpers, pr_contract, prompts, spec, vendors
+from . import advisor, after_merge, agents, checks as check_section, dispatch, fix, handoff as owner_handoff, md, names, pr as pr_helpers, pr_contract, prompts, spec, vendors
 from .common import Deferred, git, push, strip_markers
 
 REPLY_CAP = 60000
@@ -107,7 +107,7 @@ def stop(tick, issue, reason, title, text):
     from . import handoff as owner_handoff
     owner_handoff.perform(
         tick.env, reason, kind="issue", number=issue, remove=("agent-wip",),
-        title=title, text=text, hooks=tick.hooks(issue), item=issue, episode=issue)
+        title=title, text=text, hooks=tick.hooks(issue))
     return 80
 
 
@@ -239,6 +239,9 @@ def run(tick, issue):
         if not plan:
             tick.notify(f"#{issue}: spec accepted but no plan comment found", url)
             return 1
+    if (verdict := spec.VERDICT.match(plan)) and verdict[1] == "accept":
+        # Publishing a spec acceptance can outlive the spec worktree and its local outcome.
+        advisor.finish_episode(env, "issue", issue, "accept")
     resume_note, ok = setup_worktree(tick, wt, branch, issue)
     if not ok:
         return 1
