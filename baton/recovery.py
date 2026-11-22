@@ -117,6 +117,25 @@ def issue_fingerprint(wt, issue, *, branch="", base="", extra=None):
     return data
 
 
+def spec_fingerprint(wt, issue, *, branch="", base="", issue_body="", comment_digest="", round_s="", adr_head=""):
+    """Bind spec recovery to issue body, trusted comment, round, ADR head, and worktree (#125 point 6)."""
+    data = issue_fingerprint(wt, issue, branch=branch, base=base)
+    data["issue_body"] = feedback_digest(issue_body)
+    data["comment_digest"] = comment_digest or ""
+    data["round"] = str(round_s)
+    data["adr_head"] = adr_head or ""
+    return data
+
+
+def mark_dispatched(env, record):
+    """Note that the granted retry has been dispatched; keep the record until success or handoff."""
+    if not record:
+        return None
+    updated = {**record, "dispatched": True}
+    persist(env, updated)
+    return updated
+
+
 def feedback_digest(text):
     return hashlib.sha256((text or "").encode()).hexdigest()
 
@@ -254,3 +273,12 @@ def revalidate_worker(fingerprint, wt, pr):
         if not data or data.get("headRefOid") != remote:
             return False
     return True
+
+
+def revalidate_spec(fingerprint, wt, issue, *, branch, base, issue_body, comment_digest, round_s, adr_head):
+    """Re-read spec binding fields before a worker retry."""
+    if not wt:
+        return False
+    current = spec_fingerprint(wt, issue, branch=branch, base=base, issue_body=issue_body,
+                               comment_digest=comment_digest, round_s=round_s, adr_head=adr_head)
+    return fingerprint_matches({"fingerprint": fingerprint}, current)

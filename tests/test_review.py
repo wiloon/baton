@@ -1596,3 +1596,42 @@ def test_a_spent_review_retry_hands_off_on_the_same_reason(advised):
     assert [a["vendor"] for a in advised.agents if a["role"] == "review"] == ["claude", "claude"]
     assert advised.labelled("ready-for-human") and advised.merged == []
     assert len(advised.advice_calls) == 1
+
+
+def test_author_state_retry_reseeds_then_picks_reviewer(advised, monkeypatch):
+    advised.advice = [{"action": "retry_step", "reason": "transient seed failure",
+                       "evidence": ["Decision point: review_author_state_failed"]}]
+    attempts = iter([False, True, True])
+
+    def seed(self):
+        return next(attempts, True)
+
+    monkeypatch.setattr(review.Review, "seed", seed)
+    advised.reviews[:] = ["pass"]
+    assert advised.run(fixer="cursor", reviewer="claude") == 0
+    assert len(advised.advice_calls) == 1 and advised.merged == [PR]
+
+
+def test_fingerprint_mismatch_on_pending_review_recovery_hands_off(loop, monkeypatch):
+    from baton import advisor, recovery
+    from baton.config import Advisor
+    from baton import session
+    monkeypatch.setenv(advisor.KEY, "sk-" + "r" * 24)
+    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="live"))
+    remote = {"state": "OPEN", "headRefOid": "a" * 40, "baseRefName": "main"}
+    monkeypatch.setattr(review.pr_helpers, "view", lambda pr, fields: dict(remote))
+    env = session.resolve(loop.env)
+    from baton import hooks as telemetry
+    hooks = telemetry.from_env(env, issue="297", pr=PR)
+    recovery.persist(env, {
+        "action": "retry_step", "failed_vendor": "claude", "exclusions": ["claude"],
+        "remaining_budget": {}, "fingerprint": recovery.pr_fingerprint(str(loop.wt), PR, remote_head="a" * 40, base="main"),
+        "role": "reviewer", "episode": "297", "item": str(PR), "reason": "review_run_failed", "decision_id": "x",
+        "dispatched": False,
+    })
+    remote["headRefOid"] = "b" * 40
+    r = review.Review(env, hooks, PR, loop.wt, issue="297")
+    r.values = {"round": "1"}
+    from baton import handoff as owner_handoff
+    action, _ = r.recover_worker("review_run_failed", "t", "detail", "claude")
+    assert action == owner_handoff.HANDOFF

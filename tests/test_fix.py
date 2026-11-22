@@ -918,7 +918,7 @@ def test_verification_gives_up_after_the_configured_repairs(run):
     out = run.verify()
     assert (out["rc"], out["rounds"]) == (1, 2) and "still broken" in out["failure"]
     assert len(run.agent_calls) == 2
-    assert "verify failed (attempt 2 of 2)" in " ".join(run.runner_log())
+    assert "verify failed (repair 2 of 2 in this call)" in " ".join(run.runner_log())
 
 
 def test_a_repair_with_no_commit_is_checked_again_and_passes(run):
@@ -1047,3 +1047,17 @@ def test_a_live_verify_retry_rechecks_within_the_same_budget(advised_fix):
     assert len(advised_fix.advice_calls) == 1
     assert "fix_verify_failed" in advised_fix.advice_calls[0][0]
     assert advised_fix.advice_calls[0][1] == ("handoff", "retry_step")
+
+
+def test_verify_still_red_with_zero_remaining_rechecks_once(run):
+    """Point 12: remaining budget 0 means one recheck only, no repair agent; rounds keep prior count."""
+    run.verify_script("lint broke")
+    from baton import hooks as telemetry, session
+    env = session.resolve(os.environ)
+    runner = fix.Runner(env, pr=PR, hooks=telemetry.from_env(env, pr=PR))
+    rc, failure, rounds = runner.verify(str(run.worktree), "origin/main", "claude", "pr", PR,
+                                        repairs=0, repairs_before=2)
+    assert (rc, failure, rounds) == (1, "lint broke", 2)
+    assert run.agent_calls == []
+
+

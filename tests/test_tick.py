@@ -1624,6 +1624,31 @@ def test_each_dev_failure_hands_off_once_with_its_reason(devrun, monkeypatch, st
                              "--add-label", "ready-for-human")) == 1
 
 
+def test_dirty_fix_worktree_hands_off_without_advisor(ctx, monkeypatch):
+    from baton import advisor
+    pr_state(ctx)
+    ctx.gh.answers["pr list"] = lambda args: (
+        [{"number": 11, "headRefName": "agent/issue-5"}] if "agent-fix" in args else [])
+    wt = Path(ctx.env["WT_ROOT"], "agent-5")
+    wt.mkdir(parents=True)
+    seen = _watch_handoffs(monkeypatch)
+    calls = []
+    monkeypatch.setenv(advisor.KEY, "sk-" + "d" * 24)
+    monkeypatch.setattr(advisor, "call_deepseek", lambda *a, **k: calls.append(1) or ({"action": "handoff"}, {}))
+    real = tick.session.run_process
+
+    def process(args, **kwargs):
+        if "--porcelain" in args:
+            return subprocess.CompletedProcess(args, 0, " M stray.txt\n", "")
+        if "--ff-only" in args:
+            return subprocess.CompletedProcess(args, 1, "", "")
+        return real(args, **kwargs)
+
+    monkeypatch.setattr(tick.session, "run_process", process)
+    assert ctx.make().run() == 0
+    assert not calls and _reasons(seen) == ["fix_worktree_diverged"]
+
+
 def test_a_diverged_fix_worktree_hands_off_once_with_its_reason(ctx, monkeypatch):
     pr_state(ctx)
     ctx.gh.answers["pr list"] = lambda args: (

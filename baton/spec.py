@@ -31,7 +31,7 @@ import subprocess
 import sys
 import time
 
-from . import advisor, agents, checks as check_section, claude_cli, dispatch, e2e_gate, fix, handoff as owner_handoff, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, review, vendors
+from . import advisor, agents, checks as check_section, claude_cli, dispatch, e2e_gate, fix, handoff as owner_handoff, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, recovery, review, vendors
 from .common import Deferred, changed, git, permission_denials, push, restore, strip_markers
 
 REPLY_CAP = 60000
@@ -215,6 +215,17 @@ def reply_text(reply):
     return "\n".join(line for line in strip_markers(reply or "").split("\n") if not VERDICT_LINE.match(line)).rstrip("\n")
 
 
+def trusted_comment_digest(listed, owner, login_re):
+    """SHA-256 of the latest owner or cursor comment on the issue."""
+    login_re = login_re or r"^(app/cursor|cursor(\[bot\])?)$"
+    bodies = []
+    for comment in listed or []:
+        login = (comment.get("author") or {}).get("login") or ""
+        if login == owner or re.search(login_re, login):
+            bodies.append(comment.get("body") or "")
+    return recovery.feedback_digest(bodies[-1]) if bodies else ""
+
+
 class Spec:
     @session.scoped
     def __init__(self, env, hooks, issue):
@@ -323,6 +334,79 @@ class Spec:
             hooks=self.hooks, item=self.issue, episode=self.issue,
             snapshot=snapshot, revalidate=revalidate, observed_actions=observed_actions,
             after_labels=after_labels, transient=transient, continuation=continuation, resume=resume)
+
+    def spec_binding(self, round_s, issue_body, listed):
+        login_re = self.env.config.scheduling.cursor_login_re
+        return recovery.spec_fingerprint(
+            str(self.wt), self.issue, branch=self.branch, base=self.base,
+            issue_body=issue_body, comment_digest=trusted_comment_digest(listed, self.env.owner, login_re),
+            round_s=round_s, adr_head=getattr(self, "adr_head", "") or "")
+
+    def recover_worker(self, why, reason, vendor, detail, *, role="spec_reviewer", round_s="",
+                       issue_body="", listed=(), last_vendor="", other_model="", spec_followup=False,
+                       budget=None):
+        from . import advisor
+        from .common import Exhausted
+        entry = owner_handoff.REASONS.get(reason)
+        mode = owner_handoff.capped_mode(
+            advisor.settings(self.env).mode if advisor.enabled(self.env) else "off",
+            entry.mode if entry else "off")
+        if not entry or mode != "live":
+            self.handoff(why, reason)
+            return owner_handoff.HANDOFF, vendor
+        episode = self.issue
+        pending = recovery.load(self.env, episode, self.issue)
+        if pending and pending["reason"] == reason and not pending.get("dispatched"):
+            current = self.spec_binding(round_s, issue_body, listed)
+            if not recovery.fingerprint_matches(pending, current):
+                self.handoff(why, reason)
+                return owner_handoff.HANDOFF, vendor
+            try:
+                vendor = recovery.select_vendor(
+                    self.env, pending, mode="contrib", candidates=pick.all_vendors(self.env),
+                    issue=self.issue, other_model=other_model, spec_followup=spec_followup)
+            except (Deferred, Exhausted):
+                raise
+            recovery.mark_dispatched(self.env, pending)
+            return pending["action"], vendor
+        offered = recovery.offered_actions(entry, vendor, pick.all_vendors(self.env))
+        if not offered:
+            self.handoff(why, reason)
+            return owner_handoff.HANDOFF, vendor
+        fingerprint = self.spec_binding(round_s, issue_body, listed)
+        snapshot = (f"Decision point: {reason}. Repository {self.repo}, issue #{self.issue}.\n"
+                    f"Failed vendor: {vendor}; role: {role}.\nOutcome: {detail}\n"
+                    "Actions: retry_step = one more attempt with the same vendor; "
+                    "retry_step_other_vendor = one attempt with an eligible alternate; "
+                    "handoff = the owner takes the issue.\n")
+        result = self.handoff(why, reason, snapshot=snapshot,
+                              revalidate=lambda: recovery.revalidate_spec(
+                                  fingerprint, str(self.wt), self.issue, branch=self.branch, base=self.base,
+                                  issue_body=issue_body,
+                                  comment_digest=trusted_comment_digest(listed, self.env.owner,
+                                                                        self.env.config.scheduling.cursor_login_re),
+                                  round_s=round_s, adr_head=getattr(self, "adr_head", "") or ""),
+                              observed_actions=offered)
+        if result.action == owner_handoff.HANDOFF:
+            return owner_handoff.HANDOFF, vendor
+        exclusions = [vendor]
+        budget = dict(budget or {})
+        recovery.persist_grant(self.env, result, role=role, failed_vendor=vendor, exclusions=exclusions,
+                               budget=budget, fingerprint=fingerprint, episode=episode, item=self.issue, reason=reason)
+        saved = recovery.load(self.env, episode, self.issue)
+        try:
+            vendor = recovery.select_vendor(
+                self.env, saved, mode="contrib", candidates=pick.all_vendors(self.env),
+                issue=self.issue, other_model=other_model, spec_followup=spec_followup)
+        except Deferred:
+            raise
+        except Exhausted as exhausted:
+            recovery.clear(self.env, episode, self.issue)
+            self.handoff(exhausted.reason or why, reason)
+            return owner_handoff.HANDOFF, vendor
+        notify.log(f"#{self.issue}: advisor granted {result.action} for {role} ({vendor}): {result.decision.reason}")
+        recovery.mark_dispatched(self.env, saved)
+        return result.action, vendor
 
     def retry_read(self, read, why, reason, *, continuation=None):
         """Consume a waiting attempt before reading; return the value or hand off."""
@@ -450,9 +534,12 @@ class Spec:
             return True
         return False
 
-    def review_round(self, round, max_rounds, context, listed):
+    def review_round(self, round, max_rounds, context, listed, *, issue_body=""):
         """"accept", "changes" or "stop" (the owner or a failure took over)."""
         n, wt, env = self.issue, self.wt, self.env
+        if not issue_body:
+            body = self.gh("issue", "view", n, "--json", "body", "-q", ".body")
+            issue_body = body.stdout if body.returncode == 0 else ""
         if not hasattr(self, "extra"):
             self.extra = 1 if advisor.granted(env, "spec_limit", n) else 0   # granted by the advisor (#17)
         adr_note = "No ADR has been revised yet."
@@ -463,52 +550,63 @@ class Spec:
         last_vendor = last_by(listed, env.owner, "reply")
         other_model = last_model(env, n, "reply", round - 1, last_vendor)
         reviewer = self.pick("spec_reviewer", pick.all_vendors(env), last_vendor, other_model)
-        out = self.agent(reviewer, "spec_review", self.render(
-            self.self_dir / "spec-review-prompt.md", VENDOR=reviewer, ISSUE=n, GH_REPO=self.repo, WORKTREE=str(wt),
-            BRANCH=self.branch, ROUND=str(round), MAX_ROUNDS=str(max_rounds), CONTEXT_FILE=str(context),
-            ADR_NOTE=adr_note, ROUND_NOTE=self.round_note(round)), f"issue-{n}-spec-{round}", "review-settings.json",
-            followup=self.followup(round, reviewer, last_vendor))
-        outcome, model = out["outcome"], out["model"] or ""
-        if self.unverified(reviewer, last_vendor, model, other_model):
-            self.handoff("Codex spec reviewer model was not verified as different from the reviser model.",
-                         "spec_reviewer_model_unverified")
-            return "stop"
-        mode_note = self.mode_note("Review", reviewer, last_vendor, model, other_model)
-        if changed(wt, head):
-            restore(wt, head)
-            outcome = f"RESULT: failed {reviewer} changed files in a read-only spec review"
-        reply = reply_text(out["reply"])
-        self.hooks.verdict("spec_review", reviewer, head, round, outcome, out["reply"] or "")
-        if outcome.startswith("SPEC: accept"):
-            problems = self.accept_problems()
-            if not problems:
-                return self.accept(reviewer, round, mode_note, reply)
-            points = "\n".join(f"{i}. [decidable] {p}" for i, p in enumerate(problems, 1))
-            if not self.post(f"<!-- baton-spec-review round={round} by={reviewer} -->\n"
-                             f"## Spec review ({reviewer}), round {round}: accept refused by the runner\n\n"
-                             f"{reviewer} accepted, but the issue body breaks the runner's rules:\n\n{points}\n\n"
-                             f"{mode_note}{reply[:REPLY_CAP]}", f"posting the refused accept of {reviewer} failed"):
+        attempt = 0
+        while True:
+            tag = f"issue-{n}-spec-{round}" + (f"-retry{attempt}" if attempt else "")
+            out = self.agent(reviewer, "spec_review", self.render(
+                self.self_dir / "spec-review-prompt.md", VENDOR=reviewer, ISSUE=n, GH_REPO=self.repo, WORKTREE=str(wt),
+                BRANCH=self.branch, ROUND=str(round), MAX_ROUNDS=str(max_rounds), CONTEXT_FILE=str(context),
+                ADR_NOTE=adr_note, ROUND_NOTE=self.round_note(round)), tag, "review-settings.json",
+                followup=self.followup(round, reviewer, last_vendor))
+            outcome, model = out["outcome"], out["model"] or ""
+            if self.unverified(reviewer, last_vendor, model, other_model):
+                self.handoff("Codex spec reviewer model was not verified as different from the reviser model.",
+                             "spec_reviewer_model_unverified")
                 return "stop"
-            if not self.at_limit(round, max_rounds, reviewer, points, context,
-                                 f"{reviewer} accepted, but the issue body breaks the runner's rules after {round} spec rounds."):
+            mode_note = self.mode_note("Review", reviewer, last_vendor, model, other_model)
+            if changed(wt, head):
+                restore(wt, head)
+                outcome = f"RESULT: failed {reviewer} changed files in a read-only spec review"
+            reply = reply_text(out["reply"])
+            self.hooks.verdict("spec_review", reviewer, head, round, outcome, out["reply"] or "")
+            if outcome.startswith("SPEC: accept"):
+                problems = self.accept_problems()
+                if not problems:
+                    recovery.clear(self.env, self.issue, self.issue)
+                    return self.accept(reviewer, round, mode_note, reply)
+                points = "\n".join(f"{i}. [decidable] {p}" for i, p in enumerate(problems, 1))
+                if not self.post(f"<!-- baton-spec-review round={round} by={reviewer} -->\n"
+                                 f"## Spec review ({reviewer}), round {round}: accept refused by the runner\n\n"
+                                 f"{reviewer} accepted, but the issue body breaks the runner's rules:\n\n{points}\n\n"
+                                 f"{mode_note}{reply[:REPLY_CAP]}", f"posting the refused accept of {reviewer} failed"):
+                    return "stop"
+                if not self.at_limit(round, max_rounds, reviewer, points, context,
+                                     f"{reviewer} accepted, but the issue body breaks the runner's rules after {round} spec rounds."):
+                    return "stop"
+                recovery.clear(self.env, self.issue, self.issue)
+                return "changes"
+            if outcome.startswith("SPEC: changes"):
+                if not self.post(f"<!-- baton-spec-review round={round} by={reviewer} -->\n"
+                                 f"## Spec review ({reviewer}), round {round}\n\n{mode_note}{reply[:REPLY_CAP]}",
+                                 f"posting {reviewer}'s spec review failed"):
+                    return "stop"
+                if not self.at_limit(round, max_rounds, reviewer, reply[:REPLY_CAP], context,
+                                     f"{reviewer} still has points after {round} spec rounds."):
+                    return "stop"
+                recovery.clear(self.env, self.issue, self.issue)
+                return "changes"
+            if outcome.startswith("SPEC: reject"):
+                self.gh("issue", "comment", n, "--body", f"<!-- baton-note by={reviewer} -->\n"
+                        f"## Spec review ({reviewer}), round {round}: reject\n\n{reply[:REPLY_CAP]}")
+                self.handoff(f"{reviewer} rejects the issue.", "spec_rejected")
                 return "stop"
-            return "changes"
-        if outcome.startswith("SPEC: changes"):
-            if not self.post(f"<!-- baton-spec-review round={round} by={reviewer} -->\n"
-                             f"## Spec review ({reviewer}), round {round}\n\n{mode_note}{reply[:REPLY_CAP]}",
-                             f"posting {reviewer}'s spec review failed"):
+            action, reviewer = self.recover_worker(
+                f"{reviewer}'s spec review failed: {outcome}", "spec_review_run_failed", reviewer, outcome,
+                round_s=str(round), issue_body=issue_body, listed=listed,
+                other_model=other_model, spec_followup=self.followup(round, reviewer, last_vendor))
+            if action == owner_handoff.HANDOFF:
                 return "stop"
-            if not self.at_limit(round, max_rounds, reviewer, reply[:REPLY_CAP], context,
-                                 f"{reviewer} still has points after {round} spec rounds."):
-                return "stop"
-            return "changes"
-        if outcome.startswith("SPEC: reject"):
-            self.gh("issue", "comment", n, "--body", f"<!-- baton-note by={reviewer} -->\n"
-                    f"## Spec review ({reviewer}), round {round}: reject\n\n{reply[:REPLY_CAP]}")
-            self.handoff(f"{reviewer} rejects the issue.", "spec_rejected")
-            return "stop"
-        self.handoff(f"{reviewer}'s spec review failed: {outcome}", "spec_review_run_failed")
-        return "stop"
+            attempt += 1
 
     def accept_verdict(self, reviewer, round, mode_note, reply):
         return (f"<!-- baton-verdict: accept by={reviewer} -->\n"
@@ -666,9 +764,12 @@ class Spec:
         return self.publish_accept(verdict)
 
     # --- the reviser's round ---
-    def revise_round(self, round, context, listed):
+    def revise_round(self, round, context, listed, *, issue_body=""):
         """"revised" or "stop" (the owner or a failure took over)."""
         n, wt, env = self.issue, self.wt, self.env
+        if not issue_body:
+            body = self.gh("issue", "view", n, "--json", "body", "-q", ".body")
+            issue_body = body.stdout if body.returncode == 0 else ""
         out_base = f"/tmp/baton-spec-{n}-{round}"
         for stale in Path("/tmp").glob(f"baton-spec-{n}-{round}.*"):
             stale.unlink()
@@ -683,37 +784,54 @@ class Spec:
             template, ISSUE=n, GH_REPO=self.repo, WORKTREE=str(wt), BRANCH=self.branch, ROUND=str(round),
             CONTEXT_FILE=str(context), OUT=out_base)
         followup = reviser == "claude" and claude_followup
-        tag = f"issue-{n}-spec-reply-{round}"
-        out = self.agent(reviser, "spec", prompt, tag, "spec-settings.json", out_base, followup=followup)
-        denied = permission_denials(out.get("log", "")) if out["outcome"].startswith("RESULT: failed") else []
-        if denied:
-            # A denied command is the runner's setup, not a question for the owner: rerun once (#53).
-            notify.log(f"#{n}: spec revision round {round} failed after a denied command ({denied[0]}); rerunning once")
-            for suffix in (".body", ".comment"):
-                Path(f"{out_base}{suffix}").unlink(missing_ok=True)
-            out = self.agent(reviser, "spec", prompt + DENIED_NOTE.format(command=denied[0]), f"{tag}-rerun",
-                             "spec-settings.json", out_base, followup=followup)
+        pending = recovery.load(self.env, n, n)
+        denied_spent = bool((pending or {}).get("remaining_budget", {}).get("denied_spent")) if (
+            pending and pending.get("reason") == "spec_revision_run_failed" and not pending.get("dispatched")) else False
+        attempt = 0
+        human = ""
+        while True:
+            tag = f"issue-{n}-spec-reply-{round}" + (f"-retry{attempt}" if attempt else "")
+            out = self.agent(reviser, "spec", prompt, tag, "spec-settings.json", out_base, followup=followup)
             denied = permission_denials(out.get("log", "")) if out["outcome"].startswith("RESULT: failed") else []
-        outcome, model = out["outcome"], out["model"] or ""
-        if (self.unverified(reviser, last_vendor, model, other_model)
-                or (reviser == last_vendor == "claude" and not claude_cli.distinct_models(model, other_model))):
-            self.handoff(f"{reviser.capitalize()} spec reviser model was not verified as different from the reviewer model.",
-                         "spec_reviser_model_unverified")
-            return "stop"
-        mode_note = self.mode_note("Revision", reviser, last_vendor, model, other_model)
-        comment, body = Path(f"{out_base}.comment"), Path(f"{out_base}.body")
-        if git(wt, "status", "--porcelain"):
-            outcome = f"RESULT: failed uncommitted changes left in {wt}"
-        if re.match(r"SPEC: (revised|human)", outcome) and not (comment.is_file() and comment.stat().st_size):
-            outcome = f"RESULT: failed no reply in {comment}"
-        if outcome.startswith("SPEC: revised"):
-            human = ""
-        elif outcome.startswith("SPEC: human"):
-            human = " human"
-        else:
+            if denied and not denied_spent:
+                denied_spent = True
+                notify.log(f"#{n}: spec revision round {round} failed after a denied command ({denied[0]}); rerunning once")
+                for suffix in (".body", ".comment"):
+                    Path(f"{out_base}{suffix}").unlink(missing_ok=True)
+                out = self.agent(reviser, "spec", prompt + DENIED_NOTE.format(command=denied[0]), f"{tag}-rerun",
+                                 "spec-settings.json", out_base, followup=followup)
+                denied = permission_denials(out.get("log", "")) if out["outcome"].startswith("RESULT: failed") else []
+            outcome, model = out["outcome"], out["model"] or ""
+            if (self.unverified(reviser, last_vendor, model, other_model)
+                    or (reviser == last_vendor == "claude" and not claude_cli.distinct_models(model, other_model))):
+                self.handoff(f"{reviser.capitalize()} spec reviser model was not verified as different from the reviewer model.",
+                             "spec_reviser_model_unverified")
+                return "stop"
+            mode_note = self.mode_note("Revision", reviser, last_vendor, model, other_model)
+            comment, body = Path(f"{out_base}.comment"), Path(f"{out_base}.body")
+            if git(wt, "status", "--porcelain"):
+                self.handoff(f"Uncommitted changes left in {wt}; the runner will not discard them.",
+                             "spec_revision_run_failed")
+                return "stop"
+            if re.match(r"SPEC: (revised|human)", outcome) and not (comment.is_file() and comment.stat().st_size):
+                outcome = f"RESULT: failed no reply in {comment}"
+            if outcome.startswith("SPEC: revised"):
+                human = ""
+                break
+            if outcome.startswith("SPEC: human"):
+                human = " human"
+                break
             why = f" A command was denied ({denied[0]}): check the spec role's permissions." if denied else ""
-            self.handoff(f"{reviser} spec run failed: {outcome}{why}", "spec_revision_run_failed")
-            return "stop"
+            action, reviser = self.recover_worker(
+                f"{reviser} spec run failed: {outcome}{why}", "spec_revision_run_failed", reviser, outcome,
+                role="reviser", round_s=str(round), issue_body=issue_body, listed=listed,
+                other_model=other_model, spec_followup=claude_followup,
+                budget={"denied_spent": denied_spent})
+            if action == owner_handoff.HANDOFF:
+                return "stop"
+            pending = recovery.load(self.env, n, n)
+            denied_spent = bool((pending or {}).get("remaining_budget", {}).get("denied_spent", denied_spent))
+            attempt += 1
         if body.is_file() and body.stat().st_size:
             body.write_text(check_section.canonicalize(strip_markers(body.read_text())).rstrip("\n") + "\n")
             edited = self.gh("issue", "edit", n, "--body-file", str(body))
@@ -757,6 +875,7 @@ class Spec:
             self.handoff(f"{reviser} has questions only you can answer. Reply on the issue, then remove ready-for-human.",
                          "spec_questions")
             return "stop"
+        recovery.clear(self.env, self.issue, self.issue)
         return "revised"
 
     # --- the loop ---
@@ -823,12 +942,14 @@ class Spec:
             context = Path(self.ctx, f"issue-{n}-spec-{round}-{step}-{time.strftime('%Y%m%d-%H%M%S')}.md")
             context.write_text(review.issue_context(env, n, data=issue_payload))
             if step == "review":
-                result = self.review_round(round, max_rounds, context, issue_payload["comments"])
+                result = self.review_round(round, max_rounds, context, issue_payload["comments"],
+                                         issue_body=issue_payload["body"])
                 if result == "changes":
                     step = "revise"
                 else:
                     return result == "accept"
-            elif self.revise_round(round, context, issue_payload["comments"]) != "revised":
+            elif self.revise_round(round, context, issue_payload["comments"],
+                                   issue_body=issue_payload["body"]) != "revised":
                 return False
             else:
                 step, round = "review", round + 1

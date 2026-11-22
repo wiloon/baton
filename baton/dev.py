@@ -291,7 +291,9 @@ def run(tick, issue):
         offered = ("retry_step", "retry_step_other_vendor")
         result = stop(tick, issue, reason, f"#{issue}: {dev_vendor} stopped", f"{fail} {url}",
                       snapshot=snapshot, observed_actions=offered,
-                      revalidate=lambda: recovery.fingerprint_matches({"fingerprint": fingerprint}, fingerprint))
+                      revalidate=lambda: recovery.fingerprint_matches(
+                          {"fingerprint": fingerprint},
+                          recovery.issue_fingerprint(wt, issue, branch=branch, base=base)))
         if result == 80:
             return 80
         recovery.persist_grant(env, result, role="dev", failed_vendor=dev_vendor, exclusions=[dev_vendor],
@@ -320,7 +322,9 @@ def run(tick, issue):
                     "handoff = the owner takes the issue.\n")
         result = stop(tick, issue, "dev_verify_failed", f"#{issue}: local CI verification failed", url,
                       snapshot=snapshot, observed_actions=("retry_step",),
-                      revalidate=lambda: recovery.fingerprint_matches({"fingerprint": fingerprint}, fingerprint))
+                      revalidate=lambda: recovery.fingerprint_matches(
+                          {"fingerprint": fingerprint},
+                          recovery.issue_fingerprint(wt, issue, branch=branch, base=base)))
         if result == 80:
             pr_helpers.gh("issue", "comment", issue, "-R", repo, "--body",
                           f"<!-- baton-note by={dev_vendor} -->\nLocal CI verification failed before push after {rounds} of "

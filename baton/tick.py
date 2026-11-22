@@ -564,6 +564,14 @@ class Tick:
         from . import handoff as owner_handoff, recovery
         if not (session.run_process(["git", "-C", wt, "checkout", "-q", head_ref]).returncode == 0
                 and session.run_process(["git", "-C", wt, "merge", "-q", "--ff-only", f"origin/{head_ref}"]).returncode == 0):
+            ready, detail = recovery.worktree_ready(wt, head_ref)
+            if not ready:
+                owner_handoff.perform(
+                    self.env, "fix_worktree_diverged", kind="pr", number=pr, remove=("agent-fix",),
+                    item=pr, episode=issue or pr,
+                    title=f"PR #{pr} needs you", text=f"{wt}: {detail}. {url}",
+                    hooks=self.hooks(issue or "0", pr=pr))
+                return 80
             fingerprint = recovery.pr_fingerprint(wt, pr, extra={"branch": head_ref})
             snapshot = (f"Decision point: fix_worktree_diverged. Repository {self.gh_repo}, PR #{pr}.\n"
                         f"Worktree: {wt}; branch: {head_ref}.\nOutcome: fast-forward merge failed.\n"
@@ -575,14 +583,6 @@ class Tick:
                 hooks=self.hooks(issue or "0", pr=pr), snapshot=snapshot, observed_actions=("retry_step",),
                 revalidate=lambda: recovery.worktree_ready(wt, head_ref)[0])
             if result.handed_off:
-                return 80
-            ready, detail = recovery.worktree_ready(wt, head_ref)
-            if not ready:
-                owner_handoff.perform(
-                    self.env, "fix_worktree_diverged", kind="pr", number=pr, remove=("agent-fix",),
-                    item=pr, episode=issue or pr,
-                    title=f"PR #{pr} needs you", text=f"{wt}: {detail}. {url}",
-                    hooks=self.hooks(issue or "0", pr=pr))
                 return 80
             if not (session.run_process(["git", "-C", wt, "checkout", "-q", head_ref]).returncode == 0
                     and session.run_process(["git", "-C", wt, "merge", "-q", "--ff-only", f"origin/{head_ref}"]).returncode == 0):

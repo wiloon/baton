@@ -99,8 +99,11 @@ class Runner:
             self.handoff(pr, reason, title, detail)
             return owner_handoff.HANDOFF, vendor, repairs_used
         pending = recovery.load(self.env, episode, pr)
-        if pending and pending["reason"] == reason:
-            if not recovery.fingerprint_matches(pending, pending["fingerprint"]):
+        if pending and pending["reason"] == reason and not pending.get("dispatched"):
+            remote = pr_helpers.view(pr, "headRefOid,state,baseRefName") or {}
+            current = recovery.pr_fingerprint(wt, pr, remote_head=remote.get("headRefOid") or "",
+                                              base=remote.get("baseRefName") or "")
+            if not recovery.fingerprint_matches(pending, current):
                 self.handoff(pr, reason, title, detail)
                 return owner_handoff.HANDOFF, vendor, repairs_used
             try:
@@ -110,7 +113,7 @@ class Runner:
             except (Deferred, Exhausted):
                 raise
             repairs_used = int(pending.get("remaining_budget", {}).get("verify_repairs", repairs_used))
-            recovery.clear(self.env, episode, pr)
+            recovery.mark_dispatched(self.env, pending)
             return pending["action"], vendor, repairs_used
         pack = self.worker_snapshot(pr, reason, vendor, detail, role=role, wt=wt)
         if not pack:
@@ -137,7 +140,7 @@ class Runner:
             self.handoff(pr, reason, title, exhausted.reason or detail)
             return owner_handoff.HANDOFF, vendor, repairs_used
         notify.log(f"PR #{pr}: advisor granted {result.action} for {role} ({vendor}): {result.decision.reason}")
-        recovery.clear(self.env, episode, pr)
+        recovery.mark_dispatched(self.env, saved)
         return result.action, vendor, budget["verify_repairs"]
 
     def comment(self, pr, body, failed=""):
@@ -191,8 +194,9 @@ class Runner:
         failure_file = Path(self.ctx, f"{kind}-{number}-verify-failure.txt")
         # Under /tmp, the one place outside the worktree guard.sh lets a fixer write (#38).
         reply_file = Path("/tmp", f"baton-{self.repo.replace('/', '-')}-{kind}-{number}-verify-fix.md")
-        attempt, failure = repairs_before, ""
-        max_repairs = self.max_verify if repairs is None else repairs
+        local_repairs, failure = 0, ""
+        budget = self.max_verify if repairs is None else int(repairs)
+        total_rounds = int(repairs_before)
 
         def dirty():
             return bool(git(wt, "status", "--porcelain"))
@@ -204,11 +208,12 @@ class Runner:
             if dirty():
                 failure = "Verification refused: uncommitted or untracked files remain."
                 notify.log(f"{kind} #{number}: {failure}")
-                return 1, failure, attempt
+                return 1, failure, total_rounds + local_repairs
             started = time.monotonic()
             repo = self.env.repo
+            tag_round = total_rounds + local_repairs
             done = session.run_process([str(self.self_dir / "verify.sh"), str(wt), base], text=True, capture_output=True,
-                                  env=child_env(VERIFY_TAG=f"{kind}-{number}-verify-{attempt}", LOGS=str(self.env.dirs.logs),
+                                  env=child_env(VERIFY_TAG=f"{kind}-{number}-verify-{tag_round}", LOGS=str(self.env.dirs.logs),
                                                 RUNNER_LOG=str(self.env.config.paths.logs / "runner.log"), RUNNER_LOG_LABEL=notify.label(self.env),
                                                 E2E_GATE=gate, CI_COMMAND=repo.ci_command.replace("{base}", base),
                                                 VERIFY_HOOK=str(repo.verify_hook or ""), GATE_HOOK=str(repo.gate_hook or "")))
@@ -221,31 +226,31 @@ class Runner:
                     if self.gate_result and kind != "issue":
                         self.comment(number, f"<!-- baton-e2e-gate -->\n{self.gate_result}, on {git(wt, 'rev-parse', '--short', 'HEAD')}. "
                                      "The runner ran this.", f"PR #{number}: posting the E2E gate result failed")
-                    return 0, failure, attempt
+                    return 0, failure, total_rounds + local_repairs
                 failure = "CI checks passed but left uncommitted or untracked files."
             failure_file.write_text(failure + "\n")
-            notify.log(f"{kind} #{number}: verify failed (attempt {attempt} of {max_repairs})")
+            notify.log(f"{kind} #{number}: verify failed (repair {local_repairs} of {budget} in this call)")
             event("failure", started)
-            if attempt >= max_repairs:
-                return 1, failure, attempt
+            if local_repairs >= budget:
+                return 1, failure, total_rounds + local_repairs
             if not self.env.config.allows(vendor, "fixer"):
-                return 1, failure, attempt
-            attempt += 1
+                return 1, failure, total_rounds + local_repairs
+            local_repairs += 1
             head = git(wt, "rev-parse", "HEAD")
             reply_file.unlink(missing_ok=True)
             out = self.agent(vendor, "fix", self.render("verify-fix-prompt.md", VENDOR=vendor, WORKTREE=str(wt), BASE=base,
                                                         FAILURE_FILE=str(failure_file), REPLY_FILE=str(reply_file),
                                                         FAILURE=failure_excerpt(failure)),
-                             f"{kind}-{number}-verify-fix-{attempt}", wt, str(reply_file),
+                             f"{kind}-{number}-verify-fix-{total_rounds + local_repairs}", wt, str(reply_file),
                              self.env.with_runtime(fix_followup=False))
             if not out["outcome"].startswith("RESULT: fixed") or dirty():
                 notify.log(f"{kind} #{number}: {vendor} verification fix failed or left the tree dirty")
-                return 1, failure, attempt
+                return 1, failure, total_rounds + local_repairs
             if git(wt, "rev-parse", "HEAD") == head:   # fixed outside the repo: verify.sh still judges it
                 notify.log(f"{kind} #{number}: {vendor} verification fix made no commit; checking again")
                 continue
-            self.hooks.task("ci_fix", f"{kind}:{number}:{attempt}:{git(wt, 'rev-parse', 'HEAD')}",
-                            "--agent", vendor, "--round", attempt)
+            self.hooks.task("ci_fix", f"{kind}:{number}:{total_rounds + local_repairs}:{git(wt, 'rev-parse', 'HEAD')}",
+                            "--agent", vendor, "--round", total_rounds + local_repairs)
 
     def verify_failed(self, pr, failure, rounds):
         self.comment(pr, f"<!-- baton-verify-failed -->\nLocal CI verification failed before push after {rounds} of "
@@ -429,6 +434,8 @@ class Runner:
             if description_rc != 0:
                 self.description_discarded(pr, fixer, description_reason)
         base_file.unlink(missing_ok=True)
+        episode = self.env.runtime.issue or str(pr)
+        recovery.clear(self.env, str(episode), str(pr))
         return 0
 
     # --- a Cursor fixer ---
@@ -570,6 +577,8 @@ class Runner:
         if discarded and moved:
             self.description_discarded(pr, "cursor", description_reason)
         self.clear_cursor_request(pr)
+        episode = self.env.runtime.issue or str(pr)
+        recovery.clear(self.env, str(episode), str(pr))
         return 0
 
 
