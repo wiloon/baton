@@ -260,13 +260,13 @@ def test_a_minimal_config_runs_a_tick_end_to_end(bound, monkeypatch, tmp_path):
     fake = GH({"issue list": lambda args: [ready] if "ready-for-agent" in args else [],
                "api repos/acme/app/issues/12/events?per_page=100": [[
                    {"id": 1, "event": "labeled", "actor": {"login": "acme-owner"}, "label": {"name": "ready-for-agent"}}]],
-               "issue view": {"title": "A title", "body": "A body"},
+               "issue view": {"title": "A title", "body": "A body", "comments": [
+                   {"author": {"login": "acme-owner"}, "body": "<!-- baton-verdict: accept -->\nThe plan"}]},
                "pr create": "https://github.com/acme/app/pull/13\n"})
     monkeypatch.setattr(tick.pr_helpers, "gh", fake)
     for module in (notify, after_merge):
         monkeypatch.setattr(module.urllib.request, "urlopen", no_network)
     monkeypatch.setattr(tick.pick.settle, "probe", lambda *args: None)
-    monkeypatch.setattr(spec, "cursor_plan", lambda env, n: "the plan")
     monkeypatch.setattr(fix.Runner, "verify", lambda self, *a: (0, "", 0))
     monkeypatch.setattr(tick.Tick, "sweep", lambda self, n: None)
     reviews = []

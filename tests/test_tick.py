@@ -2,6 +2,7 @@
 a real git clone, a fake `gh` and stubs for the agent runs. Ported from tests/cooldown.sh (the
 production item boundary) and the control flow of python -m baton."""
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -36,6 +37,11 @@ class FakeGH:
         answer = self.answers.get(head, "[]" if list(args[1:2]) == ["list"] else "")
         if callable(answer):
             answer = answer(args)
+        if args[:2] == ("issue", "view") and "title,body,comments" in args and (
+                "issue view" not in self.answers or isinstance(answer, dict) and "comments" not in answer):
+            answer = {"title": "Issue", "body": "Body", **(answer if isinstance(answer, dict) else {}), "comments": [
+                {"author": {"login": "owner"}, "body": "<!-- baton-verdict: accept -->\nPlan"}
+            ]}
         if isinstance(answer, subprocess.CompletedProcess):
             return answer
         if not isinstance(answer, str):
@@ -87,10 +93,14 @@ def ctx(env, worktree, monkeypatch):
     return state
 
 
-def checkpoint(state, pr="11", **values):
+def checkpoint(state, pr="11", feedback="", **values):
     from baton import checkpoint as cp
-    cp.write(state.path(f"review-pending-{pr}"), {"pr": pr, "wt": "/wt", "note": "n", "fixer": "cursor", "reviewer": "codex",
-                                                  "round": 1, "step": "review", "fix_head": "", "ISSUE": "", **values})
+    if feedback:
+        values.update(reviewed_head=values["fix_head"], base_branch="main", reviewed_issue=values["ISSUE"],
+                      verdict_round=1, verdict_digest=hashlib.sha256(feedback.encode()).hexdigest())
+    cp.write(state.path(f"review-pending-{pr}"), {"pr": pr, "wt": "/wt", "note": "n", "fixer": "cursor",
+                                                "reviewer": "codex", "round": 1, "step": "review", "fix_head": "",
+                                                "ISSUE": "", **values})
 
 
 # --- arguments, pause, lock ---------------------------------------------------------------------------------
@@ -468,13 +478,13 @@ def test_the_lowest_eligible_issue_is_picked(ctx, monkeypatch):
                        issue(13, milestone="Later"), issue(14, login="stranger"), issue(15, labels=["agent-wip"]),
                        issue(16, labels=["needs-info"])],
            found=[issue(40, milestone=None, labels=["claude-found"])])
-    monkeypatch.setattr(spec, "cursor_plan", lambda env, n: "plan")
+    monkeypatch.setattr(spec, "cursor_plan", lambda env, n, listed=None: "plan")
     assert ctx.make().next_issue() == "12"
 
 
 def test_a_maintainer_label_admits_an_external_issue(ctx, monkeypatch):
     issues(ctx, ready=[issue(7, login="contributor", labels=["ready-for-agent"])])
-    monkeypatch.setattr(spec, "cursor_plan", lambda env, n: "plan")
+    monkeypatch.setattr(spec, "cursor_plan", lambda env, n, listed=None: "plan")
     assert ctx.make().next_issue() == "7"
 
 
@@ -534,7 +544,7 @@ def test_an_external_issue_still_obeys_handoff_labels(ctx, label):
 @pytest.mark.parametrize("branch", ["agent/issue-12", "cursor/issue-12"])
 def test_an_issue_with_a_pr_is_skipped(ctx, monkeypatch, branch):
     issues(ctx, ready=[issue(12), issue(13)], open_prs=[branch])
-    monkeypatch.setattr(spec, "cursor_plan", lambda env, n: "plan")
+    monkeypatch.setattr(spec, "cursor_plan", lambda env, n, listed=None: "plan")
     assert ctx.make().next_issue() == "13"
 
 
@@ -584,7 +594,7 @@ def deferred_review(ctx, prs, **extra):
 
 
 def no_vendor_blocked(monkeypatch, seen=None):
-    monkeypatch.setattr(spec, "cursor_plan", lambda env, n: "plan")
+    monkeypatch.setattr(spec, "cursor_plan", lambda env, n, listed=None: "plan")
     monkeypatch.setattr(tick.Tick, "pick_vendor", lambda self, *a, **k: "codex")
 
 
@@ -637,7 +647,7 @@ def test_a_lent_slot_starts_nothing_when_every_vendor_is_blocked(ctx, monkeypatc
     flight(ctx, wip=[5], ready=[issue(12)], prs={5: 11})
     defer_loop(monkeypatch)
     deferred_review(ctx, [11])
-    monkeypatch.setattr(spec, "cursor_plan", lambda env, n: "plan")
+    monkeypatch.setattr(spec, "cursor_plan", lambda env, n, listed=None: "plan")
     monkeypatch.setattr(tick.Tick, "pick_vendor", lambda self, *a, **k: (_ for _ in ()).throw(Deferred("pool", QUOTA)))
     assert ctx.make().next_issue() == ""
     assert not ctx.path("slot-deferred-12").exists()   # the candidate's own deferral records nothing
@@ -851,7 +861,7 @@ def test_other_deferrals_leave_no_marker(ctx, monkeypatch, how):
         ctx.make().pending_reviews()
     elif how == "candidate":
         flight(ctx, wip=[], ready=[issue(12)])
-        monkeypatch.setattr(spec, "cursor_plan", lambda env, n: "plan")
+        monkeypatch.setattr(spec, "cursor_plan", lambda env, n, listed=None: "plan")
         monkeypatch.setattr(tick.Tick, "pick_vendor", lambda self, *a, **k: (_ for _ in ()).throw(Deferred("pool", QUOTA)))
         assert t.next_issue() == ""
     elif how == "closed":
@@ -870,13 +880,18 @@ def test_a_github_description_update_failure_does_not_lend_a_slot(ctx, monkeypat
     pr_state(ctx)
     body = "<!-- baton-task issue=5 completion=partial -->\n\nRefs #5\n\n## Manual checks\nnone\n"
     original_view = ctx.gh.answers["pr view"]
+    feedback = "<!-- baton-review round=1 by=claude -->\nfix"
+    head = sh(ctx.repo, "git", "rev-parse", "HEAD")
 
     def view_pr(args):
-        fields = args[args.index("--json") + 1]
+        fields = args[args.index("--json") + 1] if "--json" in args else ""
         if fields == "body":
             return body
         if fields == "headRefName,body":
             return {"headRefName": "agent/issue-5", "body": body}
+        if "comments" in fields:
+            return {"comments": [{"author": {"login": "owner"}, "body": feedback}], "state": "OPEN",
+                    "headRefName": "agent/issue-5", "headRefOid": head, "body": body, "baseRefName": "main"}
         return original_view(args)
 
     ctx.gh.answers["pr view"] = view_pr
@@ -884,7 +899,7 @@ def test_a_github_description_update_failure_does_not_lend_a_slot(ctx, monkeypat
         subprocess.CompletedProcess(args, 1, "", "boom") if "--body-file" in args else "")
     ctx.path("pr-body-base-11").write_text(body)
     Path(ctx.env["CTX"], "pr-11-body.md").write_text(body + "\n## Summary\nCorrected description.\n")
-    checkpoint(ctx, pr="11", step="fix", wt=str(ctx.repo))
+    checkpoint(ctx, pr="11", step="fix", wt=str(ctx.repo), ISSUE="5", fix_head=head, feedback=feedback)
     monkeypatch.setattr(tick.Tick, "review_loop", ORIGINAL_REVIEW_LOOP)
     monkeypatch.setattr(pick, "choose", lambda *args, **kwargs: "cursor")
     assert ctx.make().pending_reviews() is None
@@ -905,12 +920,19 @@ def test_a_second_tick_finishes_a_deferred_description_edit(ctx, worktree, monke
     agent_calls, verified, reviewed, handoffs = [], [], [], []
     comments = [{"author": {"login": "owner"}, "createdAt": "2026-11-20T00:00:01Z",
                  "body": "Revise the description."}]
+    if resumes_review:
+        comments[0]["body"] = "<!-- baton-review round=1 by=claude -->\nRevise the description."
     remote_before = sh(worktree.origin, "git", "rev-parse", worktree.branch)
 
     def view(args):
         if "--jq" in args:
             return live if args[-1] == ".body" else "OPEN"
-        return {"body": live, "headRefName": worktree.branch, "state": "OPEN", "comments": comments}
+        fields = args[args.index("--json") + 1] if "--json" in args else ""
+        data = {"body": live, "headRefName": worktree.branch, "state": "OPEN", "comments": comments,
+                "headRefOid": sh(worktree.origin, "git", "rev-parse", worktree.branch), "baseRefName": "main"}
+        if fields:
+            return {k: data[k] for k in fields.split(",") if k in data}
+        return data
 
     def edit(args):
         nonlocal live, labelled
@@ -971,10 +993,18 @@ def test_a_second_tick_finishes_a_deferred_description_edit(ctx, worktree, monke
     monkeypatch.setattr(review.Review, "review_vendor", lambda self, reviewer: "claude")
     monkeypatch.setattr(review.Review, "run_review", lambda *args: "REVIEW: pass")
     if route == "switch-review":
-        monkeypatch.setattr(review.Review, "run_review", lambda *args: "REVIEW: changes")
+        def review_with_changes(self, round, note, reviewer):
+            comments.append({"author": {"login": "owner"}, "createdAt": "2026-11-20T00:00:02Z",
+                             "body": f"<!-- baton-review round={round} by={reviewer} -->\nRevise the description."})
+            head = sh(self.wt, "git", "rev-parse", "HEAD")
+            self.save_binding(reviewed_head=head, base_branch="main", reviewed_issue="297", verdict_round=str(round))
+            self.capture_feedback(comments[-1]["body"], "verdict_digest")
+            return "REVIEW: changes"
+
+        monkeypatch.setattr(review.Review, "run_review", review_with_changes)
     if resumes_review:
         checkpoint(ctx, pr=pr, step="fix", wt=str(worktree.wt), ISSUE="297", fix_head=remote_before,
-                   extra="1" if route == "switch-review" else "")
+                   feedback=comments[0]["body"], extra="1" if route == "switch-review" else "")
         monkeypatch.setattr(tick.Tick, "review_loop", ORIGINAL_REVIEW_LOOP)
 
     assert ctx.make().run() == 0, ctx.log()
@@ -1011,7 +1041,7 @@ def test_a_second_tick_finishes_a_deferred_description_edit(ctx, worktree, monke
         assert handoffs and "made no commit" in ctx.log()
         assert ctx.path(f"pr-{pr}-contrib").read_text().splitlines() == ["claude 1", "cursor 1", "codex 2"]
     else:
-        assert not handoffs and verified == [fix_head]
+        assert not handoffs and verified == [fix_head], (handoffs, ctx.log())
         assert reviewed or ctx.loops
         if route == "switch":
             assert ctx.path(f"pr-{pr}-contrib").read_text().splitlines() == ["claude 1", "cursor 1"]
@@ -1057,7 +1087,7 @@ def test_a_closed_issue_with_agent_wip_cannot_lend_a_slot(ctx, monkeypatch):
 def test_a_pr_waiting_for_the_owner_does_not_hold_up_new_work(ctx, monkeypatch):
     issues(ctx, ready=[issue(12)], pending=1)
     ctx.gh.answers["pr list"] = [{"headRefName": "agent/issue-0", "labels": [{"name": "ready-for-human"}]}]
-    monkeypatch.setattr(spec, "cursor_plan", lambda env, n: "plan")
+    monkeypatch.setattr(spec, "cursor_plan", lambda env, n, listed=None: "plan")
     assert ctx.make().next_issue() == "12"
 
 
@@ -1069,7 +1099,7 @@ def test_a_pr_still_in_review_holds_up_new_work(ctx):
 
 def test_an_issue_no_vendor_can_run_is_skipped_for_the_next(ctx, monkeypatch):
     issues(ctx, ready=[issue(12), issue(13)])
-    monkeypatch.setattr(spec, "cursor_plan", lambda env, n: "plan")
+    monkeypatch.setattr(spec, "cursor_plan", lambda env, n, listed=None: "plan")
     calls = iter([Deferred("pool", "no vendor can run now"), None])
 
     def pick_vendor(self, *a, **k):
@@ -1107,8 +1137,9 @@ def test_a_forced_blocked_issue_warns_and_runs(ctx, capsys):
 
 def test_a_spec_in_review_needs_a_pool_vendor(ctx, monkeypatch):
     issues(ctx, ready=[issue(12)])
-    monkeypatch.setattr(spec, "cursor_plan", lambda env, n: "")
-    monkeypatch.setattr(spec, "spec_state", lambda env, n: ("review", 1))
+    ctx.gh.answers["issue view"] = {"title": "T", "body": "B", "comments": [
+        {"author": {"login": "owner"}, "body": "<!-- baton-spec-review round=1 by=claude -->"}
+    ]}
     seen = []
     monkeypatch.setattr(tick.Tick, "pick_vendor", lambda self, role, mode, cands, **k: seen.append(cands) or "claude")
     assert ctx.make().next_issue() == "12"
@@ -1323,9 +1354,9 @@ def devrun(ctx, worktree, monkeypatch):
     wt_root.mkdir(exist_ok=True)
     state = ctx
     state.issue, state.runs, state.verify, state.script = issue, [], (0, "", 0), []
-    state.gh.answers["issue view"] = {"title": "A title", "body": "A body"}
+    state.gh.answers["issue view"] = {"title": "A title", "body": "A body", "comments": []}
     state.gh.answers["pr create"] = "https://github.com/owner/app/pull/301\n"
-    monkeypatch.setattr(spec, "cursor_plan", lambda env, n: "the plan")
+    monkeypatch.setattr(spec, "cursor_plan", lambda env, n, listed=None: "the plan")
     monkeypatch.setattr(tick.Tick, "pick_vendor", lambda self, role, mode, cands, **k: "codex")
     verify = fix.Runner.verify
     monkeypatch.setattr(fix.Runner, "verify", lambda self, *a: state.verify if state.verify else verify(self, *a))
@@ -1536,7 +1567,7 @@ def test_a_legacy_cursor_worktree_keeps_its_branch(devrun):
 
 def test_the_spec_runs_first_when_there_is_no_plan(devrun, monkeypatch):
     plans = iter(["", "the plan"])
-    monkeypatch.setattr(spec, "cursor_plan", lambda env, n: next(plans))
+    monkeypatch.setattr(spec, "cursor_plan", lambda env, n, listed=None: next(plans))
     called = []
     monkeypatch.setattr(tick.Tick, "spec_loop", lambda self, n: called.append(n) or False)
     t, rc = devrun.go()
@@ -1544,7 +1575,7 @@ def test_the_spec_runs_first_when_there_is_no_plan(devrun, monkeypatch):
 
 
 def test_an_accepted_spec_without_a_plan_comment_is_an_error(devrun, monkeypatch):
-    monkeypatch.setattr(spec, "cursor_plan", lambda env, n: "")
+    monkeypatch.setattr(spec, "cursor_plan", lambda env, n, listed=None: "")
     monkeypatch.setattr(tick.Tick, "spec_loop", lambda self, n: True)
     t, rc = devrun.go()
     assert rc == 1 and "spec accepted but no plan comment found" in devrun.log()
@@ -1689,8 +1720,9 @@ def test_a_failure_filing_side_bugs_does_not_stop_the_review(devrun, monkeypatch
 
 def test_queue_skips_blocked_spec_review_for_runnable_dev_issue(ctx, monkeypatch):
     issues(ctx, ready=[issue(12), issue(13)])
-    monkeypatch.setattr(spec, "cursor_plan", lambda env, n: "plan" if n == "13" else "")
-    monkeypatch.setattr(spec, "spec_state", lambda env, n: ("", 0))
+    ctx.gh.answers["issue view"] = lambda args: {"title": "T", "body": "B", "comments": [
+        {"author": {"login": "owner"}, "body": "<!-- baton-verdict: accept -->"}
+    ] if args[2] == "13" else []}
     t = ctx.make()
     config = t.env.config
     from dataclasses import replace
@@ -1712,8 +1744,8 @@ def test_queue_admits_a_pending_accept_issue_when_only_dev_can_run(ctx, monkeypa
     """Pending ADR acceptance uses the dev role for vendor availability (#122)."""
     issues(ctx, ready=[issue(12)])
     monkeypatch.setattr(spec, "accept_pending",
-                        lambda env, n: {"pr": "77", "verdict": "x", "index": 0} if n == "12" else None)
-    monkeypatch.setattr(spec, "cursor_plan", lambda env, n: "")
+                        lambda env, n, listed=None: {"pr": "77", "verdict": "x", "index": 0} if n == "12" else None)
+    monkeypatch.setattr(spec, "cursor_plan", lambda env, n, listed=None: "")
     monkeypatch.setattr(spec, "spec_state", lambda env, n: ("", 0))
     t = ctx.make()
     config = t.env.config
@@ -1729,13 +1761,13 @@ def test_queue_admits_a_pending_accept_issue_when_only_dev_can_run(ctx, monkeypa
     probed = []
     monkeypatch.setattr(pick.settle, "probe", lambda state, logs, vendor, model: probed.append(vendor))
     assert t.next_issue() == "12"
-    assert probed == ["cursor"]
+    assert probed == []
 
 
 def test_dev_run_does_not_dispatch_while_pending_accept_leaves_no_plan(devrun, monkeypatch):
     """While acceptance is pending, cursor_plan is empty so the tick resumes via spec_loop (#122)."""
     called = []
-    monkeypatch.setattr(spec, "cursor_plan", lambda env, n: "")
+    monkeypatch.setattr(spec, "cursor_plan", lambda env, n, listed=None: "")
     monkeypatch.setattr(tick.Tick, "spec_loop", lambda self, n: called.append(n) or False)
     monkeypatch.setattr(tick.Tick, "pick_vendor", lambda *a, **k: pytest.fail("implementation vendor picked"))
     t = devrun.make()
@@ -1748,7 +1780,7 @@ def test_dev_implements_the_saved_verdict_once_the_pending_accept_resumes(devrun
     verdict = "<!-- baton-verdict: accept by=codex -->\n## Spec review (codex), round 1: accept\n\nsaved plan"
     listed = [{"author": {"login": "owner"}, "body": f"<!-- baton-spec-accept-pending pr=77 -->\n{verdict}"}]
     monkeypatch.setattr(spec, "cursor_plan", REAL_CURSOR_PLAN)
-    monkeypatch.setattr(spec, "comments", lambda env, n: list(listed))
+    devrun.gh.answers["issue view"] = {"title": "A title", "body": "A body", "comments": listed}
     assert spec.cursor_plan(devrun.make().env, "300") == ""   # pending: no plan yet
     called = []
 
@@ -1794,3 +1826,78 @@ def test_dev_writer_without_fixer_role_hands_off_after_zero_repairs(devrun, monk
     assert ("handoff", "dev_verify_failed", "--reason", "dev_verify_failed") in events
     assert not devrun.gh.ran("pr", "create")
     assert "agent/issue-300" not in sh(devrun.repo, "git", "ls-remote", "--heads", "origin")
+
+
+@pytest.mark.parametrize("forced", [False, True])
+def test_tick_run_counts_comment_reads_across_both_delays(ctx, monkeypatch, forced):
+    from baton import handoff
+    clock = {"now": 1_000}
+    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
+    issues(ctx, ready=[issue(12)])
+    views, workers = [], []
+    ctx.gh.answers["pr list"] = lambda args: "" if "--jq" in args else []
+
+    def issue_view(args):
+        if "title,body,comments" in args:
+            views.append(clock["now"])
+            if clock["now"] < 1_360:
+                return subprocess.CompletedProcess(args, 1, "", "HTTP 503 boom")
+            return {"title": "Recovered title", "body": "Recovered body", "comments": [
+                {"author": {"login": "owner"}, "body": "<!-- baton-spec-reply round=2 by=claude -->\nRecovered reply"}
+            ]}
+        return {"labels": [{"name": "ready-for-agent"}], "author": {"login": "owner"}, "state": "OPEN"}
+
+    def worker(vendor, role, prompt, tag, *args, **kwargs):
+        context, = Path(ctx.env["CTX"]).glob("issue-12-spec-3-review-*.md")
+        workers.append((vendor, role, tag, context.read_text()))
+        return {**DONE, "outcome": "RESULT: failed test stops after reading context"}
+
+    ctx.gh.answers["issue view"] = issue_view
+    monkeypatch.setattr(spec.dispatch, "dispatch", worker)
+    for now, expected in [(1_000, [1_000]), (1_059, [1_000]), (1_060, [1_000, 1_060]),
+                          (1_359, [1_000, 1_060]), (1_360, [1_000, 1_060, 1_360])]:
+        clock["now"] = now
+        ctx.make(*(("12",) if forced else ())).run()
+        assert views == expected
+        if now < 1_360:
+            assert workers == []
+    (vendor, role, tag, context), = workers
+    assert vendor != "claude"
+    assert (role, tag) == ("spec_review", "issue-12-spec-3")
+    assert all(x in context for x in ("Recovered title", "Recovered body", "Recovered reply"))
+
+
+def test_tick_resumes_pending_adr_even_with_agent_wip_and_no_vendor(ctx, monkeypatch):
+    from baton import handoff
+    now = 1_000
+    monkeypatch.setattr(handoff, "clock", lambda: now)
+    ready = issue(12, labels=["ready-for-agent"])
+    issues(ctx, ready=[ready])
+    reads = []
+    verdict = "<!-- baton-verdict: accept by=claude -->\nAccepted plan"
+    pending = f"<!-- baton-spec-accept-pending pr=77 head={'a' * 40} -->\n{verdict}"
+
+    def read_issue(args):
+        return {"title": "Plan", "body": "Body", "state": "OPEN", "labels": ready["labels"], "comments": [
+            {"author": {"login": "owner"}, "body": pending}]}
+
+    def read_pr(args):
+        reads.append(now)
+        if len(reads) == 1:
+            return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return {"state": "MERGED", "headRefOid": "a" * 40}
+
+    ctx.gh.answers.update({"issue view": read_issue, "pr view": read_pr})
+    monkeypatch.setattr(tick.Tick, "pick_vendor", lambda *a, **k: pytest.fail("acceptance needs no worker"))
+    ctx.make().run()
+    assert reads == [1_000]
+    ready["labels"].append({"name": "agent-wip"})
+    issues(ctx, ready=[ready], pending=1)
+    ready["labels"].append({"name": "ready-for-human"})
+    now = 1_060
+    ctx.make().run()
+    assert reads == [1_000]
+    ready["labels"].pop()
+    ctx.make().run()
+    assert reads == [1_000, 1_060]
+    assert [body_of(call) for call in ctx.gh.ran("issue", "comment")] == [verdict]
