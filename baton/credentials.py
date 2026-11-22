@@ -36,7 +36,12 @@ def load(path, keys, environ=None):
         return found
     except OSError as error:
         raise CredentialError(f"{path}: cannot be read ({type(error).__name__})") from None
-    with os.fdopen(fd) as file:
+    try:
+        file = os.fdopen(fd)
+    except OSError as error:
+        os.close(fd)
+        raise CredentialError(f"{path}: cannot be read ({type(error).__name__})") from None
+    with file:
         mode = stat.S_IMODE(os.fstat(file.fileno()).st_mode)
         if mode & 0o077:
             raise CredentialError(f"{path}: others can read it (mode {mode:o}); chmod 600 it")

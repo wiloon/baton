@@ -27,7 +27,8 @@ def comments(*bodies, login="owner"):
 
 def log_lines(tmp_path):
     path = tmp_path / "logs" / "runner.log"
-    return [unlabelled(line) for line in path.read_text().splitlines() if line] if path.exists() else []
+    return [unlabelled(line) for line in path.read_text().splitlines()
+            if line[:1].isdigit()] if path.exists() else []
 
 
 # --- md --------------------------------------------------------------------------------
@@ -414,7 +415,8 @@ def test_deferred_checks_open_the_tracking_issue_when_none_is_open(gh, deferred)
 
 
 def test_deferred_checks_are_appended_to_the_open_tracking_issue_once_per_pr(gh, deferred):
-    gh.set(body=DEFERRED, title="feat: covers", open_issues=[{"number": 41, "title": "Checks to try"}])
+    gh.set(body=DEFERRED, title="feat: covers",
+           open_issues=[{"number": 41, "title": "Checks to try", "labels": ["ready-for-human"]}])
     after_merge.deferred_checks(32, "6")
     after_merge.deferred_checks(32, "6")
     comments = [c for c in gh.calls() if c[:3] == ["issue", "comment", "41"]]
@@ -510,7 +512,8 @@ def test_an_empty_section_with_no_remainder_is_done_without_a_tracker_entry(gh, 
 
 
 def test_an_open_legacy_tracker_keeps_receiving_checks(gh, deferred):
-    gh.set(body=DEFERRED, title="feat: covers", open_issues=[{"number": 41, "title": "Manual checks to try"}])
+    gh.set(body=DEFERRED, title="feat: covers",
+           open_issues=[{"number": 41, "title": "Manual checks to try", "labels": ["ready-for-human"]}])
     after_merge.deferred_checks(32, "6")
     assert gh.created() == [] and [c for c in gh.calls() if c[:3] == ["issue", "comment", "41"]]
 
@@ -551,3 +554,235 @@ def test_defer_since_is_written_once_and_cleared_when_defer_is_off(gh, monkeypat
     assert first is not None and after_merge.defer_since() == first
     monkeypatch.setenv("MANUAL_CHECKS", "gate")
     assert after_merge.defer_since() is None and not list(tmp_path.rglob("deferred-checks-since"))
+
+
+# --- missing-label recovery (#168) -------------------------------------------------------
+
+def test_follow_ups_creates_a_missing_label_then_files_labelled(gh, tmp_path):
+    gh.set_labels("needs-triage")   # follow-up absent
+    gh.set(title="t", body="## Follow-ups\n- [nit] rename helper", comments=[])
+    after_merge.follow_ups(1, "")
+    [issue] = gh.created()
+    assert issue["label"] == "follow-up" and issue["labels"] == ["follow-up"]
+    assert "follow-up" in gh.labels()
+    assert ("PR #1: follow-ups: issue create missing label "
+            "(gh: could not add label: 'follow-up' not found)") in log_lines(tmp_path)
+    assert [c[:2] for c in gh.calls() if c[:2] == ["label", "create"]] == [["label", "create"]]
+    assert sum(1 for c in gh.calls() if c[:2] == ["issue", "create"]) == 2
+
+
+def test_follow_ups_falls_back_to_unlabelled_when_label_create_fails(gh, tmp_path):
+    gh.set_labels("needs-triage")
+    gh.fail("label-create")
+    gh.set(title="t", body="## Follow-ups\n- [nit] rename helper", comments=[])
+    after_merge.follow_ups(1, "")
+    [issue] = gh.created()
+    assert issue["labels"] == [] and issue["label"] == ""
+    log = log_lines(tmp_path)
+    assert ("PR #1: follow-ups: issue create missing label "
+            "(gh: could not add label: 'follow-up' not found)") in log
+    assert ("PR #1: follow-ups: label create 'follow-up' failed "
+            "(gh: failed to create label 'follow-up')") in log
+    assert any("without label follow-up" in line and "issues/900" in line for line in log)
+    assert any("apply follow-up before work starts" in line for line in log)
+    assert sum(1 for c in gh.calls() if c[:2] == ["issue", "create"]) == 3   # labelled, retry, unlabelled
+
+
+def test_readme_documents_follow_up_and_needs_triage():
+    text = (Path(__file__).resolve().parents[1] / "README.md").read_text()
+    rows = {line.split("|")[1].strip(): line for line in text.splitlines() if line.startswith("| `")}
+    assert "files no further nits" in rows["`follow-up`"]
+    assert "side bug" in rows["`needs-triage`"]
+    loop = text[text.index("for l in"):text.index("done")]
+    assert "follow-up" in loop
+
+
+def test_filing_failure_redacts_tokens_in_runner_log(gh, tmp_path, child_token):
+    ghp = "ghp_" + ("b" * 40)
+    gh.set(title="t", body="## Follow-ups\n- [nit] rename helper", comments=[])
+    gh.fail("issue-create")
+    gh.stderr("issue-create", f"denied using {ghp} and {child_token}\n")
+    after_merge.follow_ups(1, "")
+    log = Path(tmp_path, "logs", "runner.log").read_text()
+    assert ghp not in log and child_token not in log
+    assert log_lines(tmp_path) == [
+        "PR #1: filing the follow-up issue failed (gh: denied using [redacted] and [redacted])"]
+
+
+def test_file_pr_bugs_falls_back_to_unlabelled_and_posts_the_number(gh, tmp_path):
+    gh.set_labels()   # needs-triage absent
+    gh.fail("label-create")
+    gh.set(body=BUG_BODY, comments=[])
+    after_merge.file_pr_bugs("5", "7")
+    [issue] = gh.created()
+    assert issue["labels"] == [] and issue["title"] == "My Documents omits a saved document"
+    assert "#900 My Documents omits a saved document" in gh.pr["comments"][-1]["body"]
+    log = log_lines(tmp_path)
+    assert ("PR #5: side bug: issue create missing label "
+            "(gh: could not add label: 'needs-triage' not found)") in log
+    assert ("PR #5: side bug: label create 'needs-triage' failed "
+            "(gh: failed to create label 'needs-triage')") in log
+    assert ("PR #5: filed a side bug without label needs-triage — apply it | "
+            "https://github.com/owner/app/issues/900") in log
+    assert sum(1 for c in gh.calls() if c[:2] == ["issue", "create"]) == 3
+    gh.set(open_issues=[], title="t")
+    after_merge.follow_ups("5", "7")
+    assert [c["title"] for c in gh.created()].count("My Documents omits a saved document") == 1
+
+
+def test_owner_actions_falls_back_to_unlabelled_when_label_stays_missing(gh, linear, tmp_path):
+    gh.set_labels()
+    gh.fail("label-create")
+    gh.set(body="## Before release\n- FAIL one — detail")
+    after_merge.owner_actions(5, "")
+    [issue] = gh.created()
+    assert issue["labels"] == [] and issue["title"].startswith("Before the next release")
+    log = log_lines(tmp_path)
+    assert ("PR #5: owner actions: issue create missing label "
+            "(gh: could not add label: 'ready-for-human' not found)") in log
+    assert ("PR #5: owner actions (Linear failed) without label ready-for-human — apply it | "
+            "https://github.com/owner/app/issues/900") in log
+    assert sum(1 for c in gh.calls() if c[:2] == ["issue", "create"]) == 3
+
+
+def test_owner_actions_terminal_failure_logs_why_before_the_list(gh, linear, tmp_path):
+    gh.set(body="## Before release\n- FAIL one — detail")
+    gh.fail("issue-create")
+    gh.stderr("issue-create", "HTTP 403: forbidden\n")
+    after_merge.owner_actions(5, "")
+    assert gh.created() == []
+    [line] = [l for l in log_lines(tmp_path) if "owner actions lost" in l]
+    assert "(gh: HTTP 403: forbidden)" in line
+    assert line.index("(gh:") < line.index("FAIL one")
+
+
+def test_side_bug_terminal_failure_logs_why(gh, tmp_path):
+    gh.set(body="## Follow-ups\n- [bug] Real bug — x", comments=[])
+    gh.fail("issue-create")
+    gh.stderr("issue-create", "HTTP 403: forbidden\n")
+    after_merge.follow_ups(1, "")
+    assert "PR #1: filing a side bug failed: Real bug (gh: HTTP 403: forbidden)" in log_lines(tmp_path)
+
+
+def test_two_sites_on_one_pr_log_which_filing_hit_the_rejection(gh, deferred, linear, tmp_path):
+    gh.set_labels()
+    gh.fail("label-create")
+    gh.set(body="## Before release\n- FAIL one — detail\n" + DEFERRED, title="feat: covers")
+    after_merge.owner_actions(32, "")
+    after_merge.deferred_checks(32, "6")
+    log = log_lines(tmp_path)
+    assert any(l.startswith("PR #32: owner actions: issue create missing label") for l in log)
+    assert any(l.startswith("PR #32: deferred checks: issue create missing label") for l in log)
+
+
+def test_deferred_checks_drops_the_marker_only_on_confirmed_missing_label(gh, deferred, tmp_path):
+    gh.set_labels()   # ready-for-human absent
+    gh.fail("label-create")
+    gh.set(body=DEFERRED, title="feat: covers")
+    after_merge.deferred_checks(32, "6")
+    assert gh.created() == []
+    marker = Path(tmp_path, "state", "deferred-checks-pr-32")
+    assert not marker.exists()
+    raw = Path(tmp_path, "logs", "runner.log").read_text()
+    assert "could not add label: 'ready-for-human' not found" in raw
+    lost_at = raw.index("deferred checks lost")
+    assert "(gh:" in raw[lost_at:lost_at + 120]
+    assert raw.index("(gh:", lost_at) < raw.index("Open the library", lost_at)
+    assert sum(1 for c in gh.calls() if c[:2] == ["issue", "create"]) == 2   # labelled, one retry
+    assert ("PR #32: deferred checks: label create 'ready-for-human' failed "
+            "(gh: failed to create label 'ready-for-human')") in log_lines(tmp_path)
+    gh.fail("label-create", on=False)   # label creation becomes possible; the label is still absent
+    after_merge.deferred_checks(32, "6")
+    assert "ready-for-human" in gh.labels()
+    [issue] = gh.created()
+    assert issue["label"] == "ready-for-human"
+    after_merge.deferred_checks(32, "6")
+    assert len(gh.created()) == 1
+
+
+def test_deferred_checks_keeps_the_marker_on_ambiguous_create_failure(gh, deferred, tmp_path):
+    gh.set(body=DEFERRED, title="feat: covers")
+    gh.fail("issue-create")
+    gh.stderr("issue-create", "HTTP 500: boom\n")
+    after_merge.deferred_checks(32, "6")
+    assert gh.created() == []
+    assert Path(tmp_path, "state", "deferred-checks-pr-32").exists()
+    assert not any(c[:2] == ["label", "create"] for c in gh.calls())
+    raw = Path(tmp_path, "logs", "runner.log").read_text()
+    lost_at = raw.index("deferred checks lost")
+    assert "(gh: HTTP 500: boom)" in raw[lost_at:]
+    assert raw.index("(gh:", lost_at) < raw.index("Open the library", lost_at)
+
+
+def test_deferred_checks_keeps_the_marker_when_commenting_the_tracker_fails(gh, deferred, tmp_path):
+    gh.set(body=DEFERRED, title="feat: covers",
+           open_issues=[{"number": 41, "title": "Checks to try", "labels": ["ready-for-human"]}])
+    gh.fail("issue-comment")
+    gh.stderr("issue-comment", "HTTP 403: forbidden\n")
+    after_merge.deferred_checks(32, "6")
+    assert Path(tmp_path, "state", "deferred-checks-pr-32").exists()
+    assert gh.created() == []
+    [line] = [l for l in log_lines(tmp_path) if "deferred checks lost" in l]
+    assert "(gh: HTTP 403: forbidden)" in line
+    assert line.index("(gh:") < line.index("Open the library")
+
+
+def test_follow_ups_label_create_already_exists_then_labelled_retry_succeeds(gh, tmp_path, monkeypatch):
+    """A concurrent create leaves the label in place; label create returns already-exists."""
+    meta = {"color": "d73a4a", "description": "runner follow-ups"}
+    gh.set_labels("needs-triage")
+    gh.set(title="t", body="## Follow-ups\n- [nit] rename helper", comments=[])
+    from baton import pr as pr_mod
+    inner = pr_mod.call
+
+    def call(*args, input=None, limit=None):
+        result = inner(*args, input=input, limit=limit)
+        if (args[:2] == ("issue", "create") and result.returncode != 0
+                and "follow-up" not in gh.labels()):
+            inventory = gh.labels()
+            inventory["follow-up"] = dict(meta)
+            (gh.root / "labels.json").write_text(json.dumps(inventory))
+        return result
+
+    monkeypatch.setattr(pr_mod, "call", call)
+    after_merge.follow_ups(1, "")
+    [issue] = gh.created()
+    assert issue["labels"] == ["follow-up"]
+    assert gh.labels()["follow-up"] == meta
+    assert [c for c in gh.calls() if c[:2] == ["label", "create"]] == [
+        ["label", "create", "follow-up", "-R", "owner/app"]]
+    assert ("PR #1: follow-ups: label create 'follow-up' failed "
+            "(gh: label 'follow-up' already exists; use --force to recreate)") in log_lines(tmp_path)
+
+
+def test_follow_ups_non_label_create_failure_does_not_recover(gh, tmp_path):
+    gh.set(title="t", body="## Follow-ups\n- [nit] rename helper", comments=[])
+    gh.fail("issue-create")
+    gh.stderr("issue-create", "HTTP 403: forbidden\n")
+    after_merge.follow_ups(1, "")
+    assert gh.created() == []
+    assert not any(c[:2] == ["label", "create"] for c in gh.calls())
+    assert sum(1 for c in gh.calls() if c[:2] == ["issue", "create"]) == 1
+    assert any("HTTP 403: forbidden" in line for line in log_lines(tmp_path))
+
+
+def test_follow_ups_non_label_error_on_retry_skips_unlabelled_fallback(gh, tmp_path, monkeypatch):
+    gh.set_labels("needs-triage")
+    gh.set(title="t", body="## Follow-ups\n- [nit] rename helper", comments=[])
+    creates = {"n": 0}
+    from baton import pr as pr_mod
+    import subprocess
+    inner = pr_mod.call
+
+    def call(*args, input=None, limit=None):
+        if args[:2] == ("issue", "create") and "--label" in args:
+            creates["n"] += 1
+            if creates["n"] >= 2:
+                return subprocess.CompletedProcess(["gh", *args], 1, "", "HTTP 403: still forbidden\n")
+        return inner(*args, input=input, limit=limit)
+
+    monkeypatch.setattr(pr_mod, "call", call)
+    after_merge.follow_ups(1, "")
+    assert gh.created() == []
+    assert not any(c[:2] == ["issue", "create"] and "--label" not in c for c in gh.calls())
+    assert any("HTTP 403: still forbidden" in line for line in log_lines(tmp_path))
