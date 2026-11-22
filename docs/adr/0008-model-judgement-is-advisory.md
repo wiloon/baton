@@ -36,7 +36,8 @@ else goes to handoff, except the description requests below. The saved merge of 
 spec's ADR PR qualifies, because it repeats a merge the runner already decided on and checks
 acceptance and CI again. That merge is pinned to the accepted head, or to the runner's own update
 of it once verified as only a clean merge of the base branch. A new head alone is no such proof.
-Other merge recovery keeps its decision point.
+The update itself names the validated head as a condition, so GitHub refuses it and leaves the
+branch untouched if someone pushed first. Other merge recovery keeps its decision point.
 
 After a fix, a rejected or failed PR description request is a recoverable runner outcome. A
 failed request that can be resumed may first use the safe retry budget. If it still can't be
@@ -119,3 +120,5 @@ advisor action per reason and task episode, and a recurrence after that action g
   and state that #141's exception also covers failed description requests, per the owner.
 - Issue #151 (spec round 2): require proof that an updated ADR head is the runner's clean update,
   so a concurrent push can't become the head that the merge pins.
+- Issue #151 (spec round 3): make the ADR branch update conditional on the validated head, because
+  checking the result afterwards can't undo an update to a head the runner never validated.
