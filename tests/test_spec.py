@@ -278,6 +278,33 @@ def test_a_comment_that_timed_out_but_landed_is_not_posted_twice(loop):
     assert sum(1 for c in loop.gh.calls if c[:2] == ["issue", "comment"]) == 3   # review, reply, verdict
 
 
+def test_a_transient_spec_review_comment_post_defers_then_recovers(loop, monkeypatch):
+    """spec_review_comment_post_failed: one worker, replay after 60s, no second review (#151)."""
+    from baton import handoff
+
+    clock = _spec_clock(monkeypatch)
+    monkeypatch.setattr(spec.pr_helpers, "sleep", lambda *_: None)
+    loop.gh.comments = []
+    loop.gh.labels.clear()
+    # Exhaust gh backoff without landing, then succeed on the deferred attempt.
+    loop.gh.flaky["issue comment"] = [("HTTP 503 unavailable", False)] * 4
+    loop.script = [CHANGES, reviser(), ACCEPT]
+    with pytest.raises(Deferred, match="spec_review_comment_post_failed"):
+        loop.run()
+    assert [run["role"] for run in loop.runs] == ["spec_review"]
+    saved = handoff.load_retry(session.resolve(loop.env), N, "spec_review_comment_post_failed")
+    assert saved["attempts"] == 0 and "<!-- baton-spec-review round=1" in saved["continuation"]["body"]
+    clock["now"] = 1_059
+    with pytest.raises(Deferred, match="spec_review_comment_post_failed"):
+        loop.run()
+    assert [run["role"] for run in loop.runs] == ["spec_review"]
+    clock["now"] = 1_060
+    assert loop.run() is True
+    assert [run["role"] for run in loop.runs] == ["spec_review", "spec", "spec_review"]
+    assert len(loop.gh.posted("<!-- baton-spec-review round=1 by=")) == 1
+    assert not list(Path(loop.env["STATE"]).glob("handoff-retry-*spec_review_comment_post_failed*"))
+
+
 def test_a_gh_failure_that_outlasts_the_retries_is_in_runner_log(loop):
     loop.gh.comments = []
     loop.gh.flaky["issue edit --body-file"] = [("HTTP 502: Bad Gateway", False)] * 4

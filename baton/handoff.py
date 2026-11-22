@@ -10,6 +10,7 @@ transient failure schedules at most two later attempts (due after 60s then 300s)
 consumed before it runs so a restart cannot reset the budget. Permanent failures and exhaustion
 hand off. Deferrals yield the tick without sleeping (#151).
 """
+import hashlib
 import json
 import re
 import stat
@@ -30,9 +31,15 @@ READY = "ready-for-human"
 DELAYS = (60, 300)
 MAX_ATTEMPTS = len(DELAYS)
 clock = time.time
-# Read retries wired in this slice; write retries stay direct handoff until a later slice.
+# Category-1 reads and comment-post writes share the budget; other writes stay direct for now.
 RETRY_REASONS = frozenset({
     "review_comment_missing", "spec_comments_read_failed", "spec_pending_adr_read_failed",
+    "review_comment_post_failed", "screenshot_comment_post_failed",
+    "spec_review_comment_post_failed", "spec_reply_post_failed",
+})
+COMMENT_POST_REASONS = frozenset({
+    "review_comment_post_failed", "screenshot_comment_post_failed",
+    "spec_review_comment_post_failed", "spec_reply_post_failed",
 })
 
 # Categories: 1 rule-decided, 2 judgement, 3 needs investigation, 4 owner-only.
@@ -160,6 +167,35 @@ def _read_record(path):
         raise RetryUnreadable(f"unreadable retry record {path.name}") from exc
 
 
+def body_digest(body):
+    return hashlib.sha256(body.encode()).hexdigest()
+
+
+def _comment_post_valid(reason, item, binding):
+    """Inputs captured before a comment write: exact body plus the revalidation fields (#151)."""
+    if not isinstance(binding, dict):
+        return False
+    body = binding.get("body")
+    if not isinstance(body, str) or not body or binding.get("digest") != body_digest(body):
+        return False
+    if type(binding.get("round")) is not int or binding["round"] <= 0:
+        return False
+    if reason in ("spec_review_comment_post_failed", "spec_reply_post_failed"):
+        return (isinstance(binding.get("issue_body"), str)
+                and isinstance(binding.get("adr_head"), str)
+                and (binding["adr_head"] == "" or bool(re.fullmatch(r"[0-9a-f]{40}", binding["adr_head"])))
+                and isinstance(binding.get("feedback"), str)
+                and bool(re.fullmatch(r"[0-9a-f]{64}", binding["feedback"])))
+    return (binding.get("pr") == item
+            and all(isinstance(binding.get(key), str)
+                    for key in ("head", "base", "issue", "description", "feedback", "outcome"))
+            and bool(binding["base"]) and bool(re.fullmatch(r"[0-9a-f]{40}", binding["head"]))
+            and bool(re.fullmatch(r"[0-9a-f]{64}", binding["description"]))
+            and bool(re.fullmatch(r"[0-9a-f]{64}", binding["feedback"]))
+            and binding["outcome"].startswith("REVIEW:")
+            and (binding["issue"] == "" or binding["issue"].isdecimal()))
+
+
 def _binding_valid(reason, item, binding):
     if not isinstance(binding, dict):
         return False
@@ -174,6 +210,8 @@ def _binding_valid(reason, item, binding):
                 and isinstance(binding.get("issue_body"), str)
                 and isinstance(binding.get("adr_head"), str)
                 and (binding["adr_head"] == "" or bool(re.fullmatch(r"[0-9a-f]{40}", binding["adr_head"]))))
+    if reason in COMMENT_POST_REASONS:
+        return _comment_post_valid(reason, item, binding)
     return (binding.get("pr") == item and type(binding.get("round")) is int and binding["round"] > 0
             and all(isinstance(binding.get(key), str) for key in
                     ("head", "base", "digest", "issue", "screenshot_digest"))

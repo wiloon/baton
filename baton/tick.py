@@ -605,9 +605,10 @@ class Tick:
 
     # --- pick work: an issue for the pipeline ------------------------------------------------------
     def pending_specs(self):
-        """Resume durable spec reads before new work can be blocked by admission or labels."""
+        """Resume durable spec reads and comment posts before new work can be blocked by admission or labels."""
         found = {}
-        for reason in ("spec_comments_read_failed", "spec_pending_adr_read_failed"):
+        for reason in ("spec_comments_read_failed", "spec_pending_adr_read_failed",
+                       "spec_review_comment_post_failed", "spec_reply_post_failed"):
             for prefix in ("waiting", "retry"):
                 for path in self.state.glob(f"handoff-{prefix}-*-{reason}.json"):
                     issue = path.name.removeprefix(f"handoff-{prefix}-").removesuffix(f"-{reason}.json")
@@ -641,7 +642,8 @@ class Tick:
             if not isinstance(labels, list) or any(not isinstance(label, dict) or label.get("name") == "ready-for-human"
                                                   for label in labels):
                 continue
-            if pending[issue] == "spec_pending_adr_read_failed":
+            if pending[issue] in ("spec_pending_adr_read_failed", "spec_review_comment_post_failed",
+                                  "spec_reply_post_failed"):
                 done = self.after_item(self.item(lambda: self.resume_spec(issue)))
             else:
                 done = self.after_item(self.item(lambda: dev.run(self, issue)))

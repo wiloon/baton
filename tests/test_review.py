@@ -1388,6 +1388,88 @@ def test_a_failed_review_is_classified_where_it_fails(loop, monkeypatch, case, r
     _one_handoff(loop, seen, reason)
 
 
+def test_a_transient_review_comment_post_defers_then_recovers_without_a_second_worker(loop, monkeypatch):
+    """review_comment_post_failed: no early replay, one worker, landed after 60s (#151)."""
+    from subprocess import CompletedProcess
+    from baton import handoff
+
+    clock = {"now": 1_000}
+    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
+    monkeypatch.setattr(review.pr_helpers, "sleep", lambda *_: None)
+    posts, call = [], review.pr_helpers.call
+
+    def flaky_comment(*args, **kwargs):
+        if args[:2] == ("pr", "comment"):
+            posts.append(clock["now"])
+            if clock["now"] < 1_060:
+                return CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return call(*args, **kwargs)
+
+    monkeypatch.setattr(review.pr_helpers, "call", flaky_comment)
+    assert loop.run(fixer="cursor", reviewer="claude") == 75
+    assert len(loop.agents) == 1 and not loop.fixes and loop.checkpoint()
+    saved = handoff.load_retry(session.resolve(loop.env), "297", "review_comment_post_failed", str(PR))
+    assert saved["attempts"] == 0 and saved["continuation"]["body"].startswith("<!-- baton-review round=1")
+    clock["now"] = 1_059
+    before = len(posts)
+    assert loop.run(fixer="cursor", reviewer="claude") == 75
+    assert len(posts) == before and len(loop.agents) == 1
+    clock["now"] = 1_060
+    assert loop.run(fixer="cursor", reviewer="claude") == 0
+    assert sum(1 for a in loop.agents if a["tag"].endswith("review-1")) == 1
+    assert len(loop.fixes) == 1 and loop.merged == [PR]
+    assert 1_000 in posts and 1_060 in posts
+    assert not list(Path(loop.env["STATE"]).glob("handoff-retry-*"))
+
+
+def test_a_lost_review_comment_response_is_recognized_without_a_second_write(loop, monkeypatch):
+    """A comment that landed before its answer was lost counts as success (#151)."""
+    from subprocess import CompletedProcess
+
+    monkeypatch.setattr(review.pr_helpers, "sleep", lambda *_: None)
+    call, writes = review.pr_helpers.call, []
+
+    def write_then_fail(*args, **kwargs):
+        if args[:2] == ("pr", "comment"):
+            writes.append(1)
+            call(*args, **kwargs)   # land the comment
+            return CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return call(*args, **kwargs)
+
+    monkeypatch.setattr(review.pr_helpers, "call", write_then_fail)
+    assert loop.run(fixer="cursor", reviewer="claude") == 0
+    # Round 1's lost response is reconciled once; round 2 posts after the fix.
+    assert len(writes) == 2 and len(loop.fixes) == 1 and loop.merged == [PR]
+    assert not list(Path(loop.env["STATE"]).glob("handoff-retry-*"))
+
+
+@pytest.mark.parametrize("change", ["head", "description"])
+def test_a_changed_input_during_comment_post_deferral_hands_off(loop, monkeypatch, change):
+    from subprocess import CompletedProcess
+    from baton import handoff
+
+    clock = {"now": 1_000}
+    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
+    monkeypatch.setattr(review.pr_helpers, "sleep", lambda *_: None)
+    call = review.pr_helpers.call
+
+    def flaky_comment(*args, **kwargs):
+        if args[:2] == ("pr", "comment") and clock["now"] < 1_060:
+            return CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return call(*args, **kwargs)
+
+    monkeypatch.setattr(review.pr_helpers, "call", flaky_comment)
+    assert loop.run(fixer="cursor", reviewer="claude") == 75
+    if change == "head":
+        loop.gh.set(headRefOid="f" * 40)
+    else:
+        loop.gh.set(body="Refs #297\n\nowner edited the description")
+    clock["now"] = 1_060
+    assert loop.run(fixer="cursor", reviewer="claude") == 0
+    assert not loop.fixes and loop.labelled("ready-for-human")
+    assert not list(Path(loop.env["STATE"]).glob("handoff-retry-*"))
+
+
 def test_an_agent_screenshot_failure_that_mentions_a_comment_stays_a_run_failure(loop, monkeypatch):
     seen = _watch(monkeypatch)
     loop.reviews[:] = ["pass"]
