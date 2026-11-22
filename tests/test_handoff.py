@@ -113,3 +113,49 @@ def test_category_4_sites_have_direct_mode_and_no_recovery_actions():
                    "review_independence_denied", "reviewer_role_denied"):
         entry = handoff.REASONS[reason]
         assert entry.category == 4 and entry.mode == "direct" and entry.actions == ()
+
+
+def test_a_live_worker_reason_without_offered_actions_still_hands_off(env, monkeypatch):
+    """Unwired callers keep today's handoff: live retry is opt-in via observed_actions."""
+    labelled, calls = [], []
+
+    class Hooks:
+        def task(self, kind, key, *args):
+            pass
+
+    monkeypatch.setattr(handoff, "label_ready",
+                        lambda *a, **k: labelled.append(1) or MagicMock(returncode=0))
+    monkeypatch.setattr(handoff.notify, "notify", lambda *a, **k: None)
+    monkeypatch.setattr(handoff.advisor, "advise", lambda *a, **k: calls.append(1) or handoff.advisor.Decision("handoff"))
+    monkeypatch.setattr(handoff.advisor, "settings", lambda e: Advisor(env_file=None, mode="live"))
+    result = handoff.perform(env, "review_run_failed", kind="pr", number="1",
+                             title="t", text="failed", hooks=Hooks())
+    assert result.handed_off and labelled == [1] and calls == []
+
+
+def test_a_live_retry_step_is_returned_when_the_caller_offers_it(env, monkeypatch):
+    labelled, offered = [], []
+
+    class Hooks:
+        def task(self, kind, key, *args):
+            pass
+
+    monkeypatch.setattr(handoff, "label_ready", lambda *a, **k: labelled.append(1))
+    monkeypatch.setattr(handoff.notify, "notify", lambda *a, **k: None)
+    monkeypatch.setattr(handoff.advisor, "settings", lambda e: Advisor(env_file=None, mode="live"))
+    monkeypatch.setattr(handoff.advisor, "enabled", lambda e: True)
+
+    def advise(env, reason, number, snapshot, actions, **kw):
+        offered.append(actions)
+        assert kw.get("category") == 2
+        assert kw.get("mode") == "live"
+        assert snapshot == "snap"
+        return handoff.advisor.Decision("retry_step", "try again", (), "retry_step", "", True)
+
+    monkeypatch.setattr(handoff.advisor, "advise", advise)
+    result = handoff.perform(
+        env, "review_run_failed", kind="pr", number="9", title="t", text="failed",
+        hooks=Hooks(), snapshot="snap", revalidate=lambda: True,
+        observed_actions=("retry_step", "retry_step_other_vendor"))
+    assert result.action == "retry_step" and not result.handed_off and labelled == []
+    assert offered == [("retry_step", "retry_step_other_vendor")]

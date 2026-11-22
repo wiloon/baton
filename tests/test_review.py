@@ -936,9 +936,9 @@ def test_a_screenshot_review_that_fails_goes_to_the_owner_with_neither_fix_nor_m
     handoffs = []
     handoff = review.Review.handoff
 
-    def record_handoff(self, reason, title, text):
+    def record_handoff(self, reason, title, text, **recovery):
         handoffs.append(reason)
-        handoff(self, reason, title, text)
+        return handoff(self, reason, title, text, **recovery)
 
     monkeypatch.setattr(review.Review, "handoff", record_handoff)
     if case == "run failed":
@@ -1144,7 +1144,7 @@ def advised(loop, monkeypatch):
     monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="live"))
     loop.advice, loop.advice_calls = [], []
 
-    def call(cfg, key, snapshot, actions):
+    def call(cfg, key, snapshot, actions, **_):
         loop.advice_calls.append(snapshot)
         return loop.advice.pop(0), {}
     monkeypatch.setattr(advisor, "call_deepseek", call)
@@ -1238,18 +1238,24 @@ def test_a_failed_extra_round_does_not_extend_the_next_review_episode(advised, f
     advised.reviews[:] = ["changes", "changes"]
     if failure == "fix":
         advised.fix_plans[:] = [0, 1]
+        advised.advice = [{"action": "extra_round", "reason": "fixable", "evidence": []}]
     else:
         advised.reviews.append("RESULT: failed reviewer crashed")
-    advised.advice = [{"action": "extra_round", "reason": "fixable", "evidence": []}]
+        # The extra round is granted, then the failed review asks at review_run_failed.
+        advised.advice = [
+            {"action": "extra_round", "reason": "fixable", "evidence": []},
+            {"action": "handoff", "reason": "still broken", "evidence": ["Decision point: review_run_failed"]},
+        ]
     assert advised.run(fixer="cursor") == 0
     assert not advised.checkpoint() and not advised.merged
-    assert len(advised.fixes) == 2 and len(advised.advice_calls) == 1
+    assert len(advised.fixes) == 2
+    assert len(advised.advice_calls) == (1 if failure == "fix" else 2)
 
     advised.review_text = "A different issue after the owner resumed review"
     advised.reviews[:] = ["changes", "changes", "changes"]
     advised.advice = [{"action": "handoff", "reason": "needs the owner", "evidence": []}]
     assert advised.run(fixer="cursor") == 0
-    assert len(advised.advice_calls) == 2
+    assert len(advised.advice_calls) == (2 if failure == "fix" else 3)
     assert len(advised.fixes) == 3 and advised.labelled("ready-for-human")
 
 
@@ -1360,3 +1366,35 @@ def test_an_agent_screenshot_failure_that_mentions_a_comment_stays_a_run_failure
     loop.screens = ["RESULT: failed the comment was unavailable"]
     assert screen_run(loop) == 0
     _one_handoff(loop, seen, "screenshot_run_failed")
+
+
+def test_a_live_retry_step_re_runs_the_same_reviewer_once(advised):
+    """Category-2 live: review_run_failed may retry the same vendor once, then continue."""
+    advised.reviews[:] = ["RESULT: failed boom", "pass"]
+    advised.advice = [{"action": "retry_step", "reason": "transient agent failure",
+                       "evidence": ["Decision point: review_run_failed"]}]
+    assert advised.run(fixer="cursor", reviewer="claude") == 0
+    assert [a["vendor"] for a in advised.agents if a["role"] == "review"] == ["claude", "claude"]
+    assert advised.merged == [PR] and not advised.labelled("ready-for-human")
+    assert len(advised.advice_calls) == 1
+    assert "review_run_failed" in advised.advice_calls[0]
+
+
+def test_a_live_alternate_vendor_retry_picks_another_reviewer(advised, monkeypatch):
+    advised.reviews[:] = ["RESULT: failed boom", "pass"]
+    advised.advice = [{"action": "retry_step_other_vendor", "reason": "try the other pool vendor",
+                       "evidence": ["Decision point: review_run_failed"]}]
+    assert advised.run(fixer="cursor", reviewer="claude") == 0
+    reviewers = [a["vendor"] for a in advised.agents if a["role"] == "review"]
+    assert reviewers == ["claude", "codex"]
+    assert advised.merged == [PR] and not advised.labelled("ready-for-human")
+
+
+def test_a_spent_review_retry_hands_off_on_the_same_reason(advised):
+    advised.reviews[:] = ["RESULT: failed boom", "RESULT: failed again"]
+    advised.advice = [{"action": "retry_step", "reason": "one more try",
+                       "evidence": ["Decision point: review_run_failed"]}]
+    assert advised.run(fixer="cursor", reviewer="claude") == 0
+    assert [a["vendor"] for a in advised.agents if a["role"] == "review"] == ["claude", "claude"]
+    assert advised.labelled("ready-for-human") and advised.merged == []
+    assert len(advised.advice_calls) == 1

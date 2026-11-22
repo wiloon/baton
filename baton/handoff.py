@@ -144,18 +144,29 @@ def perform(env, reason, *, kind, number, title, text, hooks, remove=(),
         notify.log(f"handoff {reason} category={entry.category}")
         return Result(HANDOFF, decision, True)
 
-    # The observation caller supplies only the actions the current evidence supports.
-    observing = entry.mode == "observe" and observed_actions is not None
-    if entry.category in (1, 4) or (not observing and "extra_round" not in entry.actions):
+    # Callers that have not opted in keep today's handoff. Observation always passes the
+    # actions the current evidence supports; live worker/investigation retries do the same
+    # once wired. The #17 round limits still offer extra_round without that opt-in.
+    if entry.category in (1, 4) or not entry.actions:
         return finish()
-    offered = tuple(a for a in entry.actions if a in observed_actions) if observing else ("extra_round",)
+    if observed_actions is not None:
+        offered = tuple(a for a in entry.actions if a in observed_actions)
+        if not offered and entry.mode != "observe":
+            return finish()
+    elif entry.mode == "live" and "extra_round" in entry.actions:
+        offered = ("extra_round",)
+    else:
+        return finish()
     cfg = advisor.settings(env)
     mode = capped_mode(cfg.mode if advisor.enabled(env) else "off", entry.mode)
     if mode == "off":   # still explain an earlier recovery of this episode
         return finish(advisor.saved_attempt(env, reason, number, kind))
+    # Category-typed validation (#125) for observation points and for live retries; the
+    # round-limit path keeps the looser #17 contract (category unset).
+    typed = entry.mode == "observe" or any(action != "extra_round" for action in offered)
     decision = advisor.advise(env, reason, number, snapshot, offered, task_kind=kind,
                              revalidate=revalidate, rule=HANDOFF, mode=mode,
-                             category=entry.category if observing else None)
+                             category=entry.category if typed else None)
     if decision.action == HANDOFF:
         return finish(decision)
     return Result(decision.action, decision, False)

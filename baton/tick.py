@@ -556,14 +556,32 @@ class Tick:
             self.log(f"worktree for PR #{pr} failed")
             return 1
         # Fast-forward only: local commits a failed push left behind are kept and pushed with the fix.
-        if not (session.run_process(["git", "-C", wt, "checkout", "-q", head_ref]).returncode == 0
-                and session.run_process(["git", "-C", wt, "merge", "-q", "--ff-only", f"origin/{head_ref}"]).returncode == 0):
+        def prepare_worktree():
+            return (session.run_process(["git", "-C", wt, "checkout", "-q", head_ref]).returncode == 0
+                    and session.run_process(["git", "-C", wt, "merge", "-q", "--ff-only", f"origin/{head_ref}"]).returncode == 0)
+
+        if not prepare_worktree():
             from . import handoff as owner_handoff
-            owner_handoff.perform(
+            detail = f"{wt} has diverged from origin/{head_ref}."
+            snapshot = (f"Decision point: fix_worktree_diverged. Repository {self.gh_repo}, PR #{pr}.\n"
+                        f"Worktree: {wt}; branch: {head_ref}.\nOutcome: {detail}\n"
+                        "Actions: retry_step = one more fast-forward-only preparation when inspection "
+                        "confirms it is safe; handoff = preserve the worktree for the owner.\n")
+            result = owner_handoff.perform(
                 self.env, "fix_worktree_diverged", kind="pr", number=pr, remove=("agent-fix",),
-                title=f"PR #{pr} needs you", text=f"{wt} has diverged from origin/{head_ref}. {url}",
-                hooks=self.hooks(issue or "0", pr=pr))
-            return 80
+                title=f"PR #{pr} needs you", text=f"{detail} {url}",
+                hooks=self.hooks(issue or "0", pr=pr),
+                snapshot=snapshot, observed_actions=("retry_step",),
+                revalidate=lambda: os.path.isdir(wt))
+            if result.action == "retry_step" and prepare_worktree():
+                self.log(f"PR #{pr}: advisor granted worktree retry: {result.decision.reason}")
+            else:
+                if not result.handed_off:
+                    owner_handoff.perform(
+                        self.env, "fix_worktree_diverged", kind="pr", number=pr, remove=("agent-fix",),
+                        title=f"PR #{pr} needs you", text=f"{detail} {url}",
+                        hooks=self.hooks(issue or "0", pr=pr))
+                return 80
         feedback_file = self.state / f"owner-fix-feedback-{pr}"
         feedback = feedback_file.read_text() if feedback_file.is_file() else review.human_feedback(self.gh_repo, self.owner, pr)
         if not feedback.strip():

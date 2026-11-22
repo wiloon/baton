@@ -103,13 +103,18 @@ def is_partial(text, issue):
         return False
 
 
-def stop(tick, issue, reason, title, text):
-    """The handoff every gate shares: ready-for-human, a telemetry handoff, a Telegram message."""
+def stop(tick, issue, reason, title, text, **recovery):
+    """The handoff every gate shares: ready-for-human, a telemetry handoff, a Telegram message.
+
+    When RECOVERY opts into a live retry, returns the shared-entry Result instead of 80 (#125).
+    """
     from . import handoff as owner_handoff
-    owner_handoff.perform(
+    result = owner_handoff.perform(
         tick.env, reason, kind="issue", number=issue, remove=("agent-wip",),
-        title=title, text=text, hooks=tick.hooks(issue))
-    return 80
+        title=title, text=text, hooks=tick.hooks(issue), **recovery)
+    if result.handed_off:
+        return 80
+    return result
 
 
 def opening_path(tick, issue):
@@ -259,7 +264,19 @@ def run(tick, issue):
         pr_helpers.gh("issue", "comment", issue, "-R", repo, "--body",
                       f"<!-- baton-note by={dev_vendor} -->\n{dev_vendor} stopped: {fail}\n\n{reply[:REPLY_CAP]}")
         reason = "dev_blocked" if fail.startswith("blocked") else "dev_result_invalid" if outcome.startswith("RESULT: ready") else "dev_run_failed"
-        return stop(tick, issue, reason, f"#{issue}: {dev_vendor} stopped", f"{fail} {url}")
+        if reason == "dev_blocked":
+            return stop(tick, issue, reason, f"#{issue}: {dev_vendor} stopped", f"{fail} {url}")
+        snapshot = (f"Decision point: {reason}. Repository {repo}, issue #{issue}.\n"
+                    f"Failed vendor: {dev_vendor}; role: dev.\nOutcome: {fail}\n"
+                    "Actions: retry_step = one more implementer attempt with the same vendor; "
+                    "retry_step_other_vendor = one attempt with an eligible alternate; "
+                    "handoff = the owner takes the issue.\n")
+        result = stop(tick, issue, reason, f"#{issue}: {dev_vendor} stopped", f"{fail} {url}",
+                      snapshot=snapshot, observed_actions=("retry_step", "retry_step_other_vendor"),
+                      revalidate=lambda: wt.is_dir())
+        if result == 80:
+            return 80
+        return run(tick, issue)
 
     verifier = fix.Runner(env, hooks)
     verifier.gate_applies = not is_partial(Path(body).read_text(), issue)
@@ -268,7 +285,22 @@ def run(tick, issue):
         pr_helpers.gh("issue", "comment", issue, "-R", repo, "--body",
                       f"<!-- baton-note by={dev_vendor} -->\nLocal CI verification failed before push after {rounds} of "
                       f"{env.config.scheduling.max_verify_fixes or 2} fix rounds. Nothing was pushed.\n\n{failure[:REPLY_CAP]}")
-        return stop(tick, issue, "dev_verify_failed", f"#{issue}: local CI verification failed", url)
+        snapshot = (f"Decision point: dev_verify_failed. Repository {repo}, issue #{issue}.\n"
+                    f"Failed vendor: {dev_vendor}; role: dev.\nOutcome: {failure}\n"
+                    "Actions: retry_step = one more local verification within the same repair budget; "
+                    "handoff = the owner takes the issue.\n")
+        result = stop(tick, issue, "dev_verify_failed", f"#{issue}: local CI verification failed", url,
+                      snapshot=snapshot, observed_actions=("retry_step",),
+                      revalidate=lambda: wt.is_dir())
+        if result == 80:
+            return 80
+        remaining = max(0, int(env.config.scheduling.max_verify_fixes or 2) - rounds)
+        rc, failure, rounds = verifier.verify(str(wt), base, dev_vendor, "issue", issue, repairs=remaining)
+        if rc != 0:
+            pr_helpers.gh("issue", "comment", issue, "-R", repo, "--body",
+                          f"<!-- baton-note by={dev_vendor} -->\nLocal CI verification failed before push after retry. "
+                          f"Nothing was pushed.\n\n{failure[:REPLY_CAP]}")
+            return stop(tick, issue, "dev_verify_failed", f"#{issue}: local CI verification failed", url)
     if not push(wt, branch, upstream=True, signoff=tick.env.repo.signoff):
         stop(tick, issue, "dev_push_failed", f"#{issue}: pushing {dev_vendor}'s branch failed",
              f"{branch} is committed in {wt}. {url}")

@@ -21,8 +21,8 @@ import subprocess
 import sys
 import time
 
-from . import agents, dispatch, e2e_gate, hooks as telemetry, notify, pr as pr_helpers, pr_contract, prompts, vendors
-from .common import Deferred, child_env, git, push, strip_markers
+from . import agents, dispatch, e2e_gate, hooks as telemetry, notify, pick, pr as pr_helpers, pr_contract, prompts, vendors
+from .common import Deferred, Exhausted, child_env, git, push, strip_markers
 
 REPLY_CAP = 60000
 # The verify output a repair run gets in its prompt: the tail, where the errors are. The whole
@@ -50,14 +50,64 @@ class Runner:
         self.hooks = hooks or telemetry.from_env(env, issue=env.runtime.issue, pr=pr, round=round)
 
     # --- the owner handoff every gate shares ---
-    def handoff(self, pr, reason, title, text):
-        """Label the PR for the owner, record why, say so on Telegram; always rc 1."""
+    def handoff(self, pr, reason, title, text, **recovery):
+        """Label the PR for the owner, record why, say so on Telegram; always rc 1.
+
+        When RECOVERY opts into a live retry (observed_actions), a non-handoff Result is
+        returned instead so the caller can re-run the step (#125).
+        """
         from . import handoff as owner_handoff
-        owner_handoff.perform(
+        result = owner_handoff.perform(
             self.env, reason, kind="pr", number=pr,
-            title=title, text=text, hooks=self.hooks)
-        self.handed_off = True
-        return 1
+            title=title, text=text, hooks=self.hooks, **recovery)
+        if result.handed_off:
+            self.handed_off = True
+            return 1
+        return result
+
+    def worker_recovery(self, pr, reason, vendor, detail, *, role="fixer", wt=""):
+        """Snapshot and offered live actions for a fix or verify failure (#125)."""
+        from . import handoff as owner_handoff
+        entry = owner_handoff.REASONS.get(reason)
+        if not entry or entry.mode != "live" or not entry.actions:
+            return {}
+        head = self.head(wt) if wt else ""
+        offered = [a for a in ("retry_step", "retry_step_other_vendor") if a in entry.actions]
+        if "retry_step_other_vendor" in offered:
+            if not any(other != vendor for other in pick.all_vendors(self.env)):
+                offered = [a for a in offered if a != "retry_step_other_vendor"]
+        if not offered:
+            return {}
+        snapshot = (f"Decision point: {reason}. Repository {self.repo}, PR #{pr}.\n"
+                    f"Failed vendor: {vendor}; role: {role}; worktree HEAD: {head}.\n"
+                    f"Outcome: {detail}\n"
+                    "Actions: retry_step = one more attempt with the same vendor; "
+                    "retry_step_other_vendor = one attempt with an eligible alternate; "
+                    "handoff = the owner takes the PR.\n")
+
+        def still_current():
+            data = pr_helpers.view(pr, "state")
+            return bool(data) and data.get("state") == "OPEN"
+        return {"snapshot": snapshot, "revalidate": still_current, "observed_actions": tuple(offered)}
+
+    def recover(self, pr, reason, title, detail, vendor, *, role="fixer", wt=""):
+        """Ask the advisor; return (action, vendor) or (HANDOFF, vendor) after a terminal handoff."""
+        from . import handoff as owner_handoff
+        recovery = self.worker_recovery(pr, reason, vendor, detail, role=role, wt=wt)
+        result = self.handoff(pr, reason, title, detail, **recovery)
+        if result == 1:
+            return owner_handoff.HANDOFF, vendor
+        if result.action == "retry_step_other_vendor":
+            try:
+                vendor = pick.choose(self.env, role, vendor, "contrib", pick.all_vendors(self.env),
+                                     pr=str(pr), exclude=vendor, issue=self.env.runtime.issue or "")
+            except Exhausted as exhausted:
+                self.handoff(pr, reason, title, exhausted.reason or detail)
+                return owner_handoff.HANDOFF, vendor
+            notify.log(f"PR #{pr}: advisor granted alternate {role} {vendor}: {result.decision.reason}")
+        else:
+            notify.log(f"PR #{pr}: advisor granted retry of {role} ({vendor}): {result.decision.reason}")
+        return result.action, vendor
 
     def comment(self, pr, body, failed=""):
         posted = pr_helpers.gh("pr", "comment", str(pr), "-R", self.repo, "--body", body)
@@ -95,8 +145,12 @@ class Runner:
             issue = marker.group(1)
         return e2e_gate.parse(view("issue", issue), self.env.repo)
 
-    def verify(self, wt, base, vendor, kind, number):
-        """(rc, failure, rounds): rc 0 passed, 1 failed or refused, 75 deferred (Deferred)."""
+    def verify(self, wt, base, vendor, kind, number, *, repairs=None):
+        """(rc, failure, rounds): rc 0 passed, 1 failed or refused, 75 deferred (Deferred).
+
+        REPAIRS caps how many verification-fix runs may follow a red check. None uses the
+        configured max_verify_fixes. 0 rechecks once with no repair (#125 advisor retry).
+        """
         try:
             gate = self.e2e_gate(kind, number)
         except ValueError as error:
@@ -107,6 +161,7 @@ class Runner:
         # Under /tmp, the one place outside the worktree guard.sh lets a fixer write (#38).
         reply_file = Path("/tmp", f"baton-{self.repo.replace('/', '-')}-{kind}-{number}-verify-fix.md")
         attempt, failure = 0, ""
+        max_repairs = self.max_verify if repairs is None else repairs
 
         def dirty():
             return bool(git(wt, "status", "--porcelain"))
@@ -138,9 +193,9 @@ class Runner:
                     return 0, failure, attempt
                 failure = "CI checks passed but left uncommitted or untracked files."
             failure_file.write_text(failure + "\n")
-            notify.log(f"{kind} #{number}: verify failed (attempt {attempt} of {self.max_verify})")
+            notify.log(f"{kind} #{number}: verify failed (attempt {attempt} of {max_repairs})")
             event("failure", started)
-            if attempt >= self.max_verify:
+            if attempt >= max_repairs:
                 return 1, failure, attempt
             if not self.env.config.allows(vendor, "fixer"):
                 return 1, failure, attempt
@@ -279,8 +334,15 @@ class Runner:
                 if log:
                     notify.log(log)
                 if rc != 0 and (rc != 2 or description_rc != 2):
-                    return self.handoff(pr, "fix_task_write_failed" if rc == 1 else "fix_task_invalid",
-                                        f"PR #{pr}: task completion change failed ({fixer})", url)
+                    reason = "fix_task_write_failed" if rc == 1 else "fix_task_invalid"
+                    if rc == 1:
+                        return self.handoff(pr, reason, f"PR #{pr}: task completion change failed ({fixer})", url)
+                    action, fixer = self.recover(
+                        pr, reason, f"PR #{pr}: task completion change failed ({fixer})",
+                        f"Invalid task relation from {fixer}. {url}", fixer, wt=wt)
+                    if action == "handoff":
+                        return 1
+                    return self.fix_pr(pr, wt, fixer, source, feedback, head)
         elif self.head(wt) != head:
             # Anything but a fix goes to the owner, who must see the partial work ("commit
             # what is done" in the fix prompts): push it unverified. Only a fix is gated below.
@@ -291,7 +353,11 @@ class Runner:
         if not outcome.startswith("RESULT: fixed"):
             if outcome.startswith("RESULT: needs-info"):
                 return self.handoff(pr, "fix_needs_info", f"PR #{pr} has questions", url)
-            return self.handoff(pr, "fix_run_failed", f"PR #{pr} fix failed ({fixer})", f"{outcome} {url}")
+            action, fixer = self.recover(
+                pr, "fix_run_failed", f"PR #{pr} fix failed ({fixer})", f"{outcome} {url}", fixer, wt=wt)
+            if action == "handoff":
+                return 1
+            return self.fix_pr(pr, wt, fixer, source, feedback, head)
         if self.head(wt) == head:
             rc, checks_changed = self.recheck_without_commit(pr, "", url, description_changed)
             if rc != 0:
@@ -299,12 +365,26 @@ class Runner:
             if description_rc != 0:
                 self.description_discarded(pr, fixer, description_reason)
             if not task_changed and not checks_changed and not description_changed:
-                return self.handoff(pr, "fix_no_commit", f"PR #{pr} needs you", f"The fix run made no commit; stopping the loop. {url}")
+                action, fixer = self.recover(
+                    pr, "fix_no_commit", f"PR #{pr} needs you",
+                    f"The fix run made no commit; stopping the loop. {url}", fixer, wt=wt)
+                if action == "handoff":
+                    return 1
+                return self.fix_pr(pr, wt, fixer, source, feedback, head)
         if self.head(wt) != head:
             rc, failure, rounds = self.verify(wt, "origin/main", fixer, "pr", pr)
             if rc != 0:
-                self.verify_failed(pr, failure, rounds)
-                return self.handoff(pr, "fix_verify_failed", f"PR #{pr}: local CI verification failed", url)
+                action, fixer = self.recover(
+                    pr, "fix_verify_failed", f"PR #{pr}: local CI verification failed",
+                    f"{failure} {url}", fixer, wt=wt)
+                if action == "handoff":
+                    self.verify_failed(pr, failure, rounds)
+                    return 1
+                remaining = max(0, self.max_verify - rounds)
+                rc, failure, rounds = self.verify(wt, "origin/main", fixer, "pr", pr, repairs=remaining)
+                if rc != 0:
+                    self.verify_failed(pr, failure, rounds)
+                    return self.handoff(pr, "fix_verify_failed", f"PR #{pr}: local CI verification failed", url)
             if not self.record(pr, fixer, wt, agent_head, model if rounds == 0 else "unknown", cursor_base):
                 return 1
             if not push(wt, "HEAD", signoff=self.env.repo.signoff):
@@ -366,7 +446,13 @@ class Runner:
             if not outcome.startswith("RESULT: fixed"):
                 if outcome.startswith("RESULT: needs-info"):
                     return self.handoff(pr, "fix_needs_info", f"Cursor PR #{pr} has questions", url)
-                return self.handoff(pr, "fix_run_failed", f"Cursor PR #{pr} fix failed", f"{outcome} {url}")
+                action, fixer = self.recover(
+                    pr, "fix_run_failed", f"Cursor PR #{pr} fix failed", f"{outcome} {url}", "cursor", wt=wt)
+                if action == "handoff":
+                    return 1
+                if fixer != "cursor":
+                    return self.fix_pr(pr, wt, fixer, source, feedback, head)
+                return self.cursor_fix(pr, wt, source, feedback, head)
             if request.exists() or request.is_symlink() or want:
                 # Publish the fixed attempt after saving its checks, before any GitHub edit.
                 temp = task_file.with_suffix(".tmp")
@@ -392,8 +478,17 @@ class Runner:
                 notify.log(f"PR #{pr}: description update deferred after GitHub failure")
                 return 75
             if rc != 0 and (rc != 2 or description_rc != 2):
-                return self.handoff(pr, "fix_task_write_failed" if rc == 1 else "fix_task_invalid",
-                                    f"PR #{pr}: task completion change failed (cursor)", url)
+                reason = "fix_task_write_failed" if rc == 1 else "fix_task_invalid"
+                if rc == 1:
+                    return self.handoff(pr, reason, f"PR #{pr}: task completion change failed (cursor)", url)
+                action, fixer = self.recover(
+                    pr, reason, f"PR #{pr}: task completion change failed (cursor)",
+                    f"Invalid task relation from cursor. {url}", "cursor", wt=wt)
+                if action == "handoff":
+                    return 1
+                if fixer != "cursor":
+                    return self.fix_pr(pr, wt, fixer, source, feedback, head)
+                return self.cursor_fix(pr, wt, source, feedback, head)
         moved = self.head(wt) != head
         if not moved:
             rc, checks_changed = self.recheck_without_commit(pr, "Cursor ", url, body_changed)
@@ -402,13 +497,31 @@ class Runner:
             if discarded:
                 self.description_discarded(pr, "cursor", description_reason)
             if not (body_changed or task_changed or checks_changed):
-                self.clear_cursor_request(pr)
-                return self.handoff(pr, "fix_no_commit", f"Cursor PR #{pr} needs you", f"Cursor's fix run made no commit. {url}")
+                action, fixer = self.recover(
+                    pr, "fix_no_commit", f"Cursor PR #{pr} needs you",
+                    f"Cursor's fix run made no commit. {url}", "cursor", wt=wt)
+                if action == "handoff":
+                    self.clear_cursor_request(pr)
+                    return 1
+                if fixer != "cursor":
+                    self.clear_cursor_request(pr)
+                    return self.fix_pr(pr, wt, fixer, source, feedback, head)
+                return self.cursor_fix(pr, wt, source, feedback, head)
         else:
             rc, failure, rounds = self.verify(wt, "origin/main", "cursor", "pr", pr)
             if rc != 0:
-                self.verify_failed(pr, failure, rounds)
-                return self.handoff(pr, "fix_verify_failed", f"Cursor PR #{pr}: local CI verification failed", url)
+                action, fixer = self.recover(
+                    pr, "fix_verify_failed", f"Cursor PR #{pr}: local CI verification failed",
+                    f"{failure} {url}", "cursor", wt=wt)
+                if action == "handoff":
+                    self.verify_failed(pr, failure, rounds)
+                    return 1
+                remaining = max(0, self.max_verify - rounds)
+                rc, failure, rounds = self.verify(wt, "origin/main", "cursor", "pr", pr, repairs=remaining)
+                if rc != 0:
+                    self.verify_failed(pr, failure, rounds)
+                    return self.handoff(pr, "fix_verify_failed", f"Cursor PR #{pr}: local CI verification failed", url)
+
         try:
             vendors.record_author(self.state, pr, "cursor")
         except OSError:
