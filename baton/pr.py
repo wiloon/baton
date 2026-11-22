@@ -61,15 +61,9 @@ def _option(args, name):
     return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else None
 
 
-# Comment / create / merge reconciliation during gh backoff (#46, #151).
-LANDED = "landed"
-ABSENT = "absent"
-UNREADABLE = "unreadable"   # also untrusted identical: do not rewrite
-
-
 def _landed(args, input):
-    """Whether a non-idempotent write reached GitHub: (LANDED, result), (ABSENT, None),
-    (UNREADABLE, None), or None when ARGS is not such a write."""
+    """For a write that may have reached GitHub before its answer was lost: the result it
+    would have given, or None when it did not land. Idempotent calls return None: retry them."""
     repo = _option(args, "-R")
     scope = ["-R", repo] if repo else []
     if args[1:2] == ("comment",) and args[0] in ("issue", "pr") and len(args) > 2:
@@ -79,74 +73,60 @@ def _landed(args, input):
             try:
                 text = input if source == "-" else Path(source).read_text()
             except OSError:
-                return UNREADABLE, None
+                return None
         if text is None:
-            return UNREADABLE, None
-        seen = call(args[0], "view", args[2], *scope, "--json", "comments")
-        if seen.returncode != 0:
-            return UNREADABLE, None
+            return None
+        seen = gh(args[0], "view", args[2], *scope, "--json", "comments")
         try:
-            comments = json.loads(seen.stdout)["comments"]
-            if not isinstance(comments, list):
-                return UNREADABLE, None
+            bodies = [c.get("body", "") for c in json.loads(seen.stdout)["comments"][-20:]]
         except (ValueError, KeyError, TypeError):
-            return UNREADABLE, None
-        owner = session.resolve().owner
-        want = text.strip()
-        matched = [c for c in comments if isinstance(c, dict) and (c.get("body") or "").strip() == want]
-        if any((c.get("author") or {}).get("login") == owner for c in matched):
-            return LANDED, subprocess.CompletedProcess(["gh", *args], 0, "", "")
-        if matched:
-            return UNREADABLE, None
-        return ABSENT, None
+            return None
+        if text.strip() in (b.strip() for b in bodies):
+            return subprocess.CompletedProcess(["gh", *args], 0, "", "")
+        return None
     if args[:2] == ("pr", "create") and (head := _option(args, "--head")):
-        found = call("pr", "list", *scope, "--state", "open", "--head", head, "--json", "url", "--jq", ".[0].url // empty")
-        if found.returncode != 0:
-            return UNREADABLE, None
-        url = found.stdout.strip()
-        return (LANDED, subprocess.CompletedProcess(["gh", *args], 0, url + "\n", "")) if url else (ABSENT, None)
+        found = gh("pr", "list", *scope, "--state", "open", "--head", head, "--json", "url", "--jq", ".[0].url // empty")
+        url = found.stdout.strip() if found.returncode == 0 else ""
+        return subprocess.CompletedProcess(["gh", *args], 0, url + "\n", "") if url else None
     if args[:2] == ("issue", "create") and (title := _option(args, "--title")):
-        found = call("issue", "list", *scope, "--state", "open", "--limit", "30", "--json", "title,url")
-        if found.returncode != 0:
-            return UNREADABLE, None
+        found = gh("issue", "list", *scope, "--state", "open", "--limit", "30", "--json", "title,url")
         try:
             url = next((i["url"] for i in json.loads(found.stdout) if i.get("title") == title), "")
         except (ValueError, KeyError, TypeError):
-            return UNREADABLE, None
-        return (LANDED, subprocess.CompletedProcess(["gh", *args], 0, url + "\n", "")) if url else (ABSENT, None)
+            return None
+        return subprocess.CompletedProcess(["gh", *args], 0, url + "\n", "") if url else None
     if args[:2] == ("pr", "merge") and len(args) > 2:
-        # A merge keeps the read backoff it always had (a transient lookup retries).
         state = gh("pr", "view", args[2], *scope, "--json", "state", "--jq", ".state")
-        if state.returncode != 0:
-            return UNREADABLE, None
-        if state.stdout.strip() == "MERGED":
-            return LANDED, subprocess.CompletedProcess(["gh", *args], 0, "", "")
-        return ABSENT, None
+        if state.returncode == 0 and state.stdout.strip() == "MERGED":
+            return subprocess.CompletedProcess(["gh", *args], 0, "", "")
     return None
 
 
-def gh(*args, input=None, limit=None):
+def gh(*args, input=None, limit=None, reconcile=None):
     """`gh ARGS`, retried on transient failures (TLS or connection errors, 502/503/504, the
     secondary rate limit) with BACKOFF; a 4xx or any other failure is returned at once. Before
     retrying a write that is not idempotent (a comment, `pr create`, `issue create`,
-    `pr merge`), it checks whether the first try landed. An unreadable or ambiguous lookup
-    stops the inner repeats and leaves the transient failure for the caller's budget (#151).
-    The one entry point for every baton `gh` call (#46); the final failure's stderr is in the
-    result (why())."""
+    `pr merge`), it checks whether the first try landed. The one entry point for every
+    baton `gh` call (#46); the final failure's stderr is in the result (why()). A saved
+    write can supply RECONCILE, which returns landed, absent, or a state that stops repeats.
+    It also checks the final transient failure, when no inner repeat remains (#151)."""
     result = call(*args, input=input, limit=limit)
     for pause in BACKOFF:
         if result.returncode == 0 or not transient(result):
             break
         sleep(pause)
-        status = _landed(args, input)
-        if status is not None:
-            kind, done = status
-            if kind == LANDED:
-                return done
-            if kind == UNREADABLE:
-                break
+        if reconcile is not None:
+            state = reconcile()
+            if state == "landed":
+                return subprocess.CompletedProcess(result.args, 0, "", "")
+            if state != "absent":
+                return result
+        elif (done := _landed(args, input)) is not None:
+            return done
         result = call(*args, input=input, limit=limit)
     if result.returncode != 0 and transient(result):
+        if reconcile is not None and reconcile() == "landed":
+            return subprocess.CompletedProcess(result.args, 0, "", "")
         from . import notify   # notify imports this module
         notify.log(f"gh {' '.join(args[:2])} failed after {len(BACKOFF) + 1} tries{why(result)}")
     return result

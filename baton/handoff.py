@@ -31,15 +31,10 @@ READY = "ready-for-human"
 DELAYS = (60, 300)
 MAX_ATTEMPTS = len(DELAYS)
 clock = time.time
-# Category-1 reads and comment-post writes share the budget; other writes stay direct for now.
+# Category-1 reads and code-review comment posts share the budget.
+REVIEW_POST = "review_comment_post_failed"
 RETRY_REASONS = frozenset({
-    "review_comment_missing", "spec_comments_read_failed", "spec_pending_adr_read_failed",
-    "review_comment_post_failed", "screenshot_comment_post_failed",
-    "spec_review_comment_post_failed", "spec_reply_post_failed",
-})
-COMMENT_POST_REASONS = frozenset({
-    "review_comment_post_failed", "screenshot_comment_post_failed",
-    "spec_review_comment_post_failed", "spec_reply_post_failed",
+    "review_comment_missing", "spec_comments_read_failed", "spec_pending_adr_read_failed", REVIEW_POST,
 })
 
 # Categories: 1 rule-decided, 2 judgement, 3 needs investigation, 4 owner-only.
@@ -171,29 +166,30 @@ def body_digest(body):
     return hashlib.sha256(body.encode()).hexdigest()
 
 
-def _comment_post_valid(reason, item, binding):
-    """Inputs captured before a comment write: exact body plus the revalidation fields (#151)."""
-    if not isinstance(binding, dict):
-        return False
+def _comment_post_valid(item, binding):
+    """The code-review verdict and the inputs it was produced from (#151)."""
     body = binding.get("body")
-    if not isinstance(body, str) or not body or binding.get("digest") != body_digest(body):
+    reviewer, round = binding.get("reviewer"), binding.get("round")
+    if (reviewer not in ("claude", "codex", "cursor") or type(round) is not int or round <= 0
+            or not isinstance(body, str) or not body.startswith(f"<!-- baton-review round={round} by={reviewer} -->\n")):
         return False
-    if type(binding.get("round")) is not int or binding["round"] <= 0:
+    try:
+        if binding.get("digest") != body_digest(body):
+            return False
+    except UnicodeEncodeError:
         return False
-    if reason in ("spec_review_comment_post_failed", "spec_reply_post_failed"):
-        return (isinstance(binding.get("issue_body"), str)
-                and isinstance(binding.get("adr_head"), str)
-                and (binding["adr_head"] == "" or bool(re.fullmatch(r"[0-9a-f]{40}", binding["adr_head"])))
-                and isinstance(binding.get("feedback"), str)
-                and bool(re.fullmatch(r"[0-9a-f]{64}", binding["feedback"])))
+    boundary = binding.get("comment_ids")
     return (binding.get("pr") == item
-            and all(isinstance(binding.get(key), str)
-                    for key in ("head", "base", "issue", "description", "feedback", "outcome"))
-            and bool(binding["base"]) and bool(re.fullmatch(r"[0-9a-f]{40}", binding["head"]))
+            and isinstance(boundary, list) and all(type(value) is int and value > 0 for value in boundary)
+            and len(set(boundary)) == len(boundary)
+            and all(isinstance(binding.get(key), str) for key in
+                    ("head", "base", "issue", "description", "feedback", "outcome", "author", "run_id"))
+            and bool(binding["base"]) and bool(binding["author"])
+            and bool(re.fullmatch(r"[0-9a-f]{40}", binding["head"]))
             and bool(re.fullmatch(r"[0-9a-f]{64}", binding["description"]))
             and bool(re.fullmatch(r"[0-9a-f]{64}", binding["feedback"]))
-            and binding["outcome"].startswith("REVIEW:")
-            and (binding["issue"] == "" or binding["issue"].isdecimal()))
+            and binding["outcome"].startswith(("REVIEW: pass", "REVIEW: changes"))
+            and (binding["issue"] == "" or binding["issue"].isascii() and binding["issue"].isdecimal()))
 
 
 def _binding_valid(reason, item, binding):
@@ -210,8 +206,8 @@ def _binding_valid(reason, item, binding):
                 and isinstance(binding.get("issue_body"), str)
                 and isinstance(binding.get("adr_head"), str)
                 and (binding["adr_head"] == "" or bool(re.fullmatch(r"[0-9a-f]{40}", binding["adr_head"]))))
-    if reason in COMMENT_POST_REASONS:
-        return _comment_post_valid(reason, item, binding)
+    if reason == REVIEW_POST:
+        return _comment_post_valid(item, binding)
     return (binding.get("pr") == item and type(binding.get("round")) is int and binding["round"] > 0
             and all(isinstance(binding.get(key), str) for key in
                     ("head", "base", "digest", "issue", "screenshot_digest"))
@@ -247,8 +243,33 @@ def load_retry(env, episode, reason, item=""):
 
 
 def restore_retry(env, episode, reason, item, pending):
-    """Keep a due attempt waiting when the authoritative read reports an owner pause."""
+    """Update the budget while keeping the saved operation unchanged."""
     atomic_json(retry_path(env, episode, reason, item), pending)
+
+
+def prepare_retry(env, episode, reason, item, binding):
+    """Save a new operation with its first deadline, before a write or after a failed read."""
+    episode, item = str(episode), str(item)
+    if not _binding_valid(reason, item, binding):
+        return None
+    waiting = {"reason": reason, "episode": episode, "item": item, "continuation": binding}
+    now = int(clock())
+    pending = {**waiting, "attempts": 0, "scheduled": now, "due": now + DELAYS[0]}
+    atomic_json(waiting_path(env, episode, reason, item), waiting)
+    restore_retry(env, episode, reason, item, pending)
+    notify.log(f"handoff-retry {reason} scheduled in {DELAYS[0]}s attempt=0/{MAX_ATTEMPTS} episode={episode}")
+    return pending
+
+
+def review_post_episodes(env):
+    """Find code-review operations by PR number, even if their review checkpoint is missing."""
+    found = {}
+    for path in Path(env.dirs.state).glob(f"handoff-*-{REVIEW_POST}.json"):
+        match = re.fullmatch(rf"handoff-(?:waiting|retry)-([0-9]+)(?:-([0-9]+))?-{REVIEW_POST}\.json", path.name)
+        if match:
+            episode, item = match.groups()
+            found.setdefault(item or episode, set()).add(episode)
+    return found
 
 
 def _clear_path(path):
@@ -342,13 +363,8 @@ def _category1(env, reason, entry, *, kind, number, title, text, hooks, remove, 
         return Result(DEFER, handed_off=False, continuation=pending["continuation"])
 
     binding = continuation if continuation is not None else {}
-    if not _binding_valid(reason, item, binding):
+    if prepare_retry(env, episode, reason, item, binding) is None:
         return finish()
-    waiting = {"reason": reason, "episode": episode, "item": item, "continuation": binding}
-    delay = DELAYS[0]
-    atomic_json(waiting_path(env, episode, reason, item), waiting)
-    atomic_json(path, {**waiting, "attempts": 0, "scheduled": now, "due": now + delay})
-    notify.log(f"handoff-retry {reason} scheduled in {delay}s attempt=0/{MAX_ATTEMPTS} episode={episode}")
     return Result(DEFER, handed_off=False, continuation=binding)
 
 

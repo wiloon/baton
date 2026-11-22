@@ -168,12 +168,8 @@ def review_binding(pr):
 def post_binding(pr, body="<!-- baton-review round=1 by=claude -->\npass"):
     return {"pr": pr, "round": 1, "head": "a" * 40, "base": "main", "issue": "9",
             "body": body, "digest": handoff.body_digest(body), "description": "c" * 64,
-            "feedback": "d" * 64, "outcome": "REVIEW: changes"}
-
-
-def spec_post_binding(body="<!-- baton-spec-review round=1 by=claude -->\nok"):
-    return {"round": 1, "body": body, "digest": handoff.body_digest(body),
-            "issue_body": "Goal\n", "adr_head": "", "feedback": "e" * 64}
+            "feedback": "d" * 64, "outcome": "REVIEW: changes", "run_id": "",
+            "comment_ids": [], "author": "owner", "reviewer": "claude"}
 
 
 def test_category_1_retry_waits_until_due_then_consumes_an_attempt(env, monkeypatch):
@@ -313,8 +309,7 @@ def test_damage_to_a_waiting_review_hands_off_once(env, monkeypatch, damage):
 def test_every_category_1_reason_is_rule_mode_with_retry_budget():
     assert handoff.RETRY_REASONS == {
         "review_comment_missing", "spec_comments_read_failed", "spec_pending_adr_read_failed",
-        "review_comment_post_failed", "screenshot_comment_post_failed",
-        "spec_review_comment_post_failed", "spec_reply_post_failed",
+        "review_comment_post_failed",
     }
     for reason in handoff.RETRY_REASONS:
         entry = handoff.REASONS[reason]
@@ -326,9 +321,6 @@ def test_every_category_1_reason_is_rule_mode_with_retry_budget():
     ("spec_comments_read_failed", {}),
     ("spec_pending_adr_read_failed", {"step": "discovery"}),
     ("review_comment_post_failed", post_binding("1")),
-    ("screenshot_comment_post_failed", post_binding("1", "<!-- baton-screenshot-review round=1 by=claude -->\nok")),
-    ("spec_review_comment_post_failed", spec_post_binding()),
-    ("spec_reply_post_failed", spec_post_binding("<!-- baton-spec-reply round=1 by=claude -->\nok")),
 ])
 def test_each_category_1_reason_defers_then_hands_off_through_perform(env, monkeypatch, reason, binding):
     """Every replayed read or comment post shares the same budget: no advisor, two later attempts, then handoff."""

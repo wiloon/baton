@@ -351,111 +351,11 @@ class Spec:
         return self.retry_read(lambda: read_issue(self.env, self.issue),
                                "Could not read the issue and its comments.", "spec_comments_read_failed")
 
-    def post(self, body, failed, reason=""):
-        """Post a trusted issue comment. Category-1 reasons use the shared write budget (#151)."""
-        n = self.issue
-        if reason not in owner_handoff.COMMENT_POST_REASONS:
-            posted = self.gh("issue", "comment", n, "--body", body)
-            if posted.returncode == 0:
-                return True
-            notify.log(f"#{n}: {failed}{pr_helpers.why(posted)}")
-            if reason:
-                self.handoff(f"{failed}{pr_helpers.why(posted)}", reason)
-            return False
-
-        try:
-            pending = owner_handoff.load_retry(self.env, n, reason)
-        except owner_handoff.RetryUnreadable as exc:
-            notify.log(f"#{n}: {reason} retry unreadable: {exc}")
-            self.handoff(f"{failed} (saved retry unreadable)", reason)
-            return False
-
-        binding = pending["continuation"] if pending else None
-        if pending:
-            result = self.handoff(failed, reason, resume=True)
-            if result.action == owner_handoff.DEFER:
-                raise Deferred("handoff-retry", reason, lends_slot=False)
-            if result.action != owner_handoff.RETRY:
-                return False
-            binding = result.continuation or binding
-            body = binding["body"]
-
-        def feedback_digest(comments):
-            parts = [(c.get("body") or "") for c in comments or ()
-                     if (c.get("author") or {}).get("login") == self.env.owner
-                     and not (c.get("body") or "").startswith("<!-- baton")]
-            return owner_handoff.body_digest("\n".join(parts))
-
-        def presence(comments):
-            want = body.strip()
-            matched = [c for c in comments or () if isinstance(c, dict) and (c.get("body") or "").strip() == want]
-            if any((c.get("author") or {}).get("login") == self.env.owner for c in matched):
-                return True
-            if matched:
-                return None
-            return False
-
-        data, transient = read_issue(self.env, n)
-        if data is None:
-            if binding is None or not transient:
-                self.handoff(f"{failed} (could not read the issue)", reason)
-                return False
-            result = self.handoff(failed, reason, transient=True, continuation=binding)
-            if result.action == owner_handoff.DEFER:
-                raise Deferred("handoff-retry", reason, lends_slot=False)
-            return False
-
-        match = re.search(r"round=(\d+)", body)
-        round = int(match.group(1)) if match else 0
-        if binding is None:
-            if round <= 0:
-                self.handoff(f"{failed} (comment has no round)", reason)
-                return False
-            binding = {
-                "round": round, "body": body, "digest": owner_handoff.body_digest(body),
-                "issue_body": data["body"], "adr_head": getattr(self, "adr_head", "") or "",
-                "feedback": feedback_digest(data.get("comments")),
-            }
-        else:
-            if data["body"] != binding["issue_body"]:
-                self.handoff(f"{failed} (issue body changed while waiting)", reason)
-                return False
-            if (getattr(self, "adr_head", "") or "") != binding["adr_head"] and binding["adr_head"]:
-                # ADR head is revalidated when known; an empty saved head allows first discovery.
-                if getattr(self, "adr_head", "") or "":
-                    self.handoff(f"{failed} (ADR head changed while waiting)", reason)
-                    return False
-            if feedback_digest(data.get("comments")) != binding["feedback"]:
-                self.handoff(f"{failed} (owner feedback changed while waiting)", reason)
-                return False
-            found = presence(data.get("comments"))
-            if found is True:
-                owner_handoff.clear_retry(self.env, n, reason)
-                return True
-            if found is None:
-                result = self.handoff(failed, reason, transient=True, continuation=binding)
-                if result.action == owner_handoff.DEFER:
-                    raise Deferred("handoff-retry", reason, lends_slot=False)
-                return False
-
-        posted = self.gh("issue", "comment", n, "--body", body)
+    def post(self, body, failed):
+        posted = self.gh("issue", "comment", self.issue, "--body", body)
         if posted.returncode == 0:
-            owner_handoff.clear_retry(self.env, n, reason)
             return True
-        refreshed, _ = read_issue(self.env, n)
-        found = presence((refreshed or {}).get("comments")) if refreshed is not None else None
-        if found is True:
-            owner_handoff.clear_retry(self.env, n, reason)
-            return True
-        if not pr_helpers.transient(posted) and found is not None:
-            self.handoff(f"{failed}{pr_helpers.why(posted)}", reason)
-            return False
-        if found is None and not pr_helpers.transient(posted):
-            self.handoff(f"{failed}{pr_helpers.why(posted)}", reason)
-            return False
-        result = self.handoff(f"{failed}{pr_helpers.why(posted)}", reason, transient=True, continuation=binding)
-        if result.action == owner_handoff.DEFER:
-            raise Deferred("handoff-retry", reason, lends_slot=False)
+        notify.log(f"#{self.issue}: {failed}{pr_helpers.why(posted)}")
         return False
 
     def worktree(self):
@@ -587,8 +487,7 @@ class Spec:
             if not self.post(f"<!-- baton-spec-review round={round} by={reviewer} -->\n"
                              f"## Spec review ({reviewer}), round {round}: accept refused by the runner\n\n"
                              f"{reviewer} accepted, but the issue body breaks the runner's rules:\n\n{points}\n\n"
-                             f"{mode_note}{reply[:REPLY_CAP]}", f"posting the refused accept of {reviewer} failed",
-                             "spec_review_comment_post_failed"):
+                             f"{mode_note}{reply[:REPLY_CAP]}", f"posting the refused accept of {reviewer} failed"):
                 return "stop"
             if not self.at_limit(round, max_rounds, reviewer, points, context,
                                  f"{reviewer} accepted, but the issue body breaks the runner's rules after {round} spec rounds."):
@@ -597,7 +496,7 @@ class Spec:
         if outcome.startswith("SPEC: changes"):
             if not self.post(f"<!-- baton-spec-review round={round} by={reviewer} -->\n"
                              f"## Spec review ({reviewer}), round {round}\n\n{mode_note}{reply[:REPLY_CAP]}",
-                             f"posting {reviewer}'s spec review failed", "spec_review_comment_post_failed"):
+                             f"posting {reviewer}'s spec review failed"):
                 return "stop"
             if not self.at_limit(round, max_rounds, reviewer, reply[:REPLY_CAP], context,
                                  f"{reviewer} still has points after {round} spec rounds."):
@@ -668,7 +567,7 @@ class Spec:
         """Post the saved verdict and make the issue runnable. Keeps pending acceptance if the
         verdict write fails so a later tick can finish after the ADR PR is merged."""
         n = self.issue
-        if not self.post(verdict, "posting the accept verdict failed", "spec_accept_post_failed"):
+        if not self.post(verdict, "posting the accept verdict failed"):
             return "stop"
         self.gh("issue", "edit", n, "--remove-label", "needs-triage", "--add-label", "ready-for-agent")
         merge.remove_worktree(self.repo_dir, self.wt)
@@ -759,9 +658,10 @@ class Spec:
         verdict = self.accept_verdict(reviewer, round, mode_note, reply[:REPLY_CAP])
         if pr:
             pending = f"<!-- baton-spec-accept-pending pr={pr} head={self.adr_head} -->\n{verdict}"
-            if not self.post(pending, f"posting pending acceptance for ADR PR #{pr} failed",
-                             "spec_pending_accept_post_failed"):
-                return "stop"   # post() already handed off once
+            if not self.post(pending, f"posting pending acceptance for ADR PR #{pr} failed"):
+                self.handoff(f"{reviewer} accepted, but posting pending acceptance failed.",
+                             "spec_pending_accept_post_failed")
+                return "stop"
             return self.merge_adr_and_publish(pr, verdict, reviewer=reviewer)
         return self.publish_accept(verdict)
 
@@ -849,7 +749,7 @@ class Spec:
         adr = f"\nADR revisions: #{self.pr}\n" if self.pr else ""
         if not self.post(f"<!-- baton-spec-reply round={round}{human} by={reviser} -->\n"
                          f"## Spec reply ({reviser}), round {round}\n{adr}\n{mode_note}{text}",
-                         f"posting {reviser} spec reply failed", "spec_reply_post_failed"):
+                         f"posting {reviser} spec reply failed"):
             return "stop"
         for leftover in Path("/tmp").glob(f"baton-spec-{n}-{round}.*"):
             leftover.unlink()
@@ -867,16 +767,6 @@ class Spec:
         ISSUE_PAYLOAD is an already-fetched {title, body, comments} from a recovered read (#151).
         """
         n, env = self.issue, self.env
-        for post_reason in ("spec_review_comment_post_failed", "spec_reply_post_failed"):
-            try:
-                post_waiting = owner_handoff.load_retry(env, n, post_reason)
-            except owner_handoff.RetryUnreadable:
-                self.handoff("Could not read the saved comment post.", post_reason)
-                return False
-            if post_waiting:
-                if not self.post(post_waiting["continuation"]["body"], "resuming the comment post", post_reason):
-                    return False
-                break
         reason = "spec_pending_adr_read_failed"
         try:
             waiting = owner_handoff.load_retry(env, n, reason)

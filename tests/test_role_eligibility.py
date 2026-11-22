@@ -233,7 +233,7 @@ def test_saved_reviewer_is_reselected_after_losing_role(gh, worktree, tmp_path, 
                 "WT_ROOT": str(tmp_path / "worktrees"), "REPO_DIR": str(worktree.repo),
                 "MAX_REVIEW_ROUNDS": "2", "STATE": str(state), "HOME": str(tmp_path)})
     gh.set(headRefName="issue-297", author={"login": "owner"}, state="OPEN", baseRefName="main",
-           headRefOid=sh(worktree.wt, "git", "rev-parse", "HEAD"), body="Refs #297", comments=[])
+           headRefOid=sh(worktree.wt, "git", "rev-parse", "HEAD"), body="Refs #297", comments=[], labels=[])
     agents = []
     monkeypatch.setattr(pick.settle, "probe", lambda *a: None)
     monkeypatch.setattr(review.dispatch, "dispatch", lambda vendor, role, *r, **k: agents.append((vendor, role)) or {

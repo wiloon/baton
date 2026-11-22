@@ -117,7 +117,8 @@ def review_context(env, pr, issue, data=None):
             login = (comment.get("author") or {}).get("login") or ""
             if kept(login):
                 lines.append(f'<pr-comment author="{login}">\n{cut(comment.get("body"), limit)}\n</pr-comment>')
-    for comment in paginated(["api", f"repos/{repo}/pulls/{pr}/comments", "--paginate"]):
+    inline = data.get("inline") if data is not None else None
+    for comment in inline if inline is not None else paginated(["api", f"repos/{repo}/pulls/{pr}/comments", "--paginate"]):
         login = (comment.get("user") or {}).get("login") or ""
         if kept(login):
             line = comment.get("line") if comment.get("line") is not None else comment.get("original_line")
@@ -289,165 +290,188 @@ class Review:
             transient=transient, continuation=continuation, resume=resume)
 
     BINDING_FIELDS = ("reviewed_head", "base_branch", "reviewed_issue", "verdict_digest",
-                      "verdict_round", "screenshot_digest", "feedback_waiting", "post_waiting")
+                      "verdict_round", "screenshot_digest", "feedback_waiting", "post_waiting", "post_outcome")
     REVISION_FIELDS = "headRefOid,baseRefName,headRefName,state,body,closingIssuesReferences"
 
-    @staticmethod
-    def owner_feedback_digest(comments, owner):
-        parts = [(c.get("body") or "") for c in comments or ()
-                 if (c.get("author") or {}).get("login") == owner
-                 and not (c.get("body") or "").startswith("<!-- baton")]
-        return owner_handoff.body_digest("\n".join(parts))
+    def read_post_inputs(self, *, once=False):
+        """Read the PR and complete comment history used to bind or reconcile a code-review post."""
+        data, _ = self.read_pr("title,labels", once=once)
+        if data is None:
+            return None, "retry"
+        if data["state"] != "OPEN":
+            return None, "superseded"
+        labels = data.get("labels")
+        if not isinstance(labels, list) or any(not isinstance(label, dict) or not isinstance(label.get("name"), str)
+                                               for label in labels):
+            return None, "retry"
+        if any(label.get("name") == "ready-for-human" for label in labels):
+            return None, "paused"
+        request = pr_helpers.call if once else pr_helpers.gh
+        for field, route, resource in (("comments", "issues", "comments"), ("reviews", "pulls", "reviews"),
+                                       ("inline", "pulls", "comments")):
+            result = request("api", f"repos/{self.repo}/{route}/{self.pr}/{resource}", "--paginate", "--slurp")
+            if result.returncode != 0:
+                return None, "retry"
+            try:
+                pages = json.loads(result.stdout)
+                if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+                    return None, "retry"
+                rows = [row for page in pages for row in page]
+                if any(type(row["id"]) is not int or row["id"] <= 0
+                       or (row["user"] is not None and not isinstance(row["user"]["login"], str))
+                       or (not isinstance(row["body"], str) and not (field == "reviews" and row["body"] is None))
+                       or (field == "reviews" and not isinstance(row["state"], str)) for row in rows):
+                    return None, "retry"
+                if len({row["id"] for row in rows}) != len(rows):
+                    return None, "retry"
+                data[field] = [{**row, "author": row["user"], "body": row["body"] or ""} for row in rows]
+            except (ValueError, KeyError, TypeError):
+                return None, "retry"
+        return data, "ok"
 
-    def trusted_comment_state(self, body, comments=None):
-        """True when the trusted author posted BODY, False when absent, None when unreadable."""
-        if comments is None:
-            data, _ = self.read_pr("comments")
-            if not data:
-                return None
-            if data["state"] != "OPEN":
-                return False
-            comments = data.get("comments") or ()
-        want = body.strip()
-        matched = [c for c in comments if isinstance(c, dict) and (c.get("body") or "").strip() == want]
-        if any((c.get("author") or {}).get("login") == self.owner for c in matched):
-            return True
-        if matched:
-            return None
-        return False
+    def owner_feedback_digest(self, data):
+        rows = [
+            (kind, row["id"], row["state"] if kind == "reviews" else "", row["body"])
+            for kind in ("comments", "reviews", "inline")
+            for row in data[kind]
+            if (row["author"] or {}).get("login") == self.owner and not row["body"].startswith("<!-- baton")
+        ]
+        return owner_handoff.body_digest(json.dumps(sorted(rows)))
 
-    def comment_post_binding(self, body, round, outcome, data):
-        issue = data.get("linked_issue")
-        if issue is None:
-            issue = "" if self.binding_fields.get("reviewed_issue") == "none" else (
-                self.binding_fields.get("reviewed_issue") or self.issue or "")
+    def comment_post_binding(self, body, round, outcome, reviewer, head, data):
         return {
-            "pr": str(self.pr), "round": round,
-            "head": data["headRefOid"], "base": data["baseRefName"],
-            "issue": "" if issue in ("", "none") else str(issue),
+            "pr": str(self.pr), "round": round, "reviewer": reviewer, "author": self.owner,
+            "head": head, "base": data["baseRefName"], "issue": data["linked_issue"],
             "body": body, "digest": owner_handoff.body_digest(body),
-            "description": owner_handoff.body_digest(data.get("body") or ""),
-            "feedback": self.owner_feedback_digest(data.get("comments"), self.owner),
-            "outcome": outcome,
+            "description": owner_handoff.body_digest(data["body"]),
+            "feedback": self.owner_feedback_digest(data),
+            "comment_ids": [row["id"] for row in data["comments"]],
+            "outcome": outcome, "run_id": self.hooks.last_run_id(),
         }
 
-    def revalidate_comment_post(self, binding, data):
-        if data["state"] != "OPEN":
-            return "superseded"
-        if any(label.get("name") == "ready-for-human" for label in data.get("labels") or ()):
-            return "paused"
-        if (data["headRefOid"], data["baseRefName"], data.get("linked_issue") or "") != (
-                binding["head"], binding["base"], binding["issue"]):
+    def check_comment_post(self, binding, round, reviewer, *, sending):
+        data, status = self.read_post_inputs(once=True)
+        if status != "ok":
+            return status
+        if (self.values.get("step") != "review" or self.binding_fields.get("verdict_round") != str(round)
+                or (round, reviewer, self.owner) != (binding["round"], binding["reviewer"], binding["author"])
+                or git(self.wt, "rev-parse", "HEAD") != binding["head"]
+                or (data["headRefOid"], data["baseRefName"], data["linked_issue"]) !=
+                    (binding["head"], binding["base"], binding["issue"])
+                or owner_handoff.body_digest(data["body"]) != binding["description"]
+                or self.owner_feedback_digest(data) != binding["feedback"]):
             return "changed"
-        if owner_handoff.body_digest(data.get("body") or "") != binding["description"]:
+        boundary = set(binding["comment_ids"])
+        matches = []
+        for row in data["comments"]:
+            if row["id"] in boundary:
+                continue
+            trusted = (row["author"] or {}).get("login") == binding["author"]
+            if row["body"] == binding["body"]:
+                matches.append(trusted)
+            elif trusted and row["body"].startswith("<!-- baton-review round="):
+                return "changed"
+        if not matches:
+            return "absent"
+        if sending and matches == [True]:
             return "changed"
-        if self.owner_feedback_digest(data.get("comments"), self.owner) != binding["feedback"]:
-            return "changed"
-        return "ok"
+        return "landed" if matches == [True] else "ambiguous"
 
-    def post_review_comment(self, body, round, outcome, reason, digest_field, data=None):
-        """Post or resume a review/screenshot comment under the category-1 write budget (#151).
+    def post_pending(self):
+        return (self.binding_fields.get("post_waiting") or self.binding_fields.get("post_outcome")
+                or str(self.pr) in owner_handoff.review_post_episodes(self.env))
 
-        DATA is the PR payload already read for this attempt; a resume always revalidates live.
-        """
-        pr = str(self.pr)
-        episode = self.issue or pr
+    def post_review_comment(self, round, reviewer, binding=None):
+        """Save before sending, or consume a due attempt before reconciling the saved write."""
+        pr, episode, reason = str(self.pr), self.issue or self.pr, owner_handoff.REVIEW_POST
         title = f"PR #{pr} comment post failed"
         text = f"Posting the review comment of round {round} failed. {self.url}"
 
-        def stop(message=text):
-            self.handoff(reason, title, message)
+        def stop(message):
+            self.handoff(reason, title, f"{text} {message}")
             return self.failed(ALREADY, "RESULT: failed posting review")
 
-        def settled(result):
-            # A handoff that already labelled and notified is terminal: do not hand off twice.
-            if result.handed_off:
-                return self.failed(ALREADY, "RESULT: failed posting review")
-            return stop()
-
+        initial = binding is not None
+        completed = self.binding_fields.get("post_outcome")
+        if completed and (not completed.startswith(REVIEWED) or self.values.get("step") != "review"
+                          or self.binding_fields.get("verdict_round") != str(round)
+                          or not re.fullmatch(r"[0-9a-f]{64}", self.binding_fields.get("verdict_digest", ""))):
+            return stop("The saved verdict is invalid.")
         try:
             pending = owner_handoff.load_retry(self.env, episode, reason, pr)
         except owner_handoff.RetryUnreadable as exc:
-            notify.log(f"PR #{pr}: {reason} retry unreadable: {exc}")
-            return stop()
-
-        binding = pending["continuation"] if pending else None
-        if pending:
+            if not completed:
+                return stop(str(exc))
+            # The post was confirmed before cleanup began. Its two files can be partly gone.
+            owner_handoff.clear_retry(self.env, episode, reason, pr)
+            pending = None
+        if initial:
+            self.save_binding(post_waiting=reason)
+            if pending is not None:
+                return DEFERRED_POST
+            pending = owner_handoff.prepare_retry(self.env, episode, reason, pr, binding)
+            if pending is None:
+                return stop("The worker inputs could not be saved.")
+        elif not completed:
             result = self.handoff(reason, title, text, resume=True)
             if result.action == owner_handoff.DEFER:
                 return DEFERRED_POST
             if result.action != owner_handoff.RETRY:
                 return self.failed(ALREADY, "RESULT: failed posting review")
-            binding = result.continuation or binding
-            body, outcome = binding["body"], binding["outcome"]
-            data = None
+            binding = result.continuation
 
-        retryable = False
-        if data is None:
-            data, retryable = self.read_pr("comments,labels")
-        if data is None:
-            if binding is None or not retryable:
-                return stop()
-            self.save_binding(post_waiting=reason)
-            result = self.handoff(reason, title, text, transient=True, continuation=binding)
-            return DEFERRED_POST if result.action == owner_handoff.DEFER else settled(result)
-
-        if data["state"] != "OPEN":
+        def finish():
+            self.save_binding(post_outcome=binding["outcome"], verdict_digest=binding["digest"])
+            self.hooks.verdict("review", binding["reviewer"], binding["head"], binding["round"],
+                               binding["outcome"], binding["body"], run_id=binding["run_id"])
             owner_handoff.clear_retry(self.env, episode, reason, pr)
             self.save_binding(post_waiting="")
-            return self.failed(ALREADY, "RESULT: failed PR closed during comment post") if pending else stop(
-                f"PR #{pr} is no longer open. {self.url}")
+            return binding["outcome"]
 
-        if binding is not None:
-            state = self.revalidate_comment_post(binding, data)
-            if state == "superseded":
-                owner_handoff.clear_retry(self.env, episode, reason, pr)
+        if completed:
+            if pending is None:
                 self.save_binding(post_waiting="")
-                return self.failed(ALREADY, "RESULT: failed PR closed during comment post")
-            if state == "paused":
-                if pending:
-                    owner_handoff.restore_retry(self.env, episode, reason, pr, pending)
+                return completed
+            binding = pending["continuation"]
+            if (completed, self.binding_fields.get("verdict_digest")) != (binding["outcome"], binding["digest"]):
+                return stop("The saved verdict differs from its post.")
+            return finish()
+
+        def reconcile(*, sending=False):
+            nonlocal status
+            status = self.check_comment_post(binding, round, reviewer, sending=sending)
+            return status
+
+        status = reconcile(sending=initial)
+        posted = None
+        if status == "absent":
+            posted = pr_helpers.gh("pr", "comment", pr, "-R", self.repo, "--body", binding["body"],
+                                   reconcile=reconcile)
+            if posted.returncode == 0:
+                return finish()
+        if status == "landed":
+            return finish()
+        if status == "superseded":
+            owner_handoff.clear_retry(self.env, episode, reason, pr)
+            advisor.finish_episode(self.env, "pr", pr, "superseded")
+            return self.failed(ALREADY, "RESULT: failed PR closed during comment post")
+        if status == "paused":
+            owner_handoff.restore_retry(self.env, episode, reason, pr, pending)
+            return DEFERRED_POST
+        if status == "retry" or status == "absent" and posted is not None and pr_helpers.transient(posted):
+            attempts = pending["attempts"] + (0 if initial else 1)
+            if attempts < owner_handoff.MAX_ATTEMPTS:
+                now = int(owner_handoff.clock())
+                owner_handoff.restore_retry(self.env, episode, reason, pr,
+                                            {**pending, "attempts": attempts, "scheduled": now,
+                                             "due": now + owner_handoff.DELAYS[attempts]})
                 return DEFERRED_POST
-            if state == "changed":
-                return stop(f"PR #{pr} inputs changed while the comment post waited. {self.url}")
-            presence = self.trusted_comment_state(body, data.get("comments"))
-            if presence is True:
-                owner_handoff.clear_retry(self.env, episode, reason, pr)
-                self.save_binding(post_waiting="")
-                self.capture_feedback(body, digest_field)
-                return outcome
-            if presence is None:
-                self.save_binding(post_waiting=reason)
-                result = self.handoff(reason, title, text, transient=True, continuation=binding)
-                return DEFERRED_POST if result.action == owner_handoff.DEFER else settled(result)
+        return stop(f"Reconciliation: {status}." + (pr_helpers.why(posted) if posted is not None else ""))
 
-        if binding is None:
-            binding = self.comment_post_binding(body, round, outcome, data)
-
-        posted = pr_helpers.gh("pr", "comment", str(pr), "-R", self.repo, "--body", body)
-        if posted.returncode == 0:
-            owner_handoff.clear_retry(self.env, episode, reason, pr)
-            self.save_binding(post_waiting="")
-            self.capture_feedback(body, digest_field)
-            return outcome
-
-        presence = self.trusted_comment_state(body)
-        if presence is True:
-            owner_handoff.clear_retry(self.env, episode, reason, pr)
-            self.save_binding(post_waiting="")
-            self.capture_feedback(body, digest_field)
-            return outcome
-        if not pr_helpers.transient(posted) and presence is not None:
-            return stop(f"{text}{pr_helpers.why(posted)}")
-        if presence is None and not pr_helpers.transient(posted):
-            return stop(f"{text}{pr_helpers.why(posted)}")
-        self.save_binding(post_waiting=reason)
-        result = self.handoff(reason, title, text + pr_helpers.why(posted), transient=True, continuation=binding)
-        return DEFERRED_POST if result.action == owner_handoff.DEFER else settled(result)
-
-    def read_pr(self, more):
+    def read_pr(self, more, *, once=False):
         fields = f"{self.REVISION_FIELDS},{more}"
-        result = pr_helpers.gh("pr", "view", str(self.pr), "-R", self.repo, "--json", fields)
+        request = pr_helpers.call if once else pr_helpers.gh
+        result = request("pr", "view", str(self.pr), "-R", self.repo, "--json", fields)
         if result.returncode != 0:
             return None, pr_helpers.transient(result)
         try:
@@ -457,11 +481,12 @@ class Review:
             if data["state"] == "OPEN":
                 if (not re.fullmatch(r"[0-9a-f]{40}", data["headRefOid"])
                         or not isinstance(data["baseRefName"], str) or not data["baseRefName"]
-                        or not isinstance(data["headRefName"], str) or not isinstance(data["body"], str)
-                        or not isinstance(data["comments"], list)):
+                        or not isinstance(data["headRefName"], str) or not isinstance(data["body"], str)):
                     return None, False
                 if any(not isinstance(comment, dict) or not isinstance(comment.get("body"), str)
-                       or not isinstance(comment.get("author") or {}, dict) for comment in data["comments"]):
+                       or not isinstance(comment.get("author") or {}, dict) for comment in data.get("comments", [])):
+                    return None, False
+                if "comments" in more.split(",") and not isinstance(data.get("comments"), list):
                     return None, False
                 data["linked_issue"] = pr_helpers.linked_task(data, self.repo)[0]
             return data, False
@@ -598,12 +623,11 @@ class Review:
             notify.log(f"PR #{self.pr}: commit {commit} has no known vendor; not counted")
 
     # --- one reviewer run ---
-    def cursor_review(self, round, note, context, data):
+    def cursor_review(self, round, note, context, data, head):
         """Cursor reviews a PR the owner wrote with Claude (principle P-4). Read-only, so the
         runner posts its review as <!-- baton-review round=N by=cursor -->.
         Returns (outcome, reply)."""
         pr, wt = self.pr, self.wt
-        head = git(wt, "rev-parse", "HEAD")
         out = self.agent("cursor", "review", self.render(
             "cursor-review-prompt.md", PR=str(pr), GH_REPO=self.repo, WORKTREE=str(wt), ROUND=str(round),
             MAX_ROUNDS=str(self.max_rounds), ROUND_NOTE=note, CONTEXT_FILE=str(context),
@@ -617,9 +641,8 @@ class Review:
             return outcome, reply
         posted = "\n".join(line for line in strip_markers(reply).split("\n") if not MARKER_LINE.match(line)).rstrip("\n")
         body = f"<!-- baton-review round={round} by=cursor -->\n{posted[:REPLY_CAP]}"
-        posted_outcome = self.post_review_comment(
-            body, round, outcome, "review_comment_post_failed", "verdict_digest", data=data)
-        return posted_outcome, reply
+        binding = self.comment_post_binding(body, round, outcome, "cursor", head, data)
+        return self.post_review_comment(round, "cursor", binding), reply
 
     def run_review(self, round, note, reviewer=None):
         """One reviewer run; returns OUTCOME. Use the loop's selected reviewer when supplied.
@@ -627,22 +650,12 @@ class Review:
         Deferred when the reviewer cannot run now."""
         pr, wt = self.pr, self.wt
         self.hooks.round = round
-        reason = "review_comment_post_failed"
-        try:
-            pending_post = owner_handoff.load_retry(self.env, self.issue or pr, reason, pr)
-        except owner_handoff.RetryUnreadable as exc:
-            notify.log(f"PR #{pr}: {reason} retry unreadable: {exc}")
-            self.handoff(reason, f"PR #{pr} comment post failed",
-                         f"Could not read the saved comment post. {self.url}")
-            return self.failed(ALREADY, "RESULT: failed posting review")
-        if pending_post is not None:
-            return self.post_review_comment(pending_post["continuation"]["body"], round,
-                                            pending_post["continuation"]["outcome"], reason, "verdict_digest")
         head = git(wt, "rev-parse", "HEAD") or ""
         if not self.seed():
             return self.failed("review_author_state_failed", "RESULT: failed recording PR authors")
         if reviewer is None:
             reviewer = self.review_vendor("pool")
+        self.values.update(round=round, step="review", reviewer=reviewer)
         followup = self.review_followup(round, reviewer)
         expected = self.env.config.models.route("review", reviewer, followup=followup).model
         if not self.review_allowed(reviewer, expected):
@@ -659,12 +672,14 @@ class Review:
             skill = ("Review the diff yourself, following AGENTS.md; no Claude plugins or hooks are available, "
                      "so don't read the `code-review` skill.")
         context = Path(self.ctx, f"pr-{pr}-review-{round}-{time.strftime('%Y%m%d-%H%M%S')}.md")
-        data, _ = self.read_pr("title,comments,reviews")
-        if not data or data["state"] != "OPEN":
+        data, status = self.read_post_inputs()
+        if status == "paused":
+            return DEFERRED_POST
+        if not data or data["headRefOid"] != head:
             return self.failed("review_comment_missing", "RESULT: failed reading the PR revision for review")
         self.save_binding(reviewed_head=head, base_branch=data["baseRefName"], reviewed_issue=data["linked_issue"] or "none",
                           verdict_round=str(round), verdict_digest="", screenshot_digest="", feedback_waiting="",
-                          post_waiting="")
+                          post_waiting="", post_outcome="")
         text = review_context(self.env, pr, data["linked_issue"], data=data)
         try:
             pr_helpers.preflight(pr)
@@ -673,8 +688,7 @@ class Review:
                      "runner artifact.\n</runner-preflight>\n")
         context.write_text(text)
         if reviewer == "cursor":
-            outcome, reply = self.cursor_review(round, note, context, data)
-            self.hooks.verdict("review", "cursor", head, round, outcome, reply)
+            outcome, _ = self.cursor_review(round, note, context, data, head)
             return outcome
         review_file = Path(f"/tmp/baton-review-{pr}-{round}.md")
         review_file.unlink(missing_ok=True)
@@ -697,11 +711,10 @@ class Review:
             if review_file.is_file() and review_file.stat().st_size:
                 body = strip_markers(review_file.read_text()).rstrip("\n")
                 posted_body = f"<!-- baton-review round={round} by={reviewer} -->\n{review_note}{body}"
-                outcome = self.post_review_comment(
-                    posted_body, round, outcome, reason, "verdict_digest", data=data)
+                binding = self.comment_post_binding(posted_body, round, outcome, reviewer, head, data)
+                return self.post_review_comment(round, reviewer, binding)
             else:
                 outcome = self.failed("review_run_failed", "RESULT: failed no review artifact")
-        self.hooks.verdict("review", reviewer, head, round, outcome, out["reply"] or "", str(review_file))
         return outcome
 
     # --- the screenshot review (#67): its own run after a successful code review ---
@@ -732,17 +745,6 @@ class Review:
         cannot run now. It never hands the PR over: the loop does, once, on a failed outcome."""
         pr, wt = self.pr, self.wt
         self.hooks.round = round
-        reason = "screenshot_comment_post_failed"
-        try:
-            pending_post = owner_handoff.load_retry(self.env, self.issue or pr, reason, pr)
-        except owner_handoff.RetryUnreadable as exc:
-            notify.log(f"PR #{pr}: {reason} retry unreadable: {exc}")
-            self.handoff(reason, f"PR #{pr} comment post failed",
-                         f"Could not read the saved screenshot comment post. {self.url}")
-            return self.failed(ALREADY, "RESULT: failed posting screenshot review")
-        if pending_post is not None:
-            return self.post_review_comment(pending_post["continuation"]["body"], round,
-                                            pending_post["continuation"]["outcome"], reason, "screenshot_digest")
         head = git(wt, "rev-parse", "HEAD") or ""
         vendor = self.screenshot_vendor()
         cfg = self.env.config
@@ -774,15 +776,11 @@ class Review:
                         if vendor == "codex" and "codex" in vendors.review_excluded(self.state, pr, self.fixed_by) else "")
                 review_note = f"Review mode: {mode} (codex/{model}).\n\n" if mode else ""
                 posted_body = f"<!-- baton-screenshot-review round={round} by={vendor} -->\n{review_note}{body}"
-                data, _ = self.read_pr("comments,labels")
-                if not data:
-                    # Inputs for the write budget must be captured before posting.
-                    self.handoff(reason, f"PR #{pr} comment post failed",
-                                 f"Could not read the PR to post the screenshot review. {self.url}")
-                    outcome = self.failed(ALREADY, "RESULT: failed posting screenshot review")
+                posted = pr_helpers.gh("pr", "comment", str(pr), "-R", self.repo, "--body", posted_body)
+                if posted.returncode != 0:
+                    outcome = self.failed("screenshot_comment_post_failed", "RESULT: failed posting screenshot review")
                 else:
-                    outcome = self.post_review_comment(
-                        posted_body, round, outcome, reason, "screenshot_digest", data=data)
+                    self.capture_feedback(posted_body, "screenshot_digest")
             else:
                 outcome = self.failed("screenshot_run_failed", "RESULT: failed no screenshot review artifact")
         self.hooks.verdict("screenshot_review", vendor, head, round, outcome, out["reply"] or "", str(review_file))
@@ -845,13 +843,15 @@ class Review:
                                    self.BINDING_FIELDS}
         else:
             self.binding_fields = {}
+        pending_post = self.post_pending()
         cfg = self.env.config
-        if reviewer not in ("pool",) and (reviewer not in cfg.declared() or not cfg.allows(reviewer, "reviewer")):
+        if (not pending_post and reviewer != "pool"
+                and (reviewer not in cfg.declared() or not cfg.allows(reviewer, "reviewer"))):
             reviewer = "pool"
         resuming_fix = step == "fix"
-        if not resuming_fix and self.seed():
+        if not (resuming_fix or pending_post) and self.seed():
             self.seed_contrib()
-        if not saved:
+        if not saved and not pending_post:
             self.label("--remove-label", "ready-for-human")
         while True:
             self.hooks.round = round
@@ -869,20 +869,24 @@ class Review:
                                code_verdict=code_verdict, screenshot=screenshot, screenshot_checks=checks,
                                extra="1" if extra else "", **self.binding_fields)
             self.save()
-            if step in ("review", "screenshot"):
+            if step in ("review", "screenshot") or pending_post:
                 verdict = code_verdict
-                if step == "review":
-                    try:
-                        reviewer = self.review_vendor(reviewer)
-                    except Exhausted as exhausted:
-                        self.handoff("reviewer_unavailable", f"PR #{pr} needs you",
-                                     exhausted.reason or "No eligible reviewer for this PR.")
-                        self.drop()
-                        return 0
-                    self.values["reviewer"] = reviewer
-                    self.save()
+                if step == "review" or pending_post:
                     self.fail_reason = ""
-                    outcome = self.run_review(round, rnote, reviewer)
+                    if pending_post:
+                        outcome = self.post_review_comment(round, reviewer)
+                        pending_post = False
+                    else:
+                        try:
+                            reviewer = self.review_vendor(reviewer)
+                        except Exhausted as exhausted:
+                            self.handoff("reviewer_unavailable", f"PR #{pr} needs you",
+                                         exhausted.reason or "No eligible reviewer for this PR.")
+                            self.drop()
+                            return 0
+                        self.values["reviewer"] = reviewer
+                        self.save()
+                        outcome = self.run_review(round, rnote, reviewer)
                     if outcome == DEFERRED_POST:
                         return 75
                     if not outcome.startswith(REVIEWED):
@@ -892,6 +896,7 @@ class Review:
                         self.drop()
                         return 0
                     verdict = "pass" if outcome.startswith("REVIEW: pass") else "changes"
+                    self.binding_fields["post_outcome"] = self.values["post_outcome"] = ""
                 if step == "screenshot" or self.screenshot_enabled(reviewer):
                     body = pr_helpers.body(pr)
                     # If the body read fails on resume, keep the checks saved with the code verdict.
@@ -911,12 +916,9 @@ class Review:
                     except Exhausted as exhausted:
                         outcome = self.failed("screenshot_reviewer_unavailable",
                                               exhausted.reason or "No screenshot reviewer available.")
-                    if outcome == DEFERRED_POST:
-                        return 75
                     if not outcome.startswith(REVIEWED):
-                        if self.fail_reason != ALREADY:
-                            self.handoff(self.fail_reason or "screenshot_run_failed",
-                                         f"PR #{pr} screenshot review failed", f"{outcome} {self.url}")
+                        self.handoff(self.fail_reason or "screenshot_run_failed", f"PR #{pr} screenshot review failed",
+                                     f"{outcome} {self.url}")
                         self.drop()
                         return 0
                     screenshot = "1"

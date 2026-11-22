@@ -298,7 +298,8 @@ class Tick:
         if self.scan_cmd:
             return self.scan_command()
         self.file_merged_follow_ups()
-        if self.force_pr and not self.is_agent_branch(self.force_pr):
+        if (self.force_pr and not self.code_review_post_pending(self.force_pr)
+                and not self.is_agent_branch(self.force_pr)):
             print("python -m baton pr N takes an agent/issue-N PR; for the owner's own PR use python -m baton review N", file=sys.stderr)
             return 2
         for step in (self.pending_openings, self.pending_reviews, self.pick_review, self.pick_fix, self.pick_issue):
@@ -456,20 +457,50 @@ class Tick:
     def pending_reviews(self):
         """Even after its trigger label was removed, or after Cursor opened a PR: re-enter at the
         saved review/fix step."""
-        for path in sorted(glob.glob(str(self.state / "review-pending-*"))):
-            done = self.after_item(self.item(lambda path=path: self.pending_review(Path(path))))
+        posts = owner_handoff.review_post_episodes(self.env)
+        paths = set(self.state.glob("review-pending-*"))
+        paths.update(self.state / f"review-pending-{pr}" for pr in posts)
+        for path in sorted(paths):
+            pr = path.name.removeprefix("review-pending-")
+            done = self.after_item(self.item(lambda: self.pending_review(path, posts.get(pr, set()))))
             if done is not None:
                 return done
         return None
 
-    def pending_review(self, path):
-        saved = checkpoint.read(path)
-        if self.force_issue or self.scan_cmd or saved is None:
+    def code_review_post_pending(self, pr):
+        if pr in owner_handoff.review_post_episodes(self.env):
+            return True
+        saved = checkpoint.read(self.state / f"review-pending-{pr}") or {}
+        return bool(saved.get("post_waiting") or saved.get("post_outcome"))
+
+    def pending_review(self, path, post_episodes=None):
+        pr = path.name.removeprefix("review-pending-")
+        if self.force_issue or self.scan_cmd:
             return 0
-        pr = saved.get("pr", "")
         if (self.force_pr or self.force_review) and pr != self.force_pr + self.force_review:
             return 0
-        if saved.get("step") != "fix" or not (saved.get("reviewed_head") or saved.get("feedback_waiting")):
+        if post_episodes is None:
+            post_episodes = owner_handoff.review_post_episodes(self.env).get(pr, set())
+        try:
+            saved = checkpoint.read(path) or {}
+        except (OSError, ValueError):
+            if not post_episodes:
+                raise
+            saved = {}
+        episode = saved.get("ISSUE") or pr
+        if post_episodes and (saved.get("pr") != pr or not saved.get("wt") or post_episodes != {episode}):
+            self.active["pr"] = pr
+            for key in post_episodes:
+                owner_handoff.clear_retry(self.env, key, owner_handoff.REVIEW_POST, pr)
+            owner_handoff.perform(self.env, owner_handoff.REVIEW_POST, kind="pr", number=pr, item=pr,
+                                  episode=episode, title=f"PR #{pr} comment post failed",
+                                  text="The saved comment post has no matching review checkpoint.",
+                                  hooks=self.hooks(saved.get("ISSUE", ""), pr))
+            return 80
+        if not saved:
+            return 0
+        post = post_episodes or saved.get("post_waiting") or saved.get("post_outcome")
+        if not post and (saved.get("step") != "fix" or not (saved.get("reviewed_head") or saved.get("feedback_waiting"))):
             state = self.state_of("pr", pr)
             if state not in ("OPEN", "MERGED", "CLOSED"):
                 return 0
@@ -493,7 +524,8 @@ class Tick:
         if not pr:
             listed = self.gh_json("pr", "list", "-R", self.gh_repo, "--state", "open", "--label", "agent-review",
                                   "--limit", "20", "--json", "number") or []
-            pr = str(min((p["number"] for p in listed), default="")) if listed else ""
+            pr = str(min((p["number"] for p in listed if not self.code_review_post_pending(str(p["number"]))),
+                         default=""))
         if not pr:
             return None
         return self.after_item(self.item(lambda: self.review_item(pr)))
@@ -545,7 +577,8 @@ class Tick:
         else:
             listed = self.gh_json("pr", "list", "-R", self.gh_repo, "--state", "open", "--label", "agent-fix",
                                   "--limit", "20", "--json", "number,headRefName") or []
-            listed = sorted((p for p in listed if names.issue_of(p["headRefName"])), key=lambda p: p["number"])
+            listed = sorted((p for p in listed if names.issue_of(p["headRefName"])
+                             and not self.code_review_post_pending(str(p["number"]))), key=lambda p: p["number"])
             pr, head_ref = (str(listed[0]["number"]), listed[0]["headRefName"]) if listed else ("", "")
         if not pr:
             return None
@@ -605,10 +638,9 @@ class Tick:
 
     # --- pick work: an issue for the pipeline ------------------------------------------------------
     def pending_specs(self):
-        """Resume durable spec reads and comment posts before new work can be blocked by admission or labels."""
+        """Resume durable spec reads before new work can be blocked by admission or labels."""
         found = {}
-        for reason in ("spec_comments_read_failed", "spec_pending_adr_read_failed",
-                       "spec_review_comment_post_failed", "spec_reply_post_failed"):
+        for reason in ("spec_comments_read_failed", "spec_pending_adr_read_failed"):
             for prefix in ("waiting", "retry"):
                 for path in self.state.glob(f"handoff-{prefix}-*-{reason}.json"):
                     issue = path.name.removeprefix(f"handoff-{prefix}-").removesuffix(f"-{reason}.json")
@@ -642,8 +674,7 @@ class Tick:
             if not isinstance(labels, list) or any(not isinstance(label, dict) or label.get("name") == "ready-for-human"
                                                   for label in labels):
                 continue
-            if pending[issue] in ("spec_pending_adr_read_failed", "spec_review_comment_post_failed",
-                                  "spec_reply_post_failed"):
+            if pending[issue] == "spec_pending_adr_read_failed":
                 done = self.after_item(self.item(lambda: self.resume_spec(issue)))
             else:
                 done = self.after_item(self.item(lambda: dev.run(self, issue)))

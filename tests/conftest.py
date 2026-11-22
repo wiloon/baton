@@ -129,6 +129,12 @@ elif args[:1] == ["api"] and any(a.endswith("/files") for a in args):
         print(f["filename"])
         if f.get("previous_filename"):
             print(f["previous_filename"])
+elif args[:1] == ["api"] and "--slurp" in args and args[1].endswith(("/comments", "/reviews")):
+    field = "reviews" if args[1].endswith("/reviews") else "comments" if "/issues/" in args[1] else "inline"
+    rows = pr.get(field, [])
+    comments = [{**row, "id": row.get("id", i + 1), "user": row.get("user", row.get("author"))}
+                for i, row in enumerate(rows)]
+    print(json.dumps([comments[i:i+100] for i in range(0, len(comments), 100)] or [[]]))
 elif args[:1] == ["api"]:
     print(json.dumps(pr.get("inline", [])))
 elif args[:2] == ["issue", "list"]:
