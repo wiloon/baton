@@ -97,12 +97,15 @@ def test_a_new_episode_after_a_terminal_outcome_may_ask_again(adv, point, result
     assert [record["result"] for record in adv.records() if record["kind"] == "outcome"] == [result]
 
 
-def test_a_duplicate_snapshot_never_grants_a_spent_round_again(adv):
-    adv.replies = [EXTRA]
+def test_an_identical_snapshot_may_grant_a_round_in_a_new_episode(adv):
+    adv.replies = [EXTRA, EXTRA]
     assert advisor.advise(adv.env, "review_limit", 22, "same", ("extra_round",), revalidate=lambda: True).extra_round
     advisor.outcome(adv.env, "review_limit", 22, "handoff")
     repeat = advisor.advise(adv.env, "review_limit", 22, "same", ("extra_round",), revalidate=lambda: True)
-    assert repeat.action == "handoff" and len(adv.calls) == 1
+    assert repeat.action == "extra_round" and len(adv.calls) == 2
+    first, outcome, second = adv.records()
+    assert outcome["decision_id"] == first["decision_id"]
+    assert outcome["episode"] == first["episode"] != second["episode"]
 
 
 @pytest.mark.parametrize("reply, failure", [
@@ -186,7 +189,7 @@ def test_the_digest_is_sent_once_a_day_with_outcomes(adv):
     advisor.outcome(adv.env, "review_limit", 9, "pass")
     now = adv.records()[-1]["ts"] + 10
     text = advisor.digest(adv.env, now=now)
-    assert "extra rounds granted 1, ended in pass/accept 1" in text and adv.notes[-1][0] == "Advisor digest"
+    assert "Extra rounds granted 1, ended in pass/accept 1" in text and adv.notes[-1][0] == "Advisor digest"
     assert advisor.digest(adv.env, now=now + 60) == ""           # not a day yet
     assert advisor.digest(adv.env, now=now + 2 * 86400) == ""     # due, but nothing new
     assert len(adv.notes) == 1

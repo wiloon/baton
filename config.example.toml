@@ -325,11 +325,11 @@ input_chars = 20000
 output_chars = 20000
 budget_usd = 1.0
 
-# Optional routine advisor (#17, ADR 0008): one DeepSeek call when a PR review or a spec review
-# runs out of rounds. "off" makes no call; "observe" records the advice and runs the rule (hand
-# off); "live" grants at most one extra round per task when the advisor says so. Decisions go to
-# STATE/advisor/decisions.jsonl and a daily digest. A [[repos]] entry with advisor = false keeps
-# that repository's text off the provider.
+# Optional routine advisor (ADR 0008): "off" makes no call. "observe" records advice and runs the
+# handoff rule. "live" allows one extra review or spec round per task episode. CI and merge
+# recommendations for implementation and ADR PRs stay in observation in either enabled mode.
+# Decisions go to STATE/advisor/decisions.jsonl and a daily digest. A [[repos]] entry with
+# advisor = false keeps that repository's text off the provider.
 [advisor]
 env_file = "~/.config/baton/deepseek.env"     # DEEPSEEK_API_KEY
 mode = "off"

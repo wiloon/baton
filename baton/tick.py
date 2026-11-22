@@ -553,7 +553,7 @@ class Tick:
             owner_handoff.perform(
                 self.env, "fix_worktree_diverged", kind="pr", number=pr, remove=("agent-fix",),
                 title=f"PR #{pr} needs you", text=f"{wt} has diverged from origin/{head_ref}. {url}",
-                hooks=self.hooks(issue or "0", pr=pr), item=pr, episode=issue or pr)
+                hooks=self.hooks(issue or "0", pr=pr))
             return 80
         feedback_file = self.state / f"owner-fix-feedback-{pr}"
         feedback = feedback_file.read_text() if feedback_file.is_file() else review.human_feedback(self.gh_repo, self.owner, pr)

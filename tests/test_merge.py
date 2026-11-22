@@ -7,7 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from baton import after_merge, ci, merge, notify, pick, pr as pr_helpers
+from baton import advisor, after_merge, ci, merge, notify, pick, pr as pr_helpers
+from baton.config import Advisor
 from conftest import sh
 from test_notify import PNG, Telegram
 
@@ -107,6 +108,107 @@ def test_a_repair_that_fails_goes_to_the_owner_without_another_wait(run):
     run.greens, run.repair = [False], 1
     run.go()
     assert run.events == ["ci", "repair", "notify PR #335: CI not green"] and not run.merged()
+
+
+REAL_CI_GREEN = merge.Merger.ci_green
+
+
+@pytest.fixture
+def observing(run, monkeypatch):
+    monkeypatch.setattr(merge.Merger, "ci_green", REAL_CI_GREEN)
+    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="live", snapshot_chars=1000))
+    monkeypatch.setenv(advisor.KEY, "fake-advisor-key")
+    calls = []
+
+    def provider(cfg, key, snapshot, actions, *, category):
+        calls.append((snapshot, actions))
+        action = "retry_step" if "retry_step" in actions else "handoff"
+        return {"action": action, "reason": "One bounded status read", "evidence": []}, {"total_tokens": 11}
+
+    monkeypatch.setattr(advisor, "call_deepseek", provider)
+    return calls
+
+
+@pytest.mark.parametrize("after_update", [False, True])
+@pytest.mark.parametrize("outcome", ["pending", "timeout", "red", "mixed", "changed", "settled", "malformed"])
+def test_ci_advisor_offers_only_an_exact_head_pending_or_timed_out_poll(run, observing, monkeypatch,
+                                                                      after_update, outcome):
+    checked_head = NEW if after_update else OLD
+    refreshed_head = "d" * 40 if outcome == "changed" else checked_head
+    rollup = {
+        "pending": [{"status": "IN_PROGRESS", "conclusion": ""}],
+        "red": [{"status": "COMPLETED", "conclusion": "FAILURE"}],
+        "mixed": [{"status": "IN_PROGRESS"}, {"state": "ERROR"}],
+        "settled": [{"status": "COMPLETED", "conclusion": "SUCCESS"}],
+        "malformed": [{"status": "COMPLETED"}, {"state": "PENDING"}],
+    }.get(outcome)
+    run.gh.set(state="OPEN", headRefOid=OLD, mergeStateStatus="BEHIND" if after_update else "CLEAN",
+               update_heads=[NEW], body="Token=private-key-material\n\n" + CLEAN,
+               after_update_status="CLEAN")
+    run.repair = 1
+    boundary = pr_helpers.call
+
+    def github(*args, **kwargs):
+        if args[:2] == ("pr", "checks") and "--fail-fast" in args:
+            if after_update and run.gh.pr["headRefOid"] == OLD:
+                return boundary(*args, **kwargs)
+            run.gh.set(headRefOid=refreshed_head, statusCheckRollup=rollup)
+        return boundary(*args, **kwargs)
+
+    monkeypatch.setattr(pr_helpers, "call", github)
+    run.gh.watches(*([(0, "")] if after_update else []), (124 if outcome == "timeout" else 1, ""))
+    run.go()
+
+    record, terminal = advisor.read_records(run.merger().env)
+    [sent] = observing
+    assert "private-key-material" not in sent[0]
+    assert record["point"] == ("ci_after_update_not_green" if after_update else "ci_before_merge_not_green")
+    assert record["mode"] == "observe" and record["executed"] == "handoff"
+    assert terminal["decision_id"] == record["decision_id"] and terminal["result"] == "handoff"
+    assert record["usage"] == {"total_tokens": 11}
+    retry = outcome in ("pending", "timeout")
+    assert ("retry_step" in sent[1]) == retry
+    assert record["advised"] == ("retry_step" if retry else "handoff")
+    if retry:
+        assert checked_head in sent[0] and "45 minutes" in sent[0]
+        digest = advisor.digest(run.merger().env, now=terminal["ts"] + 1)
+        assert "retry_step: recommended 1, executed 0" in digest
+        assert "outcome handoff" in digest and "11 total tokens" in digest
+    calls = run.gh.calls()
+    assert not run.merged() and run.labelled("ready-for-human")
+    assert sum(c[:2] == ["pr", "checks"] for c in calls) == (2 if after_update else 1)
+    assert sum(c[:2] == ["pr", "update-branch"] for c in calls) == int(after_update)
+    assert not any(c[:2] == ["run", "rerun"] for c in calls)
+
+
+@pytest.mark.parametrize("state", ["OPEN", "MERGED", "CLOSED", None])
+def test_merge_failure_advice_observes_reconciliation_without_retrying(run, observing, state):
+    run.gh.watches((0, ""))
+    run.gh.set(state=state, mergeStateStatus="CLEAN", headRefOid=OLD, merge_results=[1])
+    run.go()
+
+    record, terminal = advisor.read_records(run.merger().env)
+    assert terminal["decision_id"] == record["decision_id"] and terminal["result"] == "handoff"
+    assert (record["point"], record["mode"], record["executed"]) == ("merge_failed", "observe", "handoff")
+    assert record["advised"] == ("handoff" if state == "CLOSED" else "retry_step")
+    calls = run.gh.calls()
+    assert sum(c[:2] == ["pr", "merge"] for c in calls) == 1
+    assert not any(c[:2] == ["pr", "update-branch"] for c in calls)
+    assert run.labelled("ready-for-human")
+
+
+def test_merge_observation_discards_evidence_outside_the_sent_snapshot(run, observing, monkeypatch):
+    run.gh.watches((0, ""))
+    run.gh.set(state="OPEN", mergeStateStatus="CLEAN", headRefOid=OLD, merge_results=[1],
+               body="Long description\n" + "Source context. " * 1000 + "\nTruncated claim\n\n" + CLEAN)
+    monkeypatch.setattr(advisor, "call_deepseek", lambda *args, **kwargs: (
+        {"action": "retry_step", "reason": "One more read", "evidence": ["Truncated claim"]}, {}))
+    run.go()
+
+    decision, outcome = advisor.read_records(run.merger().env)
+    assert "outside the sent snapshot" in decision["failure"]
+    assert decision["evidence"] == [] and decision["executed"] == outcome["result"] == "handoff"
+    assert run.labelled("ready-for-human")
 
 
 def test_manual_checks_go_to_the_owner_with_screenshots(run):

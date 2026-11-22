@@ -17,6 +17,8 @@ from baton.fix import fix_pr as fix_pr_run
 from baton.common import Deferred
 from conftest import sh
 
+REAL_MERGE = merge.Merger.merge_or_handoff
+
 BIN = Path(__file__).resolve().parents[1] / "bin"
 PR = 987654
 DEFERRED = {"rc": 75, "status": "quota", "outcome": "", "reply": None, "model": "", "defer": "quota exhausted"}
@@ -1169,6 +1171,25 @@ def test_a_second_limit_hands_off_without_asking_again(advised):
     assert len(advised.fixes) == 2 and advised.merged == [] and advised.labelled("ready-for-human")
     assert len(advised.advice_calls) == 1
     assert any("after 3 review rounds" in line for line in advised.log())
+    assert any("Advisor (DeepSeek) chose extra_round: fixable" in line for line in advised.log())
+
+
+def test_an_extra_round_remains_open_until_the_merge_gate_hands_off(advised, monkeypatch):
+    from baton import advisor
+    from baton.session import resolve
+
+    monkeypatch.setattr(merge.Merger, "merge_or_handoff", REAL_MERGE)
+    advised.env["AUTO_MERGE"] = "0"
+    advised.reviews[:] = ["changes", "changes", "pass"]
+    advised.advice = [{"action": "extra_round", "reason": "One remaining test", "evidence": []}]
+
+    assert advised.run(fixer="cursor") == 0
+
+    decision, outcome = advisor.read_records(resolve(advised.env))
+    assert decision["executed"] == "extra_round" and outcome["result"] == "handoff"
+    assert decision["decision_id"] == outcome["decision_id"]
+    assert decision["episode"] == outcome["episode"]
+    assert advised.labelled("ready-for-human")
 
 
 @pytest.mark.parametrize("failure", ["fix", "review"])

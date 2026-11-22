@@ -250,8 +250,7 @@ class Review:
         """Terminal owner handoff through the shared entry (#125). Returns the entry Result."""
         return owner_handoff.perform(
             self.env, reason, kind="pr", number=self.pr,
-            title=title, text=text, hooks=self.hooks, item=self.pr, episode=self.issue,
-            snapshot=snapshot, revalidate=revalidate, close_outcomes=("review_limit",))
+            title=title, text=text, hooks=self.hooks, snapshot=snapshot, revalidate=revalidate)
 
     def render(self, template, **pairs):
         return prompts.render(self.self_dir / template, list(pairs.items()), env=self.env)
@@ -586,7 +585,6 @@ class Review:
                     if outcome.startswith("REVIEW: changes"):
                         verdict = "changes"
                 if verdict == "pass":
-                    advisor.outcome(self.env, "review_limit", pr, "pass")
                     break
                 if round >= self.max_rounds + extra:
                     snap, check = self.limit_snapshot(round, reviewer, fixer)
@@ -630,7 +628,7 @@ class Review:
             if rc == 75:
                 return 75
             if rc != 0:
-                advisor.outcome(self.env, "review_limit", pr, "handoff")
+                advisor.finish_episode(self.env, "pr", pr, "handoff")
                 self.drop()
                 return 0
             self.fixed_by = fixer

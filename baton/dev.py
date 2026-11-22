@@ -108,7 +108,7 @@ def stop(tick, issue, reason, title, text):
     from . import handoff as owner_handoff
     owner_handoff.perform(
         tick.env, reason, kind="issue", number=issue, remove=("agent-wip",),
-        title=title, text=text, hooks=tick.hooks(issue), item=issue, episode=issue)
+        title=title, text=text, hooks=tick.hooks(issue))
     return 80
 
 

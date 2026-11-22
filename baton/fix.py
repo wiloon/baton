@@ -54,7 +54,7 @@ class Runner:
         from . import handoff as owner_handoff
         owner_handoff.perform(
             self.env, reason, kind="pr", number=pr,
-            title=title, text=text, hooks=self.hooks, item=pr)
+            title=title, text=text, hooks=self.hooks)
         return 1
 
     def comment(self, pr, body, failed=""):
