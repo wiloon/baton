@@ -50,7 +50,7 @@ def adv(tmp_path, monkeypatch):
     return state
 
 
-EXTRA = {"action": "extra_round", "reason": "only tests are missing", "evidence": ["Must fix: add a test"]}
+EXTRA = {"action": "extra_round", "reason": "only tests are missing", "evidence": []}
 
 
 def test_live_extra_round_is_executed_recorded_and_granted_once(adv):
@@ -167,7 +167,7 @@ def test_advisor_key_from_env_file_is_redacted(adv, tmp_path, monkeypatch, echo_
     adv.env_file = tmp_path / "deepseek.env"
     adv.env_file.touch(mode=0o600)
     adv.env_file.write_text(f"{advisor.KEY}={key}\n")
-    adv.replies = [{"action": key if echo_in_action else "handoff", "reason": f"saw {key}", "evidence": [key]}]
+    adv.replies = [{"action": key if echo_in_action else "handoff", "reason": f"saw {key}", "evidence": ["[redacted]"]}]
     adv.usage = {"total_tokens": key}
 
     decision = advisor.advise(adv.env, "review_limit", 8, f"snapshot contains {key}", ("extra_round",))
@@ -419,3 +419,13 @@ def test_a_mode_change_after_a_grant_still_explains_the_earlier_recovery(adv, mo
     assert result.action == "handoff" and len(adv.calls) == 1   # only the original grant's call
     assert "Advisor (DeepSeek) chose extra_round" in adv.notes[-1][1]
     assert [r["kind"] for r in adv.records()] == ["decision", "outcome"]
+
+
+@pytest.mark.parametrize("reply", [
+    {"action": "extra_round", "reason": "", "evidence": []},
+    {"action": "extra_round", "reason": "only tests are missing", "evidence": ["not in the snapshot"]},
+])
+def test_round_limit_replies_need_a_reason_and_evidence_from_the_snapshot(adv, reply):
+    adv.replies = [reply]
+    d = advisor.advise(adv.env, "review_limit", 31, "Must fix: add a test", ("extra_round",), revalidate=lambda: True)
+    assert d.action == "handoff" and d.failure and not advisor.granted(adv.env, "review_limit", 31)

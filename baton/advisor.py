@@ -300,6 +300,11 @@ def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=No
             if category:
                 if any(not isinstance(quote, str) or not quote or quote not in text for quote in reply["evidence"]):
                     raise ValueError("evidence is outside the sent snapshot")
+            else:   # the #17 contract plus two stricter checks (#125)
+                if not raw_reason.strip():
+                    raise ValueError("reply has no reason")
+                if any(not quote or quote not in text for quote in raw_evidence):
+                    raise ValueError("evidence is outside the sent snapshot")
             advised = raw_action
             if advised not in actions:
                 advised = redact(advised, values)
