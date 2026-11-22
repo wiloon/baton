@@ -174,21 +174,31 @@ def _landed(args, input):
     return None
 
 
-def gh(*args, input=None, limit=None):
+def gh(*args, input=None, limit=None, reconcile=None):
     """`gh ARGS`, retried on transient failures (TLS or connection errors, 502/503/504, the
     secondary rate limit) with BACKOFF; a 4xx or any other failure is returned at once. Before
     retrying a write that is not idempotent (a comment, `pr create`, `issue create`,
     `pr merge`), it checks whether the first try landed. The one entry point for every
-    baton `gh` call (#46); the final failure's stderr is in the result (why())."""
+    baton `gh` call (#46); the final failure's stderr is in the result (why()). A saved
+    write can supply RECONCILE, which returns landed, absent, or a state that stops repeats.
+    It also checks the final transient failure, when no inner repeat remains (#151)."""
     result = call(*args, input=input, limit=limit)
     for pause in BACKOFF:
         if result.returncode == 0 or not transient(result):
             break
         sleep(pause)
-        if (done := _landed(args, input)) is not None:
+        if reconcile is not None:
+            state = reconcile()
+            if state == "landed":
+                return subprocess.CompletedProcess(result.args, 0, "", "")
+            if state != "absent":
+                return result
+        elif (done := _landed(args, input)) is not None:
             return done
         result = call(*args, input=input, limit=limit)
     if result.returncode != 0 and transient(result):
+        if reconcile is not None and reconcile() == "landed":
+            return subprocess.CompletedProcess(result.args, 0, "", "")
         from . import notify   # notify imports this module
         notify.log(f"gh {' '.join(args[:2])} failed after {len(BACKOFF) + 1} tries{why(result)}")
     return result

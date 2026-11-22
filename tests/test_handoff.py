@@ -165,6 +165,13 @@ def review_binding(pr):
             "issue": "9", "screenshot_digest": ""}
 
 
+def post_binding(pr, body="<!-- baton-review round=1 by=claude -->\npass"):
+    return {"pr": pr, "round": 1, "head": "a" * 40, "base": "main", "issue": "9",
+            "body": body, "digest": handoff.body_digest(body), "description": "c" * 64,
+            "feedback": "d" * 64, "outcome": "REVIEW: changes", "run_id": "",
+            "comment_ids": [], "author": "owner", "reviewer": "claude"}
+
+
 def test_category_1_retry_waits_until_due_then_consumes_an_attempt(env, monkeypatch):
     hooks, _ = _hooks()
     monkeypatch.setattr(handoff, "label_ready", lambda *a, **k: MagicMock(returncode=0))
@@ -302,16 +309,21 @@ def test_damage_to_a_waiting_review_hands_off_once(env, monkeypatch, damage):
 def test_every_category_1_reason_is_rule_mode_with_retry_budget():
     assert handoff.RETRY_REASONS == {
         "review_comment_missing", "spec_comments_read_failed", "spec_pending_adr_read_failed",
+        "review_comment_post_failed",
     }
     for reason in handoff.RETRY_REASONS:
         entry = handoff.REASONS[reason]
         assert (entry.category, entry.mode, entry.actions) == (1, "rule", ())
 
 
-@pytest.mark.parametrize("reason", ["review_comment_missing", "spec_comments_read_failed",
-                                    "spec_pending_adr_read_failed"])
-def test_each_category_1_reason_defers_then_hands_off_through_perform(env, monkeypatch, reason):
-    """Every replayed read shares the same budget: no advisor, two later attempts, then handoff."""
+@pytest.mark.parametrize("reason,binding", [
+    ("review_comment_missing", review_binding("1")),
+    ("spec_comments_read_failed", {}),
+    ("spec_pending_adr_read_failed", {"step": "discovery"}),
+    ("review_comment_post_failed", post_binding("1")),
+])
+def test_each_category_1_reason_defers_then_hands_off_through_perform(env, monkeypatch, reason, binding):
+    """Every replayed read or comment post shares the same budget: no advisor, two later attempts, then handoff."""
     labelled, calls = [], []
     hooks, _ = _hooks()
     clock = {"now": 1_000}
@@ -320,8 +332,6 @@ def test_each_category_1_reason_defers_then_hands_off_through_perform(env, monke
                         lambda *a, **k: labelled.append(1) or MagicMock(returncode=0))
     monkeypatch.setattr(handoff.notify, "notify", lambda *a, **k: None)
     monkeypatch.setattr(handoff.advisor, "advise", lambda *a, **k: calls.append(1) or handoff.advisor.Decision("handoff"))
-    binding = {"review_comment_missing": review_binding("1"), "spec_comments_read_failed": {},
-               "spec_pending_adr_read_failed": {"step": "discovery"}}[reason]
     assert handoff.perform(env, reason, kind="pr", number="1", title="t", text="x",
                            hooks=hooks, item="1", episode="ep", transient=True,
                            continuation=binding).action == handoff.DEFER
@@ -338,6 +348,19 @@ def test_each_category_1_reason_defers_then_hands_off_through_perform(env, monke
                            hooks=hooks, item="1", episode="ep", transient=True,
                            continuation=binding)
     assert done.handed_off and labelled == [1] and calls == []
+
+
+def test_a_comment_post_binding_without_its_body_hands_off(env, monkeypatch):
+    hooks, _ = _hooks()
+    labelled = []
+    monkeypatch.setattr(handoff, "clock", lambda: 1_000)
+    monkeypatch.setattr(handoff, "label_ready", lambda *a, **k: labelled.append(1) or MagicMock(returncode=0))
+    monkeypatch.setattr(handoff.notify, "notify", lambda *a, **k: None)
+    broken = post_binding("1")
+    del broken["body"]
+    result = handoff.perform(env, "review_comment_post_failed", kind="pr", number="1", title="t", text="x",
+                             hooks=hooks, item="1", episode="ep", transient=True, continuation=broken)
+    assert result.handed_off and labelled == [1]
 
 
 def test_a_damaged_retry_record_hands_off_without_replaying(env, monkeypatch):
