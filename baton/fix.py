@@ -266,7 +266,8 @@ class Runner:
                 marker = (f"<!-- baton-fix by={fixer} outcome=needs-info -->"
                           if outcome.startswith("RESULT: needs-info")
                           else f"<!-- baton-fix by={fixer} -->")
-                self.comment(pr, f"{marker}\n{rest.rstrip(chr(10))}")
+                if any(line.strip() and not line.startswith("RESULT: ") for line in rest.split("\n")):   # a checks-only reply has nothing to post; a bare marker would move the cutoff
+                    self.comment(pr, f"{marker}\n{rest.rstrip(chr(10))}")
             self.hooks.fix(fixer, self.round or 0, out["reply"], str(fix_file))
         task_changed, description_rc, description_changed, description_reason = False, 0, False, ""
         if outcome.startswith("RESULT: fixed"):

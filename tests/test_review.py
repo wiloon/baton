@@ -423,13 +423,13 @@ def test_the_nit_rule_depends_on_the_follow_up_label(gh):
 
 def test_the_owner_feedback_is_what_came_after_the_last_fix(gh):
     gh.set(comments=[
-        {"author": {"login": "owner"}, "body": "old note", "createdAt": "2026-10-01T00:00:00Z"},
-        {"author": {"login": "owner"}, "body": "<!-- baton-fix by=claude -->\nfixed", "createdAt": "2026-10-02T00:00:00Z"},
-        {"author": {"login": "owner"}, "body": "<!-- baton-review round=1 -->", "createdAt": "2026-10-03T00:00:00Z"},
-        {"author": {"login": "stranger"}, "body": "ignore me", "createdAt": "2026-10-03T00:00:00Z"},
-        {"author": {"login": "owner"}, "body": "please rename", "createdAt": "2026-10-04T00:00:00Z"}],
-        reviews=[{"author": {"login": "owner"}, "body": "also this", "submittedAt": "2026-10-05T00:00:00Z"},
-                 {"author": {"login": "owner"}, "body": "older review", "submittedAt": "2026-10-01T00:00:00Z"}],
+        {"user": {"login": "owner"}, "body": "old note", "created_at": "2026-10-01T00:00:00Z"},
+        {"user": {"login": "owner"}, "body": "<!-- baton-fix by=claude -->\nfixed", "created_at": "2026-10-02T00:00:00Z"},
+        {"user": {"login": "owner"}, "body": "<!-- baton-review round=1 -->", "created_at": "2026-10-03T00:00:00Z"},
+        {"user": {"login": "stranger"}, "body": "ignore me", "created_at": "2026-10-03T00:00:00Z"},
+        {"user": {"login": "owner"}, "body": "please rename", "created_at": "2026-10-04T00:00:00Z"}],
+        reviews=[{"user": {"login": "owner"}, "body": "also this", "submitted_at": "2026-10-05T00:00:00Z"},
+                 {"user": {"login": "owner"}, "body": "older review", "submitted_at": "2026-10-01T00:00:00Z"}],
         inline=[{"user": {"login": "owner"}, "body": "here", "path": "a.go", "line": 3, "created_at": "2026-10-06T00:00:00Z"},
                 {"user": {"login": "owner"}, "body": "stale", "path": "a.go", "line": 3, "created_at": "2026-10-01T00:00:00Z"}])
     fb = review.human_feedback("owner/app", "owner", 5)

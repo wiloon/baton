@@ -1002,3 +1002,10 @@ def test_without_screenshot_review_the_fix_prompt_names_no_screenshots_dir(run):
     run.agent(dict(CHECKED))
     run.fix("claude")
     assert f"pr-{PR}-shots" not in run.prompts[0]
+
+
+@pytest.mark.parametrize("fixer", ["claude", "codex"])
+def test_a_checks_only_reply_posts_no_fix_comment(run, fixer):
+    run.agent({"file": "## Checks to verify\nnone\n\nRESULT: fixed\n"})
+    assert run.fix(fixer)["rc"] == 0
+    assert run.comments() == []

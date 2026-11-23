@@ -13,7 +13,15 @@ from test_fix import cursor_plan
 
 
 def comment(login, body, at):
-    return {"author": {"login": login}, "body": body, "createdAt": at}
+    return {"user": {"login": login}, "body": body, "created_at": at}
+
+
+def review_row(login, body, at):
+    return {"user": {"login": login}, "body": body, "submitted_at": at}
+
+
+def pages(rows, size=100):
+    return [rows[i:i + size] for i in range(0, len(rows), size)] or [[]]
 
 
 def inline(login, body, at, path="a.go", line=3):
@@ -53,20 +61,13 @@ CODE_NONE = (
 
 
 def owner_fix_setup(ctx, worktree, monkeypatch, comments, reviews=None, inline_comments=None,
-                     fixer="codex", pr="20"):
+                     fixer="codex", pr="20", page_size=100):
     """Real human_feedback from FakeGH; capture the fixer prompt and review-loop note."""
-    reviews = reviews or []
-    inline_comments = inline_comments or []
-    payload = {
-        "comments": comments,
-        "reviews": reviews,
-        "headRefName": "cursor/issue-297",
-        "author": {"login": "cursor"},
-    }
     ctx.gh.answers["pr list"] = [{"number": int(pr), "headRefName": "cursor/issue-297"}]
-    ctx.gh.answers["pr view"] = lambda args: (
-        "cursor/issue-297" if "headRefName" in args[-1] else json.dumps(payload))
-    ctx.gh.answers[f"api repos/owner/app/pulls/{pr}/comments"] = inline_comments
+    ctx.gh.answers["pr view"] = lambda args: "cursor/issue-297"
+    for route, rows in (("issues", comments), ("pulls", inline_comments or [])):
+        ctx.gh.answers[f"api repos/owner/app/{route}/{pr}/comments"] = pages(rows, page_size)
+    ctx.gh.answers[f"api repos/owner/app/pulls/{pr}/reviews"] = pages(reviews or [], page_size)
     monkeypatch.setattr(tick.vendors, "seed_authors", lambda *a: 0)
     monkeypatch.setattr(tick.vendors, "seed_contrib", lambda *a: [])
     monkeypatch.setattr(tick.Tick, "pick_vendor", lambda self, *a, **k: fixer)
@@ -231,7 +232,9 @@ def test_consecutive_needs_info_replies_keep_the_decision_before_them(ctx, workt
 def test_inline_decision_then_pr_comment_correction_are_ordered(ctx, worktree, monkeypatch):
     captured = owner_fix_setup(
         ctx, worktree, monkeypatch,
-        comments=[comment("owner", "actually fix item 1 instead", "2026-11-04T12:00:00Z")],
+        comments=[comment("owner", "<!-- baton-fix by=claude outcome=needs-info -->\n1. which item?",
+                          "2026-11-04T11:00:00Z"),
+                  comment("owner", "actually fix item 1 instead", "2026-11-04T12:00:00Z")],
         inline_comments=[inline("owner", "fix item 2 only", "2026-11-04T10:00:00Z")])
     assert run_fix_item(ctx, worktree) == 80
     prompt = fixer_prompt(captured)
@@ -268,3 +271,92 @@ def test_feedback_cli_prints_only_owner_words(gh, capsys):
     assert "please rename" in out
     assert "rename the helper" not in out
     assert "{" not in out and "findings" not in out.lower()
+
+
+# --- review round 1 ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("fixer", ["claude", "codex", "cursor"])
+def test_rendered_fix_prompts_scope_an_owner_triggered_fix_to_the_owners_words(run, fixer):
+    feedback = review.format_fix_feedback("fix item 2 only", "## Must fix\n1. a\n2. b")
+    run.agent({"file": "## Must fix\nnone\n\nRESULT: fixed\n", "reply": "RESULT: fixed"})
+    run.fix(fixer, feedback=feedback)
+    prompt = run.prompts[0]
+    assert "handle only the points they ask for" in prompt
+    assert "answer only the Must fix items the owner's words ask for" in prompt
+    if fixer != "cursor":
+        assert "Handle every point" in prompt   # the ordinary-review rule stays
+
+
+def test_marked_inline_comment_alone_dispatches_nothing(ctx, worktree, monkeypatch):
+    captured = owner_fix_setup(
+        ctx, worktree, monkeypatch, comments=[],
+        inline_comments=[inline("owner", "<!-- baton-note -->\nfix it", "2026-11-04T10:00:00Z")])
+    assert run_fix_item(ctx, worktree) == 80
+    assert captured == [] and "PR #20: nothing to fix" in ctx.log()
+
+
+def test_decisive_comments_on_a_later_page_are_read(ctx, worktree, monkeypatch):
+    rows = [comment("owner", f"filler {i}", f"2026-11-01T00:0{i}:00Z") for i in range(3)]
+    rows += [comment("owner", "<!-- baton-fix by=claude -->\nfixed", "2026-11-02T00:00:00Z"),
+             comment("owner", "please rename", "2026-11-03T00:00:00Z")]
+    captured = owner_fix_setup(
+        ctx, worktree, monkeypatch, comments=rows,
+        reviews=[review_row("owner", "old", "2026-10-01T00:00:00Z"),
+                 review_row("owner", "older", "2026-10-02T00:00:00Z"),
+                 review_row("owner", "review on page two", "2026-11-04T00:00:00Z")],
+        page_size=2)
+    assert run_fix_item(ctx, worktree) == 80
+    prompt = fixer_prompt(captured)
+    assert "please rename" in prompt and "review on page two" in prompt
+    assert "filler" not in prompt and "older" not in prompt
+    assert all("--paginate" in c and "--slurp" in c for c in ctx.gh.calls if c[:1] == ["api"])
+
+
+@pytest.mark.parametrize("failing", ["issues/20/comments", "pulls/20/reviews", "pulls/20/comments"])
+def test_incomplete_read_dispatches_nothing_and_keeps_the_label(ctx, worktree, monkeypatch, failing):
+    captured = owner_fix_setup(
+        ctx, worktree, monkeypatch,
+        comments=[comment("owner", "old", "2026-11-01T00:00:00Z"),
+                  comment("owner", "<!-- baton-fix by=claude -->\nfixed", "2026-11-02T00:00:00Z"),
+                  comment("owner", "please rename", "2026-11-03T00:00:00Z")],
+        inline_comments=[inline("owner", "inline correction", "2026-11-04T00:00:00Z")])
+    ctx.gh.fails.add(f"api repos/owner/app/{failing}")
+    assert run_fix_item(ctx, worktree) == 75
+    assert captured == [] and not ctx.loops
+    assert "nothing to fix" not in ctx.log()
+    assert not [c for c in ctx.gh.calls if c[:2] == ["pr", "edit"] and "--remove-label" in c]
+    assert not Path(ctx.env["STATE"], "owner-fix-feedback-20").exists()
+
+
+@pytest.mark.parametrize("cached", ['{"owner":null,"findings":""}', '{"owner":"x","findings":3}', "[1]"])
+def test_malformed_json_cache_falls_back_to_the_raw_text(ctx, worktree, monkeypatch, cached):
+    owner_fix_setup(ctx, worktree, monkeypatch, comments=[])
+    Path(ctx.env["STATE"], "owner-fix-feedback-20").write_text(cached)
+    captured = []
+    monkeypatch.setattr(tick.Tick, "fix_pr", lambda self, *a, **k: captured.append(("fix", a, k)) or 0)
+    assert run_fix_item(ctx, worktree) == 80
+    assert fixer_prompt(captured) == cached
+
+
+def test_deferred_fix_resumes_with_both_saved_fields_after_the_cutoff_moves(ctx, worktree, monkeypatch):
+    owner_fix_setup(
+        ctx, worktree, monkeypatch,
+        comments=[comment("owner", LATEST_REVIEW, "2026-11-02T00:00:00Z"),
+                  comment("owner", "fix item 2 only", "2026-11-03T00:00:00Z")])
+    prompts = []
+
+    def defer_then_finish(self, *a, **k):
+        prompts.append(a[4])
+        return 75 if len(prompts) == 1 else 0
+
+    monkeypatch.setattr(tick.Tick, "fix_pr", defer_then_finish)
+    assert run_fix_item(ctx, worktree) == 75
+    # a reply posted before the deferral moves the live cutoff past the owner's words
+    ctx.gh.answers["api repos/owner/app/issues/20/comments"] = pages([
+        comment("owner", LATEST_REVIEW, "2026-11-02T00:00:00Z"),
+        comment("owner", "fix item 2 only", "2026-11-03T00:00:00Z"),
+        comment("owner", "<!-- baton-fix by=claude -->\nfixed", "2026-11-04T00:00:00Z")])
+    assert run_fix_item(ctx, worktree) == 80
+    assert len(prompts) == 2 and prompts[1] == prompts[0]
+    assert "fix item 2 only" in prompts[1].split("<findings>")[0]
+    assert "rename the helper" in prompts[1].split("<findings>")[1]

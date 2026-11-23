@@ -990,7 +990,9 @@ def test_a_second_tick_finishes_a_deferred_description_edit(ctx, worktree, monke
     ctx.gh.answers["pr comment"] = comment
     ctx.gh.answers["pr list"] = lambda args: (
         [{"number": int(pr), "headRefName": worktree.branch}] if labelled and "agent-fix" in args else [])
-    monkeypatch.setattr(review, "paginated", lambda *args: [])
+    monkeypatch.setattr(review, "read_rows", lambda repo, route, number, resource: (
+        [{"user": c["author"], "body": c["body"], "created_at": c["createdAt"]} for c in comments]
+        if route == "issues" else []))
     monkeypatch.setattr(review, "agent_review", lambda *args: "Revise the description.")
     monkeypatch.setattr(pick, "choose", lambda *args, **kwargs: (
         "codex" if switched and "codex" not in agent_calls else "cursor"))

@@ -620,13 +620,18 @@ class Tick:
                 cached = json.loads(raw)
             except ValueError:
                 cached = None
-            if isinstance(cached, dict) and "owner" in cached and "findings" in cached:
+            if (isinstance(cached, dict) and isinstance(cached.get("owner"), str)
+                    and isinstance(cached.get("findings"), str)):
                 owner_text, findings = cached["owner"], cached["findings"]
             else:
                 # Legacy plain-text cache from an exit-75 deferral before #178.
                 owner_text, findings = raw, ""
         else:
             fb = review.human_feedback(self.gh_repo, self.owner, pr)
+            if fb is None:
+                # Keep agent-fix: dropping it or reporting "nothing to fix" would lose the feedback.
+                self.log(f"PR #{pr}: could not read the review comments completely; retrying later")
+                return 75
             owner_text, findings = fb.owner, fb.findings
         if not owner_text.strip():
             pr_helpers.gh("pr", "edit", pr, "-R", self.gh_repo, "--remove-label", "agent-fix")

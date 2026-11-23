@@ -295,7 +295,8 @@ def owner_words(reviews, comments, inline, owner, since):
                 and (c.get("createdAt") or "") > since):
             items.append((c.get("createdAt") or "", f"Comment ({c.get('createdAt')}):\n{body}"))
     for comment in inline or ():
-        if (comment.get("user") or {}).get("login") == owner and (comment.get("created_at") or "") > since:
+        if ((comment.get("user") or {}).get("login") == owner and (comment.get("created_at") or "") > since
+                and not (comment.get("body") or "").startswith("<!-- baton")):
             line = comment.get("line") if comment.get("line") is not None else comment.get("original_line")
             text = (f"Inline comment on {jq_str(comment.get('path'))}:{jq_str(line)}:\n"
                     f"{comment.get('body')}")
@@ -322,14 +323,36 @@ def format_fix_feedback(owner, findings):
             f"{findings}\n</findings>")
 
 
+def read_rows(repo, route, pr, resource):
+    """Every row of a PR's paginated REST list, or None when a page is missing or malformed."""
+    result = pr_helpers.gh("api", f"repos/{repo}/{route}/{pr}/{resource}", "--paginate", "--slurp")
+    if result.returncode != 0:
+        return None
+    try:
+        pages = json.loads(result.stdout)
+    except ValueError:
+        return None
+    if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+        return None
+    rows = [row for page in pages for row in page]
+    return rows if all(isinstance(row, dict) for row in rows) else None
+
+
 def human_feedback(repo, owner, pr):
-    """Owner words since the last ordinary fix, and Must fix findings from the latest review."""
-    result = pr_helpers.gh("pr", "view", str(pr), "-R", repo, "--json", "reviews,comments")
-    data = json.loads(result.stdout) if result.returncode == 0 else {}
-    comments, reviews = data.get("comments") or (), data.get("reviews") or ()
+    """Owner words since the last ordinary fix, and Must fix findings from the latest review.
+    None when any of the three lists could not be read completely: a partial read would move
+    the cutoff or drop a correction, so the caller retries."""
+    comments = read_rows(repo, "issues", pr, "comments")
+    reviews = read_rows(repo, "pulls", pr, "reviews")
+    inline = read_rows(repo, "pulls", pr, "comments")
+    if comments is None or reviews is None or inline is None:
+        return None
+    comments = [{"author": c.get("user"), "body": c.get("body") or "", "createdAt": c.get("created_at")}
+                for c in comments]
+    reviews = [{"author": r.get("user"), "body": r.get("body") or "", "submittedAt": r.get("submitted_at")}
+               for r in reviews]
     since = ordinary_fix_cutoff(comments, owner)
     findings = review_findings(comments, owner)
-    inline = paginated(["api", f"repos/{repo}/pulls/{pr}/comments", "--paginate"])
     return HumanFeedback(owner=owner_words(reviews, comments, inline, owner, since), findings=findings)
 
 
@@ -1140,7 +1163,11 @@ def main(argv=None):
     args = parser.parse_args(argv)
     env = session.resolve()
     if args.command == "feedback":
-        print(human_feedback(env.repo.gh_repo, env.owner, args.pr).owner)
+        fb = human_feedback(env.repo.gh_repo, env.owner, args.pr)
+        if fb is None:
+            print("could not read the PR's comments completely", file=sys.stderr)
+            return 1
+        print(fb.owner)
         return 0
     if args.command == "issue-context":
         sys.stdout.write(issue_context(env, args.issue))
