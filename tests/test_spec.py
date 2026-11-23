@@ -3107,6 +3107,24 @@ def test_a_deferred_denied_rerun_keeps_the_saved_round_limit_and_retry(advised, 
     assert "ready-for-human" in advised.gh.labels
 
 
+def test_a_resumed_worker_after_a_deferred_denied_rerun_keeps_the_command_and_is_not_rerun(advised, monkeypatch, tmp_path):
+    advised.gh.body = f"Goal\n{EXCERPT}\n"
+    deferral = {"rc": 75, "status": "quota", "outcome": "", "reply": None, "model": "", "defer": "quota"}
+    advised.script = [CHANGES, reviser(QUESTIONS, outcome="SPEC: human"), denied_failure(tmp_path), deferral,
+                      denied_failure(tmp_path, "again")]
+    advised.advice = advice(grounded())
+    monkeypatch.setattr(dev, "setup_worktree", lambda *a, **k: ("", False))
+
+    def run():
+        return spec.run(SimpleNamespace(issue=N), session.resolve(advised.env))["rc"]
+
+    assert run() == 75
+    run()
+    resumed = advised.runs[-1]
+    assert "`wc -l /ctx/issue.md`" in resumed["prompt"]
+    assert [r["role"] for r in advised.runs] == ["spec_review", "spec", "spec", "spec", "spec"]
+
+
 EXCERPT = "Manual checks use the existing gate path."
 
 

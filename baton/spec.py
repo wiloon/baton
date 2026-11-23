@@ -327,15 +327,37 @@ class Spec:
             self.clear_answer_intent()
             owner_handoff.clear_retry(self.env, self.issue, owner_handoff.SPEC_REPLY_POST)
 
-    def keep_denied_spent(self):
-        """Record on the saved answer intent that the denied-command rerun was chosen (survives a deferral)."""
+    def saved_denied(self, pending=None):
+        """(spent, command, ok): the denied-command retry decision saved with the answer intent or the
+        pending retry. ok is False when a saved intent exists but cannot be read."""
+        budget = pending[0]["remaining_budget"] if pending else {}
+        spent, command = bool(budget.get("denied_spent")), budget.get("denied_command") or ""
         path = self.answer_intent_path()
+        if not path.exists():
+            return spent, command, True
         try:
             data = json.loads(path.read_text())
         except (OSError, ValueError):
-            return
-        if isinstance(data, dict) and not data.get("denied_spent"):
-            atomic_json(path, {**data, "denied_spent": True})
+            return spent, command, False
+        if not isinstance(data, dict):
+            return spent, command, False
+        return (spent or data.get("denied_spent") is True,
+                command or str(data.get("denied_command") or ""), True)
+
+    def keep_denied_spent(self, command):
+        """Durably record on the saved answer intent that the denied-command rerun was chosen, with the
+        command. False when the saved intent cannot be read or written: the rerun must not dispatch."""
+        path = self.answer_intent_path()
+        if not path.exists():
+            return True
+        try:
+            data = json.loads(path.read_text())
+            if not isinstance(data, dict):
+                return False
+            atomic_json(path, {**data, "denied_spent": True, "denied_command": command})
+        except (OSError, ValueError):
+            return False
+        return True
 
     def gh(self, *args):
         return pr_helpers.gh(*args, "-R", self.repo)
@@ -1543,13 +1565,9 @@ class Spec:
         reviser = pending[1] if pending else self.pick(
             "reviser", list(env.config.quota.vendor_pool), last_vendor, other_model, spec_followup=claude_followup)
         self.mark_base(round)
-        denied_spent = bool(pending and pending[0]["remaining_budget"].get("denied_spent"))
-        try:
-            saved = json.loads(self.answer_intent_path().read_text())
-            denied_spent = denied_spent or saved.get("denied_spent") is True
-        except (OSError, ValueError, AttributeError):
-            pass
+        denied_spent, denied_command, intent_ok = self.saved_denied(pending)
         attempt = int(bool(pending))
+        restored = denied_spent  # a saved, already-spent denied retry: the first dispatch repeats its note
         human = ""
         while True:
             template = self.self_dir / ("codex-spec-prompt.md" if reviser == "codex" else "spec-prompt.md")
@@ -1560,12 +1578,16 @@ class Spec:
             for suffix in (".body", ".comment"):
                 Path(f"{out_base}{suffix}").unlink(missing_ok=True)
             tag = f"issue-{n}-spec-reply-{round}" + (f"-retry{attempt}" if attempt else "")
+            if restored and denied_command:
+                # A resumed worker keeps the denied-command instruction of the rerun it replaces.
+                prompt += DENIED_NOTE.format(command=denied_command)
+                tag += "-rerun"
+                restored = False
             out = self.agent(reviser, "spec", prompt, tag, "spec-settings.json", out_base, followup=followup,
                              round_s=str(round))
             denied = permission_denials(out.get("log", "")) if out["outcome"].startswith("RESULT: failed") else []
-            if denied and not denied_spent:
-                denied_spent = True
-                self.keep_denied_spent()
+            if denied and not denied_spent and intent_ok and self.keep_denied_spent(denied[0]):
+                denied_spent, denied_command = True, denied[0]
                 notify.log(f"#{n}: spec revision round {round} failed after a denied command ({denied[0]}); rerunning once")
                 for suffix in (".body", ".comment"):
                     Path(f"{out_base}{suffix}").unlink(missing_ok=True)
@@ -1598,7 +1620,7 @@ class Spec:
                 f"{reviser} spec run failed: {outcome}{why}", "spec_revision_run_failed", reviser, outcome,
                 role="reviser", round_s=str(round), issue_body=issue_body, listed=listed,
                 last_vendor=last_vendor, other_model=other_model, spec_followup=claude_followup,
-                budget={"denied_spent": denied_spent})
+                budget={"denied_spent": denied_spent, "denied_command": denied_command})
             if not retry:
                 return "stop"
             _, reviser = retry
