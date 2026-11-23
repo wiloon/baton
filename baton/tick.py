@@ -347,7 +347,8 @@ class Tick:
         return (out or "").strip()
 
     def cleanup(self):
-        waiting_posts = {issue for issue, reason in self.pending_specs().items() if reason in owner_handoff.SPEC_POSTS}
+        waiting_posts = {issue for issue, reason in self.pending_specs().items()
+                         if reason in owner_handoff.SPEC_WRITE_POSTS}
         for n, path in names.worktrees(self.wt_root):
             if n in waiting_posts:
                 continue
@@ -650,7 +651,7 @@ class Tick:
         """Resume durable spec reads and comment posts before new work can be blocked by admission or labels."""
         found = {}
         for reason in ("spec_comments_read_failed", "spec_pending_adr_read_failed",
-                       *owner_handoff.SPEC_POSTS):
+                       *owner_handoff.SPEC_WRITE_POSTS):
             for prefix in ("waiting", "retry"):
                 for path in self.state.glob(f"handoff-{prefix}-*-{reason}.json"):
                     issue = path.name.removeprefix(f"handoff-{prefix}-").removesuffix(f"-{reason}.json")
@@ -676,7 +677,7 @@ class Tick:
             if self.force_issue and self.force_issue != issue:
                 continue
             reason = pending[issue]
-            if reason in owner_handoff.SPEC_POSTS:
+            if reason in owner_handoff.SPEC_WRITE_POSTS:
                 try:
                     post = owner_handoff.load_retry(self.env, issue, reason)
                 except owner_handoff.RetryUnreadable:
@@ -696,7 +697,7 @@ class Tick:
             if not isinstance(labels, list) or any(not isinstance(label, dict) or label.get("name") == "ready-for-human"
                                                   for label in labels):
                 continue
-            if reason in ("spec_pending_adr_read_failed", *owner_handoff.SPEC_POSTS):
+            if reason in ("spec_pending_adr_read_failed", *owner_handoff.SPEC_WRITE_POSTS):
                 done = self.after_item(self.item(lambda: self.resume_spec(issue)))
             else:
                 done = self.after_item(self.item(lambda: dev.run(self, issue)))

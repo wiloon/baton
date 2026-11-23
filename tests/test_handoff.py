@@ -316,11 +316,26 @@ def spec_post_binding(issue="7", *, reply=False):
             "mode_note": "", "limit_why": "still has points", "run_id": ""}
 
 
+def accept_post_binding(issue="7", *, pending=False):
+    verdict = ("<!-- baton-verdict: accept by=claude -->\n"
+               "## Spec review (claude), round 1: accept\n\nall good")
+    if pending:
+        body = f"<!-- baton-spec-accept-pending pr=77 head={'a' * 40} -->\n{verdict}"
+        next_step, pr, head = "merge", "77", "a" * 40
+    else:
+        body, next_step, pr, head = verdict, "transition", "", ""
+    return {"issue": issue, "pr": pr, "round": 1, "reviewer": "claude", "author": "owner",
+            "body": body, "verdict": verdict, "digest": handoff.body_digest(body),
+            "issue_body": "c" * 64, "adr_head": head, "feedback": "d" * 64, "comment_ids": [],
+            "next": next_step}
+
+
 def test_every_category_1_reason_is_rule_mode_with_retry_budget():
     assert handoff.RETRY_REASONS == {
         "review_comment_missing", "spec_comments_read_failed", "spec_pending_adr_read_failed",
         "review_comment_post_failed", "screenshot_comment_post_failed",
         "spec_review_comment_post_failed", "spec_reply_post_failed",
+        "spec_pending_accept_post_failed", "spec_accept_post_failed",
     }
     for reason in handoff.RETRY_REASONS:
         entry = handoff.REASONS[reason]
@@ -336,6 +351,8 @@ def test_every_category_1_reason_is_rule_mode_with_retry_budget():
      post_binding("1", body="<!-- baton-screenshot-review round=1 by=claude -->\npass")),
     ("spec_review_comment_post_failed", spec_post_binding("1")),
     ("spec_reply_post_failed", spec_post_binding("1", reply=True)),
+    ("spec_pending_accept_post_failed", accept_post_binding("1", pending=True)),
+    ("spec_accept_post_failed", accept_post_binding("1")),
 ])
 def test_each_category_1_reason_defers_then_hands_off_through_perform(env, monkeypatch, reason, binding):
     """Every replayed read or comment post shares the same budget: no advisor, two later attempts, then handoff."""

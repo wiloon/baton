@@ -36,11 +36,16 @@ REVIEW_POST = "review_comment_post_failed"
 SCREENSHOT_POST = "screenshot_comment_post_failed"
 SPEC_REVIEW_POST = "spec_review_comment_post_failed"
 SPEC_REPLY_POST = "spec_reply_post_failed"
+SPEC_PENDING_ACCEPT_POST = "spec_pending_accept_post_failed"
+SPEC_ACCEPT_POST = "spec_accept_post_failed"
 COMMENT_POSTS = (REVIEW_POST, SCREENSHOT_POST)
 SPEC_POSTS = (SPEC_REVIEW_POST, SPEC_REPLY_POST)
+SPEC_ACCEPT_POSTS = (SPEC_PENDING_ACCEPT_POST, SPEC_ACCEPT_POST)
+# Spec comment posts and accept/pending-accept posts share tick discovery and the confirmed phase.
+SPEC_WRITE_POSTS = (*SPEC_POSTS, *SPEC_ACCEPT_POSTS)
 RETRY_REASONS = frozenset({
     "review_comment_missing", "spec_comments_read_failed", "spec_pending_adr_read_failed",
-    *COMMENT_POSTS, *SPEC_POSTS,
+    *COMMENT_POSTS, *SPEC_WRITE_POSTS,
 })
 
 # Categories: 1 rule-decided, 2 judgement, 3 needs investigation, 4 owner-only.
@@ -233,6 +238,54 @@ def _spec_comment_post_valid(item, binding, *, reason):
             and type(binding.get("max_rounds")) is int and binding["max_rounds"] > 0)
 
 
+def _spec_accept_post_valid(item, binding, *, reason):
+    """A trusted accept or pending-accept comment and the inputs it was produced from (#151)."""
+    body, reviewer, round = binding.get("body"), binding.get("reviewer"), binding.get("round")
+    if reviewer not in ("claude", "codex", "cursor") or type(round) is not int or round <= 0 or not isinstance(body, str):
+        return False
+    verdict = binding.get("verdict")
+    if not isinstance(verdict, str) or not verdict.startswith(f"<!-- baton-verdict: accept by={reviewer} -->\n"):
+        return False
+    if f"round {round}: accept" not in verdict.split("\n", 2)[1]:
+        return False
+    if reason == SPEC_PENDING_ACCEPT_POST:
+        pr = binding.get("pr")
+        if not isinstance(pr, str) or not pr.isdecimal():
+            return False
+        head = binding.get("adr_head")
+        if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
+            return False
+        expected = f"<!-- baton-spec-accept-pending pr={pr} head={head} -->\n{verdict}"
+        if body != expected or binding.get("next") != "merge":
+            return False
+    else:
+        if body != verdict or binding.get("next") != "transition":
+            return False
+        pr = binding.get("pr")
+        if not isinstance(pr, str) or (pr != "" and not pr.isdecimal()):
+            return False
+        head = binding.get("adr_head")
+        # Head may be empty when resuming a pending comment that omitted it; the merge gate
+        # still requires the PR (when set) to be MERGED.
+        if not isinstance(head, str) or (head != "" and not re.fullmatch(r"[0-9a-f]{40}", head)):
+            return False
+        if head and not pr:
+            return False
+    try:
+        if binding.get("digest") != body_digest(body):
+            return False
+    except UnicodeEncodeError:
+        return False
+    boundary = binding.get("comment_ids")
+    return (binding.get("issue") == item
+            and isinstance(boundary, list) and all(type(value) is int and value > 0 for value in boundary)
+            and len(set(boundary)) == len(boundary)
+            and all(isinstance(binding.get(key), str) for key in ("author", "issue_body", "feedback"))
+            and bool(binding["author"])
+            and bool(re.fullmatch(r"[0-9a-f]{64}", binding["issue_body"]))
+            and bool(re.fullmatch(r"[0-9a-f]{64}", binding["feedback"])))
+
+
 def _binding_valid(reason, item, binding):
     if not isinstance(binding, dict):
         return False
@@ -253,6 +306,8 @@ def _binding_valid(reason, item, binding):
         return _comment_post_valid(item, binding, marker="baton-screenshot-review")
     if reason in SPEC_POSTS:
         return _spec_comment_post_valid(item, binding, reason=reason)
+    if reason in SPEC_ACCEPT_POSTS:
+        return _spec_accept_post_valid(item, binding, reason=reason)
     return (binding.get("pr") == item and type(binding.get("round")) is int and binding["round"] > 0
             and all(isinstance(binding.get(key), str) for key in
                     ("head", "base", "digest", "issue", "screenshot_digest"))
@@ -278,7 +333,7 @@ def load_retry(env, episode, reason, item=""):
         raise RetryUnreadable(f"mismatched retry operation {path.name}")
     if not _binding_valid(reason, item, binding):
         raise RetryUnreadable(f"invalid continuation in {path.name}")
-    if "confirmed" in data and (reason not in SPEC_POSTS or data["confirmed"] is not True):
+    if "confirmed" in data and (reason not in SPEC_WRITE_POSTS or data["confirmed"] is not True):
         raise RetryUnreadable(f"invalid confirmed-post phase in {path.name}")
     attempts, due, scheduled = data.get("attempts"), data.get("due"), data.get("scheduled")
     if type(attempts) is not int or not (0 <= attempts <= MAX_ATTEMPTS):
