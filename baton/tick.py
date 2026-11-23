@@ -681,7 +681,7 @@ class Tick:
                     post = owner_handoff.load_retry(self.env, issue, reason)
                 except owner_handoff.RetryUnreadable:
                     post = None  # Let the spec loop handle damaged state.
-                if (post and not post.get("confirmed") and post["attempts"] < owner_handoff.MAX_ATTEMPTS
+                if (post and (post.get("reads") or not post.get("confirmed") and post["attempts"] < owner_handoff.MAX_ATTEMPTS)
                         and owner_handoff.clock() < post["due"]):
                     if self.force_issue:
                         return self.defer("handoff-retry", reason)

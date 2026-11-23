@@ -283,8 +283,13 @@ def load_retry(env, episode, reason, item=""):
     attempts, due, scheduled = data.get("attempts"), data.get("due"), data.get("scheduled")
     if type(attempts) is not int or not (0 <= attempts <= MAX_ATTEMPTS):
         raise RetryUnreadable(f"out-of-range attempts in {path.name}")
+    reads = data.get("reads")
+    if reads is not None and (data.get("confirmed") is not True or type(reads) is not int
+                              or not 1 <= reads <= MAX_ATTEMPTS):
+        raise RetryUnreadable(f"out-of-range reads in {path.name}")
+    index = min(attempts, MAX_ATTEMPTS - 1) if reads is None else reads - 1
     if (type(due) is not int or type(scheduled) is not int or not 0 <= scheduled <= int(clock())
-            or due != scheduled + DELAYS[min(attempts, MAX_ATTEMPTS - 1)]):
+            or due != scheduled + DELAYS[index]):
         raise RetryUnreadable(f"out-of-range due in {path.name}")
     return data
 

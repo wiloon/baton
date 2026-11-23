@@ -573,6 +573,15 @@ class Spec:
                                             {**pending, "attempts": attempts, "scheduled": now,
                                              "due": now + owner_handoff.DELAYS[attempts]})
                 raise Deferred("handoff-retry", reason, lends_slot=False)
+        if confirmed and status == "retry":
+            # The post already landed: a transient read only delays the continuation (#151).
+            reads = pending.get("reads", 0) + 1
+            if reads <= owner_handoff.MAX_ATTEMPTS:
+                now = int(owner_handoff.clock())
+                owner_handoff.restore_retry(self.env, n, reason, n,
+                                            {**pending, "reads": reads, "scheduled": now,
+                                             "due": now + owner_handoff.DELAYS[reads - 1]})
+                raise Deferred("handoff-retry", reason, lends_slot=False)
         return stop(f"Reconciliation: {status}." + (pr_helpers.why(posted) if posted is not None else ""))
 
     def worktree(self):

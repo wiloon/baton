@@ -2092,3 +2092,65 @@ def test_a_stop_before_the_limit_decision_keeps_the_saved_post(loop, monkeypatch
     assert "handoff spec_review_comment_post_failed " not in loop.log()
     assert post_times == [1_000] * 4 + [1_060] * 4 + [1_360]
     assert len(loop.runs) == 5
+
+
+def _stopped_after_a_landed_post(loop, monkeypatch, healthy_at):
+    """Land the third review post, stop before the limit decision, then fail GraphQL reads until HEALTHY_AT."""
+    clock = _spec_clock(monkeypatch)
+    loop.script = [CHANGES, reviser(), CHANGES, reviser(), CHANGES]
+    call, at_limit = spec.pr_helpers.call, spec.Spec.at_limit
+    reads = []
+
+    def unavailable(*args, input=None, limit=None):
+        body = args[args.index("--body") + 1] if "--body" in args else ""
+        if args[:2] == ("issue", "comment") and body.startswith("<!-- baton-spec-review round=3"):
+            if clock["now"] < 1_360:
+                return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        if args[:2] == ("api", "graphql") and clock["now"] >= 1_361:
+            reads.append(clock["now"])
+            if clock["now"] < healthy_at:
+                return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return call(*args, input=input, limit=limit)
+
+    def stopped(self, *args):
+        raise InterruptedError("runner stopped before the limit decision")
+
+    monkeypatch.setattr(spec.pr_helpers, "call", unavailable)
+    monkeypatch.setattr(spec.Spec, "at_limit", stopped)
+    for now in (1_000, 1_060):
+        clock["now"] = now
+        with pytest.raises(Deferred, match="spec_review_comment_post_failed"):
+            loop.run()
+    clock["now"] = 1_360
+    with pytest.raises(InterruptedError):
+        loop.run()
+    monkeypatch.setattr(spec.Spec, "at_limit", at_limit)
+    return clock, reads
+
+
+def test_a_transient_read_after_a_confirmed_post_waits_and_recovers(loop, monkeypatch):
+    clock, reads = _stopped_after_a_landed_post(loop, monkeypatch, healthy_at=1_420)
+    clock["now"] = 1_361
+    with pytest.raises(Deferred, match="spec_review_comment_post_failed"):
+        loop.run()
+    clock["now"] = 1_400
+    tick.Tick(loop.env).run()
+    assert reads == [1_361]
+    clock["now"] = 1_421
+    tick.Tick(loop.env).run()
+    assert "handoff spec_limit " in loop.log()
+    assert "handoff spec_review_comment_post_failed " not in loop.log()
+    assert len(loop.gh.posted("<!-- baton-spec-review round=3")) == 1
+
+
+def test_a_persistent_read_failure_after_a_confirmed_post_hands_off_once(loop, monkeypatch):
+    clock, reads = _stopped_after_a_landed_post(loop, monkeypatch, healthy_at=10_000)
+    clock["now"] = 1_361
+    with pytest.raises(Deferred, match="spec_review_comment_post_failed"):
+        loop.run()
+    for now in (1_420, 1_421, 1_700, 1_721):
+        clock["now"] = now
+        tick.Tick(loop.env).run()
+    assert reads == [1_361, 1_421, 1_721]
+    assert loop.log().count("handoff spec_review_comment_post_failed ") == 1
+    assert len(loop.gh.posted("<!-- baton-spec-review round=3")) == 1
