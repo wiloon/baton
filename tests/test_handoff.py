@@ -464,6 +464,18 @@ def test_a_comment_post_binding_without_its_body_hands_off(env, monkeypatch):
     assert result.handed_off and labelled == [1]
 
 
+@pytest.mark.parametrize("reason", ["dev_push_failed", "spec_adr_push_failed"])
+def test_an_issue_push_record_accepts_landed_but_never_finished(env, monkeypatch, reason):
+    monkeypatch.setattr(handoff, "clock", lambda: 1_000)
+    pending = handoff.prepare_retry(env, "1", reason, "1", issue_push_binding("1", reason=reason))
+    assert pending is not None
+    handoff.restore_retry(env, "1", reason, "1", {**pending, "phase": "landed"})
+    assert handoff.load_retry(env, "1", reason)["phase"] == "landed"
+    handoff.restore_retry(env, "1", reason, "1", {**pending, "phase": "finished"})
+    with pytest.raises(handoff.RetryUnreadable):
+        handoff.load_retry(env, "1", reason)
+
+
 def test_a_damaged_retry_record_hands_off_without_replaying(env, monkeypatch):
     """An unreadable retry must fail closed: no fresh budget, no lookup replay."""
     labelled = []

@@ -317,10 +317,11 @@ def check_dev_push(tick, env, binding):
         return "paused"
     # An open PR for this branch means another path already finished the push.
     listed = tick.gh_json("pr", "list", "-R", tick.gh_repo, "--state", "open", "--head", binding["branch"],
-                          "--json", "number")
+                          "--json", "number,isCrossRepository")
     if listed is None:
         return "retry"
-    if listed:
+    # A fork's same-named branch is absence, not supersession.
+    if any(not row.get("isCrossRepository") for row in listed):
         return "superseded"
     if owner_feedback_digest(env.owner, data["comments"]) != binding["feedback"]:
         return "changed"
@@ -391,6 +392,10 @@ def push_with_retry(tick, env, issue, wt, branch, *, vendor, title, body_text, b
         remote, unreadable_transient = owner_handoff.observe_remote(wt, dest)
         if remote is None and not unreadable_transient:
             return handoff(f"{branch} is committed in {wt}; could not observe the remote ref.")
+        if gate_result:
+            # Named after sign-off so the SHA is the one that reaches origin.
+            short = git(wt, "rev-parse", "--short", commit) or commit[:7]
+            body_text += f"\n\n## E2E gate\n{gate_result}, on {short}. The runner ran this."
         binding = {
             "issue": str(issue), "commit": commit, "branch": dest, "ref": dest,
             "remote": remote, "upstream": True, "wt": str(wt), "feedback": feedback,
@@ -680,8 +685,6 @@ def run(tick, issue):
     except ValueError:
         return stop(tick, issue, "dev_task_invalid", f"#{issue}: invalid PR task relation",
                     f"Review the completion field in {body}. {url}")
-    if verifier.gate_result:
-        text += f"\n\n## E2E gate\n{verifier.gate_result}, on {git(wt, 'rev-parse', '--short', 'HEAD')}. The runner ran this."
     if rounds:
         for attempt in attempts:
             if attempt[0] == dev_vendor:

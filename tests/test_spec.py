@@ -396,6 +396,44 @@ def test_a_transient_adr_push_defers_then_recovers_without_a_second_worker(loop,
     assert not list(Path(loop.env["STATE"]).glob("handoff-*-*spec_adr_push_failed.json"))
 
 
+def test_a_landed_adr_push_makes_no_extra_issue_read_and_clears_after_the_reply_is_saved(loop, monkeypatch):
+    """The continuation reuses the round's inputs (first path) or the check's read (resume) (#151)."""
+    from baton import common
+
+    clock = _spec_clock(monkeypatch)
+    real, reads, state = common.push, [], {"fail": True}
+
+    def flaky(wt, ref, *, upstream=False, signoff=False):
+        if state["fail"]:
+            return common.PushResult(False, transient=True, detail="connection refused")
+        return real(wt, ref, upstream=upstream, signoff=signoff)
+
+    monkeypatch.setattr(spec, "push", flaky)
+    read = spec.read_issue
+    monkeypatch.setattr(spec, "read_issue", lambda *a, **k: (reads.append(k.get("once")), read(*a, **k))[1])
+    order = []
+    clear = handoff.clear_retry
+
+    def clearing(env, episode, reason, *a, **k):
+        if reason == "spec_adr_push_failed":
+            order.append(("clear", bool(loop.gh.posted("<!-- baton-spec-reply")),
+                          bool(list(Path(env.dirs.state).glob("handoff-*spec_reply_post_failed.json")))))
+        return clear(env, episode, reason, *a, **k)
+
+    monkeypatch.setattr(handoff, "clear_retry", clearing)
+    loop.script = [CHANGES, reviser(commit=True), ACCEPT]
+    with pytest.raises(Deferred, match="spec_adr_push_failed"):
+        loop.run()
+    state["fail"] = False
+    clock["now"] = 1_060
+    reads.clear()
+    assert loop.run() is True
+    assert [run["role"] for run in loop.runs] == ["spec_review", "spec", "spec_review"]
+    assert len(loop.gh.posted("<!-- baton-spec-reply round=1 by=")) == 1
+    # the push record went only after the reply operation was saved, and before the reply was posted
+    assert order[0][2] is True and order[0][1] is False
+
+
 def test_a_lost_adr_push_response_is_recognized_without_a_second_write(loop, monkeypatch):
     """A push that landed before its answer was lost counts as success (#151)."""
     from baton import common

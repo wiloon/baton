@@ -472,7 +472,7 @@ def load_retry(env, episode, reason, item=""):
     if "confirmed" in data and (reason not in (*SPEC_POSTS, SPEC_ACCEPT_POST) or data["confirmed"] is not True):
         raise RetryUnreadable(f"invalid confirmed-post phase in {path.name}")
     if "phase" in data:
-        finished_ok = (reason == FIX_PUSH and binding.get("next") == "done") or reason in ISSUE_PUSHES
+        finished_ok = reason == FIX_PUSH and binding.get("next") == "done"
         if (reason not in PUSH_REASONS or data["phase"] not in ("landed", "finished")
                 or binding["remote"] is None
                 or (data["phase"] == "finished" and not finished_ok)):

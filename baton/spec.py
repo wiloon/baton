@@ -283,6 +283,7 @@ class Spec:
         self.wt = Path(str(env.dirs.worktrees), f"spec-{issue}")
         self.branch = f"docs/spec-issue-{issue}"
         self.pr, self.base, self.adr_head = "", "origin/main", ""
+        self.adr_read, self.adr_round = None, None
         self.extra = 1 if advisor.granted(self.env, "spec_limit", self.issue) else 0
         self.fresh_payload = None
 
@@ -735,7 +736,7 @@ class Spec:
                 raise Deferred("handoff-retry", reason, lends_slot=False)
         return stop(f"Reconciliation: {status}." + (pr_helpers.why(failure) if failure is not None else ""))
 
-    def post_comment(self, reason, binding, *, initial, claim=None, context=None):
+    def post_comment(self, reason, binding, *, initial, claim=None, context=None, after_save=None):
         """Save before sending a spec comment, or consume a due attempt before reconciling (#151).
 
         On a resume CLAIM (labels, worktree) runs only once the attempt is due and the issue is neither
@@ -760,6 +761,8 @@ class Spec:
             pending = owner_handoff.prepare_retry(self.env, n, reason, n, binding)
             if pending is None:
                 return stop("The worker inputs could not be saved.")
+            if after_save is not None:
+                after_save()
         elif pending is not None:
             binding = pending["continuation"]
         confirmed = pending is not None and pending.get("confirmed", False)
@@ -1216,6 +1219,7 @@ class Spec:
         data, transient = read_issue(self.env, self.issue, once=True)
         if data is None:
             return "retry" if transient else "failed"
+        self.adr_read = data   # the continuation reuses this read instead of making a second one
         if data["state"] == "CLOSED":
             return "superseded"
         labels = {label["name"] for label in data["labels"]}
@@ -1232,7 +1236,8 @@ class Spec:
             return "changed"
         return "ok"
 
-    def finish_revision_reply(self, reviser, model, round, human, reply, mode_note, max_rounds, inputs, applied):
+    def finish_revision_reply(self, reviser, model, round, human, reply, mode_note, max_rounds, inputs, applied,
+                              after_save=None):
         """Post the reply after ADR work (or when there was none) and clear the worker grant."""
         n = self.issue
         adr = f"\nADR revisions: #{self.pr}\n" if self.pr else ""
@@ -1245,7 +1250,7 @@ class Spec:
             reply=reply, max_rounds=max_rounds, limit_why="n/a", issue_body=applied)
         recovery.clear(self.env, self.issue, self.issue)
         try:
-            return self.post_comment(owner_handoff.SPEC_REPLY_POST, binding, initial=True)
+            return self.post_comment(owner_handoff.SPEC_REPLY_POST, binding, initial=True, after_save=after_save)
         finally:
             for leftover in Path("/tmp").glob(f"baton-spec-{n}-{round}.*"):
                 leftover.unlink()
@@ -1278,16 +1283,27 @@ class Spec:
             owner_handoff.clear_retry(self.env, n, owner_handoff.SPEC_ADR_PUSH)
             self.push_flag().unlink(missing_ok=True)
             return "stop"
-        owner_handoff.clear_retry(self.env, n, owner_handoff.SPEC_ADR_PUSH)
-        self.push_flag().unlink(missing_ok=True)
-        data, _ = read_issue(self.env, n, once=True)
-        if data is None:
-            self.handoff("Could not read the issue after the ADR push landed.",
-                         "spec_comments_read_failed")
-            return "stop"
+        if self.adr_round is not None:
+            inputs, applied = self.adr_round   # first path: the round's own inputs, no new read
+        else:
+            data = self.adr_read
+            if data is None:
+                self.handoff("Could not read the issue after the ADR push landed.",
+                             "spec_comments_read_failed")
+                return "stop"
+            known = set(binding["comment_ids"])
+            inputs = {"body": data["body"], "comments": [r for r in data["comments"] if r["id"] in known]}
+            applied = None
+
+        def after_save():
+            # Only once the reply operation is saved: a crash before this still resumes from the landed record.
+            owner_handoff.clear_retry(self.env, n, owner_handoff.SPEC_ADR_PUSH)
+            self.push_flag().unlink(missing_ok=True)
+
         return self.finish_revision_reply(
             binding["reviser"], binding["model"], binding["round"], binding["human"],
-            binding["reply"], binding["mode_note"], binding["max_rounds"], data, applied=None)
+            binding["reply"], binding["mode_note"], binding["max_rounds"], inputs, applied,
+            after_save=after_save)
 
     def push_adr(self, binding, *, initial, pending=None):
         """Save before pushing ADR commits, or consume a due attempt before reconciling (#151)."""
@@ -1506,6 +1522,7 @@ class Spec:
                 return "stop"
             binding = self.adr_push_binding(
                 reviser, model, round, human, text, mode_note, max_rounds, inputs, applied)
+            self.adr_round = (inputs, applied)
             try:
                 return self.push_adr(binding, initial=True)
             finally:

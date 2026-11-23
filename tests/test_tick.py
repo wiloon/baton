@@ -2378,3 +2378,48 @@ def test_a_push_wait_ends_a_previous_quota_slot_loan(ctx, monkeypatch):
     ctx.make().pending_reviews()
     assert ctx.make().next_issue() == ""
     assert not ctx.path("slot-deferred-11").exists()
+
+
+def test_the_gate_line_names_the_signed_off_commit_that_is_pushed(devrun, monkeypatch):
+    def verify(self, *args):
+        self.gate_result = "E2E gate passed: e2e/a.spec.ts (1 passed)"
+        return 0, "", 0
+    monkeypatch.setattr(dev.fix.Runner, "verify", verify)
+    from baton import config
+    read = config.Repo.__getattribute__
+    monkeypatch.setattr(config.Repo, "__getattribute__",
+                        lambda self, name: True if name == "signoff" else read(self, name))
+    devrun.script = [implements()]
+    devrun.go()
+    create, = devrun.gh.ran("pr", "create")
+    pushed = sh(devrun.repo, "git", "ls-remote", "origin", "refs/heads/agent/issue-300").split()[0]
+    assert f", on {pushed[:7]}." in body_of(create)
+
+
+def _waiting_dev_push(devrun, monkeypatch, open_prs):
+    from baton import common, handoff
+    clock = {"now": 1_000}
+    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
+    monkeypatch.setattr(dev, "push",
+                        lambda *a, **k: common.PushResult(False, transient=True, detail="connection refused"))
+    devrun.script = [implements()]
+    assert devrun.go()[1] == 75
+    devrun.gh.answers["pr list"] = open_prs
+    clock["now"] = 1_060
+
+
+def test_a_fork_pr_from_the_same_branch_name_does_not_supersede_a_dev_push(devrun, monkeypatch):
+    from baton import handoff, session
+    _waiting_dev_push(devrun, monkeypatch, [{"number": 9, "isCrossRepository": True}])
+    t, rc = devrun.go()
+    # The fork's PR is absence: the push is retried (it fails again, still transient), not dropped.
+    assert handoff.load_retry(session.resolve(devrun.env), "300", "dev_push_failed") is not None
+    assert len(devrun.runs) == 1
+
+
+def test_a_same_repo_pr_from_the_branch_supersedes_a_dev_push(devrun, monkeypatch):
+    from baton import handoff, session
+    _waiting_dev_push(devrun, monkeypatch, [{"number": 9, "isCrossRepository": False}])
+    t, rc = devrun.go()
+    assert rc == 80 and not devrun.gh.ran("pr", "create")
+    assert handoff.load_retry(session.resolve(devrun.env), "300", "dev_push_failed") is None
