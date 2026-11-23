@@ -756,36 +756,76 @@ class Spec:
             return "unreadable"
         return data
 
-    def questions_citation_entries(self, issue_body, comments):
+    def referenced_documents(self, texts, limit, chars):
+        """(relative path, text) of the ADR files TEXTS reference, read from the spec worktree."""
+        root = Path(self.wt, "docs", "adr")
+        if not root.is_dir():
+            return []
+        names = []
+        for text in texts:
+            for match in re.finditer(r"docs/adr/([A-Za-z0-9][A-Za-z0-9._-]*\.md)|\bADR[ -]?0*(\d{1,4})\b",
+                                     text or "", re.I):
+                if match.group(1):
+                    names.append(match.group(1))
+                else:
+                    names.extend(p.name for p in sorted(root.glob(f"{int(match.group(2)):04d}-*.md")))
+        found = []
+        for name in dict.fromkeys(names):
+            path = root / name
+            if not path.is_file() or path.is_symlink() or len(found) >= limit:
+                continue
+            try:
+                found.append((f"docs/adr/{name}", path.read_text()[:chars]))
+            except OSError:
+                continue
+        return found
+
+    def questions_citation_entries(self, issue_body, comments, reply=""):
         """Baseline citation rows from the issue body and genuine owner comments."""
         entries, owner = [], self.env.owner
 
         def one_line(text):
-            return re.sub(r"\s+", " ", (text or "").strip())[:1500]
+            line = re.sub(r"\s+", " ", (text or "").strip())
+            return line[:1500] + advisor.TRUNCATED if len(line) > 1500 else line
 
         body = one_line(issue_body)
         if body:
             entries.append((f"c{len(entries) + 1}", "issue body", body))
+        owner_texts = [issue_body, reply]
         for comment in comments or ():
             login = (comment.get("author") or {}).get("login") or ""
             text = one_line(comment.get("body") or "")
             if login != owner or not text or text.startswith("<!-- baton"):
                 continue
+            owner_texts.append(comment.get("body") or "")
             entries.append((f"c{len(entries) + 1}", "owner comment", text))
         if self.env.repo.advisor_local_documents:
-            for path in sorted(Path(self.repo_dir, "docs", "adr").glob("*.md"))[:5]:
-                try:
-                    text = one_line(path.read_text()[:2000])
-                except OSError:
-                    continue
+            for rel, text in self.referenced_documents(owner_texts, 5, 2000):
+                text = one_line(text)
                 if text:
-                    entries.append((f"c{len(entries) + 1}", f"document {path.relative_to(self.repo_dir)}",
-                                    text))
+                    entries.append((f"c{len(entries) + 1}", f"document {rel}", text))
         return entries
+
+    def answer_inputs_current(self, data, saved):
+        """True while the issue, owner replies, question comment and ADR head match SAVED (#125)."""
+        if self.body_key(data["body"]) != saved["issue_body"]:
+            return False
+        if self.owner_feedback_digest(data["comments"]) != saved["feedback"]:
+            return False
+        found = any((c.get("body") or "").startswith(f"<!-- baton-spec-reply round={saved['round']} human ")
+                    and owner_handoff.body_digest(c["body"]) == saved["questions"]
+                    for c in data["comments"])
+        if not found:
+            return False
+        if saved.get("pr"):
+            revision, _ = self.read_pr_revision(saved["pr"])
+            if not revision or revision["state"] != "OPEN" or revision["headRefOid"] != saved.get("adr_head"):
+                return False
+        return True
 
     def questions_snapshot(self, binding, questions, payload):
         """(snapshot, revalidate) for the spec_questions decision point."""
-        entries = self.questions_citation_entries(payload["body"], payload["comments"])
+        entries = self.questions_citation_entries(payload["body"], payload["comments"], binding.get("reply") or "")
         question_lines = "\n".join(f"- {q['id']}: {q['text']}" for q in questions)
         citation_block = advisor.format_citations(entries) if entries else "Citation evidence:\n"
         baseline = (
@@ -797,28 +837,15 @@ class Spec:
             f"Latest reviser reply:\n{binding.get('reply') or ''}"
         )
         snapshot = advisor.augment_snapshot(self.env, baseline)
-        expected = {
-            "digest": binding["digest"], "issue_body": binding["issue_body"],
-            "adr_head": binding.get("adr_head") or "", "feedback": binding["feedback"],
+        saved = {
+            "questions": binding["digest"], "round": binding["round"], "issue_body": binding["issue_body"],
+            "feedback": binding["feedback"], "adr_head": binding.get("adr_head") or "",
+            "pr": binding.get("pr") or "",
         }
 
         def still_current():
             data, _ = read_issue(self.env, self.issue, once=True)
-            if data is None:
-                return False
-            if self.body_key(data["body"]) != expected["issue_body"]:
-                return False
-            if self.owner_feedback_digest(data["comments"]) != expected["feedback"]:
-                return False
-            if (binding.get("adr_head") or "") != expected["adr_head"]:
-                # Re-read ADR head only when the binding carried one.
-                if expected["adr_head"]:
-                    return False
-            found = next((c for c in data["comments"]
-                          if (c.get("body") or "").startswith(
-                              f"<!-- baton-spec-reply round={binding['round']} human ")
-                          and owner_handoff.body_digest(c["body"]) == expected["digest"]), None)
-            return found is not None
+            return data is not None and self.answer_inputs_current(data, saved)
 
         return snapshot, still_current
 
@@ -864,10 +891,10 @@ class Spec:
             self.clear_answer_intent()
             self.handoff("Could not re-read the issue before posting advisor answers.", "spec_questions")
             return "stop"
-        # A genuine owner reply supersedes any advisory continuation.
-        if binding and self.owner_feedback_digest(data["comments"]) != binding["feedback"]:
+        # A genuine owner reply, an edited issue or a moved ADR supersedes the saved answer, also on restart.
+        if not self.answer_inputs_current(data, intent):
             self.clear_answer_intent()
-            self.handoff(f"{binding['reviewer']} has questions only you can answer. "
+            self.handoff(f"{intent['reviewer']} has questions only you can answer. "
                          "Reply on the issue, then remove ready-for-human.", "spec_questions")
             return "stop"
         matches = [c for c in data["comments"]
@@ -935,7 +962,7 @@ class Spec:
             return "stop"
         # Re-check citations against the current sources before posting.
         entries = {i: text for i, _, text in self.questions_citation_entries(
-            payload["body"], payload["comments"])}
+            payload["body"], payload["comments"], binding.get("reply") or "")}
         for row in answers:
             combined = "\n".join(entries[c] for c in row["citations"] if c in entries)
             if row["text"] not in combined:
@@ -1162,11 +1189,7 @@ class Spec:
             diff_excerpt = (git(self.wt, "diff", "origin/main...HEAD") or "")[:4000]
         docs = []
         if env.repo.advisor_local_documents:
-            for path in sorted(Path(self.repo_dir, "docs", "adr").glob("*.md"))[:3]:
-                try:
-                    docs.append((str(path.relative_to(self.repo_dir)), path.read_text()[:1500]))
-                except OSError:
-                    continue
+            docs = self.referenced_documents([issue_text, reply], 3, 1500)
         snapshot = advisor.augment_snapshot(env, baseline, diff_excerpt=diff_excerpt,
                                             document_excerpts=tuple(docs))
         return snapshot, (lambda: spec_state(env, n) == state)
@@ -1610,7 +1633,7 @@ class Spec:
             if post_reason in owner_handoff.SPEC_ACCEPT_POSTS:
                 return self.post_accept(post_reason, None, initial=False) == "accept"
             outcome = self.post_comment(post_reason, None, initial=False, claim=claim)
-            if outcome == "changes":
+            if outcome in ("changes", "answered"):
                 step, round = "revise", binding["round"]
             elif outcome == "revised":
                 step, round = "review", binding["round"] + 1

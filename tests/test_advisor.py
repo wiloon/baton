@@ -1,4 +1,5 @@
 """baton.advisor (#17, ADR 0008): the DeepSeek routine advisor at the review and spec round limits."""
+import time
 import os
 import urllib.error
 from dataclasses import replace
@@ -463,7 +464,6 @@ def test_live_grounded_answers_are_executed_when_complete_and_cited(adv):
 
 
 @pytest.mark.parametrize("answers", [
-    [{"id": "q1", "case": "reversible_default", "text": "prefer gate", "citations": []}],
     [{"id": "q1", "case": "grounded", "text": "invented decision", "citations": ["c1"]}],
     [{"id": "q1", "case": "grounded", "text": "Manual checks use the existing gate path.",
       "citations": ["missing"]}],
@@ -515,3 +515,62 @@ def test_augment_snapshot_includes_only_enabled_excerpt_flags(adv):
                                          advisor_ci_log_excerpts=True, advisor_local_documents=True))
     assert advisor.advise(off, "review_limit", 99, with_diff, ("extra_round",)).action == "handoff"
     assert adv.calls == []
+
+
+EXCERPT = "Manual checks use the existing gate path."
+
+
+def questions_snapshot(rows=None):
+    rows = rows or [f"[c1] (issue body): {EXCERPT}"]
+    return "Decision point: spec_questions.\nQuestions:\n- q1: Use gate or defer?\nCitation evidence:\n" + "\n".join(rows) + "\n"
+
+
+def answer_reply(text=EXCERPT, case="grounded", cites=("c1",)):
+    return [{"action": "answer_spec_questions", "reason": "r", "evidence": [],
+             "answers": [{"id": "q1", "case": case, "text": text, "citations": list(cites)}]}]
+
+
+def test_reversible_default_is_recorded_for_observation_and_counted_in_the_digest(adv):
+    adv.replies = answer_reply("Prefer the gate, easy to reverse.", "reversible_default", ())
+    d = advisor.advise(adv.env, "spec_questions", 12, questions_snapshot(), ("answer_spec_questions",),
+                       category=2, revalidate=lambda: True)
+    assert d.action == "handoff" and d.advised == "answer_spec_questions" and not d.failure
+    [record] = adv.records()
+    assert record["executed"] == "handoff" and not record["failure"]
+    assert record["answers"][0]["case"] == "reversible_default"
+    assert "Prefer the gate" in record["answers"][0]["text"]
+    assert not advisor.granted(adv.env, "spec_questions", 12)
+    text = advisor.digest(adv.env, now=int(time.time()) + 10**6)
+    assert "observed reversible-default recommendations: 1" in text
+
+
+def test_a_citation_the_runner_cut_cannot_support_an_answer(adv):
+    cut = f"[c1] (issue body): {EXCERPT}{advisor.TRUNCATED}"
+    adv.replies = answer_reply()
+    d = advisor.advise(adv.env, "spec_questions", 13, questions_snapshot([cut]), ("answer_spec_questions",),
+                       category=2, revalidate=lambda: True)
+    assert d.action == "handoff" and "truncated" in d.failure
+
+
+def test_a_citation_cut_by_the_snapshot_cap_cannot_support_an_answer(adv, monkeypatch):
+    real = advisor.settings
+    monkeypatch.setattr(advisor, "settings", lambda env: replace_cap(real(env), 1000))
+    rows = [f"[c1] (issue body): {EXCERPT}", "[c2] (owner comment): " + "y" * 1500]
+    snapshot = questions_snapshot(rows)
+    adv.replies = answer_reply("y" * 900, "grounded", ("c2",))
+    d = advisor.advise(adv.env, "spec_questions", 14, snapshot, ("answer_spec_questions",),
+                       category=2, revalidate=lambda: True)
+    assert d.action == "handoff" and "truncated" in d.failure
+
+
+def test_an_answer_over_the_length_limit_is_rejected_not_trimmed(adv):
+    long = "z" * 700
+    adv.replies = answer_reply(long)
+    d = advisor.advise(adv.env, "spec_questions", 16, questions_snapshot([f"[c1] (issue body): {long}"]),
+                       ("answer_spec_questions",), category=2, revalidate=lambda: True)
+    assert d.action == "handoff" and "length limit" in d.failure
+
+
+def replace_cap(cfg, chars):
+    from dataclasses import replace
+    return replace(cfg, snapshot_chars=chars)

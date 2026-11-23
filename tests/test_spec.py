@@ -2949,3 +2949,145 @@ def test_restart_reconciles_a_saved_advisor_answer_intent(advised, monkeypatch):
     assert advised.run() is True
     assert len(advised.gh.posted("<!-- baton-advisor-answer")) == 1
     assert advised.gh.posted("<!-- baton-verdict: accept")
+
+
+EXCERPT = "Manual checks use the existing gate path."
+
+
+def grounded(text=EXCERPT, cite="c1", qid="q1"):
+    return {"id": qid, "case": "grounded", "text": text, "citations": [cite]}
+
+
+def advice(*answers):
+    return [{"action": "answer_spec_questions", "reason": "settled", "evidence": [EXCERPT],
+             "answers": list(answers)}]
+
+
+TWO_QUESTIONS = QUESTIONS + "- Keep the old flag?\n"
+
+
+def test_a_live_mixed_answer_set_hands_off_without_an_answer_comment(advised, monkeypatch):
+    advised.gh.body = f"Goal\n{EXCERPT}\n"
+    advised.script = [CHANGES, reviser(TWO_QUESTIONS, outcome="SPEC: human")]
+    advised.advice = advice(grounded(), {"id": "q2", "case": "reversible_default",
+                                         "text": "Keep it for now.", "citations": []})
+    assert advised.run() is False
+    assert not advised.gh.posted("<!-- baton-advisor-answer")
+    assert "ready-for-human" in advised.gh.labels and advised.advice_calls
+
+
+def test_stale_evidence_during_the_advisor_call_hands_off_without_an_answer(advised, monkeypatch):
+    advised.gh.body = f"Goal\n{EXCERPT}\n"
+    advised.script = [CHANGES, reviser(QUESTIONS, outcome="SPEC: human")]
+    answers = advice(grounded())
+
+    def provider(cfg, key, snapshot, actions, **_):
+        advised.advice_calls.append(snapshot)
+        advised.gh.body += "edited meanwhile\n"
+        return answers.pop(0), {}
+
+    monkeypatch.setattr(spec.advisor, "call_deepseek", provider)
+    assert advised.run() is False
+    assert not advised.gh.posted("<!-- baton-advisor-answer") and "ready-for-human" in advised.gh.labels
+
+
+def test_an_adr_head_that_moves_during_the_advisor_call_hands_off(advised, monkeypatch):
+    advised.gh.body = f"Goal\n{EXCERPT}\n"
+    advised.script = [CHANGES, reviser(QUESTIONS, outcome="SPEC: human", commit=True)]
+    answers = advice(grounded())
+
+    def provider(cfg, key, snapshot, actions, **_):
+        advised.advice_calls.append(snapshot)
+        advised.gh.head_oid = "c" * 40
+        return answers.pop(0), {}
+
+    monkeypatch.setattr(spec.advisor, "call_deepseek", provider)
+    assert advised.run() is False
+    assert advised.advice_calls and not advised.gh.posted("<!-- baton-advisor-answer")
+    assert "ready-for-human" in advised.gh.labels
+
+
+def test_an_exhausted_round_budget_asks_no_advisor(advised, monkeypatch):
+    advised.gh.body = f"Goal\n{EXCERPT}\n"
+    advised.script = [CHANGES, reviser(QUESTIONS, outcome="SPEC: human")]
+    advised.advice = advice(grounded())
+    real = spec.Spec.comment_post_binding
+
+    def at_budget(self, *args, **kwargs):
+        binding = real(self, *args, **kwargs)
+        return {**binding, "max_rounds": binding["round"]} if kwargs.get("next_step") == "human" else binding
+
+    monkeypatch.setattr(spec.Spec, "comment_post_binding", at_budget)
+    assert advised.run() is False
+    assert advised.advice_calls == [] and not advised.gh.posted("<!-- baton-advisor-answer")
+    assert "ready-for-human" in advised.gh.labels
+
+
+def test_a_saved_answer_is_not_posted_after_the_owner_replied_before_the_restart(advised, monkeypatch):
+    advised.gh.body = f"Goal\n{EXCERPT}\n"
+    advised.script = [CHANGES, reviser(QUESTIONS, outcome="SPEC: human")]
+    advised.advice = advice(grounded())
+    original = spec.Spec.complete_answer_post
+
+    def crash(self, intent, binding=None):
+        raise InterruptedError("stopped after the intent was saved")
+
+    monkeypatch.setattr(spec.Spec, "complete_answer_post", crash)
+    with pytest.raises(InterruptedError):
+        advised.run()
+    assert list(Path(advised.env["STATE"]).glob("advisor-answer-*"))
+    advised.gh.comments.append({"author": {"login": "owner"}, "body": "defer them"})
+    monkeypatch.setattr(spec.Spec, "complete_answer_post", original)
+    assert advised.run() is False
+    assert not advised.gh.posted("<!-- baton-advisor-answer")
+    assert not list(Path(advised.env["STATE"]).glob("advisor-answer-*"))
+    assert "ready-for-human" in advised.gh.labels
+
+
+def test_a_resumed_reply_post_with_live_answers_runs_the_revision(advised, monkeypatch):
+    clock = _spec_clock(monkeypatch)
+    advised.gh.body = f"Goal\n{EXCERPT}\n"
+    advised.script = [CHANGES, reviser(QUESTIONS, outcome="SPEC: human"), reviser("adopted"), ACCEPT]
+    advised.advice = advice(grounded())
+    monkeypatch.setattr(dev, "setup_worktree", lambda *a, **k: ("", False))
+    call = spec.pr_helpers.call
+    down = {"on": True}
+
+    def unavailable(*args, input=None, limit=None):
+        if (down["on"] and args[:2] == ("issue", "comment") and "--body" in args
+                and args[args.index("--body") + 1].startswith("<!-- baton-spec-reply")):
+            return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return call(*args, input=input, limit=limit)
+
+    monkeypatch.setattr(spec.pr_helpers, "call", unavailable)
+    with pytest.raises(Deferred):
+        advised.run()
+    down["on"] = False
+    clock["now"] = 1_600
+    assert advised.run() is True
+    assert len(advised.gh.posted("<!-- baton-advisor-answer")) == 1
+    assert advised.gh.posted("<!-- baton-verdict: accept") and "ready-for-human" not in advised.gh.labels
+
+
+def test_only_the_referenced_documents_are_sent_when_local_documents_are_enabled(advised, monkeypatch):
+    from dataclasses import replace
+    doc = "Manual checks use the gate path."
+    advised.gh.body = "Goal\nSee ADR 0008 for the manual checks.\n"
+
+    def with_docs(vendor, output, cwd):
+        root = Path(cwd, "docs", "adr")
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "0001-first.md").write_text("Unrelated first record.\n")
+        (root / "0008-gates.md").write_text(doc + "\n")
+        return reviser(QUESTIONS, outcome="SPEC: human", commit=True)(vendor, output, cwd)
+
+    advised.script = [CHANGES, with_docs, reviser("adopted"), ACCEPT]
+    advised.advice = [{**advice(grounded(doc, "c2"))[0], "evidence": [doc]}]
+    monkeypatch.setattr(dev, "setup_worktree", lambda *a, **k: ("", False))
+    base = session.resolve(advised.env)
+    enabled = replace(base, repo=replace(base.repo, advisor_local_documents=True))
+    assert spec.Spec(enabled, spec.telemetry.from_env(enabled, issue=N), N).loop() is True
+    [snapshot] = advised.advice_calls
+    assert "document docs/adr/0008-gates.md" in snapshot and "Unrelated first record" not in snapshot
+    assert "Diff excerpt:" not in snapshot and "CI log excerpt:" not in snapshot
+    assert len(advised.gh.posted("<!-- baton-advisor-answer")) == 1

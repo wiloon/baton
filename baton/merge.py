@@ -125,9 +125,25 @@ class Merger:
         baseline = "\n\n".join(context)
         ci_log = ""
         if self.env.repo.advisor_ci_log_excerpts and status in ("failed", "pending"):
-            ci_log = f"CI status={status}; last exit={self.last_ci[1] if self.last_ci else 'unknown'}"
+            ci_log = self.failed_check_log(data.get("statusCheckRollup"))
         snapshot = advisor.augment_snapshot(self.env, baseline, ci_log_excerpt=ci_log)
         return {"snapshot": snapshot, "observed_actions": ("retry_step",) if retry else ()}
+
+    def failed_check_log(self, rollup, chars=3000):
+        """The bounded tail of the failed check run's log for the observed head; "" when none (#125).
+
+        The runs come from the head's own check rollup, so the log belongs to that head."""
+        for check in rollup if isinstance(rollup, list) else ():
+            if not isinstance(check, dict) or str(check.get("conclusion") or "").upper() in (
+                    "", "SUCCESS", "NEUTRAL", "SKIPPED"):
+                continue
+            found = re.search(r"/actions/runs/(\d+)", str(check.get("detailsUrl") or ""))
+            if not found:
+                continue
+            result = pr_helpers.gh("run", "view", found.group(1), "-R", self.repo, "--log-failed")
+            if result.returncode == 0 and result.stdout.strip():
+                return f"{check.get('name') or 'check'} (run {found.group(1)}):\n{result.stdout[-chars:]}"
+        return ""
 
     # --- CI ---
     def ci_green(self, minutes):

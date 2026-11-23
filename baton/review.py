@@ -78,8 +78,10 @@ def issue_context_from(issue, data, owner, login_re, limit):
         login = (comment.get("author") or {}).get("login") or ""
         body = comment.get("body") or ""
         # Advisor answers are runner-wrapped owner posts: keep them out of owner context (#125).
-        if body.startswith("<!-- baton-advisor-answer"):
-            lines.append(f'<advisor-answer author="DeepSeek">\n{cut(body, limit)}\n</advisor-answer>')
+        if login == owner and re.match(
+                r"<!-- baton-advisor-answer round=\d+ questions=[0-9a-f]+ by=deepseek -->", body):
+            safe = cut(body, limit).replace("</advisor-answer>", "<\\/advisor-answer>")
+            lines.append(f'<advisor-answer author="DeepSeek">\n{safe}\n</advisor-answer>')
             continue
         if login == owner or re.search(login_re, login):
             lines.append(f'<issue-comment author="{login}">\n{cut(body, limit)}\n</issue-comment>')

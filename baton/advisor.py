@@ -35,6 +35,7 @@ QUESTIONS_HEADING = re.compile(r"^### Questions for the owner\s*$", re.M)
 QUESTION_ITEM = re.compile(r"^[-*]\s+(\S.*)$")
 CITATION_LINE = re.compile(
     r"^\[(?P<id>c\d+)\] \((?P<source>[^)]+)\): (?P<text>.*)$", re.M)
+TRUNCATED = " [excerpt truncated]"   # appended by the runner to a citation row it had to cut
 ANSWER_CASES = frozenset({"grounded", "reversible_default", "owner_decision"})
 
 SYSTEM = """You advise an unattended coding-agent pipeline at one decision point.
@@ -129,8 +130,11 @@ def question_ids(snapshot):
     return [m.group(1) for m in re.finditer(r"^- (q\d+):", block.group(1), re.M)]
 
 
-def normalize_answers(raw, snapshot):
-    """Validate and normalize the answer set for answer_spec_questions; raise ValueError if unsafe."""
+def normalize_answers(raw, snapshot, unusable=frozenset()):
+    """Validate and normalize the answer set for answer_spec_questions; raise ValueError if unsafe.
+
+    A set with any non-grounded case is structurally validated only: the runner hands it off.
+    UNUSABLE names citation ids whose row the snapshot cap cut or dropped."""
     if not isinstance(raw, list) or not raw:
         raise ValueError("expected a nonempty answers array")
     expected = question_ids(snapshot)
@@ -151,9 +155,12 @@ def normalize_answers(raw, snapshot):
             raise ValueError("citations must be strings")
         text.encode("utf-8")
         if case != "grounded":
-            raise ValueError(f"non-grounded case {case}")
+            answers.append({"id": qid, "case": case, "text": text, "citations": ()})
+            continue
         if not cites or any(c not in citations for c in cites):
             raise ValueError("citation outside the sent snapshot")
+        if any(c in unusable or citations[c].endswith(TRUNCATED) for c in cites):
+            raise ValueError("citation excerpt was truncated")
         combined = "\n".join(citations[c] for c in cites)
         if not text or text not in combined:
             raise ValueError("answer text is not taken from its citations")
@@ -380,7 +387,10 @@ def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=No
     values = secret_values(env)
     if key:
         values.add(key)
-    text = redact(snapshot, values)[: int(cfg.snapshot_chars)]
+    full = redact(snapshot, values)
+    text = full[: int(cfg.snapshot_chars)]
+    kept = parse_citations(text)
+    cut_rows = {i for i, row in parse_citations(full).items() if kept.get(i) != row}
     digest = hashlib.sha256(text.encode()).hexdigest()
     for record in reversed(pending):
         if record["point"] == point and record["snapshot_sha"] == digest and record["actions"] == list(actions):
@@ -395,6 +405,7 @@ def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=No
               "decision_id": decision_id, "snapshot_sha": digest, "actions": list(actions), "backend": "deepseek",
               "model": cfg.model, "prompt_version": version, "mode": effective, "rule": rule}
     advised, reason, evidence, answers, usage = "", "", [], (), {}
+    observed_only = False   # a well-formed answer set with a non-grounded case: recorded, never executed
 
     def counted(metadata):
         return {k: count for k, count in metadata.items()
@@ -431,9 +442,13 @@ def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=No
             reason = redact(raw_reason, values)[:600]
             evidence = [redact(quote, values)[:300] for quote in raw_evidence[:5]]
             if not failure and advised == "answer_spec_questions":
-                answers = normalize_answers(reply.get("answers"), text)
-                answers = tuple(
-                    {**row, "text": redact(row["text"], values)[:600]} for row in answers)
+                answers = normalize_answers(reply.get("answers"), text, cut_rows)
+                observed_only = any(row["case"] != "grounded" for row in answers)
+                for row in answers:
+                    clean = redact(row["text"], values)
+                    if row["case"] == "grounded" and (clean != row["text"] or len(clean) > 600):
+                        raise ValueError("answer text was changed by redaction or exceeds the length limit")
+                answers = tuple({**row, "text": redact(row["text"], values)[:600]} for row in answers)
     except urllib.error.HTTPError as error:
         failure = f"HTTP {error.code}"
     except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as error:
@@ -446,14 +461,16 @@ def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=No
         failure = "malformed reply: invalid Unicode text"
     except (ValueError, KeyError, IndexError, TypeError, AttributeError, RuntimeError) as error:
         failure = f"malformed reply: {type(error).__name__}: {redact(str(error), values)[:120]}"
-        answers = ()
+        answers, observed_only = (), False
     executed = rule
     if not failure and advised != rule and effective == "live":
         try:
             fresh = revalidate() if revalidate else True
         except Exception:
             fresh = False
-        if fresh:
+        if observed_only:
+            pass   # ADR 0008: reversible defaults and owner decisions are observation only
+        elif fresh:
             executed = advised
         else:
             failure = "stale snapshot: the state changed before acting"
@@ -619,6 +636,10 @@ def digest(env, now=None):
     executed = Counter(r["executed"] for r in decisions if r.get("executed"))
     counts = [f"{action}: recommended {recommended[action]}, executed {executed[action]}"
               for action in sorted(recommended.keys() | executed.keys())]
+    observed_defaults = sum(
+        any(a.get("case") == "reversible_default" for a in r.get("answers") or ()) for r in decisions)
+    if observed_defaults:
+        counts.append(f"observed reversible-default recommendations: {observed_defaults}")
     tokens = sum((r.get("usage") or {}).get("total_tokens", 0) for r in decisions)
     text = (f"{len(decisions)} decision(s), {tokens} total tokens. "
             f"Extra rounds granted {len(extra)}, ended merged/accepted {won}. "
