@@ -41,7 +41,7 @@ SPEC_ACCEPT_POST = "spec_accept_post_failed"
 COMMENT_POSTS = (REVIEW_POST, SCREENSHOT_POST)
 SPEC_POSTS = (SPEC_REVIEW_POST, SPEC_REPLY_POST)
 SPEC_ACCEPT_POSTS = (SPEC_PENDING_ACCEPT_POST, SPEC_ACCEPT_POST)
-# Spec comment posts and accept/pending-accept posts share tick discovery and the confirmed phase.
+# Spec comment posts and accept/pending-accept posts share tick discovery.
 SPEC_WRITE_POSTS = (*SPEC_POSTS, *SPEC_ACCEPT_POSTS)
 RETRY_REASONS = frozenset({
     "review_comment_missing", "spec_comments_read_failed", "spec_pending_adr_read_failed",
@@ -265,8 +265,7 @@ def _spec_accept_post_valid(item, binding, *, reason):
         if not isinstance(pr, str) or (pr != "" and not pr.isdecimal()):
             return False
         head = binding.get("adr_head")
-        # Head may be empty when resuming a pending comment that omitted it; the merge gate
-        # still requires the PR (when set) to be MERGED.
+        # Older records may omit the head. Reconciliation requires a matching revision for any saved PR.
         if not isinstance(head, str) or (head != "" and not re.fullmatch(r"[0-9a-f]{40}", head)):
             return False
         if head and not pr:
@@ -333,14 +332,14 @@ def load_retry(env, episode, reason, item=""):
         raise RetryUnreadable(f"mismatched retry operation {path.name}")
     if not _binding_valid(reason, item, binding):
         raise RetryUnreadable(f"invalid continuation in {path.name}")
-    if "confirmed" in data and (reason not in SPEC_WRITE_POSTS or data["confirmed"] is not True):
+    if "confirmed" in data and (reason not in (*SPEC_POSTS, SPEC_ACCEPT_POST) or data["confirmed"] is not True):
         raise RetryUnreadable(f"invalid confirmed-post phase in {path.name}")
     attempts, due, scheduled = data.get("attempts"), data.get("due"), data.get("scheduled")
     if type(attempts) is not int or not (0 <= attempts <= MAX_ATTEMPTS):
         raise RetryUnreadable(f"out-of-range attempts in {path.name}")
     reads = data.get("reads")
-    if reads is not None and (data.get("confirmed") is not True or type(reads) is not int
-                              or not 0 <= reads <= MAX_ATTEMPTS):
+    if "reads" in data and (reason not in SPEC_POSTS or data.get("confirmed") is not True
+                            or type(reads) is not int or not 0 <= reads <= MAX_ATTEMPTS):
         raise RetryUnreadable(f"out-of-range reads in {path.name}")
     index = min(attempts if reads is None else reads, MAX_ATTEMPTS - 1)
     if (type(due) is not int or type(scheduled) is not int or not 0 <= scheduled <= int(clock())
