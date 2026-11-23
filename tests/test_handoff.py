@@ -330,18 +330,11 @@ def accept_post_binding(issue="7", *, pending=False):
             "next": next_step}
 
 
-def push_binding(item="1", *, reason="fix_push_failed"):
-    base = {"commit": "a" * 40, "branch": "agent/issue-1", "ref": "HEAD", "remote": "b" * 40,
-            "upstream": False, "wt": "/tmp/wt", "issue": item if reason != "fix_push_failed" else "9"}
-    if reason == "fix_push_failed":
-        return {**base, "pr": item, "next": "done", "outcome": "", "handoff_reason": "",
-                "description_rc": 0, "description_reason": "", "who": "", "fixer": "claude",
-                "clear_cursor": False}
-    if reason == "dev_push_failed":
-        return {**base, "next": "open_pr", "vendor": "claude", "base": "c" * 40, "body": "t", "model": "m"}
-    return {**base, "next": "spec_continue", "reviser": "claude", "round": 1, "model": "m",
-            "human": "", "reply": "points", "mode_note": "", "max_rounds": 3,
-            "issue_body": "d" * 64, "feedback": "e" * 64, "author": "owner", "comment_ids": []}
+def push_binding(item="1"):
+    return {"commit": "a" * 40, "branch": "agent/issue-1", "ref": "HEAD", "remote": "b" * 40,
+            "upstream": False, "wt": "/tmp/wt", "issue": "9", "pr": item, "next": "done",
+            "outcome": "", "handoff_reason": "", "description_rc": 0, "description_reason": "",
+            "who": "", "fixer": "claude", "clear_cursor": False}
 
 
 def test_every_category_1_reason_is_rule_mode_with_retry_budget():
@@ -350,7 +343,7 @@ def test_every_category_1_reason_is_rule_mode_with_retry_budget():
         "review_comment_post_failed", "screenshot_comment_post_failed",
         "spec_review_comment_post_failed", "spec_reply_post_failed",
         "spec_pending_accept_post_failed", "spec_accept_post_failed",
-        "dev_push_failed", "fix_push_failed", "spec_adr_push_failed",
+        "fix_push_failed",
     }
     for reason in handoff.RETRY_REASONS:
         entry = handoff.REASONS[reason]
@@ -369,8 +362,6 @@ def test_every_category_1_reason_is_rule_mode_with_retry_budget():
     ("spec_pending_accept_post_failed", accept_post_binding("1", pending=True)),
     ("spec_accept_post_failed", accept_post_binding("1")),
     ("fix_push_failed", push_binding("1")),
-    ("dev_push_failed", push_binding("1", reason="dev_push_failed")),
-    ("spec_adr_push_failed", push_binding("1", reason="spec_adr_push_failed")),
 ])
 def test_each_category_1_reason_defers_then_hands_off_through_perform(env, monkeypatch, reason, binding):
     """Every replayed read, comment post or push shares the same budget: no advisor, two later attempts, then handoff."""

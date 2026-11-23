@@ -145,36 +145,42 @@ class Merger:
         Returns 0 when a repair was pushed, HANDED_OFF when the repair run already handed the PR to
         the owner, and 1 when no repair is possible. A repair that cannot run now hands the head off."""
         pr = self.pr
-        found = ci.classify(str(pr), self.state, list(self.env.repo.ci_fixable_checks))
-        if found is None or not re.fullmatch(r"[a-f0-9]{40,64}", found["head"]):
-            return 1
-        head = found["head"]
         runner = fix.Runner(self.env, self.hooks, pr, "ci")
-        waiting = runner.waiting_push(pr)
+        waiting = runner.waiting_push(pr)   # before any CI read or vendor choice (#151)
         if waiting == "unreadable":
             return HANDED_OFF if runner.handed_off else 1
+        head_file = Path(self.state, f"ci-fix-waiting-{pr}")
+        if waiting is not None:
+            head = head_file.read_text().strip() if head_file.is_file() else ""
+        else:
+            found = ci.classify(str(pr), self.state, list(self.env.repo.ci_fixable_checks))
+            if found is None or not re.fullmatch(r"[a-f0-9]{40,64}", found["head"]):
+                return 1
+            head = found["head"]
         try:
             if waiting is not None:
                 # Resume the saved push without picking another fixer (#151).
                 notify.log(f"PR #{pr}: resuming the CI repair push for {head}")
-                rc = runner.push_with_retry(
-                    pr, wt, waiting["continuation"]["ref"],
-                    next_step=waiting["continuation"]["next"], url=self.url, pending=waiting)
                 fixer = waiting["continuation"].get("fixer") or "agent"
+                rc = fix.fix_pr(runner, pr, wt, fixer, "CI code checks", "")
             else:
                 fixer = pick.choose(self.env, "fixer", "agent", "contrib", pick.all_vendors(self.env),
                                     pr=str(pr), issue=self.issue)
                 notify.log(f"PR #{pr}: code-only CI failure on {head}; one repair round by {fixer}")
+                head_file.write_text(head)
                 rc = fix.fix_pr(runner, pr, wt, fixer, "CI code checks", found["feedback"])
         except Deferred as deferred:
             # Category-1 push waits keep the repair; a vendor deferral still hands the head off (#151).
             if deferred.vendor == "handoff-retry":
                 raise
+            head_file.unlink(missing_ok=True)
             rc = 75
+        head_file.unlink(missing_ok=True)
         if rc == 75:
             notify.log(f"PR #{pr}: CI repair deferred; handing off this head")
             return 1
-        Path(self.state, f"ci-fix-{pr}-{head}").touch()   # one repair round for this PR head, even across ticks
+        if head:
+            Path(self.state, f"ci-fix-{pr}-{head}").touch()   # one repair round for this PR head, even across ticks
         if rc != 0:
             # Only a real handoff by the repair run ends here; any other failure (e.g. recording
             # authorship) falls through to the merge gate's own CI handoff.
@@ -375,7 +381,7 @@ class Merger:
             if not deferred and (body is None or not pr_helpers.checks_none(body)):
                 notify.send_shots(pr, note="Checks for you" if left is None else "", left=owed)
             return
-        if not self.ci_green(45):
+        if Path(self.state, f"fix-push-waiting-{pr}").exists() or not self.ci_green(45):
             repaired = self.ci_fix_round(wt)
             if repaired == HANDED_OFF:
                 return

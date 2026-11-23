@@ -309,6 +309,60 @@ def test_a_deferred_fixer_leaves_a_checkpoint_and_the_resume_goes_straight_to_th
     assert loop.fixes[1]["head"] == loop.fixes[0]["head"]
 
 
+def save_waiting_fix_push(loop, fixer):
+    from baton import handoff
+    binding = {"commit": "d" * 40, "branch": "cursor/issue-297", "ref": "HEAD", "remote": "e" * 40,
+               "upstream": False, "wt": str(loop.wt), "issue": "297", "pr": str(PR), "next": "done",
+               "outcome": "", "handoff_reason": "", "description_rc": 0, "description_reason": "",
+               "who": "", "fixer": fixer, "clear_cursor": False}
+    assert handoff.prepare_retry(session.resolve(loop.env), "297", "fix_push_failed", str(PR), binding)
+    Path(loop.env["STATE"], f"fix-push-waiting-{PR}").write_text("1")
+
+
+def test_a_waiting_fix_push_resumes_with_its_fixer_before_any_read_or_vendor_choice(loop, monkeypatch):
+    loop.reviews[:] = ["changes", "pass"]
+    loop.fix_plans[:] = [75]
+    with pytest.raises(Deferred):
+        loop.run(fixer="cursor", reviewer="codex")
+    save_waiting_fix_push(loop, "codex")
+    monkeypatch.setattr(review.Review, "fixer_feedback", lambda *a, **k: pytest.fail("re-read the review"))
+    monkeypatch.setattr(review.pick, "choose", lambda *a, **k: pytest.fail("chose a vendor"))
+    calls_before = len(loop.gh.calls())
+    loop.fix_plans[:] = [1]
+    loop.reviews[:] = []
+    loop.run(fixer="agent", reviewer="pool")
+    assert [f["fixer"] for f in loop.fixes][1:] == ["codex"] and len(loop.agents) == 1
+    assert not any(c[:2] == ["pr", "view"] for c in loop.gh.calls()[calls_before:])
+
+
+def test_a_waiting_fix_push_whose_record_is_gone_hands_off_without_a_second_fix(loop):
+    loop.reviews[:] = ["changes"]
+    loop.fix_plans[:] = [75]
+    with pytest.raises(Deferred):
+        loop.run(fixer="cursor", reviewer="codex")
+    Path(loop.env["STATE"], f"fix-push-waiting-{PR}").write_text("1")
+    assert loop.run(fixer="cursor", reviewer="codex") == 0
+    assert len(loop.fixes) == 1 and loop.labelled("ready-for-human") and loop.merged == []
+
+
+def test_a_deferred_merge_step_keeps_the_checkpoint_and_resumes_at_the_merge(loop, monkeypatch):
+    attempts = []
+
+    def merge_step(self, wt, screenshot=None):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise Deferred("handoff-retry", "fix_push_failed", lends_slot=False)
+        loop.merged.append(self.pr)
+
+    monkeypatch.setattr(merge.Merger, "merge_or_handoff", merge_step)
+    loop.reviews[:] = ["pass"]
+    assert loop.run(fixer="cursor", reviewer="codex") == 75
+    assert loop.checkpoint()["step"] == "merge" and len(loop.agents) == 1
+    assert loop.run(fixer="cursor", reviewer="codex") == 0
+    assert len(attempts) == 2 and loop.merged == [PR] and len(loop.agents) == 1
+    assert not Path(loop.env["STATE"], f"review-pending-{PR}").exists()
+
+
 def test_a_deferred_reviewer_checkpoints_the_review_step_and_the_resume_reviews_again(loop):
     loop.reviews[:] = ["defer"]
     with pytest.raises(Deferred) as deferred:

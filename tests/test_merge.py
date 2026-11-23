@@ -749,6 +749,48 @@ def test_a_repair_failure_without_a_handoff_is_not_taken_for_one(repair):
     assert Path(repair.env["STATE"], f"ci-fix-{PR}-{HEAD}").exists()
 
 
+def save_waiting_push(repair, fixer="codex"):
+    """A deferred CI-repair push as the fix run saves it, with the repaired head noted."""
+    from baton import handoff, session
+    binding = {"commit": "d" * 40, "branch": "cursor/issue-297", "ref": "HEAD", "remote": "e" * 40,
+               "upstream": False, "wt": str(repair.wt), "issue": "297", "pr": str(PR), "next": "done",
+               "outcome": "", "handoff_reason": "", "description_rc": 0, "description_reason": "",
+               "who": "", "fixer": fixer, "clear_cursor": False}
+    assert handoff.prepare_retry(session.resolve(repair.env), "297", "fix_push_failed", str(PR), binding)
+    Path(repair.env["STATE"], f"fix-push-waiting-{PR}").write_text("1")
+    Path(repair.env["STATE"], f"ci-fix-waiting-{PR}").write_text(HEAD)
+
+
+def test_a_deferred_repair_push_keeps_the_repair_and_hands_nothing_off(repair, monkeypatch):
+    """The push wait leaves the merge step in place: no outer CI handoff, the head note stays."""
+    def waiting(runner, *args, **kwargs):
+        raise merge.Deferred("handoff-retry", "fix_push_failed", lends_slot=False)
+    monkeypatch.setattr(merge.fix, "fix_pr", waiting)
+    repair.greens[:] = [False]
+    with pytest.raises(merge.Deferred):
+        repair.go()
+    assert not repair.labelled("ready-for-human")
+    assert Path(repair.env["STATE"], f"ci-fix-waiting-{PR}").read_text() == HEAD
+
+
+def test_a_waiting_repair_push_resumes_before_any_ci_read_or_vendor_choice(repair, monkeypatch):
+    save_waiting_push(repair)
+    monkeypatch.setattr(merge.ci, "classify", lambda *a, **k: pytest.fail("classified CI before the push was due"))
+    monkeypatch.setattr(merge.pick, "choose", lambda *a, **k: pytest.fail("chose a vendor for a waiting push"))
+    repair.go()
+    assert repair.events.count("ci") == 1   # only the gate after the push, never before it
+    assert [f["fixer"] for f in repair.fixes] == ["codex"]
+    assert Path(repair.env["STATE"], f"ci-fix-{PR}-{HEAD}").exists()
+    assert not Path(repair.env["STATE"], f"ci-fix-waiting-{PR}").exists()
+    assert repair.merged()
+
+
+def test_a_waiting_repair_push_whose_record_is_gone_hands_off_without_a_second_repair(repair):
+    Path(repair.env["STATE"], f"fix-push-waiting-{PR}").write_text("1")
+    repair.go()
+    assert repair.fixes == [] and repair.labelled("ready-for-human") and not repair.merged()
+
+
 # --- behind branches (#122) -----------------------------------------------------------------
 
 OLD = "a" * 40

@@ -356,11 +356,85 @@ def test_the_fixer_sees_the_current_origin_main(run, fixer):
     assert sh(run.worktree, "git", "rev-parse", "origin/main") == sh(other, "git", "rev-parse", "HEAD")
 
 
+def reject_pushes(run):
+    hook = run.root / "origin.git" / "hooks" / "pre-receive"
+    hook.write_text("#!/bin/sh\necho rejected by policy >&2\nexit 1\n")
+    hook.chmod(0o755)
+
+
 def test_a_failed_push_hands_off(run):
+    """A real `git push` the remote refuses is permanent: one worker, one handoff, no retry."""
+    reject_pushes(run)
     run.agent({})
-    sh(run.worktree, "git", "remote", "set-url", "origin", "/nonexistent")
-    assert run.fix()["rc"] == 1 and run.labelled()
+    assert run.fix()["rc"] == 1 and run.labelled() and len(run.agent_calls) == 1
     assert any(f"PR #{PR}: pushing fix failed" in line for line in run.runner_log())
+
+
+def test_a_partial_fix_whose_push_fails_permanently_hands_off_with_the_workers_outcome(run, monkeypatch):
+    from baton import handoff
+
+    sent = []
+    monkeypatch.setattr(handoff.notify, "notify", lambda title, text="": sent.append((title, text)))
+    reject_pushes(run)
+    run.agent({"outcome": "RESULT: failed ran out of time"})
+    assert run.fix()["rc"] == 1 and len(sent) == 1
+    assert "ran out of time" in sent[0][1] and "pushing fix failed" in sent[0][1]
+
+
+def test_an_unreadable_remote_ref_that_looks_transient_is_retried_not_handed_off(run, monkeypatch):
+    from baton import handoff
+
+    clock = {"now": 1_000}
+    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
+    real = handoff.observe_remote
+
+    def flaky(wt, branch):
+        return (None, True) if clock["now"] < 1_060 else real(wt, branch)
+
+    monkeypatch.setattr(handoff, "observe_remote", flaky)
+    run.agent({})
+    assert run.fix()["rc"] == 75 and not run.labelled() and len(run.agent_calls) == 1
+    clock["now"] = 1_060
+    assert run.fix()["rc"] == 0 and run.pushed() and not run.labelled()
+    assert len(run.agent_calls) == 1
+
+
+def test_an_unreadable_remote_ref_that_is_permanent_hands_off(run, monkeypatch):
+    from baton import handoff
+
+    monkeypatch.setattr(handoff, "observe_remote", lambda wt, branch: (None, False))
+    run.agent({})
+    assert run.fix()["rc"] == 1 and run.labelled() and not run.pushed()
+
+
+def test_a_missing_fix_push_record_hands_off_instead_of_running_the_worker_again(run, monkeypatch):
+    from baton import common, handoff, session
+
+    clock = {"now": 1_000}
+    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
+    pushes = []
+
+    def refused(*a, **k):
+        pushes.append(1)
+        return common.PushResult(False, transient=True, detail="refused")
+
+    monkeypatch.setattr(fix, "push", refused)
+    run.agent({}, {})
+    assert run.fix()["rc"] == 75
+    context = session.resolve()
+    for path in (handoff.retry_path(context, "419", "fix_push_failed", str(PR)),
+                 handoff.waiting_path(context, "419", "fix_push_failed", str(PR))):
+        path.unlink(missing_ok=True)
+    clock["now"] = 1_060
+    assert run.fix()["rc"] == 1 and run.labelled()
+    assert len(run.agent_calls) == 1 and len(pushes) == 1
+
+
+def test_a_cursor_run_with_no_commit_posts_one_discard_comment(run, monkeypatch):
+    monkeypatch.setattr(fix.pr_helpers, "apply_body", lambda *a, **k: (2, False, "something", False))
+    run.agent(cursor_plan("Adopted.\n\nRESULT: fixed", commit=False))
+    run.fix("cursor")
+    assert sum("baton-description-discarded" in c for c in run.comments()) == 1
 
 
 def test_a_transient_fix_push_defers_then_recovers_without_a_second_worker(run, monkeypatch):
@@ -415,6 +489,9 @@ def test_a_lost_fix_push_response_is_recognized_without_a_second_write(run, monk
 def test_an_exhausted_fix_push_hands_off_exactly_once(run, monkeypatch):
     from baton import common, handoff, session
 
+    sent = []
+    monkeypatch.setattr(handoff.notify, "notify", lambda title, text="": sent.append((title, text)))
+
     clock = {"now": 1_000}
     monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
     monkeypatch.setattr(fix, "push",
@@ -425,6 +502,8 @@ def test_an_exhausted_fix_push_hands_off_exactly_once(run, monkeypatch):
         clock["now"] = now
         assert run.fix()["rc"] == (1 if now == 1_360 else 75)
     assert run.labelled() and len(run.agent_calls) == 1
+    edits = [c for c in run.fake_gh.calls() if c[:2] == ["pr", "edit"] and "ready-for-human" in c]
+    assert len(edits) == 1 and len(sent) == 1
     assert handoff.load_retry(session.resolve(), "419", "fix_push_failed", str(PR)) is None
 
 
@@ -449,6 +528,22 @@ def test_a_recovered_partial_push_keeps_the_original_handoff(run, monkeypatch):
     assert run.fix()["rc"] == 1 and run.pushed() and run.labelled()
     assert len(run.agent_calls) == 1
     assert any("fix failed" in line for line in run.runner_log())
+
+
+def test_an_exhausted_partial_push_hands_off_once_with_the_workers_outcome(run, monkeypatch):
+    from baton import common, handoff
+
+    sent = []
+    monkeypatch.setattr(handoff.notify, "notify", lambda title, text="": sent.append((title, text)))
+    clock = {"now": 1_000}
+    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
+    monkeypatch.setattr(fix, "push", lambda *a, **k: common.PushResult(False, transient=True, detail="refused"))
+    run.agent({"outcome": "RESULT: failed ran out of time"})
+    assert run.fix()["rc"] == 75
+    for now in (1_060, 1_360):
+        clock["now"] = now
+        run.fix()
+    assert len(sent) == 1 and "ran out of time" in sent[0][1]
 
 
 def test_a_damaged_fix_push_record_hands_off_without_replay(run, monkeypatch):

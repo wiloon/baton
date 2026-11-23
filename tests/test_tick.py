@@ -422,6 +422,26 @@ def test_an_agent_fix_label_runs_the_fix_then_the_review(ctx, worktree, monkeypa
     assert "PR #20: commit abc1234 has no known vendor; not counted" in ctx.log()
 
 
+def test_a_waiting_fix_push_resumes_with_its_saved_fixer_before_any_read_or_notice(ctx, worktree, monkeypatch):
+    from baton import handoff
+    fix_ctx(ctx, worktree, monkeypatch)
+    t = ctx.make()
+    binding = {"commit": "d" * 40, "branch": "cursor/issue-297", "ref": "HEAD", "remote": "e" * 40,
+               "upstream": False, "wt": str(worktree.wt), "issue": "297", "pr": "20", "next": "done",
+               "outcome": "", "handoff_reason": "", "description_rc": 0, "description_reason": "",
+               "who": "", "fixer": "claude", "clear_cursor": False}
+    assert handoff.prepare_retry(t.env, "297", "fix_push_failed", "20", binding)
+    Path(t.env.config.paths.state, "fix-push-waiting-20").write_text("1")
+    Path(t.env.config.paths.state, "owner-fix-feedback-20").write_text("please rename")
+    forbidden = lambda *a, **k: pytest.fail("read, notified or chose a vendor before the push was due")
+    monkeypatch.setattr(tick.review, "human_feedback", forbidden)
+    monkeypatch.setattr(tick.vendors, "seed_authors", forbidden)
+    monkeypatch.setattr(tick.Tick, "pick_vendor", forbidden)
+    monkeypatch.setattr(tick.Tick, "notify", forbidden)
+    assert t.pick_fix() == 0
+    assert ctx.loops[0][0] == "fix" and ctx.loops[0][1][2] == "claude"
+
+
 def test_no_feedback_means_nothing_to_fix(ctx, worktree, monkeypatch):
     fix_ctx(ctx, worktree, monkeypatch, feedback=" \n")
     assert ctx.make().pick_fix() == 0

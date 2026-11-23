@@ -1009,23 +1009,34 @@ class Review:
             self.values.update(step=step, fix_head=fix_head, code_verdict=code_verdict, screenshot=screenshot,
                                screenshot_checks="")
             self.save()
-            feedback, deferred = self.fixer_feedback(round, bool(screenshot), fix_head)
-            if deferred is not None:
-                if deferred == 0:
-                    self.drop()
-                return deferred
-            if resuming_fix and self.seed():
-                self.seed_contrib()
-            resuming_fix = False
-            # The next round's reviewer must stay free: a fixed reviewer, or a sole pool vendor.
-            pool = self.env.config.quota.vendor_pool
-            exclude = "cursor" if reviewer == "cursor" else ("" if len(pool) > 1 else pool[0])
-            fixer = pick.choose(self.env, "fixer", fixer, "contrib", self.vendors(), pr=str(pr), exclude=exclude,
-                                issue=self.issue)
-            self.values["fixer"] = fixer
-            self.save()
             runner = fix.Runner(self.env.with_runtime(fix_followup=round > 1), self.hooks, pr, str(round))
-            rc = fix.fix_pr(runner, pr, wt, fixer, f"the reviewer agent (round {round})", feedback, fix_head)
+            waiting = runner.waiting_push(pr)
+            if waiting is not None:
+                # A saved push resumes first: no reads, vendor choice or notification before it is due (#151).
+                if waiting == "unreadable":
+                    self.drop()
+                    return 0
+                fixer = waiting["continuation"].get("fixer") or fixer
+                self.values["fixer"] = fixer
+                rc = fix.fix_pr(runner, pr, wt, fixer, f"the reviewer agent (round {round})", "", fix_head)
+                feedback = ""
+            else:
+                feedback, deferred = self.fixer_feedback(round, bool(screenshot), fix_head)
+                if deferred is not None:
+                    if deferred == 0:
+                        self.drop()
+                    return deferred
+                if resuming_fix and self.seed():
+                    self.seed_contrib()
+                # The next round's reviewer must stay free: a fixed reviewer, or a sole pool vendor.
+                pool = self.env.config.quota.vendor_pool
+                exclude = "cursor" if reviewer == "cursor" else ("" if len(pool) > 1 else pool[0])
+                fixer = pick.choose(self.env, "fixer", fixer, "contrib", self.vendors(), pr=str(pr), exclude=exclude,
+                                    issue=self.issue)
+                self.values["fixer"] = fixer
+                self.save()
+                rc = fix.fix_pr(runner, pr, wt, fixer, f"the reviewer agent (round {round})", feedback, fix_head)
+            resuming_fix = False
             if rc == 75:
                 return 75
             if rc != 0:

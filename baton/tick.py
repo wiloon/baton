@@ -614,27 +614,36 @@ class Tick:
                 hooks=self.hooks(issue or "0", pr=pr))
             return 80
         feedback_file = self.state / f"owner-fix-feedback-{pr}"
-        feedback = feedback_file.read_text() if feedback_file.is_file() else review.human_feedback(self.gh_repo, self.owner, pr)
-        if not feedback.strip():
-            pr_helpers.gh("pr", "edit", pr, "-R", self.gh_repo, "--remove-label", "agent-fix")
-            self.notify(f"PR #{pr}: nothing to fix", f"No new review feedback from {self.owner}.")
-            return 80
-        if vendors.seed_authors(str(self.state), pr, self.gh_repo, self.env.config.scheduling.cursor_branch_re, self.cursor_login):
-            self.log(f"PR #{pr}: recording authors failed")
-            return 1
-        for commit in vendors.seed_contrib(str(self.state), pr, wt):
-            self.log(f"PR #{pr}: commit {commit} has no known vendor; not counted")
-        fixer = self.pick_vendor("fixer", "contrib", self.all_vendors(), pr=pr, issue=issue)
-        self.notify(f"PR #{pr}: {fixer} is addressing your review", url)
-        # Posting a fix reply advances human_feedback's cutoff even when an edit defers.
-        if not feedback_file.is_file():
-            temp = feedback_file.with_suffix(".tmp")
-            temp.write_text(feedback)
-            temp.replace(feedback_file)
-        # The label stays only on a deferral, so the fix resumes; any other outcome drops it.
-        rc = self.fix_pr(pr, wt, fixer, f"{self.owner} (the repository owner)", feedback, issue)
-        if rc == 75:
-            return 75
+        # A saved push resumes first: no reads, notifications or vendor choice before it is due (#151).
+        waiting = fix.Runner(self.env.with_runtime(issue=issue, pr=str(pr)), self.hooks(issue, pr), pr, "").waiting_push(pr)
+        if waiting is not None:
+            feedback = feedback_file.read_text() if feedback_file.is_file() else ""
+            fixer = "claude" if waiting == "unreadable" else waiting["continuation"].get("fixer") or "claude"
+            rc = 1 if waiting == "unreadable" else self.fix_pr(pr, wt, fixer, f"{self.owner} (the repository owner)", feedback, issue)
+            if rc == 75:
+                return 75
+        else:
+            feedback = feedback_file.read_text() if feedback_file.is_file() else review.human_feedback(self.gh_repo, self.owner, pr)
+            if not feedback.strip():
+                pr_helpers.gh("pr", "edit", pr, "-R", self.gh_repo, "--remove-label", "agent-fix")
+                self.notify(f"PR #{pr}: nothing to fix", f"No new review feedback from {self.owner}.")
+                return 80
+            if vendors.seed_authors(str(self.state), pr, self.gh_repo, self.env.config.scheduling.cursor_branch_re, self.cursor_login):
+                self.log(f"PR #{pr}: recording authors failed")
+                return 1
+            for commit in vendors.seed_contrib(str(self.state), pr, wt):
+                self.log(f"PR #{pr}: commit {commit} has no known vendor; not counted")
+            fixer = self.pick_vendor("fixer", "contrib", self.all_vendors(), pr=pr, issue=issue)
+            self.notify(f"PR #{pr}: {fixer} is addressing your review", url)
+            # Posting a fix reply advances human_feedback's cutoff even when an edit defers.
+            if not feedback_file.is_file():
+                temp = feedback_file.with_suffix(".tmp")
+                temp.write_text(feedback)
+                temp.replace(feedback_file)
+            # The label stays only on a deferral, so the fix resumes; any other outcome drops it.
+            rc = self.fix_pr(pr, wt, fixer, f"{self.owner} (the repository owner)", feedback, issue)
+            if rc == 75:
+                return 75
         feedback_file.unlink(missing_ok=True)
         pr_helpers.gh("pr", "edit", pr, "-R", self.gh_repo, "--remove-label", "agent-fix")
         if rc != 0:
