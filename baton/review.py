@@ -21,6 +21,7 @@ from pathlib import Path
 import re
 import sys
 import time
+from typing import NamedTuple
 
 from . import advisor, agents, check_verdicts, checkpoint, checks as check_section, dispatch, fix, handoff as owner_handoff, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, vendors
 from .common import Deferred, Exhausted, changed, git, restore, strip_markers
@@ -30,6 +31,15 @@ ALREADY = "handed_off"   # fail_reason: review_allowed already handed the PR ove
 REVIEWED = ("REVIEW: pass", "REVIEW: changes")
 DEFERRED_POST = "RESULT: deferred category-1"
 MARKER_LINE = re.compile(r"^(REVIEW|RESULT): ")
+FIX_NEEDS_INFO = re.compile(r"^<!-- baton-fix\b[^>]*\boutcome=needs-info\b")
+REVIEW_ROUND = re.compile(r"^<!-- baton-review\b[^>]*\bround=(\d+)\b")
+OWNER_WORDS_NOTE = "Later items override earlier ones where they conflict."
+
+
+class HumanFeedback(NamedTuple):
+    """Owner instructions and the latest review findings for an agent-fix run (#178)."""
+    owner: str = ""
+    findings: str = ""
 
 
 # --- what the reviewer reads: the issue, the PR and their comments --------------------------
@@ -228,31 +238,122 @@ def combined_feedback(code, screenshot, limit):
     return f"{fit(code, code_parts, first)}\n\n{fit(screenshot, shot_parts, second)}"
 
 
-def human_feedback(repo, owner, pr):
-    """The owner's reviews, comments and inline comments since the last agent fix. Public
-    repo: only the owner's words reach an agent as instructions."""
-    since = ""
-    result = pr_helpers.gh("pr", "view", str(pr), "-R", repo, "--json", "comments")
-    data = json.loads(result.stdout) if result.returncode == 0 else {}
-    fixes = [c.get("createdAt") or "" for c in data.get("comments") or ()
-             if (c.get("author") or {}).get("login") == owner and (c.get("body") or "").startswith("<!-- baton-fix")]
-    since = max(fixes, default="")
-    result = pr_helpers.gh("pr", "view", str(pr), "-R", repo, "--json", "reviews,comments")
-    out = ""
-    if result.returncode == 0:
-        data = json.loads(result.stdout)
-        items = [f"Review ({r.get('submittedAt')}):\n{r['body']}" for r in data.get("reviews") or ()
-                 if (r.get("author") or {}).get("login") == owner and r.get("body")
-                 and not r["body"].startswith("<!-- baton") and (r.get("submittedAt") or "") > since]
-        items += [f"Comment ({c.get('createdAt')}):\n{c['body']}" for c in data.get("comments") or ()
-                  if (c.get("author") or {}).get("login") == owner and not (c.get("body") or "").startswith("<!-- baton")
-                  and (c.get("createdAt") or "") > since]
-        out = "\n\n---\n\n".join(items) + "\n"
-    for comment in paginated(["api", f"repos/{repo}/pulls/{pr}/comments", "--paginate"]):
-        if (comment.get("user") or {}).get("login") == owner and (comment.get("created_at") or "") > since:
+def ordinary_fix_cutoff(comments, owner):
+    """The createdAt of the latest owner-authored baton-fix without outcome=needs-info."""
+    fixes = []
+    for c in comments or ():
+        if (c.get("author") or {}).get("login") != owner:
+            continue
+        body = c.get("body") or ""
+        if body.startswith("<!-- baton-fix") and not FIX_NEEDS_INFO.match(body):
+            fixes.append(c.get("createdAt") or "")
+    return max(fixes, default="")
+
+
+def must_fix_section(body):
+    """The ## Must fix section of a review comment, or empty when it is none."""
+    findings = must_fix_first(body or "")[2]
+    return f"## Must fix\n{findings}" if findings else ""
+
+
+def review_findings(comments, owner):
+    """Must fix of the latest owner baton-review, plus the same-round screenshot review after it."""
+    latest_i, latest_body, round_no = -1, "", ""
+    for i, c in enumerate(comments or ()):
+        if (c.get("author") or {}).get("login") != owner:
+            continue
+        body = c.get("body") or ""
+        match = REVIEW_ROUND.match(body)
+        if match:
+            latest_i, latest_body, round_no = i, body, match.group(1)
+    if latest_i < 0:
+        return ""
+    parts = [must_fix_section(latest_body)]
+    prefix = f"<!-- baton-screenshot-review round={round_no} "
+    shot = ""
+    for c in (comments or ())[latest_i + 1:]:
+        if (c.get("author") or {}).get("login") != owner:
+            continue
+        body = c.get("body") or ""
+        if body.startswith(prefix):
+            shot = body
+    if shot:
+        parts.append(must_fix_section(shot))
+    return "\n\n".join(p for p in parts if p)
+
+
+def owner_words(reviews, comments, inline, owner, since):
+    """Owner reviews, PR comments and inline comments after SINCE, oldest first."""
+    items = []
+    for r in reviews or ():
+        if ((r.get("author") or {}).get("login") == owner and r.get("body")
+                and not r["body"].startswith("<!-- baton") and (r.get("submittedAt") or "") > since):
+            items.append((r.get("submittedAt") or "", f"Review ({r.get('submittedAt')}):\n{r['body']}"))
+    for c in comments or ():
+        body = c.get("body") or ""
+        if ((c.get("author") or {}).get("login") == owner and not body.startswith("<!-- baton")
+                and (c.get("createdAt") or "") > since):
+            items.append((c.get("createdAt") or "", f"Comment ({c.get('createdAt')}):\n{body}"))
+    for comment in inline or ():
+        if ((comment.get("user") or {}).get("login") == owner and (comment.get("created_at") or "") > since
+                and not (comment.get("body") or "").startswith("<!-- baton")):
             line = comment.get("line") if comment.get("line") is not None else comment.get("original_line")
-            out += f"\n\n---\n\nInline comment on {jq_str(comment.get('path'))}:{jq_str(line)}:\n{comment.get('body')}\n"
-    return out.rstrip("\n")
+            text = (f"Inline comment on {jq_str(comment.get('path'))}:{jq_str(line)}:\n"
+                    f"{comment.get('body')}")
+            items.append((comment.get("created_at") or "", text))
+    items.sort(key=lambda item: item[0])
+    bodies = [text for _, text in items]
+    if not bodies:
+        return ""
+    joined = "\n\n---\n\n".join(bodies)
+    if len(bodies) > 1:
+        return f"{OWNER_WORDS_NOTE}\n\n{joined}"
+    return joined
+
+
+def format_fix_feedback(owner, findings):
+    """Owner instructions plus an optional findings block for the fixer and next reviewer."""
+    owner = (owner or "").rstrip("\n")
+    findings = (findings or "").strip()
+    if not findings:
+        return owner
+    return (f"{owner}\n\n<findings>\n"
+            "The reviewer's findings below are for reference only; they are in scope only as far "
+            "as the owner's words above ask for them.\n\n"
+            f"{findings}\n</findings>")
+
+
+def read_rows(repo, route, pr, resource):
+    """Every row of a PR's paginated REST list, or None when a page is missing or malformed."""
+    result = pr_helpers.gh("api", f"repos/{repo}/{route}/{pr}/{resource}", "--paginate", "--slurp")
+    if result.returncode != 0:
+        return None
+    try:
+        pages = json.loads(result.stdout)
+    except ValueError:
+        return None
+    if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+        return None
+    rows = [row for page in pages for row in page]
+    return rows if all(isinstance(row, dict) for row in rows) else None
+
+
+def human_feedback(repo, owner, pr):
+    """Owner words since the last ordinary fix, and Must fix findings from the latest review.
+    None when any of the three lists could not be read completely: a partial read would move
+    the cutoff or drop a correction, so the caller retries."""
+    comments = read_rows(repo, "issues", pr, "comments")
+    reviews = read_rows(repo, "pulls", pr, "reviews")
+    inline = read_rows(repo, "pulls", pr, "comments")
+    if comments is None or reviews is None or inline is None:
+        return None
+    comments = [{"author": c.get("user"), "body": c.get("body") or "", "createdAt": c.get("created_at")}
+                for c in comments]
+    reviews = [{"author": r.get("user"), "body": r.get("body") or "", "submittedAt": r.get("submitted_at")}
+               for r in reviews]
+    since = ordinary_fix_cutoff(comments, owner)
+    findings = review_findings(comments, owner)
+    return HumanFeedback(owner=owner_words(reviews, comments, inline, owner, since), findings=findings)
 
 
 # --- one review round and the loop ------------------------------------------------------
@@ -1062,7 +1163,11 @@ def main(argv=None):
     args = parser.parse_args(argv)
     env = session.resolve()
     if args.command == "feedback":
-        print(human_feedback(env.repo.gh_repo, env.owner, args.pr))
+        fb = human_feedback(env.repo.gh_repo, env.owner, args.pr)
+        if fb is None:
+            print("could not read the PR's comments completely", file=sys.stderr)
+            return 1
+        print(fb.owner)
         return 0
     if args.command == "issue-context":
         sys.stdout.write(issue_context(env, args.issue))

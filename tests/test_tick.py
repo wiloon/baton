@@ -402,7 +402,8 @@ def fix_ctx(ctx, worktree, monkeypatch, feedback="please rename", fixer="codex")
     ctx.gh.answers["pr list"] = [{"number": 20, "headRefName": "cursor/issue-297"}, {"number": 3, "headRefName": "feature/x"}]
     ctx.gh.answers["pr view"] = lambda a: "cursor/issue-297" if "headRefName" in a[-1] else json.dumps(
         {"headRefName": "cursor/issue-297", "author": {"login": "cursor"}}) if False else "cursor/issue-297"
-    monkeypatch.setattr(tick.review, "human_feedback", lambda repo, owner, pr: feedback)
+    monkeypatch.setattr(tick.review, "human_feedback",
+                        lambda repo, owner, pr: review.HumanFeedback(owner=feedback, findings=""))
     monkeypatch.setattr(tick.vendors, "seed_authors", lambda *args: 0)
     monkeypatch.setattr(tick.vendors, "seed_contrib", lambda *args: ["abc1234"])
     monkeypatch.setattr(tick.Tick, "pick_vendor", lambda self, *a, **k: fixer)
@@ -807,7 +808,8 @@ def test_an_agent_fix_deferred_in_vendor_selection_lends_its_slot(ctx, monkeypat
     ctx.gh.answers["pr list"] = lambda args: [{"number": 11, "headRefName": "agent/issue-5", "labels": []}]
     Path(ctx.env["WT_ROOT"], "agent-5").mkdir(parents=True)
     monkeypatch.setattr(tick.session, "run_process", lambda *a, **k: subprocess.CompletedProcess(a, 0, "", ""))
-    monkeypatch.setattr(tick.review, "human_feedback", lambda *a: "please fix")
+    monkeypatch.setattr(tick.review, "human_feedback",
+                        lambda *a: review.HumanFeedback(owner="please fix", findings=""))
     monkeypatch.setattr(tick.vendors, "seed_authors", lambda *a: 0)
     monkeypatch.setattr(tick.vendors, "seed_contrib", lambda *a: [])
     t = ctx.make()
@@ -988,7 +990,9 @@ def test_a_second_tick_finishes_a_deferred_description_edit(ctx, worktree, monke
     ctx.gh.answers["pr comment"] = comment
     ctx.gh.answers["pr list"] = lambda args: (
         [{"number": int(pr), "headRefName": worktree.branch}] if labelled and "agent-fix" in args else [])
-    monkeypatch.setattr(review, "paginated", lambda *args: [])
+    monkeypatch.setattr(review, "read_rows", lambda repo, route, number, resource: (
+        [{"user": c["author"], "body": c["body"], "created_at": c["createdAt"]} for c in comments]
+        if route == "issues" else []))
     monkeypatch.setattr(review, "agent_review", lambda *args: "Revise the description.")
     monkeypatch.setattr(pick, "choose", lambda *args, **kwargs: (
         "codex" if switched and "codex" not in agent_calls else "cursor"))

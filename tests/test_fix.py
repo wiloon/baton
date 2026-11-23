@@ -80,8 +80,9 @@ def run(gh, tmp_path, monkeypatch):
             """The next agent runs: {outcome, reply, commit, file, rc, model}."""
             self.plans[:] = list(plans)
 
-        def fix(self, fixer="claude", feedback="feedback", head="", source="reviewer"):
-            args = type("A", (), {"pr": PR, "wt": str(wt), "fixer": fixer, "source": source, "head": head})
+        def fix(self, fixer="claude", feedback="feedback", head="", source="reviewer", owner_triggered=False):
+            args = type("A", (), {"pr": PR, "wt": str(wt), "fixer": fixer, "source": source, "head": head,
+                                  "owner_triggered": owner_triggered})
             return fix.run("pr", args, os.environ, feedback)
 
         def verify(self, vendor="claude"):
@@ -1002,3 +1003,10 @@ def test_without_screenshot_review_the_fix_prompt_names_no_screenshots_dir(run):
     run.agent(dict(CHECKED))
     run.fix("claude")
     assert f"pr-{PR}-shots" not in run.prompts[0]
+
+
+@pytest.mark.parametrize("fixer", ["claude", "codex"])
+def test_a_checks_only_reply_posts_no_fix_comment(run, fixer):
+    run.agent({"file": "## Checks to verify\nnone\n\nRESULT: fixed\n"})
+    assert run.fix(fixer)["rc"] == 0
+    assert run.comments() == []
