@@ -278,6 +278,8 @@ def load_retry(env, episode, reason, item=""):
         raise RetryUnreadable(f"mismatched retry operation {path.name}")
     if not _binding_valid(reason, item, binding):
         raise RetryUnreadable(f"invalid continuation in {path.name}")
+    if "confirmed" in data and (reason not in SPEC_POSTS or data["confirmed"] is not True):
+        raise RetryUnreadable(f"invalid confirmed-post phase in {path.name}")
     attempts, due, scheduled = data.get("attempts"), data.get("due"), data.get("scheduled")
     if type(attempts) is not int or not (0 <= attempts <= MAX_ATTEMPTS):
         raise RetryUnreadable(f"out-of-range attempts in {path.name}")

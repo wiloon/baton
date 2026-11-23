@@ -8,7 +8,7 @@ import subprocess
 import pytest
 
 from baton import after_merge, config, credentials, dev, fix, initialization, notify, session, spec, tick
-from conftest import sh
+from conftest import issue_snapshot_pages, sh
 
 ROOT = Path(__file__).resolve().parents[1]
 TEXT = (ROOT / "config.example.toml").read_text()
@@ -267,8 +267,8 @@ def test_a_minimal_config_runs_a_tick_end_to_end(bound, monkeypatch, tmp_path):
     fake = GH({"issue list": lambda args: [ready] if "ready-for-agent" in args else [],
                "api repos/acme/app/issues/12/events?per_page=100": [[
                    {"id": 1, "event": "labeled", "actor": {"login": "acme-owner"}, "label": {"name": "ready-for-agent"}}]],
-               "issue view": {"title": "A title", "body": "A body", "comments": [
-                   {"author": {"login": "acme-owner"}, "body": "<!-- baton-verdict: accept -->\nThe plan"}]},
+               "api graphql": issue_snapshot_pages({"title": "A title", "body": "A body", "comments": [
+                   {"author": {"login": "acme-owner"}, "body": "<!-- baton-verdict: accept -->\nThe plan"}]}),
                "pr create": "https://github.com/acme/app/pull/13\n"})
     monkeypatch.setattr(tick.pr_helpers, "gh", fake)
     for module in (notify, after_merge):

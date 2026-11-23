@@ -14,7 +14,7 @@ import pytest
 
 from baton import capacity, dev, fix, merge, notify, pick, review, scan, spec, tick
 from baton.common import Deferred
-from conftest import sh
+from conftest import issue_snapshot_pages, sh
 
 REAL_CURSOR_PLAN = spec.cursor_plan   # the devrun fixture stubs it
 
@@ -28,30 +28,24 @@ class FakeGH:
 
     def __init__(self):
         self.calls, self.answers, self.fails = [], {}, set()
-        self._issue_comments = []
 
     def __call__(self, *args, input=None):
         self.calls.append(list(args))
-        head = " ".join(args[:2])
+        graphql = args[:2] == ("api", "graphql")
+        head = "issue view" if graphql else " ".join(args[:2])
         if head in self.fails:
             return subprocess.CompletedProcess(args, 1, "", "boom")
-        if args[:1] == ("api",) and "/comments" in args[1] and "--slurp" in args:
-            rows = [{"id": c.get("id", i + 1), "user": c.get("user") or c.get("author") or {"login": "owner"},
-                     "body": c.get("body", "")} for i, c in enumerate(self._issue_comments)]
-            return subprocess.CompletedProcess(args, 0, json.dumps([rows]), "")
         answer = self.answers.get(head, "[]" if list(args[1:2]) == ["list"] else "")
         if callable(answer):
-            answer = answer(args)
-        if args[:2] == ("issue", "view") and "title,body,comments" in args and (
+            issue = next(arg.removeprefix("issue=") for arg in args if arg.startswith("issue=")) if graphql else None
+            answer = answer(("issue", "view", issue, "--json", "title,body,comments") if graphql else args)
+        if graphql and (
                 "issue view" not in self.answers or isinstance(answer, dict) and "comments" not in answer):
             answer = {"title": "Issue", "body": "Body", **(answer if isinstance(answer, dict) else {}), "comments": [
                 {"author": {"login": "owner"}, "body": "<!-- baton-verdict: accept -->\nPlan"}
             ]}
-        if args[:2] == ("issue", "view") and isinstance(answer, dict) and "comments" in answer:
-            self._issue_comments = list(answer["comments"])
-        if args[:2] == ("issue", "view") and "state,body,labels" in args and isinstance(answer, dict):
-            answer = {"state": answer.get("state", "OPEN"), "body": answer.get("body", "Body"),
-                      "labels": answer.get("labels", [{"name": "ready-for-agent"}])}
+        if graphql and isinstance(answer, dict) and "comments" in answer:
+            answer = issue_snapshot_pages(answer)
         if isinstance(answer, subprocess.CompletedProcess):
             return answer
         if not isinstance(answer, str):

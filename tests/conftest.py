@@ -10,6 +10,26 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 
+
+def issue_snapshot_pages(*issues):
+    """GraphQL wire format for issue snapshots. Each input supplies one page of comments."""
+    pages = []
+    for index, issue in enumerate(issues):
+        labels = issue.get("labels", [])
+        row = {
+            "title": issue.get("title", "Issue"), "body": issue.get("body", "Body"),
+            "state": issue.get("state", "OPEN"),
+            "labels": {"totalCount": len(labels), "nodes": labels},
+            "comments": {
+                "nodes": [{"fullDatabaseId": str(row.get("id", i)), "body": row["body"],
+                           "author": row.get("author")}
+                          for i, row in enumerate(issue["comments"], 1)],
+                "pageInfo": {"hasNextPage": index + 1 < len(issues), "endCursor": str(index)},
+            },
+        }
+        pages.append({"data": {"repository": {"issue": row}}})
+    return pages
+
 # When baton works on itself, this suite runs inside a baton run (the verify hook, an agent's own
 # check) and inherits what that run hands its children: the real runner log, the hooks and CI
 # command, and the telemetry context. Tests must never see those (#73, #74).

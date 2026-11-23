@@ -46,23 +46,65 @@ PENDING_ACCEPT = re.compile(
     r"^<!-- baton-spec-accept-pending pr=(?P<pr>\d+)(?: head=(?P<head>[0-9a-f]{40}))? -->\n(?P<verdict>.*)", re.DOTALL)
 
 
-def read_issue(env, issue):
-    """Return ({title, body, comments}, transient) or (None, transient). One gh call (#151)."""
-    result = pr_helpers.gh("issue", "view", str(issue), "-R", env.repo.gh_repo, "--json", "title,body,comments")
+ISSUE_SNAPSHOT = """
+query($owner: String!, $repo: String!, $issue: Int!, $endCursor: String) {
+  repository(owner: $owner, name: $repo) {
+    issue(number: $issue) {
+      title body state
+      labels(first: 100) { totalCount nodes { name } }
+      comments(first: 100, after: $endCursor) {
+        nodes { fullDatabaseId body author { login } }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+"""
+
+
+def read_issue(env, issue, *, once=False):
+    """Read the issue and full comment history, including IDs shared with saved post records."""
+    owner, repo = env.repo.gh_repo.split("/", 1)
+    request = pr_helpers.call if once else pr_helpers.gh
+    result = request("api", "graphql", "--paginate", "--slurp", "-f", f"query={ISSUE_SNAPSHOT}",
+                     "-f", f"owner={owner}", "-f", f"repo={repo}", "-F", f"issue={issue}")
     if result.returncode != 0:
         return None, pr_helpers.transient(result)
     try:
-        data = json.loads(result.stdout)
-    except (ValueError, TypeError, AttributeError):
-        return None, False
-    if (not isinstance(data, dict) or not isinstance(data.get("title"), str)
-            or not isinstance(data.get("body"), str) or not isinstance(data.get("comments"), list)):
-        return None, False
-    for comment in data["comments"]:
-        if (not isinstance(comment, dict) or not isinstance(comment.get("body"), str)
-                or not isinstance(comment.get("author") or {}, dict)):
+        pages = json.loads(result.stdout)
+        if not isinstance(pages, list) or not pages:
             return None, False
-    return data, False
+        snapshot, comments, ids = None, [], set()
+        for index, page in enumerate(pages):
+            if page.get("errors"):
+                return None, False
+            row = page["data"]["repository"]["issue"]
+            labels = row["labels"]["nodes"]
+            if (row["state"] not in ("OPEN", "CLOSED") or not isinstance(row["title"], str)
+                    or not isinstance(row["body"], str) or not isinstance(labels, list)
+                    or row["labels"]["totalCount"] != len(labels)
+                    or any(not isinstance(label["name"], str) for label in labels)):
+                return None, False
+            issue_fields = {"title": row["title"], "body": row["body"], "state": row["state"], "labels": labels}
+            if snapshot is not None and snapshot != issue_fields:
+                return None, False
+            snapshot = issue_fields
+            connection = row["comments"]
+            if (connection["pageInfo"]["hasNextPage"] is not (index + 1 < len(pages))
+                    or not isinstance(connection["nodes"], list)):
+                return None, False
+            for comment in connection["nodes"]:
+                identity, body, author = comment["fullDatabaseId"], comment["body"], comment["author"]
+                if isinstance(identity, str) and identity.isdecimal():
+                    identity = int(identity)
+                if (type(identity) is not int or identity <= 0 or identity in ids or not isinstance(body, str)
+                        or author is not None and not isinstance(author["login"], str)):
+                    return None, False
+                ids.add(identity)
+                comments.append({"id": identity, "body": body, "author": author})
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None, False
+    return {**snapshot, "comments": comments}, False
 
 
 def read_comments(env, issue):
@@ -361,63 +403,6 @@ class Spec:
         notify.log(f"#{self.issue}: {failed}{pr_helpers.why(posted)}")
         return False
 
-    def read_post_inputs(self, *, once=False, ignore_pause=False):
-        """Issue body, labels and complete comment history for a spec comment post (#151).
-
-        Status "retry" is a transient unreadable lookup (it uses the retry budget); "failed" is a
-        permanent or malformed answer (a direct handoff)."""
-        request = pr_helpers.call if once else pr_helpers.gh
-        result = request("issue", "view", self.issue, "-R", self.repo, "--json", "state,body,labels")
-        if result.returncode != 0:
-            return None, "retry" if pr_helpers.transient(result) else "failed"
-        try:
-            data = json.loads(result.stdout)
-            if not isinstance(data, dict) or data.get("state") not in ("OPEN", "CLOSED"):
-                return None, "failed"
-            if data["state"] != "OPEN":
-                return None, "superseded"
-            if not isinstance(data.get("body"), str):
-                return None, "failed"
-            labels = data.get("labels")
-            if not isinstance(labels, list) or any(not isinstance(label, dict) or not isinstance(label.get("name"), str)
-                                                   for label in labels):
-                return None, "failed"
-            # A fresh round already claimed the issue; only a wait/resume must honour the pause.
-            if not ignore_pause and any(label.get("name") == "ready-for-human" for label in labels):
-                return None, "paused"
-        except (TypeError, ValueError):
-            return None, "failed"
-        result = request("api", f"repos/{self.repo}/issues/{self.issue}/comments", "--paginate", "--slurp")
-        if result.returncode != 0:
-            return None, "retry" if pr_helpers.transient(result) else "failed"
-        try:
-            pages = json.loads(result.stdout)
-            if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
-                return None, "failed"
-            rows = [row for page in pages for row in page]
-            if any(type(row["id"]) is not int or row["id"] <= 0
-                   or (row["user"] is not None and not isinstance(row["user"]["login"], str))
-                   or not isinstance(row["body"], str) for row in rows):
-                return None, "failed"
-            if len({row["id"] for row in rows}) != len(rows):
-                return None, "failed"
-            data["comments"] = [{**row, "author": row["user"]} for row in rows]
-        except (KeyError, TypeError, ValueError):
-            return None, "failed"
-        return data, "ok"
-
-    def read_inputs_budgeted(self):
-        """The pre-worker read of the post inputs: (data, "ok"), (None, "superseded") for a closed
-        issue, or (None, "stop") once a handoff happened. A transient failure uses the read budget."""
-        def read():
-            data, status = self.read_post_inputs(ignore_pause=True)
-            return ({}, False) if status == "superseded" else (data, status == "retry")
-
-        data = self.retry_read(read, "Could not read inputs for the spec comment.", "spec_comments_read_failed")
-        if data is None:
-            return None, "stop"
-        return (data, "ok") if data else (None, "superseded")
-
     def owner_feedback_digest(self, comments):
         rows = [
             (row["id"], row["body"])
@@ -442,9 +427,21 @@ class Spec:
         }
 
     def check_comment_post(self, binding, *, sending):
-        data, status = self.read_post_inputs(once=True)
-        if status != "ok":
-            return status
+        data, transient = read_issue(self.env, self.issue, once=True)
+        if data is None:
+            return "retry" if transient else "failed"
+        if data["state"] == "CLOSED":
+            return "superseded"
+        labels = {label["name"] for label in data["labels"]}
+        if "ready-for-human" in labels:
+            return "paused"
+        boundary = set(binding["comment_ids"])
+        new_comments = [row for row in data["comments"] if row["id"] not in boundary]
+        if "ready-for-agent" in labels and "needs-triage" not in labels and any(
+            (row["author"] or {}).get("login") == binding["author"]
+            and (verdict := VERDICT.match(row["body"])) and verdict[1] == "accept" for row in new_comments
+        ):
+            return "accepted"
         adr, transient = self.discover_adr(pr_helpers.call, ("-R", self.repo))
         if adr is None:
             return "retry" if transient else "failed"
@@ -454,14 +451,9 @@ class Spec:
                 or str(adr.get("number", "")) != binding["pr"]
                 or self.owner_feedback_digest(data["comments"]) != binding["feedback"]):
             return "changed"
-        boundary = set(binding["comment_ids"])
         matches = []
-        for row in data["comments"]:
-            if row["id"] in boundary:
-                continue
+        for row in new_comments:
             trusted = (row["author"] or {}).get("login") == binding["author"]
-            if trusted and row["body"].startswith("<!-- baton-verdict: accept"):
-                return "accepted"
             if row["body"] == binding["body"]:
                 matches.append(trusted)
             elif trusted and row["body"].startswith(("<!-- baton-spec-review round=", "<!-- baton-spec-reply round=")):
@@ -497,9 +489,10 @@ class Spec:
             pending = owner_handoff.prepare_retry(self.env, n, reason, n, binding)
             if pending is None:
                 return stop("The worker inputs could not be saved.")
-        else:
-            if pending is not None:
-                binding = pending["continuation"]
+        elif pending is not None:
+            binding = pending["continuation"]
+        confirmed = pending is not None and pending.get("confirmed", False)
+        if not initial and not confirmed:
             result = self.handoff(text(), reason, resume=True)
             if result.action == owner_handoff.DEFER:
                 raise Deferred("handoff-retry", reason, lends_slot=False)
@@ -509,6 +502,9 @@ class Spec:
             # Keep the pre-resume attempts: resume already consumed one on disk (#151).
 
         def finish():
+            if not confirmed:
+                saved = owner_handoff.load_retry(self.env, n, reason)
+                owner_handoff.restore_retry(self.env, n, reason, n, {**saved, "confirmed": True})
             if reason == owner_handoff.SPEC_REVIEW_POST:
                 if binding["round"] >= binding["max_rounds"] + self.extra:
                     if context is not None:
@@ -545,7 +541,7 @@ class Spec:
 
         status = reconcile(sending=initial)
         posted = None
-        if status == "absent":
+        if status == "absent" and not confirmed:
             if not claimed():
                 return "stop"
             posted = pr_helpers.gh("issue", "comment", n, "-R", self.repo, "--body", binding["body"],
@@ -568,7 +564,8 @@ class Spec:
         if status == "paused":
             owner_handoff.restore_retry(self.env, n, reason, n, pending)
             raise Deferred("handoff-retry", reason, lends_slot=False)
-        if status == "retry" or status == "absent" and posted is not None and pr_helpers.transient(posted):
+        if not confirmed and (status == "retry" or status == "absent" and posted is not None
+                              and pr_helpers.transient(posted)):
             attempts = pending["attempts"] + (0 if initial else 1)
             if attempts < owner_handoff.MAX_ATTEMPTS:
                 now = int(owner_handoff.clock())
@@ -670,14 +667,10 @@ class Spec:
             return True
         return False
 
-    def review_round(self, round, max_rounds, context, listed):
+    def review_round(self, round, max_rounds, context, inputs):
         """"accept", "changes" or "stop" (the owner or a failure took over)."""
         n, wt, env = self.issue, self.wt, self.env
-        inputs, status = self.read_inputs_budgeted()
-        if status != "ok":
-            if status == "superseded":
-                notify.log(f"#{n}: issue closed during spec review; nothing posted")
-            return "stop"
+        listed = inputs["comments"]
         adr_note = "No ADR has been revised yet."
         if git(wt, "rev-list", "origin/main..HEAD"):
             adr_note = (f"Earlier rounds revised ADRs on this branch (docs PR #{self.pr or '?'}): "
@@ -889,17 +882,12 @@ class Spec:
         return self.publish_accept(verdict)
 
     # --- the reviser's round ---
-    def revise_round(self, round, context, listed, max_rounds=None):
+    def revise_round(self, round, context, inputs, max_rounds=None):
         """"revised" or "stop" (the owner or a failure took over)."""
         n, wt, env = self.issue, self.wt, self.env
+        listed = inputs["comments"]
         if max_rounds is None:
             max_rounds = max(int(env.config.scheduling.max_spec_rounds or 3), round + 1)
-        # The post binds these inputs: read them before the paid run so a failed read loses no work.
-        inputs, status = self.read_inputs_budgeted()
-        if status != "ok":
-            if status == "superseded":
-                notify.log(f"#{n}: issue closed during spec revision; nothing run")
-            return "stop"
         out_base = f"/tmp/baton-spec-{n}-{round}"
         for stale in Path("/tmp").glob(f"baton-spec-{n}-{round}.*"):
             stale.unlink()
@@ -1045,7 +1033,7 @@ class Spec:
                 if not self.worktree():
                     notify.log(f"spec worktree for #{n} failed")
                     return False
-                self.gh("issue", "edit", n, "--remove-label", "ready-for-human", "--add-label", "agent-wip")
+                self.gh("issue", "edit", n, "--add-label", "agent-wip")
                 return True
 
             outcome = self.post_comment(post_reason, None, initial=False, claim=claim)
@@ -1061,6 +1049,8 @@ class Spec:
             if issue_payload is None:
                 return False
         else:
+            if issue_payload["state"] == "CLOSED":
+                return False
             listed = issue_payload["comments"]
             pending = accept_pending(env, n, listed=listed)
             if pending:
@@ -1086,7 +1076,7 @@ class Spec:
         # Sent by started() once a vendor is picked: a deferred tick (no vendor can run now) repeats every
         # timer interval, and announcing each one floods the owner with notices of work that never ran.
         self.announce = f"#{n}: spec review (round {round}, {'revision' if step == 'revise' else step})"
-        while True:
+        while issue_payload["state"] == "OPEN":
             self.hooks.round = round
             self.path("spec-paused").write_text(f"{n}\n")
             if adr is None:
@@ -1099,18 +1089,19 @@ class Spec:
             context = Path(self.ctx, f"issue-{n}-spec-{round}-{step}-{time.strftime('%Y%m%d-%H%M%S')}.md")
             context.write_text(review.issue_context(env, n, data=issue_payload))
             if step == "review":
-                result = self.review_round(round, max_rounds, context, issue_payload["comments"])
+                result = self.review_round(round, max_rounds, context, issue_payload)
                 if result == "changes":
                     step = "revise"
                 else:
                     return result == "accept"
-            elif self.revise_round(round, context, issue_payload["comments"], max_rounds) != "revised":
+            elif self.revise_round(round, context, issue_payload, max_rounds) != "revised":
                 return False
             else:
                 step, round = "review", round + 1
             issue_payload = self.issue_payload()
             if issue_payload is None:
                 return False
+        return False
 
 
 @session.scoped
