@@ -46,7 +46,7 @@ def run(gh, tmp_path, monkeypatch):
         if path.is_file():
             (selfdir / path.name).symlink_to(path)
     (selfdir / "verify.sh").unlink()
-    gh.set(body=BODY, headRefName="cursor/issue-419", state="OPEN", labels=[])
+    gh.set(body=BODY, headRefName="cursor/issue-419", headRefOid="a" * 40, state="OPEN", labels=[])
     for name, value in (("SELF_DIR", str(selfdir)), ("MAX_VERIFY_FIXES", "2"), ("ISSUE", "419"), ("ROUND", "0")):
         monkeypatch.setenv(name, value)
 
@@ -1953,3 +1953,156 @@ def test_a_checks_only_reply_posts_no_fix_comment(run, fixer):
     run.agent({"file": "## Checks to verify\nnone\n\nRESULT: fixed\n"})
     assert run.fix(fixer)["rc"] == 0
     assert run.comments() == []
+
+
+# --- deferred TASK: writes keep the rest of the fix (#151) ---
+def _flaky_edits(monkeypatch, fail_until=1_060):
+    """A GitHub whose body edits answer 503 until the clock reaches FAIL_UNTIL; returns (clock, edits)."""
+    import subprocess
+    from baton import handoff
+
+    clock, edits = {"now": 1_000}, []
+    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
+    monkeypatch.setattr(fix.pr_helpers, "sleep", lambda *_: None)
+    call = fix.pr_helpers.call
+
+    def flaky(*args, input=None, limit=None):
+        if args[:2] == ("pr", "edit") and "--body-file" in args:
+            edits.append(clock["now"])
+            if clock["now"] < fail_until:
+                return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return call(*args, input=input, limit=limit)
+
+    monkeypatch.setattr(fix.pr_helpers, "call", flaky)
+    return clock, edits
+
+
+_TASK_REPLY = {"reply": "TASK: partial\nRESULT: fixed", "file": "## Must fix\nnone\n\nRESULT: fixed\n"}
+
+
+def test_a_deferred_task_write_resumes_verify_and_push_without_a_second_worker(run, monkeypatch):
+    clock, _ = _flaky_edits(monkeypatch)
+    run.fake_gh.set(body=COMPLETE)
+    run.agent(_TASK_REPLY)
+    assert run.fix("claude")["rc"] == 75
+    assert run.pushed_new and len(run.agent_calls) == 1
+    clock["now"] = 1_060
+    assert run.fix("claude")["rc"] == 0
+    assert len(run.agent_calls) == 1 and run.pushed() and not run.labelled()
+    assert "completion=partial" in run.body()
+
+
+def test_a_deferred_task_write_still_refreshes_the_fixers_checks(run, monkeypatch):
+    clock, _ = _flaky_edits(monkeypatch)
+    run.fake_gh.set(body=COMPLETE)
+    run.agent({"commit": False, "reply": "TASK: partial\nRESULT: fixed",
+               "file": "## Checks to verify\n- /billing: brand colour\n\nRESULT: fixed\n"})
+    assert run.fix("claude")["rc"] == 75
+    assert section(run.body(), "Checks to verify") == "none"
+    clock["now"] = 1_060
+    assert run.fix("claude")["rc"] == 0 and len(run.agent_calls) == 1
+    assert "completion=partial" in run.body()
+    assert section(run.body(), "Checks to verify") == "- /billing: brand colour"
+    assert not run.labelled()
+
+
+@pytest.mark.parametrize("fixer", ["claude", "cursor"])
+def test_a_deferred_task_write_posts_the_discard_comment_once(run, monkeypatch, fixer):
+    clock, _ = _flaky_edits(monkeypatch)
+    run.fake_gh.set(body=COMPLETE, headRefName="cursor/issue-419")
+    bad = "Task completion: partial\nTask completion: complete\n\n## What changed\nNope.\n"
+    if fixer == "cursor":
+        run.agent(cursor_plan("TASK: partial\nRESULT: fixed", request=bad, commit=False))
+    else:
+        run.agent({**_TASK_REPLY, "description": bad, "commit": False})
+    assert run.fix(fixer)["rc"] == 75
+    assert not [c for c in run.comments() if "Discarded the PR description request" in c]
+    clock["now"] = 1_060
+    assert run.fix(fixer)["rc"] == 0 and len(run.agent_calls) == 1
+    assert len([c for c in run.comments() if "Discarded the PR description request" in c]) == 1
+    assert "Nope." not in run.body() and "completion=partial" in run.body()
+
+
+def test_a_deferred_cursor_task_write_still_pushes_its_commit(run, monkeypatch):
+    clock, _ = _flaky_edits(monkeypatch)
+    run.fake_gh.set(body=COMPLETE, headRefName="cursor/issue-419")
+    run.agent(cursor_plan("TASK: partial\nRESULT: fixed"))
+    assert run.fix("cursor")["rc"] == 75 and run.pushed_new
+    clock["now"] = 1_060
+    assert run.fix("cursor")["rc"] == 0 and len(run.agent_calls) == 1
+    assert run.pushed() and "completion=partial" in run.body()
+
+
+def test_an_exhausted_task_write_hands_off_exactly_once(run, monkeypatch):
+    from baton import handoff
+
+    clock, edits = _flaky_edits(monkeypatch, fail_until=10 ** 9)
+    notes = []
+    monkeypatch.setattr(handoff.notify, "notify", lambda title, text="": notes.append((title, text)))
+    run.fake_gh.set(body=COMPLETE)
+    run.agent(_TASK_REPLY)
+    assert run.fix("claude")["rc"] == 75
+    clock["now"] = 1_060
+    assert run.fix("claude")["rc"] == 75
+    clock["now"] = 1_360
+    assert run.fix("claude")["rc"] == 1 and run.labelled()
+    assert sum("task completion change failed" in title for title, _ in notes) == 1
+    assert sorted(set(edits)) == [1_000, 1_060, 1_360] and len(run.agent_calls) == 1   # one write per attempt, with gh's own repeats
+    assert not list(Path(run.root / "state").glob("handoff-*-*fix_task_write_failed.json"))
+
+
+def test_a_pr_closed_during_the_last_attempt_clears_without_a_handoff(run, monkeypatch):
+    clock, _ = _flaky_edits(monkeypatch, fail_until=10 ** 9)
+    run.fake_gh.set(body=COMPLETE)
+    run.agent({"commit": False, "reply": "RESULT: fixed",
+               "file": "## Checks to verify\n- /billing: brand colour\n\nRESULT: fixed\n"})
+    assert run.fix("claude")["rc"] == 75
+    clock["now"] = 1_060
+    assert run.fix("claude")["rc"] == 75
+    clock["now"] = 1_360
+    call = fix.pr_helpers.call
+
+    def closing(*args, input=None, limit=None):
+        done = call(*args, input=input, limit=limit)
+        if args[:2] == ("pr", "edit") and "--body-file" in args:
+            run.fake_gh.set(state="MERGED")
+        return done
+
+    monkeypatch.setattr(fix.pr_helpers, "call", closing)
+    run.fix("claude")
+    assert not run.labelled() and len(run.agent_calls) == 1
+    assert not list(Path(run.root / "state").glob("handoff-*-*fix_checks_refresh_failed.json"))
+
+
+def test_a_landed_checks_refresh_counts_as_progress_when_the_body_cannot_be_read_after(run, monkeypatch):
+    run.fake_gh.set(body=COMPLETE)
+    run.agent({"commit": False, "reply": "RESULT: fixed",
+               "file": "## Checks to verify\n- /billing: brand colour\n\nRESULT: fixed\n"})
+    body = fix.pr_helpers.body
+
+    def body_after_edit(pr):
+        return None if section(run.body(), "Checks to verify") != "none" else body(pr)
+
+    monkeypatch.setattr(fix.pr_helpers, "body", body_after_edit)
+    assert run.fix("claude")["rc"] == 0 and not run.labelled()
+    assert not any("made no commit" in line for line in run.runner_log())
+
+
+def test_an_unreadable_pr_head_hands_off_before_a_task_write_is_saved(run, gh):
+    gh.set(body=COMPLETE, headRefOid="")
+    run.agent(_TASK_REPLY)
+    assert run.fix("claude")["rc"] == 1 and run.labelled()
+    assert "completion=partial" not in run.body()
+
+
+def test_a_deferred_replacement_description_preserves_the_owners_issue_correction(run, gh):
+    gh.set(body=COMPLETE, headRefName="owner-branch")
+    request = COMPLETE.replace("Disabled buttons.", "Revised description.")
+    run.agent(cursor_plan("## Checks to verify\nnone\n\nTASK: partial\nRESULT: fixed", request=request, commit=False))
+    gh.fail("edit-before-write")
+    assert run.fix("cursor")["rc"] == 75
+    corrected = COMPLETE.replace("419", "420").replace("## Checks to verify\nnone", "## Checks to verify\n- Owner check")
+    gh.set(body=corrected)
+    gh.fail("edit-before-write", False)
+    assert run.fix("cursor")["rc"] == 1 and run.labelled()
+    assert run.body() == corrected and len(run.agent_calls) == 1

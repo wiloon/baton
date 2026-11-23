@@ -435,13 +435,13 @@ def _fix_meta_write_binding_valid(item, binding, *, reason):
             or not isinstance(binding.get("fixer"), str) or not binding["fixer"]
             or not isinstance(binding.get("who"), str)
             or not isinstance(head, str)
-            or (head != "" and not re.fullmatch(r"[0-9a-f]{40}", head))
+            or not re.fullmatch(r"[0-9a-f]{40}", head)
             or not isinstance(feedback, str)
             or (feedback != "" and not re.fullmatch(r"[0-9a-f]{64}", feedback))
             or type(description_rc) is not int or description_rc not in (0, 1, 2)
             or not isinstance(binding.get("description_reason"), str)
             or type(binding.get("clear_cursor")) is not bool
-            or bool(description_rc) != bool(binding["description_reason"])):
+            or not (binding.get("resume") is None or isinstance(binding["resume"], dict))):
         return False
     if reason == FIX_CHECKS:
         return type(binding.get("consume")) is bool
