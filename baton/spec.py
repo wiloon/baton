@@ -319,11 +319,23 @@ class Spec:
                                     env, self.hooks)
             if out["rc"] == 75:
                 raise Deferred(vendor, out["defer"])
-        if role == "spec" and self.answer_intent_path().exists():
-            # Dispatched: recovery.dispatching now owns the continuation.
+        return out
+
+    def settle_answer_intent(self):
+        """The revision worker ran to completion: recovery now owns the continuation, so drop the saved one."""
+        if self.answer_intent_path().exists():
             self.clear_answer_intent()
             owner_handoff.clear_retry(self.env, self.issue, owner_handoff.SPEC_REPLY_POST)
-        return out
+
+    def keep_denied_spent(self):
+        """Record on the saved answer intent that the denied-command rerun was chosen (survives a deferral)."""
+        path = self.answer_intent_path()
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return
+        if isinstance(data, dict) and not data.get("denied_spent"):
+            atomic_json(path, {**data, "denied_spent": True})
 
     def gh(self, *args):
         return pr_helpers.gh(*args, "-R", self.repo)
@@ -1532,6 +1544,11 @@ class Spec:
             "reviser", list(env.config.quota.vendor_pool), last_vendor, other_model, spec_followup=claude_followup)
         self.mark_base(round)
         denied_spent = bool(pending and pending[0]["remaining_budget"].get("denied_spent"))
+        try:
+            saved = json.loads(self.answer_intent_path().read_text())
+            denied_spent = denied_spent or saved.get("denied_spent") is True
+        except (OSError, ValueError, AttributeError):
+            pass
         attempt = int(bool(pending))
         human = ""
         while True:
@@ -1548,12 +1565,14 @@ class Spec:
             denied = permission_denials(out.get("log", "")) if out["outcome"].startswith("RESULT: failed") else []
             if denied and not denied_spent:
                 denied_spent = True
+                self.keep_denied_spent()
                 notify.log(f"#{n}: spec revision round {round} failed after a denied command ({denied[0]}); rerunning once")
                 for suffix in (".body", ".comment"):
                     Path(f"{out_base}{suffix}").unlink(missing_ok=True)
                 out = self.agent(reviser, "spec", prompt + DENIED_NOTE.format(command=denied[0]), f"{tag}-rerun",
                                  "spec-settings.json", out_base, followup=followup, round_s=str(round))
                 denied = permission_denials(out.get("log", "")) if out["outcome"].startswith("RESULT: failed") else []
+            self.settle_answer_intent()
             outcome, model = out["outcome"], out["model"] or ""
             if (self.unverified(reviser, last_vendor, model, other_model)
                     or (reviser == last_vendor == "claude" and not claude_cli.distinct_models(model, other_model))):
