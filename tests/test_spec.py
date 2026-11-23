@@ -3062,6 +3062,29 @@ def test_restart_reconciles_a_saved_advisor_answer_intent(advised, monkeypatch, 
         assert advised.gh.posted("<!-- baton-verdict: accept")
 
 
+def test_a_short_block_on_the_answered_revision_keeps_the_saved_round_limit(advised, monkeypatch):
+    from dataclasses import replace
+
+    advised.gh.body = f"Goal\n{EXCERPT}\n"
+    deferral = {"rc": 75, "status": "quota", "outcome": "", "reply": None, "model": "", "defer": "quota"}
+    advised.script = [CHANGES, reviser(QUESTIONS, outcome="SPEC: human"), deferral,
+                      reviser("adopted"), CHANGES]
+    advised.advice = advice(grounded())
+    monkeypatch.setattr(dev, "setup_worktree", lambda *a, **k: ("", False))
+
+    def run(limit):
+        base = session.resolve(advised.env)
+        config = replace(base.config, scheduling=replace(base.config.scheduling, max_spec_rounds=limit))
+        return spec.run(SimpleNamespace(issue=N), replace(base, config=config))["rc"]
+
+    assert run(2) == 75
+    assert len(advised.gh.posted("<!-- baton-advisor-answer")) == 1
+    assert run(4) == 1
+    assert len(advised.gh.posted("<!-- baton-advisor-answer")) == 1
+    assert [r["role"] for r in advised.runs].count("spec_review") == 2
+    assert "ready-for-human" in advised.gh.labels
+
+
 EXCERPT = "Manual checks use the existing gate path."
 
 

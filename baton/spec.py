@@ -319,6 +319,10 @@ class Spec:
                                     env, self.hooks)
             if out["rc"] == 75:
                 raise Deferred(vendor, out["defer"])
+        if role == "spec" and self.answer_intent_path().exists():
+            # Dispatched: recovery.dispatching now owns the continuation.
+            self.clear_answer_intent()
+            owner_handoff.clear_retry(self.env, self.issue, owner_handoff.SPEC_REPLY_POST)
         return out
 
     def gh(self, *args):
@@ -937,8 +941,7 @@ class Spec:
                 or intent["body"] not in self.posted_answer_bodies(data, intent)):
             self.stop_advisor_answer(intent, closed=bool(data and data["state"] == "CLOSED"))
             return None
-        self.clear_answer_intent()
-        owner_handoff.clear_retry(self.env, self.issue, owner_handoff.SPEC_REPLY_POST)
+        # The intent stays until the reviser is dispatched (agent): a short block resumes it, saved limit and all.
         return data
 
     def complete_answer_post(self, intent):
