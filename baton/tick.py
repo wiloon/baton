@@ -328,6 +328,8 @@ class Tick:
             found = None
             for c in issue.get("comments") or []:
                 login, text = (c.get("author") or {}).get("login") or "", c.get("body") or ""
+                if text.startswith("<!-- baton-advisor-answer"):
+                    continue   # advisor provenance must not drive Cursor triage (#125)
                 if (re.search(self.cursor_login, login) and VERDICT_CURSOR.match(text)) \
                         or (login == self.owner and VERDICT_BY_CURSOR.match(text)):
                     found = text

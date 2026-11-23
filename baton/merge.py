@@ -122,7 +122,12 @@ class Merger:
         if acceptance:
             context.append(acceptance)
         context.append(f"PR title: {data.get('title') or ''}\n{data.get('body') or ''}")
-        return {"snapshot": "\n\n".join(context), "observed_actions": ("retry_step",) if retry else ()}
+        baseline = "\n\n".join(context)
+        ci_log = ""
+        if self.env.repo.advisor_ci_log_excerpts and status in ("failed", "pending"):
+            ci_log = f"CI status={status}; last exit={self.last_ci[1] if self.last_ci else 'unknown'}"
+        snapshot = advisor.augment_snapshot(self.env, baseline, ci_log_excerpt=ci_log)
+        return {"snapshot": snapshot, "observed_actions": ("retry_step",) if retry else ()}
 
     # --- CI ---
     def ci_green(self, minutes):

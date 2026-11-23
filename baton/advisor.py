@@ -27,9 +27,15 @@ from . import credentials, notify, session
 
 PROMPT_VERSION = "3"
 OBSERVATION_PROMPT_VERSION = "4"
+QUESTIONS_PROMPT_VERSION = "5"
 KEY = "DEEPSEEK_API_KEY"
 HANDOFF = "handoff"
 DIGEST_SECONDS = 24 * 3600
+QUESTIONS_HEADING = re.compile(r"^### Questions for the owner\s*$", re.M)
+QUESTION_ITEM = re.compile(r"^[-*]\s+(\S.*)$")
+CITATION_LINE = re.compile(
+    r"^\[(?P<id>c\d+)\] \((?P<source>[^)]+)\): (?P<text>.*)$", re.M)
+ANSWER_CASES = frozenset({"grounded", "reversible_default", "owner_decision"})
 
 SYSTEM = """You advise an unattended coding-agent pipeline at one decision point.
 The runner gives you a snapshot and the actions it allows. Pick exactly one allowed action.
@@ -47,6 +53,16 @@ Every evidence item must be one unbroken passage copied character for character 
 keeping its punctuation and Markdown. Keep each under 200 characters and within one line. Do not add
 labels, quotation marks or ellipses, and do not paraphrase or join passages. Put references and your
 own wording in reason. Use an empty evidence array when no exact quote applies."""
+
+QUESTIONS_SYSTEM = """When answer_spec_questions is allowed, answer every listed question or choose handoff.
+For answer_spec_questions return the same JSON fields plus
+"answers": [{"id": "qN", "case": "grounded"|"reversible_default"|"owner_decision",
+"text": "<answer>", "citations": ["cN", ...]}, ...].
+Use grounded only when the citation excerpts already settle the question; copy the answer text
+character for character from those excerpts (no new decision wording). Use reversible_default for a
+technical default the owner could reverse, and owner_decision when only the owner can decide.
+Any non-grounded case, missing question, duplicate id, or citation outside the snapshot means the
+runner will hand the whole set off. Prefer handoff when evidence is incomplete or conflicting."""
 
 # Secret-looking text never leaves the host (#17 redaction).
 PATTERNS = [
@@ -71,10 +87,101 @@ class Decision:
     failure: str = ""
     called: bool = False
     previous: bool = False
+    answers: tuple = ()    # grounded answer set for answer_spec_questions, else ()
 
     @property
     def extra_round(self):
         return self.action == "extra_round"
+
+
+def extract_questions(text):
+    """Stable question IDs in list order under ### Questions for the owner; [] when unparseable."""
+    match = QUESTIONS_HEADING.search(text or "")
+    if not match:
+        return []
+    rest = (text or "")[match.end():]
+    if stop := re.search(r"^###\s", rest, re.M):
+        rest = rest[:stop.start()]
+    questions = []
+    for line in rest.splitlines():
+        item = QUESTION_ITEM.match(line.strip())
+        if not item:
+            if line.strip():
+                return []   # prose or a broken list: the whole set is unparseable
+            continue
+        questions.append({"id": f"q{len(questions) + 1}", "text": item.group(1).strip()})
+    return questions
+
+
+def parse_citations(snapshot):
+    """Citation id → excerpt text from the runner-built Citation evidence block."""
+    found = {}
+    for match in CITATION_LINE.finditer(snapshot or ""):
+        found[match["id"]] = match["text"]
+    return found
+
+
+def question_ids(snapshot):
+    """qN ids listed under Questions: in the snapshot, in order."""
+    block = re.search(r"(?ms)^Questions:\n(.*?)(?=^Citation evidence:|\Z)", snapshot or "")
+    if not block:
+        return []
+    return [m.group(1) for m in re.finditer(r"^- (q\d+):", block.group(1), re.M)]
+
+
+def normalize_answers(raw, snapshot):
+    """Validate and normalize the answer set for answer_spec_questions; raise ValueError if unsafe."""
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("expected a nonempty answers array")
+    expected = question_ids(snapshot)
+    if not expected:
+        raise ValueError("snapshot has no questions")
+    citations = parse_citations(snapshot)
+    seen, answers = set(), []
+    for row in raw:
+        if not isinstance(row, dict):
+            raise ValueError("each answer must be an object")
+        qid, case, text, cites = row.get("id"), row.get("case"), row.get("text"), row.get("citations")
+        if not isinstance(qid, str) or qid in seen:
+            raise ValueError("missing or duplicate question id")
+        seen.add(qid)
+        if case not in ANSWER_CASES or not isinstance(text, str) or not isinstance(cites, list):
+            raise ValueError("invalid answer case, text or citations")
+        if any(not isinstance(c, str) for c in cites):
+            raise ValueError("citations must be strings")
+        text.encode("utf-8")
+        if case != "grounded":
+            raise ValueError(f"non-grounded case {case}")
+        if not cites or any(c not in citations for c in cites):
+            raise ValueError("citation outside the sent snapshot")
+        combined = "\n".join(citations[c] for c in cites)
+        if not text or text not in combined:
+            raise ValueError("answer text is not taken from its citations")
+        answers.append({"id": qid, "case": case, "text": text, "citations": tuple(cites)})
+    if sorted(seen) != sorted(expected) or [a["id"] for a in answers] != expected:
+        raise ValueError("answers must cover each question id exactly once in order")
+    return tuple(answers)
+
+
+def format_citations(entries):
+    """Render citation evidence lines from (id, source, text) rows."""
+    return "Citation evidence:\n" + "\n".join(f"[{i}] ({source}): {text}" for i, source, text in entries)
+
+
+def augment_snapshot(env, baseline, *, diff_excerpt="", ci_log_excerpt="", document_excerpts=()):
+    """Append repository-opted-in excerpts; baseline alone when every flag is off (#125)."""
+    env = session.resolve(env)
+    repo = env.repo
+    parts = [baseline]
+    if getattr(repo, "advisor_diff_excerpts", False) and diff_excerpt:
+        parts.append(f"Diff excerpt:\n{diff_excerpt}")
+    if getattr(repo, "advisor_ci_log_excerpts", False) and ci_log_excerpt:
+        parts.append(f"CI log excerpt:\n{ci_log_excerpt}")
+    if getattr(repo, "advisor_local_documents", False) and document_excerpts:
+        blocks = [f"Document {path}:\n{text}" for path, text in document_excerpts if path and text]
+        if blocks:
+            parts.append("Local documents:\n" + "\n\n".join(blocks))
+    return "\n\n".join(parts)
 
 
 def secret_values(env):
@@ -209,7 +316,9 @@ def enabled(env):
 def call_deepseek(cfg, key, snapshot, actions, *, category=None):
     """(parsed reply dict, usage dict); raises on transport, HTTP or format failure."""
     system = SYSTEM
-    if category == 2:
+    if "answer_spec_questions" in actions:
+        system += "\n" + QUESTIONS_SYSTEM
+    elif category == 2:
         system += ("\nFor a CI judgement, retry_step means one bounded status poll of existing checks on the "
                    "specified head. It cannot repair a check, rerun a job, update a branch or merge a PR."
                    "\nFor a worker failure, retry_step means one more attempt of the same step with the same "
@@ -278,12 +387,14 @@ def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=No
             return Decision(rule, record.get("reason", ""), tuple(record.get("evidence") or ()),
                             record.get("advised", ""), "duplicate snapshot", previous=True)
     decision_id = uuid4().hex
+    answering = "answer_spec_questions" in actions
+    version = (QUESTIONS_PROMPT_VERSION if answering
+               else OBSERVATION_PROMPT_VERSION if category else PROMPT_VERSION)
     record = {"kind": "decision", "ts": int(time.time()), "point": point, "repo": env.repo.gh_repo, "item": str(item),
               "task_kind": task_kind, "episode": pending[0]["episode"] if pending else decision_id,
               "decision_id": decision_id, "snapshot_sha": digest, "actions": list(actions), "backend": "deepseek",
-              "model": cfg.model, "prompt_version": OBSERVATION_PROMPT_VERSION if category else PROMPT_VERSION,
-              "mode": effective, "rule": rule}
-    advised, reason, evidence, usage = "", "", [], {}
+              "model": cfg.model, "prompt_version": version, "mode": effective, "rule": rule}
+    advised, reason, evidence, answers, usage = "", "", [], (), {}
 
     def counted(metadata):
         return {k: count for k, count in metadata.items()
@@ -319,6 +430,10 @@ def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=No
                 failure = f"action outside the allowed set: {advised[:60]!r}"
             reason = redact(raw_reason, values)[:600]
             evidence = [redact(quote, values)[:300] for quote in raw_evidence[:5]]
+            if not failure and advised == "answer_spec_questions":
+                answers = normalize_answers(reply.get("answers"), text)
+                answers = tuple(
+                    {**row, "text": redact(row["text"], values)[:600]} for row in answers)
     except urllib.error.HTTPError as error:
         failure = f"HTTP {error.code}"
     except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as error:
@@ -331,6 +446,7 @@ def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=No
         failure = "malformed reply: invalid Unicode text"
     except (ValueError, KeyError, IndexError, TypeError, AttributeError, RuntimeError) as error:
         failure = f"malformed reply: {type(error).__name__}: {redact(str(error), values)[:120]}"
+        answers = ()
     executed = rule
     if not failure and advised != rule and effective == "live":
         try:
@@ -348,14 +464,16 @@ def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=No
             # Exclusive creation spends the grant even if a process stops before dispatch.
             with path.open("x") as file:
                 file.write(f"{decision_id}\n")
+        recorded = [{**row, "citations": list(row["citations"])} for row in answers]
         record.update(advised=advised, reason=reason, evidence=evidence, executed=executed, failure=failure,
-                      latency_ms=int((time.monotonic() - started) * 1000), usage=usage)
+                      latency_ms=int((time.monotonic() - started) * 1000), usage=usage,
+                      **({"answers": recorded} if recorded else {}))
         append(env, record)
     except OSError as error:
-        executed, failure = rule, f"could not persist advisor decision: {type(error).__name__}"
+        executed, failure, answers = rule, f"could not persist advisor decision: {type(error).__name__}", ()
     notify.log(f"advisor {point} #{item}: advised={advised or '-'} executed={executed}"
                + (f" failure={failure}" if failure else ""))
-    return Decision(executed, reason, tuple(evidence), advised, failure, True)
+    return Decision(executed, reason, tuple(evidence), advised, failure, True, answers=answers)
 
 
 def pending_items(env, task_kind):

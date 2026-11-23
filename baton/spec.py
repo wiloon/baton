@@ -33,6 +33,7 @@ import time
 
 from . import advisor, agents, checks as check_section, claude_cli, dispatch, e2e_gate, fix, handoff as owner_handoff, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, recovery, review, vendors
 from .common import Deferred, changed, git, permission_denials, push, restore, strip_markers
+from .quota import atomic_json
 
 REPLY_CAP = 60000
 DENIED_NOTE = ("\n\nA previous attempt at this round ended with `RESULT: failed` after this command was denied: "
@@ -42,6 +43,8 @@ VERDICT = re.compile(r"<!-- baton-verdict: (accept|revise)( by=(cursor|codex|cla
 STATE_RE = re.compile(r"<!-- baton-spec-(?P<k>review|reply) round=(?P<r>[0-9]+)(?P<h> human)?")
 KIND_RE = r"<!-- baton-spec-%s round=[0-9]+( human)? by=(?P<v>[a-z]+) -->"
 VERDICT_LINE = re.compile(r"^(SPEC|RESULT): ")
+ADVISOR_ANSWER = re.compile(
+    r"^<!-- baton-advisor-answer round=(?P<r>\d+) questions=(?P<q>[0-9a-f]+) by=deepseek -->")
 PENDING_ACCEPT = re.compile(
     r"^<!-- baton-spec-accept-pending pr=(?P<pr>\d+)(?: head=(?P<head>[0-9a-f]{40}))? -->\n(?P<verdict>.*)", re.DOTALL)
 
@@ -735,6 +738,211 @@ class Spec:
                 raise Deferred("handoff-retry", reason, lends_slot=False)
         return stop(f"Reconciliation: {status}." + (pr_helpers.why(failure) if failure is not None else ""))
 
+    def answer_intent_path(self):
+        return Path(self.state, f"advisor-answer-{self.issue}.json")
+
+    def clear_answer_intent(self):
+        self.answer_intent_path().unlink(missing_ok=True)
+
+    def load_answer_intent(self):
+        path = self.answer_intent_path()
+        try:
+            data = json.loads(path.read_text())
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError):
+            return "unreadable"
+        if not isinstance(data, dict) or not isinstance(data.get("body"), str):
+            return "unreadable"
+        return data
+
+    def questions_citation_entries(self, issue_body, comments):
+        """Baseline citation rows from the issue body and genuine owner comments."""
+        entries, owner = [], self.env.owner
+
+        def one_line(text):
+            return re.sub(r"\s+", " ", (text or "").strip())[:1500]
+
+        body = one_line(issue_body)
+        if body:
+            entries.append((f"c{len(entries) + 1}", "issue body", body))
+        for comment in comments or ():
+            login = (comment.get("author") or {}).get("login") or ""
+            text = one_line(comment.get("body") or "")
+            if login != owner or not text or text.startswith("<!-- baton"):
+                continue
+            entries.append((f"c{len(entries) + 1}", "owner comment", text))
+        if self.env.repo.advisor_local_documents:
+            for path in sorted(Path(self.repo_dir, "docs", "adr").glob("*.md"))[:5]:
+                try:
+                    text = one_line(path.read_text()[:2000])
+                except OSError:
+                    continue
+                if text:
+                    entries.append((f"c{len(entries) + 1}", f"document {path.relative_to(self.repo_dir)}",
+                                    text))
+        return entries
+
+    def questions_snapshot(self, binding, questions, payload):
+        """(snapshot, revalidate) for the spec_questions decision point."""
+        entries = self.questions_citation_entries(payload["body"], payload["comments"])
+        question_lines = "\n".join(f"- {q['id']}: {q['text']}" for q in questions)
+        citation_block = advisor.format_citations(entries) if entries else "Citation evidence:\n"
+        baseline = (
+            f"Decision point: spec_questions. Issue #{self.issue} of {self.repo}, round {binding['round']}.\n"
+            f"Reviser: {binding['reviewer']}. ADR PR: {binding.get('pr') or 'none'}; "
+            f"head: {binding.get('adr_head') or 'none'}.\n"
+            f"Questions:\n{question_lines}\n{citation_block}\n"
+            f"Question comment digest: {binding['digest']}.\n"
+            f"Latest reviser reply:\n{binding.get('reply') or ''}"
+        )
+        snapshot = advisor.augment_snapshot(self.env, baseline)
+        expected = {
+            "digest": binding["digest"], "issue_body": binding["issue_body"],
+            "adr_head": binding.get("adr_head") or "", "feedback": binding["feedback"],
+        }
+
+        def still_current():
+            data, _ = read_issue(self.env, self.issue, once=True)
+            if data is None:
+                return False
+            if self.body_key(data["body"]) != expected["issue_body"]:
+                return False
+            if self.owner_feedback_digest(data["comments"]) != expected["feedback"]:
+                return False
+            if (binding.get("adr_head") or "") != expected["adr_head"]:
+                # Re-read ADR head only when the binding carried one.
+                if expected["adr_head"]:
+                    return False
+            found = next((c for c in data["comments"]
+                          if (c.get("body") or "").startswith(
+                              f"<!-- baton-spec-reply round={binding['round']} human ")
+                          and owner_handoff.body_digest(c["body"]) == expected["digest"]), None)
+            return found is not None
+
+        return snapshot, still_current
+
+    def format_answer_body(self, binding, answers, questions_digest):
+        cleaned = []
+        for row in answers:
+            text = "\n".join(
+                line for line in strip_markers(row["text"]).split("\n") if not VERDICT_LINE.match(line)
+            ).rstrip("\n")
+            cites = ", ".join(row["citations"])
+            cleaned.append(f"### {row['id']}\n{text}\n\nCitations: {cites}")
+        return (
+            f"<!-- baton-advisor-answer round={binding['round']} questions={questions_digest} by=deepseek -->\n"
+            f"## Advisor answers (DeepSeek), round {binding['round']}\n\n"
+            f"Answering the reviser's questions (comment digest `{questions_digest[:12]}`).\n\n"
+            + "\n\n".join(cleaned)
+        )
+
+    def publish_advisor_answers(self, binding, answers):
+        """Persist intent, post one attributed answer comment, reconcile a lost response (#125)."""
+        body = self.format_answer_body(binding, answers, binding["digest"])
+        intent = {
+            "body": body, "digest": owner_handoff.body_digest(body),
+            "questions": binding["digest"], "round": binding["round"],
+            "max_rounds": binding["max_rounds"], "reviewer": binding["reviewer"],
+            "issue_body": binding["issue_body"], "feedback": binding["feedback"],
+            "adr_head": binding.get("adr_head") or "", "pr": binding.get("pr") or "",
+        }
+        try:
+            atomic_json(self.answer_intent_path(), intent)
+        except OSError:
+            self.handoff("Could not save the advisor answer before posting.", "spec_questions")
+            return "stop"
+        return self.complete_answer_post(intent, binding)
+
+    def complete_answer_post(self, intent, binding=None):
+        """Post or reconcile the saved advisor answer; 'answered' resumes revision."""
+        n = self.issue
+        data, transient = read_issue(self.env, n, once=True)
+        if data is None:
+            if transient:
+                raise Deferred("advisor-answer", "spec_questions", lends_slot=False)
+            self.clear_answer_intent()
+            self.handoff("Could not re-read the issue before posting advisor answers.", "spec_questions")
+            return "stop"
+        # A genuine owner reply supersedes any advisory continuation.
+        if binding and self.owner_feedback_digest(data["comments"]) != binding["feedback"]:
+            self.clear_answer_intent()
+            self.handoff(f"{binding['reviewer']} has questions only you can answer. "
+                         "Reply on the issue, then remove ready-for-human.", "spec_questions")
+            return "stop"
+        matches = [c for c in data["comments"]
+                   if (c.get("author") or {}).get("login") == self.env.owner
+                   and (c.get("body") or "") == intent["body"]]
+        def done():
+            # The human reply continuation is finished once answers are posted (or reconciled).
+            owner_handoff.clear_retry(self.env, n, owner_handoff.SPEC_REPLY_POST)
+            self.clear_answer_intent()
+            return "answered"
+
+        if matches:
+            return done()
+        if any(ADVISOR_ANSWER.match(c.get("body") or "") and
+               ADVISOR_ANSWER.match(c["body"])["q"] == intent["questions"]
+               for c in data["comments"]
+               if (c.get("author") or {}).get("login") == self.env.owner):
+            # A different body for the same question version: do not double-post.
+            self.clear_answer_intent()
+            self.handoff("An advisor answer for these questions is already present but does not match "
+                         "the saved intent.", "spec_questions")
+            return "stop"
+
+        def reconcile():
+            data, transient = read_issue(self.env, n, once=True)
+            if data is None:
+                return "retry" if transient else "failed"
+            if any((c.get("body") or "") == intent["body"] for c in data["comments"]):
+                return "landed"
+            return "absent"
+
+        posted = pr_helpers.gh("issue", "comment", n, "-R", self.repo, "--body", intent["body"],
+                               reconcile=reconcile)
+        if posted.returncode == 0 or reconcile() == "landed":
+            return done()
+        if pr_helpers.transient(posted):
+            raise Deferred("advisor-answer", "spec_questions", lends_slot=False)
+        self.clear_answer_intent()
+        self.handoff(f"Posting the advisor answers failed.{pr_helpers.why(posted)}", "spec_questions")
+        return "stop"
+
+    def answer_or_handoff(self, binding):
+        """Consult the advisor for grounded answers, or hand off (#125)."""
+        why = (f"{binding['reviewer']} has questions only you can answer. "
+               "Reply on the issue, then remove ready-for-human.")
+        questions = advisor.extract_questions(binding.get("reply") or "")
+        if not questions:
+            self.handoff(why, "spec_questions")
+            return "stop"
+        # A revision plus an independent review must still fit in the remaining budget.
+        if binding["round"] >= binding["max_rounds"] + self.extra:
+            self.handoff(why + " No remaining round for an advisor answer and review.", "spec_questions")
+            return "stop"
+        payload = self.issue_payload()
+        if payload is None:
+            return "stop"
+        snap, check = self.questions_snapshot(binding, questions, payload)
+        result = self.handoff(why, "spec_questions", snapshot=snap, revalidate=check,
+                              observed_actions=("answer_spec_questions",))
+        if result.action != "answer_spec_questions":
+            return "stop"
+        answers = getattr(result.decision, "answers", ()) or ()
+        if not answers:
+            self.handoff(why, "spec_questions")
+            return "stop"
+        # Re-check citations against the current sources before posting.
+        entries = {i: text for i, _, text in self.questions_citation_entries(
+            payload["body"], payload["comments"])}
+        for row in answers:
+            combined = "\n".join(entries[c] for c in row["citations"] if c in entries)
+            if row["text"] not in combined:
+                self.handoff(why + " Advisor citations no longer match the issue.", "spec_questions")
+                return "stop"
+        return self.publish_advisor_answers(binding, answers)
+
     def post_comment(self, reason, binding, *, initial, claim=None, context=None):
         """Save before sending a spec comment, or consume a due attempt before reconciling (#151).
 
@@ -808,10 +1016,11 @@ class Spec:
                 owner_handoff.clear_retry(self.env, n, reason)
                 return "changes"
             if binding["next"] == "human":
-                self.handoff(f"{binding['reviewer']} has questions only you can answer. "
-                             "Reply on the issue, then remove ready-for-human.", "spec_questions")
+                # Clear only after the handoff or answer attempt returns: an interrupt during
+                # handoff must leave the confirmed reply so the next tick retries the handoff.
+                outcome = self.answer_or_handoff(binding)
                 owner_handoff.clear_retry(self.env, n, reason)
-                return "stop"
+                return "answered" if outcome == "answered" else "stop"
             owner_handoff.clear_retry(self.env, n, reason)
             return "revised"
 
@@ -942,12 +1151,24 @@ class Spec:
         except OSError:
             issue_text = ""
         diff = git(self.wt, "diff", "--stat", "origin/main...HEAD") or "no ADR changes"
-        snapshot = (f"Decision point: spec round limit. Issue #{n} of {self.repo} used {round} spec review rounds "
+        baseline = (f"Decision point: spec round limit. Issue #{n} of {self.repo} used {round} spec review rounds "
                     f"and the last reviewer ({reviewer}) still asks for changes.\n"
                     "Actions: extra_round = one more revision of the issue by an agent, then one more review; "
                     "handoff = the owner takes the spec.\n\n"
                     f'<last-review round="{round}" by="{reviewer}">\n{reply}\n</last-review>\n\n'
                     f"<adr-changes>\n{diff}\n</adr-changes>\n\n{issue_text}")
+        diff_excerpt = ""
+        if env.repo.advisor_diff_excerpts:
+            diff_excerpt = (git(self.wt, "diff", "origin/main...HEAD") or "")[:4000]
+        docs = []
+        if env.repo.advisor_local_documents:
+            for path in sorted(Path(self.repo_dir, "docs", "adr").glob("*.md"))[:3]:
+                try:
+                    docs.append((str(path.relative_to(self.repo_dir)), path.read_text()[:1500]))
+                except OSError:
+                    continue
+        snapshot = advisor.augment_snapshot(env, baseline, diff_excerpt=diff_excerpt,
+                                            document_excerpts=tuple(docs))
         return snapshot, (lambda: spec_state(env, n) == state)
 
     def at_limit(self, round, max_rounds, reviewer, reply, context, why):
@@ -1197,7 +1418,7 @@ class Spec:
 
     # --- the reviser's round ---
     def revise_round(self, round, context, inputs, max_rounds=None):
-        """"revised" or "stop" (the owner or a failure took over)."""
+        """"revised", "answered" (advisor posted grounded answers) or "stop"."""
         n, wt, env = self.issue, self.wt, self.env
         listed, issue_body = inputs["comments"], inputs["body"]
         if max_rounds is None:
@@ -1339,6 +1560,19 @@ class Spec:
         ISSUE_PAYLOAD is an already-fetched {title, body, comments} from a recovered read (#151).
         """
         n, env = self.issue, self.env
+        answer_intent = self.load_answer_intent()
+        if answer_intent == "unreadable":
+            self.clear_answer_intent()
+            self.handoff("Could not read the saved advisor answer intent.", "spec_questions")
+            return False
+        if answer_intent is not None:
+            outcome = self.complete_answer_post(answer_intent)
+            if outcome != "answered":
+                return False
+            # Fall through into the normal reply-human → revise path with the posted answers.
+            issue_payload = self.issue_payload()
+            if issue_payload is None:
+                return False
         resume_post = self.waiting_comment_post()
         if resume_post == "unreadable":
             return False
@@ -1438,9 +1672,18 @@ class Spec:
                     step = "revise"
                 else:
                     return result == "accept"
-            elif self.revise_round(round, context, issue_payload, max_rounds) != "revised":
-                return False
             else:
+                revised = self.revise_round(round, context, issue_payload, max_rounds)
+                if revised == "answered":
+                    # Grounded answers resume one revision with the remaining budget (no round bump).
+                    issue_payload = self.issue_payload()
+                    if issue_payload is None:
+                        return False
+                    context = Path(self.ctx, f"issue-{n}-spec-{round}-revise-{time.strftime('%Y%m%d-%H%M%S')}.md")
+                    context.write_text(review.issue_context(env, n, data=issue_payload))
+                    revised = self.revise_round(round, context, issue_payload, max_rounds)
+                if revised != "revised":
+                    return False
                 step, round = "review", round + 1
             issue_payload = self.issue_payload()
             if issue_payload is None:
