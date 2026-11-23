@@ -327,35 +327,15 @@ class Spec:
             self.clear_answer_intent()
             owner_handoff.clear_retry(self.env, self.issue, owner_handoff.SPEC_REPLY_POST)
 
-    def saved_denied(self, pending=None):
-        """(spent, command, ok): the denied-command retry decision saved with the answer intent or the
-        pending retry. ok is False when a saved intent exists but cannot be read."""
-        budget = pending[0]["remaining_budget"] if pending else {}
-        spent, command = bool(budget.get("denied_spent")), budget.get("denied_command") or ""
-        path = self.answer_intent_path()
-        if not path.exists():
-            return spent, command, True
-        try:
-            data = json.loads(path.read_text())
-        except (OSError, ValueError):
-            return spent, command, False
-        if not isinstance(data, dict):
-            return spent, command, False
-        return (spent or data.get("denied_spent") is True,
-                command or str(data.get("denied_command") or ""), True)
-
-    def keep_denied_spent(self, command):
-        """Durably record on the saved answer intent that the denied-command rerun was chosen, with the
-        command. False when the saved intent cannot be read or written: the rerun must not dispatch."""
-        path = self.answer_intent_path()
-        if not path.exists():
+    def keep_denied_spent(self, answer_intent, command):
+        """Persist the selected rerun with the validated advisor continuation before dispatch."""
+        if answer_intent is None:
             return True
         try:
-            data = json.loads(path.read_text())
-            if not isinstance(data, dict):
-                return False
-            atomic_json(path, {**data, "denied_spent": True, "denied_command": command})
-        except (OSError, ValueError):
+            atomic_json(self.answer_intent_path(),
+                        {**answer_intent, "denied_spent": True, "denied_command": command})
+        except OSError:
+            self.handoff("Could not save the advisor answer intent for the denied-command rerun.", "spec_questions")
             return False
         return True
 
@@ -1547,7 +1527,7 @@ class Spec:
         return self.publish_accept(binding)
 
     # --- the reviser's round ---
-    def revise_round(self, round, context, inputs, max_rounds=None):
+    def revise_round(self, round, context, inputs, max_rounds=None, *, answer_intent=None):
         """"revised", "answered" (advisor posted grounded answers) or "stop"."""
         n, wt, env = self.issue, self.wt, self.env
         listed, issue_body = inputs["comments"], inputs["body"]
@@ -1565,7 +1545,12 @@ class Spec:
         reviser = pending[1] if pending else self.pick(
             "reviser", list(env.config.quota.vendor_pool), last_vendor, other_model, spec_followup=claude_followup)
         self.mark_base(round)
-        denied_spent, denied_command, intent_ok = self.saved_denied(pending)
+        budget = pending[0]["remaining_budget"] if pending else {}
+        saved_answer = answer_intent or {}
+        denied_spent = bool(budget.get("denied_spent")) or saved_answer.get("denied_spent") is True
+        denied_command = budget.get("denied_command") or str(saved_answer.get("denied_command") or "")
+        if denied_spent and not self.keep_denied_spent(answer_intent, denied_command):
+            return "stop"
         attempt = int(bool(pending))
         restored = denied_spent  # a saved, already-spent denied retry: the first dispatch repeats its note
         human = ""
@@ -1586,7 +1571,9 @@ class Spec:
             out = self.agent(reviser, "spec", prompt, tag, "spec-settings.json", out_base, followup=followup,
                              round_s=str(round))
             denied = permission_denials(out.get("log", "")) if out["outcome"].startswith("RESULT: failed") else []
-            if denied and not denied_spent and intent_ok and self.keep_denied_spent(denied[0]):
+            if denied and not denied_spent:
+                if not self.keep_denied_spent(answer_intent, denied[0]):
+                    return "stop"
                 denied_spent, denied_command = True, denied[0]
                 notify.log(f"#{n}: spec revision round {round} failed after a denied command ({denied[0]}); rerunning once")
                 for suffix in (".body", ".comment"):
@@ -1805,7 +1792,6 @@ class Spec:
                     return False
                 self.pr, self.adr_head = answer_intent["pr"], answer_intent["adr_head"]
                 max_rounds, self.extra = answer_intent["max_rounds"], 0
-                answer_intent = None
             else:
                 if issue_payload is None:
                     return False
@@ -1825,12 +1811,13 @@ class Spec:
                 else:
                     return result == "accept"
             else:
-                revised = self.revise_round(round, context, issue_payload, max_rounds)
+                revised = self.revise_round(round, context, issue_payload, max_rounds, answer_intent=answer_intent)
                 if revised == "answered":
                     answer_intent = self.answer_intent
                     continue
                 if revised != "revised":
                     return False
+                answer_intent = None
                 step, round = "review", round + 1
             issue_payload = self.issue_payload()
             if issue_payload is None:

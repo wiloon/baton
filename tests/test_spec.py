@@ -3085,6 +3085,30 @@ def test_a_short_block_on_the_answered_revision_keeps_the_saved_round_limit(advi
     assert "ready-for-human" in advised.gh.labels
 
 
+def test_a_denied_rerun_does_not_dispatch_when_the_answer_intent_cannot_be_saved(advised, monkeypatch, tmp_path):
+    advised.gh.body = f"Goal\n{EXCERPT}\n"
+    intent = advised.path("advisor-answer").with_suffix(".json")
+    denied = denied_failure(tmp_path)
+    replace = Path.replace
+
+    def reject_intent_save(path, target):
+        if target == intent:
+            raise PermissionError("cannot save the answer intent")
+        return replace(path, target)
+
+    def lose_intent(*args):
+        intent.unlink()
+        monkeypatch.setattr(Path, "replace", reject_intent_save)
+        return denied
+
+    advised.script = [CHANGES, reviser(QUESTIONS, outcome="SPEC: human"), lose_intent]
+    advised.advice = advice(grounded())
+
+    assert advised.run() is False
+    assert [run["role"] for run in advised.runs] == ["spec_review", "spec", "spec"]
+    assert "ready-for-human" in advised.gh.labels
+
+
 def test_a_deferred_denied_rerun_keeps_the_saved_round_limit_and_retry(advised, monkeypatch, tmp_path):
     from dataclasses import replace
 
@@ -3107,11 +3131,23 @@ def test_a_deferred_denied_rerun_keeps_the_saved_round_limit_and_retry(advised, 
     assert "ready-for-human" in advised.gh.labels
 
 
-def test_a_resumed_worker_after_a_deferred_denied_rerun_keeps_the_command_and_is_not_rerun(advised, monkeypatch, tmp_path):
+@pytest.mark.parametrize("intent_corrupted", [False, True])
+def test_a_resumed_worker_after_a_deferred_denied_rerun_keeps_the_command_and_is_not_rerun(
+        advised, monkeypatch, tmp_path, intent_corrupted):
     advised.gh.body = f"Goal\n{EXCERPT}\n"
     deferral = {"rc": 75, "status": "quota", "outcome": "", "reply": None, "model": "", "defer": "quota"}
+    intent = advised.path("advisor-answer").with_suffix(".json")
+    denied_again = denied_failure(tmp_path, "again")
+
+    def resumed_worker(*args):
+        saved = json.loads(intent.read_text())
+        assert saved["denied_spent"] is True
+        assert saved["denied_command"] == "wc -l /ctx/issue.md"
+        assert saved["max_rounds"] == 3
+        return denied_again
+
     advised.script = [CHANGES, reviser(QUESTIONS, outcome="SPEC: human"), denied_failure(tmp_path), deferral,
-                      denied_failure(tmp_path, "again")]
+                      resumed_worker]
     advised.advice = advice(grounded())
     monkeypatch.setattr(dev, "setup_worktree", lambda *a, **k: ("", False))
 
@@ -3119,6 +3155,16 @@ def test_a_resumed_worker_after_a_deferred_denied_rerun_keeps_the_command_and_is
         return spec.run(SimpleNamespace(issue=N), session.resolve(advised.env))["rc"]
 
     assert run() == 75
+    if intent_corrupted:
+        call = spec.pr_helpers.call
+
+        def corrupt_after_load(*args, **kwargs):
+            if args[:2] == ("api", "graphql"):
+                intent.write_text("invalid JSON")
+                monkeypatch.setattr(spec.pr_helpers, "call", call)
+            return call(*args, **kwargs)
+
+        monkeypatch.setattr(spec.pr_helpers, "call", corrupt_after_load)
     run()
     resumed = advised.runs[-1]
     assert "`wc -l /ctx/issue.md`" in resumed["prompt"]
