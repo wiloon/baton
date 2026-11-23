@@ -133,6 +133,15 @@ auto_merge = true
 # or new name, waits for the owner after review and CI pass, even with auto_merge on; no advisor
 # may release it. List the files that decide what agents may do (guard, quota, merge rules).
 owner_review_paths = []
+# false: the advisor is never called for this repository (its issue and PR text stay on the host).
+advisor = true
+# Opt-in raw excerpts the routine advisor may receive as citation evidence. Each defaults to
+# false; advisor = true alone permits only the baseline snapshot (issue/PR metadata, trusted
+# feedback, diff size, CI status). No flag overrides a global advisor mode of off, or
+# advisor = false on this repository. Redaction and snapshot_chars still apply to every field.
+advisor_diff_excerpts = false
+advisor_ci_log_excerpts = false
+advisor_local_documents = false
 
 [repos.areas]
 # Top-level directory -> area, for per-area vendor preferences (`dev_ui = [...]`). Anything else is "other".
@@ -339,8 +348,10 @@ budget_usd = 1.0
 # and worktree steps send redacted context for retry_step or retry_step_other_vendor when
 # eligible. Verification retains its repair budget. CI and merge
 # recommendations for implementation and ADR PRs stay in observation in either enabled mode.
+# Complete, cited grounded answers to SPEC: human questions may resume revision in live mode.
 # Decisions go to STATE/advisor/decisions.jsonl and a daily digest. A [[repos]] entry with
-# advisor = false keeps that repository's text off the provider.
+# advisor = false keeps that repository's text off the provider. Per-repository excerpt flags
+# (advisor_diff_excerpts, advisor_ci_log_excerpts, advisor_local_documents) default off.
 [advisor]
 env_file = "~/.config/baton/deepseek.env"     # DEEPSEEK_API_KEY
 mode = "off"

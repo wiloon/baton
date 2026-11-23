@@ -1103,3 +1103,30 @@ def test_a_damaged_durable_ci_head_hands_off_before_replaying(repair, monkeypatc
     repair.go()
     assert not repair.merged()
     assert sum(c[:2] == ["pr", "edit"] and "ready-for-human" in c for c in repair.gh.calls()) == 1
+
+
+def test_ci_log_excerpt_is_sent_only_with_its_flag_and_for_the_failed_check(run, observing, monkeypatch):
+    import subprocess
+    from dataclasses import replace
+    rollup = [{"status": "COMPLETED", "conclusion": "SUCCESS", "name": "lint",
+               "detailsUrl": "https://github.com/o/r/actions/runs/111/job/1"},
+              {"status": "COMPLETED", "conclusion": "FAILURE", "name": "tests",
+               "detailsUrl": "https://github.com/o/r/actions/runs/222/job/2"}]
+    monkeypatch.setattr(pr_helpers, "view", lambda pr, fields: {
+        "state": "OPEN", "headRefOid": OLD, "baseRefName": "main", "statusCheckRollup": rollup})
+    runs = []
+
+    def gh(*args, **kw):
+        runs.append(args)
+        return subprocess.CompletedProcess(args, 0, "FAILED test_x\n" + "x" * 5000 + "\nassert boom", "")
+
+    monkeypatch.setattr(pr_helpers, "gh", gh)
+    merger = run.merger()
+    merger.last_ci = (OLD, 1, 30)
+    merger.env = replace(merger.env, repo=replace(merger.env.repo, advisor_ci_log_excerpts=False))
+    assert "CI log excerpt:" not in merger.observation("ci", ci_failed=True)["snapshot"] and not runs
+    merger.env = replace(merger.env, repo=replace(merger.env.repo, advisor_ci_log_excerpts=True))
+    snapshot = merger.observation("ci", ci_failed=True)["snapshot"]
+    assert "CI log excerpt:\ntests (run 222):" in snapshot and "assert boom" in snapshot
+    assert [a[:3] for a in runs] == [("run", "view", "222")] and "--log-failed" in runs[0]
+    assert len(snapshot.split("CI log excerpt:")[1]) < 3200

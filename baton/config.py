@@ -98,6 +98,12 @@ class Repo:
     # false: the advisor (#17) is never called for this repository: its issue and PR text stays
     # on the host, and its decision points use the rules.
     advisor: bool = True
+    # Opt-in raw excerpts the routine advisor may receive as citation evidence (#125). Each
+    # defaults off; advisor = true alone permits only the baseline snapshot. No flag overrides
+    # global off or repository advisor = false.
+    advisor_diff_excerpts: bool = False
+    advisor_ci_log_excerpts: bool = False
+    advisor_local_documents: bool = False
 
 
 @dataclass(frozen=True)

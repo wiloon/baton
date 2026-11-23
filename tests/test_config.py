@@ -225,6 +225,22 @@ def test_owner_review_paths_default_empty_and_reject_absolute_paths(tmp_path):
             config.load(broken, home=tmp_path)
 
 
+def test_repository_advisor_excerpt_flags_default_off_and_opt_in(tmp_path):
+    # Older repository config that omits all three flags keeps them false.
+    head, repo = TEXT.split('\n[[repos]]\n', 1)
+    stripped = repo
+    for flag in ("advisor_diff_excerpts", "advisor_ci_log_excerpts", "advisor_local_documents", "advisor"):
+        stripped = re.sub(rf'^{flag} = .*\n', '', stripped, flags=re.M)
+    omitted = write(tmp_path, head + '\n[[repos]]\n' + stripped)
+    c = config.load(omitted, home=tmp_path)
+    assert c.repos[0].advisor is True
+    assert c.repos[0].advisor_diff_excerpts is False
+    assert c.repos[0].advisor_ci_log_excerpts is False
+    assert c.repos[0].advisor_local_documents is False
+    on = write(tmp_path, TEXT.replace('advisor_diff_excerpts = false\n', 'advisor_diff_excerpts = true\n', 1))
+    assert config.load(on, home=tmp_path).repos[0].advisor_diff_excerpts is True
+
+
 def test_the_advisor_section_is_optional_and_validated(tmp_path):
     plain = write(tmp_path, TEXT)
     assert config.load(plain, home=tmp_path).advisor.mode == "off"
