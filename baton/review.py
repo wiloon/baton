@@ -883,6 +883,17 @@ class Review:
             self.drop()
             return 0
         resuming_fix = step == "fix"
+        if step == "merge":
+            # A category-1 CI-repair push deferred after the review passed (#151).
+            shots = ({"checks": checks,
+                      "comment": agent_comment(self.repo, self.owner, pr, "baton-screenshot-review", round)}
+                     if screenshot else None)
+            try:
+                merge.Merger(self.env, self.hooks, pr, self.issue).merge_or_handoff(wt, shots)
+            except Deferred:
+                return 75
+            self.drop()
+            return 0
         if not (resuming_fix or pending_post) and self.seed():
             self.seed_contrib()
         if not saved and not pending_post:
@@ -1026,11 +1037,19 @@ class Review:
             self.fixed_by = fixer
             round, step = round + 1, "review"
             code_verdict = screenshot = checks = ""
-        self.drop()
+        # Keep the checkpoint through merge so a category-1 CI-repair push can resume (#151).
+        step = "merge"
+        self.values.update(step=step, code_verdict=code_verdict, screenshot=screenshot,
+                           screenshot_checks=checks)
+        self.save()
         # The last round's screenshot verdicts decide which manual checks still need the owner (#92).
         shots = ({"checks": checks, "comment": agent_comment(self.repo, self.owner, pr, "baton-screenshot-review", round)}
                  if screenshot else None)
-        merge.Merger(self.env, self.hooks, pr, self.issue).merge_or_handoff(wt, shots)
+        try:
+            merge.Merger(self.env, self.hooks, pr, self.issue).merge_or_handoff(wt, shots)
+        except Deferred:
+            return 75
+        self.drop()
         return 0
 
 

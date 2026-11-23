@@ -38,14 +38,18 @@ SPEC_REVIEW_POST = "spec_review_comment_post_failed"
 SPEC_REPLY_POST = "spec_reply_post_failed"
 SPEC_PENDING_ACCEPT_POST = "spec_pending_accept_post_failed"
 SPEC_ACCEPT_POST = "spec_accept_post_failed"
+DEV_PUSH = "dev_push_failed"
+FIX_PUSH = "fix_push_failed"
+SPEC_ADR_PUSH = "spec_adr_push_failed"
 COMMENT_POSTS = (REVIEW_POST, SCREENSHOT_POST)
 SPEC_POSTS = (SPEC_REVIEW_POST, SPEC_REPLY_POST)
 SPEC_ACCEPT_POSTS = (SPEC_PENDING_ACCEPT_POST, SPEC_ACCEPT_POST)
 # Spec comment posts and accept/pending-accept posts share tick discovery.
 SPEC_WRITE_POSTS = (*SPEC_POSTS, *SPEC_ACCEPT_POSTS)
+PUSH_REASONS = (DEV_PUSH, FIX_PUSH, SPEC_ADR_PUSH)
 RETRY_REASONS = frozenset({
     "review_comment_missing", "spec_comments_read_failed", "spec_pending_adr_read_failed",
-    *COMMENT_POSTS, *SPEC_WRITE_POSTS,
+    *COMMENT_POSTS, *SPEC_WRITE_POSTS, *PUSH_REASONS,
 })
 
 # Categories: 1 rule-decided, 2 judgement, 3 needs investigation, 4 owner-only.
@@ -285,6 +289,59 @@ def _spec_accept_post_valid(item, binding, *, reason):
             and bool(re.fullmatch(r"[0-9a-f]{64}", binding["feedback"])))
 
 
+def _push_binding_valid(item, binding, *, reason):
+    """A push of a known post-sign-off commit to a destination ref (#151)."""
+    commit, branch, remote = binding.get("commit"), binding.get("branch"), binding.get("remote")
+    ref, next_step = binding.get("ref"), binding.get("next")
+    if (not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit)
+            or not isinstance(branch, str) or not branch
+            or not isinstance(ref, str) or not ref
+            or not isinstance(remote, str)
+            or (remote and not re.fullmatch(r"[0-9a-f]{40}", remote))
+            or type(binding.get("upstream")) is not bool
+            or not isinstance(binding.get("wt"), str) or not binding["wt"]
+            or next_step not in ("done", "handoff", "open_pr", "spec_continue")):
+        return False
+    if reason == FIX_PUSH:
+        if binding.get("pr") != item or not isinstance(binding.get("issue"), str):
+            return False
+        if next_step == "handoff":
+            if binding.get("handoff_reason") not in ("fix_run_failed", "fix_needs_info"):
+                return False
+            if not isinstance(binding.get("outcome"), str) or not binding["outcome"]:
+                return False
+        elif next_step != "done":
+            return False
+        return (isinstance(binding.get("who"), str)
+                and type(binding.get("description_rc")) is int
+                and isinstance(binding.get("description_reason"), str)
+                and isinstance(binding.get("fixer"), str)
+                and type(binding.get("clear_cursor")) is bool)
+    if reason == DEV_PUSH:
+        return (binding.get("issue") == item and next_step == "open_pr"
+                and isinstance(binding.get("vendor"), str) and bool(binding["vendor"])
+                and isinstance(binding.get("base"), str)
+                and (binding["base"] == "" or bool(re.fullmatch(r"[0-9a-f]{40}", binding["base"])))
+                and isinstance(binding.get("body"), str) and isinstance(binding.get("model"), str))
+    # spec_adr_push_failed
+    return (binding.get("issue") == item and next_step == "spec_continue"
+            and isinstance(binding.get("reviser"), str) and bool(binding["reviser"])
+            and type(binding.get("round")) is int and binding["round"] > 0
+            and isinstance(binding.get("model"), str)
+            and isinstance(binding.get("human"), str)
+            and isinstance(binding.get("reply"), str)
+            and isinstance(binding.get("mode_note"), str)
+            and type(binding.get("max_rounds")) is int and binding["max_rounds"] > 0
+            and isinstance(binding.get("issue_body"), str)
+            and isinstance(binding.get("feedback"), str)
+            and isinstance(binding.get("author"), str) and bool(binding["author"])
+            and isinstance(binding.get("comment_ids"), list)
+            and all(type(value) is int and value > 0 for value in binding["comment_ids"])
+            and len(set(binding["comment_ids"])) == len(binding["comment_ids"])
+            and (binding["issue_body"] == "" or bool(re.fullmatch(r"[0-9a-f]{64}", binding["issue_body"])))
+            and (binding["feedback"] == "" or bool(re.fullmatch(r"[0-9a-f]{64}", binding["feedback"]))))
+
+
 def _binding_valid(reason, item, binding):
     if not isinstance(binding, dict):
         return False
@@ -307,6 +364,8 @@ def _binding_valid(reason, item, binding):
         return _spec_comment_post_valid(item, binding, reason=reason)
     if reason in SPEC_ACCEPT_POSTS:
         return _spec_accept_post_valid(item, binding, reason=reason)
+    if reason in PUSH_REASONS:
+        return _push_binding_valid(item, binding, reason=reason)
     return (binding.get("pr") == item and type(binding.get("round")) is int and binding["round"] > 0
             and all(isinstance(binding.get(key), str) for key in
                     ("head", "base", "digest", "issue", "screenshot_digest"))
@@ -379,6 +438,63 @@ def comment_post_episodes(env, reason=None):
                 episode, item = match.groups()
                 found.setdefault(item or episode, set()).add(episode)
     return found
+
+
+def push_episodes(env, reason=None):
+    """Find waiting push operations keyed by item (PR or issue number)."""
+    reasons = (reason,) if reason else PUSH_REASONS
+    found = {}
+    for name in reasons:
+        for path in Path(env.dirs.state).glob(f"handoff-*-{name}.json"):
+            match = re.fullmatch(rf"handoff-(?:waiting|retry)-([0-9]+)(?:-([0-9]+))?-{re.escape(name)}\.json",
+                                 path.name)
+            if match:
+                episode, item = match.groups()
+                found.setdefault(item or episode, set()).add((episode, name))
+    return found
+
+
+def observe_remote(wt, branch):
+    """The SHA currently at origin/BRANCH, or '' when that ref is absent; None when unreadable."""
+    from . import session
+    done = session.run_process(
+        ["git", "-C", str(wt), "ls-remote", "origin", f"refs/heads/{branch}"],
+        capture_output=True, text=True)
+    if done.returncode != 0:
+        return None
+    line = (done.stdout or "").strip().splitlines()
+    return line[0].split()[0] if line else ""
+
+
+def push_destination(wt, ref):
+    """The branch name a push of REF updates on origin."""
+    from .common import git
+    if ref == "HEAD":
+        return git(wt, "branch", "--show-current") or ""
+    return ref
+
+
+def check_push_landed(binding):
+    """Whether origin already holds the saved post-sign-off commit (#151)."""
+    from . import session
+    from .common import git, push_transient
+    wt, branch, commit = binding["wt"], binding["branch"], binding["commit"]
+    local = git(wt, "rev-parse", "HEAD")
+    current_branch = git(wt, "branch", "--show-current")
+    if local != commit or current_branch != branch:
+        return "changed"
+    done = session.run_process(
+        ["git", "-C", str(wt), "ls-remote", "origin", f"refs/heads/{branch}"],
+        capture_output=True, text=True)
+    if done.returncode != 0:
+        return "retry" if push_transient((done.stderr or "") + (done.stdout or "")) else "failed"
+    line = (done.stdout or "").strip().splitlines()
+    current = line[0].split()[0] if line else ""
+    if current == commit:
+        return "landed"
+    if current == binding["remote"]:
+        return "absent"
+    return "changed"
 
 
 def _clear_path(path):

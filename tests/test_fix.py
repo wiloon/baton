@@ -4,6 +4,7 @@ tests/completion.sh and the fix half of tests/verify.sh."""
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 
 import pytest
@@ -360,6 +361,133 @@ def test_a_failed_push_hands_off(run):
     sh(run.worktree, "git", "remote", "set-url", "origin", "/nonexistent")
     assert run.fix()["rc"] == 1 and run.labelled()
     assert any(f"PR #{PR}: pushing fix failed" in line for line in run.runner_log())
+
+
+def test_a_transient_fix_push_defers_then_recovers_without_a_second_worker(run, monkeypatch):
+    """fix_push_failed: no early replay, one worker, landed after 60s (#151)."""
+    from baton import common, handoff, session
+
+    clock = {"now": 1_000}
+    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
+    pushes, real = [], common.push
+
+    def flaky(wt, ref, *, upstream=False, signoff=False):
+        pushes.append(clock["now"])
+        if clock["now"] < 1_060:
+            return common.PushResult(False, transient=True, detail="connection refused")
+        return real(wt, ref, upstream=upstream, signoff=signoff)
+
+    monkeypatch.setattr(fix, "push", flaky)
+    run.agent({})
+    assert run.fix()["rc"] == 75
+    assert len(run.agent_calls) == 1 and not run.labelled() and not run.pushed()
+    env = session.resolve()
+    saved = handoff.load_retry(env, "419", "fix_push_failed", str(PR))
+    assert saved["attempts"] == 0 and re.fullmatch(r"[0-9a-f]{40}", saved["continuation"]["commit"])
+    clock["now"] = 1_059
+    before = len(pushes)
+    assert run.fix()["rc"] == 75
+    assert len(pushes) == before and len(run.agent_calls) == 1
+    clock["now"] = 1_060
+    assert run.fix()["rc"] == 0
+    assert len(run.agent_calls) == 1 and run.pushed()
+    assert 1_000 in pushes and 1_060 in pushes
+    assert handoff.load_retry(env, "419", "fix_push_failed", str(PR)) is None
+
+
+def test_a_lost_fix_push_response_is_recognized_without_a_second_write(run, monkeypatch):
+    """A push that landed before its answer was lost counts as success (#151)."""
+    from baton import common
+
+    pushes, real = [], common.push
+
+    def write_then_fail(wt, ref, *, upstream=False, signoff=False):
+        pushes.append(ref)
+        result = real(wt, ref, upstream=upstream, signoff=signoff)
+        assert result.ok
+        return common.PushResult(False, transient=True, detail="connection reset")
+
+    monkeypatch.setattr(fix, "push", write_then_fail)
+    run.agent({})
+    assert run.fix()["rc"] == 0 and run.pushed() and len(pushes) == 1
+
+
+def test_an_exhausted_fix_push_hands_off_exactly_once(run, monkeypatch):
+    from baton import common, handoff, session
+
+    clock = {"now": 1_000}
+    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
+    monkeypatch.setattr(fix, "push",
+                        lambda *a, **k: common.PushResult(False, transient=True, detail="connection refused"))
+    run.agent({})
+    assert run.fix()["rc"] == 75
+    for now in (1_060, 1_360):
+        clock["now"] = now
+        assert run.fix()["rc"] == (1 if now == 1_360 else 75)
+    assert run.labelled() and len(run.agent_calls) == 1
+    assert handoff.load_retry(session.resolve(), "419", "fix_push_failed", str(PR)) is None
+
+
+def test_a_recovered_partial_push_keeps_the_original_handoff(run, monkeypatch):
+    """After a partial push recovers, finish with fix_run_failed — not a second worker (#151)."""
+    from baton import common, handoff
+
+    clock = {"now": 1_000}
+    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
+    pushes, real = [], common.push
+
+    def flaky(wt, ref, *, upstream=False, signoff=False):
+        pushes.append(clock["now"])
+        if clock["now"] < 1_060:
+            return common.PushResult(False, transient=True, detail="connection refused")
+        return real(wt, ref, upstream=upstream, signoff=signoff)
+
+    monkeypatch.setattr(fix, "push", flaky)
+    run.agent({"outcome": "RESULT: failed ran out of time"})
+    assert run.fix()["rc"] == 75 and not run.labelled()
+    clock["now"] = 1_060
+    assert run.fix()["rc"] == 1 and run.pushed() and run.labelled()
+    assert len(run.agent_calls) == 1
+    assert any("fix failed" in line for line in run.runner_log())
+
+
+def test_a_damaged_fix_push_record_hands_off_without_replay(run, monkeypatch):
+    from baton import common, handoff, session
+
+    clock = {"now": 1_000}
+    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
+    monkeypatch.setattr(fix, "push",
+                        lambda *a, **k: common.PushResult(False, transient=True, detail="connection refused"))
+    run.agent({})
+    assert run.fix()["rc"] == 75
+    path = handoff.retry_path(session.resolve(), "419", "fix_push_failed", str(PR))
+    path.write_text("{not-json")
+    clock["now"] = 1_060
+    assert run.fix()["rc"] == 1 and run.labelled() and len(run.agent_calls) == 1
+
+
+def test_a_remote_change_during_fix_push_wait_hands_off(run, monkeypatch):
+    from baton import common, handoff
+
+    clock = {"now": 1_000}
+    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
+    monkeypatch.setattr(fix, "push",
+                        lambda *a, **k: common.PushResult(False, transient=True, detail="connection refused"))
+    run.agent({})
+    assert run.fix()["rc"] == 75
+    # A different commit lands on the remote while we wait.
+    other = run.root / "other"
+    sh(run.root, "git", "clone", "-q", str(run.root / "origin.git"), str(other))
+    for key, value in (("user.name", "t"), ("user.email", "t@example.invalid")):
+        sh(other, "git", "config", key, value)
+    sh(other, "git", "checkout", "-q", "cursor/issue-1")
+    (other / "remote-change.txt").write_text("x\n")
+    sh(other, "git", "add", "-A")
+    sh(other, "git", "commit", "-q", "-m", "remote")
+    sh(other, "git", "push", "-q", "origin", "HEAD:cursor/issue-1")
+    clock["now"] = 1_060
+    assert run.fix()["rc"] == 1 and run.labelled() and not run.pushed()
+    assert len(run.agent_calls) == 1
 
 
 def test_a_partial_fix_is_pushed_unverified_for_the_owner(run):
