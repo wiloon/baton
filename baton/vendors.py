@@ -76,12 +76,15 @@ def _git(wt, *args):
                           capture_output=True, check=False)
 
 
-def record_contrib(state, pr, vendor, wt, base, end="HEAD"):
+def record_contrib(state, pr, vendor, wt, base, end="HEAD", *, once=False):
     result = _git(wt, "diff", "--numstat", base, end)
     lines = _changed_lines(result.stdout)
     if lines > 0:
-        with state_path(state, pr, "contrib").open("a") as file:
-            file.write(f"{vendor} {lines}\n")
+        path = state_path(state, pr, "contrib")
+        row = f"{vendor} {lines}" + (f" {base} {end}" if once else "")
+        if not once or row not in _lines(path):
+            with path.open("a") as file:
+                file.write(row + "\n")
 
 
 def seed_contrib(state, pr, wt):
@@ -268,7 +271,7 @@ def task_area(repo, pr="", issue=""):
 
 
 def review_excluded(state, pr, fixed_by=""):
-    return [fixed_by] if fixed_by else _lines(state_path(state, pr, "authors"))
+    return fixed_by.split() if fixed_by else _lines(state_path(state, pr, "authors"))
 
 
 def codex_review_mode(state, pr, model):

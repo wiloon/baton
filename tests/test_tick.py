@@ -402,7 +402,8 @@ def fix_ctx(ctx, worktree, monkeypatch, feedback="please rename", fixer="codex")
     ctx.gh.answers["pr list"] = [{"number": 20, "headRefName": "cursor/issue-297"}, {"number": 3, "headRefName": "feature/x"}]
     ctx.gh.answers["pr view"] = lambda a: "cursor/issue-297" if "headRefName" in a[-1] else json.dumps(
         {"headRefName": "cursor/issue-297", "author": {"login": "cursor"}}) if False else "cursor/issue-297"
-    monkeypatch.setattr(tick.review, "human_feedback", lambda repo, owner, pr: feedback)
+    monkeypatch.setattr(tick.review, "human_feedback",
+                        lambda repo, owner, pr: review.HumanFeedback(owner=feedback, findings=""))
     monkeypatch.setattr(tick.vendors, "seed_authors", lambda *args: 0)
     monkeypatch.setattr(tick.vendors, "seed_contrib", lambda *args: ["abc1234"])
     monkeypatch.setattr(tick.Tick, "pick_vendor", lambda self, *a, **k: fixer)
@@ -441,6 +442,22 @@ def test_a_waiting_fix_push_resumes_with_its_saved_fixer_before_any_read_or_noti
     monkeypatch.setattr(tick.Tick, "notify", forbidden)
     assert t.pick_fix() == 0
     assert ctx.loops[0][0] == "fix" and ctx.loops[0][1][2] == "claude"
+
+
+def test_an_agent_fix_review_excludes_every_attempt_author(ctx, worktree, monkeypatch):
+    from types import SimpleNamespace
+
+    fix_ctx(ctx, worktree, monkeypatch, fixer="claude")
+
+    def fixed(self, *args, **kwargs):
+        self.fix_runner = SimpleNamespace(last_fixer="codex", attempt_authors=["claude", "codex"])
+        return 0
+
+    monkeypatch.setattr(tick.Tick, "fix_pr", fixed)
+    assert ctx.make().pick_fix() == 0
+    args, _ = ctx.loops[0]
+    assert args[2].startswith("codex just addressed")
+    assert set(args[5].split()) == {"claude", "codex"}
 
 
 def test_no_feedback_means_nothing_to_fix(ctx, worktree, monkeypatch):
@@ -828,7 +845,8 @@ def test_an_agent_fix_deferred_in_vendor_selection_lends_its_slot(ctx, monkeypat
     ctx.gh.answers["pr list"] = lambda args: [{"number": 11, "headRefName": "agent/issue-5", "labels": []}]
     Path(ctx.env["WT_ROOT"], "agent-5").mkdir(parents=True)
     monkeypatch.setattr(tick.session, "run_process", lambda *a, **k: subprocess.CompletedProcess(a, 0, "", ""))
-    monkeypatch.setattr(tick.review, "human_feedback", lambda *a: "please fix")
+    monkeypatch.setattr(tick.review, "human_feedback",
+                        lambda *a: review.HumanFeedback(owner="please fix", findings=""))
     monkeypatch.setattr(tick.vendors, "seed_authors", lambda *a: 0)
     monkeypatch.setattr(tick.vendors, "seed_contrib", lambda *a: [])
     t = ctx.make()
@@ -1013,7 +1031,9 @@ def test_a_second_tick_finishes_a_deferred_description_edit(ctx, worktree, monke
         ctx.gh.answers[f"api repos/owner/app/pulls/{pr}/{endpoint}"] = [[]]
     ctx.gh.answers["pr list"] = lambda args: (
         [{"number": int(pr), "headRefName": worktree.branch}] if labelled and "agent-fix" in args else [])
-    monkeypatch.setattr(review, "paginated", lambda *args: [])
+    monkeypatch.setattr(review, "read_rows", lambda repo, route, number, resource: (
+        [{"user": c["author"], "body": c["body"], "created_at": c["createdAt"]} for c in comments]
+        if route == "issues" else []))
     monkeypatch.setattr(review, "agent_review", lambda *args: "Revise the description.")
     monkeypatch.setattr(pick, "choose", lambda *args, **kwargs: (
         "codex" if switched and "codex" not in agent_calls else "cursor"))
@@ -1658,6 +1678,257 @@ def test_each_dev_failure_hands_off_once_with_its_reason(devrun, monkeypatch, st
                              "--add-label", "ready-for-human")) == 1
 
 
+@pytest.fixture
+def advised_dev(devrun, monkeypatch):
+    from baton import advisor
+    from baton.config import Advisor
+
+    monkeypatch.setenv(advisor.KEY, "sk-" + "d" * 24)
+    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="live"))
+    devrun.gh.answers["issue view"].update(state="OPEN", labels=[{"name": "ready-for-agent"}])
+    monkeypatch.setattr(tick.Tick, "owner_ready", lambda self, issue: True)
+    devrun.advice_calls, devrun.action = [], "retry_step_other_vendor"
+
+    def advise(cfg, key, snapshot, actions, **kwargs):
+        devrun.advice_calls.append((snapshot, actions))
+        reason = snapshot.splitlines()[0].split(".")[0]
+        return {"action": devrun.action, "reason": "try again", "evidence": [reason]}, {}
+
+    monkeypatch.setattr(advisor, "call_deepseek", advise)
+    return devrun
+
+
+def test_dev_retry_does_not_publish_the_previous_description(advised_dev, monkeypatch):
+    def failed(cwd, output):
+        implements()(cwd, output)
+        return {**DONE, "outcome": "RESULT: failed after committing"}
+
+    advised_dev.script = [failed, lambda cwd, output: dict(DONE)]
+    seen = _watch_handoffs(monkeypatch)
+    _, rc = advised_dev.go()
+    assert rc == 80 and not advised_dev.gh.ran("pr", "create")
+    assert [attempt["vendor"] for attempt in advised_dev.runs] == ["codex", "claude"]
+    assert _reasons(seen) == ["dev_result_invalid"]
+
+
+def test_dev_retry_keeps_all_attempt_authors(advised_dev):
+    def failed(cwd, output):
+        implements()(cwd, output)
+        return {**DONE, "outcome": "RESULT: failed after committing"}
+
+    def second(cwd, output):
+        Path(cwd, "second.txt").write_text("second\n")
+        sh(cwd, "git", "add", "-A")
+        sh(cwd, "git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "-m", "more")
+        return implements(commit=False)(cwd, output)
+
+    advised_dev.script = [failed, second]
+    _, rc = advised_dev.go()
+    assert rc == 80 and advised_dev.gh.ran("pr", "create")
+    assert set(advised_dev.path("pr-301-authors").read_text().split()) == {"codex", "claude"}
+
+
+def test_dev_attempt_without_a_commit_is_not_an_author(advised_dev):
+    advised_dev.script = [lambda cwd, output: {**DONE, "outcome": "RESULT: failed boom"}, implements()]
+    _, rc = advised_dev.go()
+    assert rc == 80 and advised_dev.gh.ran("pr", "create")
+    assert advised_dev.path("pr-301-authors").read_text().split() == ["claude"]
+
+
+def _commit(cwd, name):
+    Path(cwd, name).write_text(f"{name}\n")
+    sh(cwd, "git", "add", "-A")
+    sh(cwd, "git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "-m", name)
+
+
+def _defers(cwd, output):
+    return {**DONE, "rc": 75, "defer": "short block"}
+
+
+def test_dev_keeps_the_contribution_of_a_run_that_committed_and_deferred(devrun, monkeypatch):
+    """Advisor off: the commit of a deferred run still counts for its author when another vendor finishes."""
+    vendors_ = iter(["codex", "claude"])
+    monkeypatch.setattr(tick.Tick, "pick_vendor", lambda self, role, mode, cands, **k: next(vendors_))
+
+    def commits_and_defers(cwd, output):
+        _commit(cwd, "first.txt")
+        return _defers(cwd, output)
+
+    def finishes(cwd, output):
+        _commit(cwd, "second.txt")
+        return implements(commit=False)(cwd, output)
+
+    devrun.script = [commits_and_defers, finishes]
+    assert devrun.go()[1] == 75
+    assert devrun.go()[1] == 80 and devrun.gh.ran("pr", "create")
+    assert set(devrun.path("pr-301-authors").read_text().split()) == {"codex", "claude"}
+    owners = {row.split()[0] for row in devrun.path("pr-301-contrib").read_text().splitlines()}
+    assert owners == {"codex", "claude"}   # the retained commit has its own row
+
+
+def test_dev_deferral_after_a_granted_retry_committed_continues(advised_dev, monkeypatch):
+    advised_dev.action = "retry_step"
+    seen = _watch_handoffs(monkeypatch)
+
+    def failed(cwd, output):
+        _commit(cwd, "first.txt")
+        return {**DONE, "outcome": "RESULT: failed after committing"}
+
+    def retry(cwd, output):
+        _commit(cwd, "second.txt")
+        return implements(commit=False)(cwd, output)
+
+    advised_dev.script = [failed, retry]
+    calls = []
+
+    def verify(self, *args, **kwargs):
+        calls.append(args)
+        if len(calls) == 1:
+            raise Deferred("codex", "short block")
+        return 0, "", 0
+
+    monkeypatch.setattr(fix.Runner, "verify", verify)
+    assert advised_dev.go()[1] == 75
+    assert advised_dev.go()[1] == 80 and advised_dev.gh.ran("pr", "create")
+    assert len(advised_dev.runs) == 2 and len(advised_dev.advice_calls) == 1   # the worker did not run again
+    assert _reasons(seen) == []
+
+
+def test_dev_worker_retry_survives_main_advancing_during_the_block(advised_dev, monkeypatch):
+    from baton import names
+    advised_dev.action = "retry_step"
+    seen = _watch_handoffs(monkeypatch)
+    advised_dev.script = [lambda cwd, output: {**DONE, "outcome": "RESULT: failed boom"}, _defers, implements()]
+    assert advised_dev.go()[1] == 75
+    _, wt = names.for_issue(Path(advised_dev.env["WT_ROOT"]), "300")
+    tree = sh(wt, "git", "rev-parse", "origin/main^{tree}")
+    tip = sh(wt, "git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit-tree", tree,
+             "-p", "origin/main", "-m", "main moved")
+    sh(wt, "git", "update-ref", "refs/remotes/origin/main", tip)
+    assert advised_dev.go()[1] == 80 and advised_dev.gh.ran("pr", "create")
+    assert _reasons(seen) == [] and len(advised_dev.runs) == 3
+
+
+def test_dev_blocked_after_a_granted_retry_hands_off_once(advised_dev, monkeypatch):
+    advised_dev.action = "retry_step"
+    seen = _watch_handoffs(monkeypatch)
+    advised_dev.script = [lambda cwd, output: {**DONE, "outcome": "RESULT: failed boom"},
+                          lambda cwd, output: {**DONE, "outcome": "RESULT: blocked no plan", "reply": "stuck"}]
+    assert advised_dev.go()[1] == 80
+    assert _reasons(seen) == ["dev_blocked"] and len(advised_dev.advice_calls) == 1
+    assert len(advised_dev.runs) == 2
+
+
+def test_dev_verification_retry_resumes_after_deferral(advised_dev, monkeypatch):
+    monkeypatch.setattr(spec, "cursor_plan", lambda *a, **k: "<!-- baton-verdict: accept by=claude -->\nPlan")
+    advised_dev.action = "retry_step"
+    advised_dev.script = [implements()]
+    calls = []
+
+    def verify(self, *args, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return 1, "lint broke\nLast 200 lines:\nraw excerpt", 2
+        if len(calls) == 2:
+            raise Deferred("codex", "short block")
+        return 0, "", 2
+
+    monkeypatch.setattr(fix.Runner, "verify", verify)
+    assert advised_dev.go()[1] == 75
+    assert advised_dev.go()[1] == 80
+    assert len(advised_dev.runs) == len(advised_dev.advice_calls) == 1
+    assert calls[1:] == [{"repairs": 0, "repairs_before": 2}] * 2
+    assert "raw excerpt" not in advised_dev.advice_calls[0][0]
+    assert advised_dev.gh.ran("pr", "create")
+
+
+def test_dev_retry_hands_off_when_the_owner_withdraws_authorization(advised_dev, monkeypatch):
+    from baton import advisor
+
+    call = advisor.call_deepseek
+
+    def withdraw(*args, **kwargs):
+        advised_dev.gh.answers["issue view"]["labels"] = []
+        return call(*args, **kwargs)
+
+    monkeypatch.setattr(advisor, "call_deepseek", withdraw)
+    advised_dev.script = [lambda cwd, output: {**DONE, "outcome": "RESULT: failed"}]
+    assert advised_dev.go()[1] == 80
+    assert len(advised_dev.runs) == len(advised_dev.advice_calls) == 1
+    assert not advised_dev.gh.ran("pr", "create")
+
+
+def test_dirty_fix_worktree_hands_off_without_advisor(ctx, monkeypatch):
+    from baton import advisor
+    from baton.config import Advisor
+    pr_state(ctx)
+    ctx.gh.answers["pr list"] = lambda args: (
+        [{"number": 11, "headRefName": "agent/issue-5"}] if "agent-fix" in args else [])
+    wt = Path(ctx.env["WT_ROOT"], "agent-5")
+    wt.mkdir(parents=True)
+    sh(wt, "git", "init", "-q", "-b", "agent/issue-5")
+    sh(wt, "git", "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+       "commit", "-q", "--allow-empty", "-m", "base")
+    sh(wt, "git", "update-ref", "refs/remotes/origin/agent/issue-5", "HEAD")
+    (wt / "stray.txt").write_text("local changes")
+    ctx.gh.answers["pr view"] = {
+        "state": "OPEN", "headRefOid": sh(wt, "git", "rev-parse", "HEAD"), "baseRefName": "main",
+        "headRefName": "agent/issue-5", "labels": [{"name": "agent-fix"}],
+        "body": "Refs #5", "comments": [], "reviews": [],
+    }
+    seen = _watch_handoffs(monkeypatch)
+    calls = []
+    monkeypatch.setenv(advisor.KEY, "sk-" + "d" * 24)
+    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="live"))
+    monkeypatch.setattr(advisor, "call_deepseek", lambda *a, **k: calls.append(1) or ({"action": "handoff"}, {}))
+    real = tick.session.run_process
+
+    def process(args, **kwargs):
+        if "--ff-only" in args:
+            return subprocess.CompletedProcess(args, 1, "", "")
+        return real(args, **kwargs)
+
+    monkeypatch.setattr(tick.session, "run_process", process)
+    assert ctx.make().run() == 0
+    assert not calls and _reasons(seen) == ["fix_worktree_diverged"]
+
+
+@pytest.mark.parametrize("stale", [False, True])
+def test_worktree_retry_checks_the_pr_before_retrying(ctx, worktree, monkeypatch, stale):
+    from baton import advisor
+    from baton.config import Advisor
+
+    fix_ctx(ctx, worktree, monkeypatch)
+    head = sh(worktree.wt, "git", "rev-parse", "HEAD")
+    pr = {"state": "OPEN", "headRefOid": head, "baseRefName": "main",
+          "headRefName": "cursor/issue-297", "labels": [{"name": "agent-fix"}],
+          "body": "Refs #297", "comments": [], "reviews": []}
+    ctx.gh.answers["pr view"] = lambda args: dict(pr)
+    monkeypatch.setenv(advisor.KEY, "sk-" + "d" * 24)
+    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="live"))
+
+    def advise(*args, **kwargs):
+        if stale:
+            pr["state"] = "CLOSED"
+        return {"action": "retry_step", "reason": "transient",
+                "evidence": ["Decision point: fix_worktree_diverged"]}, {}
+
+    monkeypatch.setattr(advisor, "call_deepseek", advise)
+    real, merges = tick.session.run_process, []
+
+    def process(args, **kwargs):
+        if "--ff-only" in args:
+            merges.append(args)
+            if len(merges) == 1:
+                return subprocess.CompletedProcess(args, 1, "", "transient")
+        return real(args, **kwargs)
+
+    monkeypatch.setattr(tick.session, "run_process", process)
+    assert ctx.make().pick_fix() == 0
+    assert len(merges) == (1 if stale else 2)
+    assert bool(ctx.loops) is not stale
+
+
 def test_a_diverged_fix_worktree_hands_off_once_with_its_reason(ctx, monkeypatch):
     pr_state(ctx)
     ctx.gh.answers["pr list"] = lambda args: (
@@ -1953,7 +2224,7 @@ def test_tick_resumes_pending_adr_even_with_agent_wip_and_no_vendor(ctx, monkeyp
 def test_a_forced_fix_push_without_a_label_is_resumed_by_the_scheduler(ctx, worktree, monkeypatch, changed):
     from baton import common, handoff
 
-    monkeypatch.setattr(tick.review, "human_feedback", lambda *a: "please rename")
+    monkeypatch.setattr(tick.review, "human_feedback", lambda *a: tick.review.HumanFeedback(owner="please rename", findings=""))
     monkeypatch.setattr(tick.vendors, "seed_authors", lambda *a: 0)
     monkeypatch.setattr(tick.vendors, "seed_contrib", lambda *a: [])
     monkeypatch.setattr(tick.Tick, "pick_vendor", lambda *a, **kw: "codex")
@@ -2011,7 +2282,7 @@ def test_a_forced_fix_push_without_a_label_is_resumed_by_the_scheduler(ctx, work
         with monkeypatch.context() as stopped:
             stopped.setattr(fix.Runner, "refresh_checks", interrupt)
             assert ctx.make().run() == 1
-        assert ctx.path("owner-fix-feedback-20").read_text() == "please rename"
+        assert json.loads(ctx.path("owner-fix-feedback-20").read_text()) == {"owner": "please rename", "findings": ""}
     ctx.make().run()
     assert workers == ["codex"]
     if changed in ("branch", "remote"):

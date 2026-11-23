@@ -21,15 +21,26 @@ from pathlib import Path
 import re
 import sys
 import time
+from typing import NamedTuple
 
 from . import advisor, agents, check_verdicts, checkpoint, checks as check_section, dispatch, fix, handoff as owner_handoff, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, vendors
 from .common import Deferred, Exhausted, changed, git, restore, strip_markers
+from . import recovery as task_recovery
 
 REPLY_CAP = 60000
 ALREADY = "handed_off"   # fail_reason: review_allowed already handed the PR over
 REVIEWED = ("REVIEW: pass", "REVIEW: changes")
 DEFERRED_POST = "RESULT: deferred category-1"
 MARKER_LINE = re.compile(r"^(REVIEW|RESULT): ")
+FIX_NEEDS_INFO = re.compile(r"^<!-- baton-fix\b[^>]*\boutcome=needs-info\b")
+REVIEW_ROUND = re.compile(r"^<!-- baton-review\b[^>]*\bround=(\d+)\b")
+OWNER_WORDS_NOTE = "Later items override earlier ones where they conflict."
+
+
+class HumanFeedback(NamedTuple):
+    """Owner instructions and the latest review findings for an agent-fix run (#178)."""
+    owner: str = ""
+    findings: str = ""
 
 
 # --- what the reviewer reads: the issue, the PR and their comments --------------------------
@@ -263,31 +274,122 @@ def owner_feedback_digest(owner, data):
     return owner_handoff.body_digest(json.dumps(sorted(rows)))
 
 
-def human_feedback(repo, owner, pr):
-    """The owner's reviews, comments and inline comments since the last agent fix. Public
-    repo: only the owner's words reach an agent as instructions."""
-    since = ""
-    result = pr_helpers.gh("pr", "view", str(pr), "-R", repo, "--json", "comments")
-    data = json.loads(result.stdout) if result.returncode == 0 else {}
-    fixes = [c.get("createdAt") or "" for c in data.get("comments") or ()
-             if (c.get("author") or {}).get("login") == owner and (c.get("body") or "").startswith("<!-- baton-fix")]
-    since = max(fixes, default="")
-    result = pr_helpers.gh("pr", "view", str(pr), "-R", repo, "--json", "reviews,comments")
-    out = ""
-    if result.returncode == 0:
-        data = json.loads(result.stdout)
-        items = [f"Review ({r.get('submittedAt')}):\n{r['body']}" for r in data.get("reviews") or ()
-                 if (r.get("author") or {}).get("login") == owner and r.get("body")
-                 and not r["body"].startswith("<!-- baton") and (r.get("submittedAt") or "") > since]
-        items += [f"Comment ({c.get('createdAt')}):\n{c['body']}" for c in data.get("comments") or ()
-                  if (c.get("author") or {}).get("login") == owner and not (c.get("body") or "").startswith("<!-- baton")
-                  and (c.get("createdAt") or "") > since]
-        out = "\n\n---\n\n".join(items) + "\n"
-    for comment in paginated(["api", f"repos/{repo}/pulls/{pr}/comments", "--paginate"]):
-        if (comment.get("user") or {}).get("login") == owner and (comment.get("created_at") or "") > since:
+def ordinary_fix_cutoff(comments, owner):
+    """The createdAt of the latest owner-authored baton-fix without outcome=needs-info."""
+    fixes = []
+    for c in comments or ():
+        if (c.get("author") or {}).get("login") != owner:
+            continue
+        body = c.get("body") or ""
+        if body.startswith("<!-- baton-fix") and not FIX_NEEDS_INFO.match(body):
+            fixes.append(c.get("createdAt") or "")
+    return max(fixes, default="")
+
+
+def must_fix_section(body):
+    """The ## Must fix section of a review comment, or empty when it is none."""
+    findings = must_fix_first(body or "")[2]
+    return f"## Must fix\n{findings}" if findings else ""
+
+
+def review_findings(comments, owner):
+    """Must fix of the latest owner baton-review, plus the same-round screenshot review after it."""
+    latest_i, latest_body, round_no = -1, "", ""
+    for i, c in enumerate(comments or ()):
+        if (c.get("author") or {}).get("login") != owner:
+            continue
+        body = c.get("body") or ""
+        match = REVIEW_ROUND.match(body)
+        if match:
+            latest_i, latest_body, round_no = i, body, match.group(1)
+    if latest_i < 0:
+        return ""
+    parts = [must_fix_section(latest_body)]
+    prefix = f"<!-- baton-screenshot-review round={round_no} "
+    shot = ""
+    for c in (comments or ())[latest_i + 1:]:
+        if (c.get("author") or {}).get("login") != owner:
+            continue
+        body = c.get("body") or ""
+        if body.startswith(prefix):
+            shot = body
+    if shot:
+        parts.append(must_fix_section(shot))
+    return "\n\n".join(p for p in parts if p)
+
+
+def owner_words(reviews, comments, inline, owner, since):
+    """Owner reviews, PR comments and inline comments after SINCE, oldest first."""
+    items = []
+    for r in reviews or ():
+        if ((r.get("author") or {}).get("login") == owner and r.get("body")
+                and not r["body"].startswith("<!-- baton") and (r.get("submittedAt") or "") > since):
+            items.append((r.get("submittedAt") or "", f"Review ({r.get('submittedAt')}):\n{r['body']}"))
+    for c in comments or ():
+        body = c.get("body") or ""
+        if ((c.get("author") or {}).get("login") == owner and not body.startswith("<!-- baton")
+                and (c.get("createdAt") or "") > since):
+            items.append((c.get("createdAt") or "", f"Comment ({c.get('createdAt')}):\n{body}"))
+    for comment in inline or ():
+        if ((comment.get("user") or {}).get("login") == owner and (comment.get("created_at") or "") > since
+                and not (comment.get("body") or "").startswith("<!-- baton")):
             line = comment.get("line") if comment.get("line") is not None else comment.get("original_line")
-            out += f"\n\n---\n\nInline comment on {jq_str(comment.get('path'))}:{jq_str(line)}:\n{comment.get('body')}\n"
-    return out.rstrip("\n")
+            text = (f"Inline comment on {jq_str(comment.get('path'))}:{jq_str(line)}:\n"
+                    f"{comment.get('body')}")
+            items.append((comment.get("created_at") or "", text))
+    items.sort(key=lambda item: item[0])
+    bodies = [text for _, text in items]
+    if not bodies:
+        return ""
+    joined = "\n\n---\n\n".join(bodies)
+    if len(bodies) > 1:
+        return f"{OWNER_WORDS_NOTE}\n\n{joined}"
+    return joined
+
+
+def format_fix_feedback(owner, findings):
+    """Owner instructions plus an optional findings block for the fixer and next reviewer."""
+    owner = (owner or "").rstrip("\n")
+    findings = (findings or "").strip()
+    if not findings:
+        return owner
+    return (f"{owner}\n\n<findings>\n"
+            "The reviewer's findings below are for reference only; they are in scope only as far "
+            "as the owner's words above ask for them.\n\n"
+            f"{findings}\n</findings>")
+
+
+def read_rows(repo, route, pr, resource):
+    """Every row of a PR's paginated REST list, or None when a page is missing or malformed."""
+    result = pr_helpers.gh("api", f"repos/{repo}/{route}/{pr}/{resource}", "--paginate", "--slurp")
+    if result.returncode != 0:
+        return None
+    try:
+        pages = json.loads(result.stdout)
+    except ValueError:
+        return None
+    if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+        return None
+    rows = [row for page in pages for row in page]
+    return rows if all(isinstance(row, dict) for row in rows) else None
+
+
+def human_feedback(repo, owner, pr):
+    """Owner words since the last ordinary fix, and Must fix findings from the latest review.
+    None when any of the three lists could not be read completely: a partial read would move
+    the cutoff or drop a correction, so the caller retries."""
+    comments = read_rows(repo, "issues", pr, "comments")
+    reviews = read_rows(repo, "pulls", pr, "reviews")
+    inline = read_rows(repo, "pulls", pr, "comments")
+    if comments is None or reviews is None or inline is None:
+        return None
+    comments = [{"author": c.get("user"), "body": c.get("body") or "", "createdAt": c.get("created_at")}
+                for c in comments]
+    reviews = [{"author": r.get("user"), "body": r.get("body") or "", "submittedAt": r.get("submitted_at")}
+               for r in reviews]
+    since = ordinary_fix_cutoff(comments, owner)
+    findings = review_findings(comments, owner)
+    return HumanFeedback(owner=owner_words(reviews, comments, inline, owner, since), findings=findings)
 
 
 # --- one review round and the loop ------------------------------------------------------
@@ -316,13 +418,51 @@ class Review:
         pr_helpers.gh("pr", "edit", str(self.pr), "-R", self.repo, *options)
 
     def handoff(self, reason, title, text, *, snapshot="", revalidate=None, transient=False,
-                continuation=None, resume=False):
+                continuation=None, resume=False, observed_actions=None, fallback=False):
         """Owner handoff or category-1 retry through the shared entry (#125, #151)."""
         return owner_handoff.perform(
             self.env, reason, kind="pr", number=self.pr,
-            title=title, text=text, hooks=self.hooks, item=self.pr, episode=self.issue,
-            snapshot=snapshot, revalidate=revalidate,
-            transient=transient, continuation=continuation, resume=resume)
+            title=title, text=text, hooks=self.hooks, item=self.pr, episode=self.issue or self.pr,
+            snapshot=snapshot, revalidate=revalidate, observed_actions=observed_actions,
+            transient=transient, continuation=continuation, resume=resume, fallback=fallback)
+
+    def retry_binding(self, role):
+        evidence = None
+        if role == "screenshot_reviewer":
+            try:
+                evidence = {"screenshots": {str(path): hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                                            for path in notify.shots(self.pr, self.ctx)}}
+            except OSError:
+                return None
+        return task_recovery.worker_fingerprint(self.wt, self.pr, round_s=self.values.get("round", ""),
+                                                extra=evidence)
+
+    def retry_picker(self, pinned):
+        return dict(mode="review", candidates=self.vendors(), pr=str(self.pr), issue=self.issue,
+                    fixed_by=self.fixed_by, pinned=pinned)
+
+    def recover_worker(self, reason, title, detail, vendor, *, role="reviewer", pinned=False,
+                       fallback=False):
+        binding = lambda: self.retry_binding(role)
+        fingerprint = getattr(self, "worker_start", {}).get(role)
+        if role not in getattr(self, "worker_start", {}):
+            fingerprint = binding()
+        result = task_recovery.request(
+            self.env, self.issue or self.pr, self.pr, reason, role, vendor, detail, fingerprint, binding,
+            lambda text=detail, **kw: self.handoff(reason, title, f"{text} {self.url}",
+                                                   fallback=fallback, **kw),
+            local=reason == "review_author_state_failed", **self.retry_picker(pinned))
+        return (result[0]["action"], result[1]) if result else (owner_handoff.HANDOFF, vendor)
+
+    def resume_worker(self, role, *, pinned=False):
+        prefix = "screenshot_" if role == "screenshot_reviewer" else "review_"
+        return task_recovery.resume(
+            self.env, self.issue or self.pr, self.pr,
+            lambda reason: reason.startswith(prefix) and reason != "review_author_state_failed",
+            lambda: self.retry_binding(role),
+            lambda text: self.handoff("review_run_failed" if role == "reviewer" else "screenshot_run_failed",
+                                      f"PR #{self.pr} needs you", text),
+            **self.retry_picker(pinned))
 
     BINDING_FIELDS = ("reviewed_head", "base_branch", "reviewed_issue", "verdict_digest",
                       "verdict_round", "screenshot_digest", "feedback_waiting", "post_waiting", "post_outcome")
@@ -773,7 +913,7 @@ class Review:
                 f"Codex: view_image):{listed}\n"
                 "   Compare each with the manual checks above and the issue.")
 
-    def run_screenshot_review(self, round, data, checks):
+    def run_screenshot_review(self, round, data, checks, vendor=""):
         """One screenshot reviewer run and its comment; returns OUTCOME. Deferred when the reviewer
         cannot run now. It never hands the PR over: the loop does, once, on a failed outcome."""
         pr, wt = self.pr, self.wt
@@ -781,7 +921,8 @@ class Review:
         head = git(wt, "rev-parse", "HEAD") or ""
         if data["headRefOid"] != head:
             return self.failed("screenshot_run_failed", "RESULT: failed reading the PR revision for screenshot review")
-        vendor = self.screenshot_vendor()
+        vendor = vendor or self.screenshot_vendor()
+        self.screenshot_reviewer = vendor
         cfg = self.env.config
         if vendor not in cfg.declared() or not cfg.allows(vendor, "screenshot_reviewer"):
             return self.failed("screenshot_reviewer_role_denied", "RESULT: failed screenshot reviewer not role-allowed")
@@ -824,6 +965,7 @@ class Review:
 
     def drop(self):
         self.checkpoint.unlink(missing_ok=True)
+        task_recovery.clear(self.env, self.issue or self.pr, self.pr)
 
     def finish_review(self, saved):
         pr, wt = self.pr, self.wt
@@ -934,7 +1076,44 @@ class Review:
         resuming_fix = step == "fix"
         if step == "merge":
             return self.finish_review(saved)
-        if not (resuming_fix or pending_post) and self.seed():
+        self.values = {"round": round}
+        self.worker_start = {}
+        if not (resuming_fix or pending_post):
+            seed_reason = "review_author_state_failed"
+            pending_seed = task_recovery.resume(
+                self.env, self.issue or pr, pr, lambda reason: reason == seed_reason,
+                lambda: self.retry_binding("reviewer"),
+                lambda text: self.handoff(seed_reason, f"PR #{pr} needs you", text), local=True)
+            if pending_seed is False:
+                self.drop()
+                return 0
+            seeded = self.seed()
+            if pending_seed:
+                if not seeded:
+                    self.handoff(seed_reason, f"PR #{pr} needs you",
+                                 f"RESULT: failed recording PR authors after retry {self.url}")
+                    self.drop()
+                    return 0
+                task_recovery.clear(self.env, self.issue or pr, pr)
+            elif not seeded:
+                action, _ = self.recover_worker(
+                    seed_reason, f"PR #{pr} needs you",
+                    "RESULT: failed recording PR authors", "", role="reviewer", fallback=True)
+                if (action == owner_handoff.HANDOFF and advisor.enabled(self.env)
+                        and advisor.settings(self.env).mode == "live"):
+                    # Live: a handoff advice or a grant that failed revalidation ends it, with one
+                    # handoff. Only off and observe keep the old continuation below.
+                    self.handoff(seed_reason, f"PR #{pr} needs you",
+                                 f"RESULT: failed recording PR authors {self.url}")
+                    self.drop()
+                    return 0
+                if action != owner_handoff.HANDOFF and not self.seed():
+                    self.handoff(seed_reason, f"PR #{pr} needs you",
+                                 f"RESULT: failed recording PR authors after retry {self.url}")
+                    self.drop()
+                    return 0
+                if action != owner_handoff.HANDOFF:
+                    task_recovery.clear(self.env, self.issue or self.pr, pr)
             self.seed_contrib()
         starting_review = not saved or (step == "review" and round == 1 and saved.get("push_completed"))
         if starting_review and not pending_post:
@@ -966,7 +1145,11 @@ class Review:
                         pending_post = False
                     else:
                         try:
-                            reviewer = self.review_vendor(reviewer)
+                            pending = self.resume_worker("reviewer", pinned=reviewer == "cursor")
+                            if pending is False:
+                                self.drop()
+                                return 0
+                            reviewer = pending[1] if pending else self.review_vendor(reviewer)
                         except Exhausted as exhausted:
                             self.handoff("reviewer_unavailable", f"PR #{pr} needs you",
                                          exhausted.reason or "No eligible reviewer for this PR.")
@@ -974,7 +1157,24 @@ class Review:
                             return 0
                         self.values["reviewer"] = reviewer
                         self.save()
+                        if advisor.enabled(self.env):
+                            self.worker_start["reviewer"] = self.retry_binding("reviewer")
                         outcome = self.run_review(round, rnote, reviewer)
+                        while not (outcome.startswith(REVIEWED) or outcome == DEFERRED_POST):
+                            if self.fail_reason == ALREADY:   # handed off where it was decided
+                                self.drop()
+                                return 0
+                            reason = self.fail_reason or "review_run_failed"
+                            action, reviewer = self.recover_worker(
+                                reason, f"PR #{pr} review failed ({reviewer})", outcome, reviewer,
+                                pinned=reviewer == "cursor")
+                            if action == owner_handoff.HANDOFF:
+                                self.drop()
+                                return 0
+                            self.values["reviewer"] = reviewer
+                            self.save()
+                            self.fail_reason = ""
+                            outcome = self.run_review(round, rnote, reviewer)
                     if outcome == DEFERRED_POST:
                         return 75
                     if not outcome.startswith(REVIEWED):
@@ -983,6 +1183,7 @@ class Review:
                                          f"{outcome} {self.url}")
                         self.drop()
                         return 0
+                    task_recovery.clear(self.env, self.issue or str(pr), str(pr))
                     verdict = "pass" if outcome.startswith("REVIEW: pass") else "changes"
                     self.binding_fields["post_outcome"] = self.values["post_outcome"] = ""
                 data = None
@@ -1007,24 +1208,53 @@ class Review:
                     code_verdict = verdict
                     self.values.update(step=step, code_verdict=code_verdict, screenshot_checks=checks)
                     self.save()
-                    self.fail_reason = ""
                     if screenshot_post:
+                        self.fail_reason = ""
                         outcome = self.post_screenshot_comment(round)
                         screenshot_post = False
+                        if outcome == DEFERRED_POST:
+                            return 75
+                        if not outcome.startswith(REVIEWED):
+                            if self.fail_reason != ALREADY:
+                                self.handoff(self.fail_reason or "screenshot_run_failed",
+                                             f"PR #{pr} screenshot review failed", f"{outcome} {self.url}")
+                            self.drop()
+                            return 0
                     else:
-                        try:
-                            outcome = self.run_screenshot_review(round, data, checks)
-                        except Exhausted as exhausted:
-                            outcome = self.failed("screenshot_reviewer_unavailable",
-                                                  exhausted.reason or "No screenshot reviewer available.")
-                    if outcome == DEFERRED_POST:
-                        return 75
-                    if not outcome.startswith(REVIEWED):
-                        if self.fail_reason != ALREADY:
-                            self.handoff(self.fail_reason or "screenshot_run_failed",
-                                         f"PR #{pr} screenshot review failed", f"{outcome} {self.url}")
-                        self.drop()
-                        return 0
+                        pending = self.resume_worker("screenshot_reviewer")
+                        if pending is False:
+                            self.drop()
+                            return 0
+                        selected = pending[1] if pending else ""
+                        if advisor.enabled(self.env):
+                            self.worker_start["screenshot_reviewer"] = self.retry_binding("screenshot_reviewer")
+                        while True:
+                            self.fail_reason = ""
+                            try:
+                                outcome = self.run_screenshot_review(round, data, checks, selected)
+                            except Exhausted as exhausted:
+                                outcome = self.failed("screenshot_reviewer_unavailable",
+                                                      exhausted.reason or "No screenshot reviewer available.")
+                            if outcome.startswith(REVIEWED) or outcome == DEFERRED_POST:
+                                break
+                            if self.fail_reason == ALREADY:   # the comment post handed off where it failed
+                                self.drop()
+                                return 0
+                            reason = self.fail_reason or "screenshot_run_failed"
+                            if reason in ("screenshot_reviewer_unavailable", "screenshot_reviewer_role_denied",
+                                          "screenshot_independence_denied"):
+                                self.handoff(reason, f"PR #{pr} screenshot review failed", f"{outcome} {self.url}")
+                                self.drop()
+                                return 0
+                            action, selected = self.recover_worker(
+                                reason, f"PR #{pr} screenshot review failed", outcome, self.screenshot_reviewer,
+                                role="screenshot_reviewer")
+                            if action == owner_handoff.HANDOFF:
+                                self.drop()
+                                return 0
+                        if outcome == DEFERRED_POST:
+                            return 75
+                    task_recovery.clear(self.env, self.issue or str(pr), str(pr))
                     screenshot = "1"
                     self.binding_fields["post_outcome"] = self.values["post_outcome"] = ""
                     if outcome.startswith("REVIEW: changes"):
@@ -1051,6 +1281,10 @@ class Review:
                                screenshot_checks="")
             self.save()
             runner = fix.Runner(self.env.with_runtime(fix_followup=round > 1), self.hooks, pr, str(round))
+            # The next round's reviewer must stay free: a fixed reviewer, or a sole pool vendor.
+            pool = self.env.config.quota.vendor_pool
+            exclude = "cursor" if reviewer == "cursor" else ("" if len(pool) > 1 else pool[0])
+            runner.retry_exclusions = exclude.split()
             waiting = runner.waiting_push(pr)
             if waiting is not None:
                 # A saved push resumes first: no reads, vendor choice or notification before it is due (#151).
@@ -1060,7 +1294,6 @@ class Review:
                 fixer = waiting["continuation"].get("fixer") or fixer
                 self.values["fixer"] = fixer
                 rc = fix.fix_pr(runner, pr, wt, fixer, f"the reviewer agent (round {round})", "", fix_head)
-                feedback = ""
             else:
                 feedback, deferred = self.fixer_feedback(round, bool(screenshot), fix_head)
                 if deferred is not None:
@@ -1069,11 +1302,9 @@ class Review:
                     return deferred
                 if resuming_fix and self.seed():
                     self.seed_contrib()
-                # The next round's reviewer must stay free: a fixed reviewer, or a sole pool vendor.
-                pool = self.env.config.quota.vendor_pool
-                exclude = "cursor" if reviewer == "cursor" else ("" if len(pool) > 1 else pool[0])
-                fixer = pick.choose(self.env, "fixer", fixer, "contrib", self.vendors(), pr=str(pr), exclude=exclude,
-                                    issue=self.issue)
+                if not task_recovery.pending_fix(self.env, self.issue or pr, pr):
+                    fixer = pick.choose(self.env, "fixer", fixer, "contrib", self.vendors(), pr=str(pr),
+                                        exclude=exclude, issue=self.issue)
                 self.values["fixer"] = fixer
                 self.save()
                 rc = fix.fix_pr(runner, pr, wt, fixer, f"the reviewer agent (round {round})", feedback, fix_head)
@@ -1089,7 +1320,8 @@ class Review:
                                    f"The fix run of round {round} failed before a handoff. {self.url}")
                 self.drop()
                 return 0
-            self.fixed_by = fixer
+            fixer = runner.last_fixer or fixer
+            self.fixed_by = " ".join(dict.fromkeys([*runner.attempt_authors, fixer]))
             round, step = round + 1, "review"
             code_verdict = screenshot = checks = ""
             if runner.push_flag(pr).exists():
@@ -1136,7 +1368,11 @@ def main(argv=None):
     args = parser.parse_args(argv)
     env = session.resolve()
     if args.command == "feedback":
-        print(human_feedback(env.repo.gh_repo, env.owner, args.pr))
+        fb = human_feedback(env.repo.gh_repo, env.owner, args.pr)
+        if fb is None:
+            print("could not read the PR's comments completely", file=sys.stderr)
+            return 1
+        print(fb.owner)
         return 0
     if args.command == "issue-context":
         sys.stdout.write(issue_context(env, args.issue))

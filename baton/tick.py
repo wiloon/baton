@@ -260,10 +260,12 @@ class Tick:
         loop = review.Review(self.env.with_runtime(issue=issue), self.hooks(issue, pr), pr, wt, issue, fixed_by)
         return loop.loop(note, fixer, reviewer)
 
-    def fix_pr(self, pr, wt, fixer, source, feedback, issue="", head=""):
+    def fix_pr(self, pr, wt, fixer, source, feedback, issue="", head="", *, owner_triggered=False):
         self.active["cursor_fix"] = str(pr)
         runner = fix.Runner(self.env.with_runtime(issue=issue, pr=str(pr)), self.hooks(issue, pr), pr, "")
-        return fix.fix_pr(runner, pr, wt, fixer, source, feedback, head)
+        runner.required_retry_label = "agent-fix"
+        self.fix_runner = runner
+        return fix.fix_pr(runner, pr, wt, fixer, source, feedback, head, owner_triggered=owner_triggered)
 
     def spec_loop(self, issue):
         self.active["spec"] = self.active["issue"] = str(issue)
@@ -645,18 +647,59 @@ class Tick:
             self.log(f"worktree for PR #{pr} failed")
             return 1
         # Fast-forward only: local commits a failed push left behind are kept and pushed with the fix.
-        if not (session.run_process(["git", "-C", wt, "checkout", "-q", head_ref]).returncode == 0
-                and session.run_process(["git", "-C", wt, "merge", "-q", "--ff-only", f"origin/{head_ref}"]).returncode == 0):
-            from . import handoff as owner_handoff
-            owner_handoff.perform(
-                self.env, "fix_worktree_diverged", kind="pr", number=pr, remove=("agent-fix",),
-                item=pr, episode=issue or pr,
-                title=f"PR #{pr} needs you", text=f"{wt} has diverged from origin/{head_ref}. {url}",
-                hooks=self.hooks(issue or "0", pr=pr))
+        from . import handoff as owner_handoff, recovery
+        reason = "fix_worktree_diverged"
+        episode = issue or pr
+        detail = f"{wt} could not fast-forward to origin/{head_ref}. {url}"
+
+        def handoff(text=detail, **kwargs):
+            return owner_handoff.perform(
+                self.env, reason, kind="pr", number=pr, remove=("agent-fix",),
+                item=pr, episode=episode, title=f"PR #{pr} needs you", text=text,
+                hooks=self.hooks(issue or "0", pr=pr), **kwargs)
+
+        def binding():
+            if not recovery.worktree_ready(wt, head_ref)[0]:
+                return None
+            remote = git(wt, "rev-parse", f"origin/{head_ref}")
+            current = recovery.worker_fingerprint(wt, pr, extra={"origin_branch": remote},
+                                                  head_ref=head_ref, required_label="agent-fix")
+            return current if current and current["remote_head"] == remote else None
+
+        def fast_forward():
+            return (session.run_process(["git", "-C", wt, "checkout", "-q", head_ref]).returncode == 0
+                    and session.run_process(["git", "-C", wt, "merge", "-q", "--ff-only",
+                                             f"origin/{head_ref}"]).returncode == 0)
+
+        pending = recovery.resume(self.env, episode, pr, lambda saved: saved == reason, binding, handoff, local=True)
+        if pending is False:
             return 80
+        if not fast_forward():
+            ready, why = recovery.worktree_ready(wt, head_ref)
+            if pending or not ready:
+                handoff(text=f"{wt}: {why}. {url}" if why else detail)
+                return 80
+            retry = recovery.request(self.env, episode, pr, reason, "worktree", "", detail,
+                                     binding(), binding, handoff, local=True)
+            if not retry:
+                return 80
+            if not fast_forward():
+                handoff()
+                return 80
+            pending = retry
+        if pending:
+            recovery.clear(self.env, episode, pr)
         feedback_file = self.state / f"owner-fix-feedback-{pr}"
-        feedback = feedback_file.read_text() if feedback_file.is_file() else review.human_feedback(self.gh_repo, self.owner, pr)
-        if not feedback.strip():
+        if feedback_file.is_file():
+            owner_text, findings = self.cached_owner_feedback(feedback_file)
+        else:
+            fb = review.human_feedback(self.gh_repo, self.owner, pr)
+            if fb is None:
+                # Keep agent-fix: dropping it or reporting "nothing to fix" would lose the feedback.
+                self.log(f"PR #{pr}: could not read the review comments completely; retrying later")
+                return 75
+            owner_text, findings = fb.owner, fb.findings
+        if not owner_text.strip():
             pr_helpers.gh("pr", "edit", pr, "-R", self.gh_repo, "--remove-label", "agent-fix")
             self.notify(f"PR #{pr}: nothing to fix", f"No new review feedback from {self.owner}.")
             return 80
@@ -665,15 +708,34 @@ class Tick:
             return 1
         for commit in vendors.seed_contrib(str(self.state), pr, wt):
             self.log(f"PR #{pr}: commit {commit} has no known vendor; not counted")
-        fixer = self.pick_vendor("fixer", "contrib", self.all_vendors(), pr=pr, issue=issue)
+        fixer = recovery.pending_fix(self.env, episode, pr) or self.pick_vendor(
+            "fixer", "contrib", self.all_vendors(), pr=pr, issue=issue)
         self.notify(f"PR #{pr}: {fixer} is addressing your review", url)
+        feedback = review.format_fix_feedback(owner_text, findings)
         # Posting a fix reply advances human_feedback's cutoff even when an edit defers.
         if not feedback_file.is_file():
             temp = feedback_file.with_suffix(".tmp")
-            temp.write_text(feedback)
+            temp.write_text(json.dumps({"owner": owner_text, "findings": findings}))
             temp.replace(feedback_file)
-        rc = self.fix_pr(pr, wt, fixer, f"{self.owner} (the repository owner)", feedback, issue)
+        # The label stays only on a deferral, so the fix resumes; any other outcome drops it.
+        self.fix_runner = None
+        rc = self.fix_pr(pr, wt, fixer, f"{self.owner} (the repository owner)", feedback, issue,
+                         owner_triggered=True)
         return self.finish_standalone_fix(pr, wt, fixer, feedback, issue, rc)
+
+    @staticmethod
+    def cached_owner_feedback(feedback_file):
+        """The (owner words, findings) saved for a deferred owner fix."""
+        raw = feedback_file.read_text()
+        try:
+            cached = json.loads(raw)
+        except ValueError:
+            cached = None
+        if (isinstance(cached, dict) and isinstance(cached.get("owner"), str)
+                and isinstance(cached.get("findings"), str)):
+            return cached["owner"], cached["findings"]
+        # Legacy plain-text cache from an exit-75 deferral before #178.
+        return raw, ""
 
     def resume_standalone_push(self, pr, episodes):
         self.active["cursor_fix"] = self.active["pr"] = pr
@@ -694,8 +756,12 @@ class Tick:
             return self.finish_standalone_fix(pr, "", "", "", issue, 1)
         issue, wt, fixer = binding["issue"], binding["wt"], binding["fixer"]
         feedback_file = self.state / f"owner-fix-feedback-{pr}"
-        feedback = feedback_file.read_text() if feedback_file.is_file() else ""
-        rc = self.fix_pr(pr, wt, fixer, f"{self.owner} (the repository owner)", feedback, issue)
+        feedback = (review.format_fix_feedback(*self.cached_owner_feedback(feedback_file))
+                    if feedback_file.is_file() else "")
+        # The label stays only on a deferral, so the fix resumes; any other outcome drops it.
+        self.fix_runner = None
+        rc = self.fix_pr(pr, wt, fixer, f"{self.owner} (the repository owner)", feedback, issue,
+                         owner_triggered=True)
         return self.finish_standalone_fix(pr, wt, fixer, feedback, issue, rc)
 
     def finish_standalone_fix(self, pr, wt, fixer, feedback, issue, rc):
@@ -706,20 +772,23 @@ class Tick:
         pr_helpers.gh("pr", "edit", pr, "-R", self.gh_repo, "--remove-label", "agent-fix")
         if rc != 0:
             return 80
-        note = f"""{fixer} just addressed this review feedback from {self.owner}. Check that each point is resolved or convincingly answered in its `<!-- baton-fix by={fixer}` comment, and review the new commits. The rest of the PR was reviewed before.
+        if self.fix_runner:
+            fixer = self.fix_runner.last_fixer or fixer
+        fixed_by = " ".join(dict.fromkeys([*(self.fix_runner.attempt_authors if self.fix_runner else []), fixer]))
+        note = f"""{fixer} just addressed this review feedback from {self.owner}. Check that each of the owner's points is resolved or convincingly answered in its `<!-- baton-fix by={fixer}` comment, and review the new commits. The findings block is context: an item the owner did not ask for or expressly declined is not to be reopened. The rest of the PR was reviewed before.
 
 <feedback>
 {feedback}
 </feedback>"""
         runner = fix.Runner(self.env.with_runtime(issue=issue, pr=pr), self.hooks(issue, pr), pr)
         if runner.push_flag(pr).exists():
-            loop = review.Review(runner.env, runner.hooks, pr, wt, issue, fixer)
+            loop = review.Review(runner.env, runner.hooks, pr, wt, issue, fixed_by)
             loop.values = {"note": note, "fixer": "agent", "reviewer": "pool", "step": "review",
                            "round": 1, "push_completed": "1"}
             loop.save()
             runner.acknowledge_push(pr)
         (self.state / f"owner-fix-feedback-{pr}").unlink(missing_ok=True)
-        rc = self.review_loop(pr, wt, note, "agent", "pool", fixer, issue)
+        rc = self.review_loop(pr, wt, note, "agent", "pool", fixed_by, issue)
         return 75 if rc == 75 else 80
 
     # --- pick work: an issue for the pipeline ------------------------------------------------------
@@ -892,6 +961,8 @@ class Tick:
             self.log(f"{len(pending)} issue(s) still waiting on review (agent-wip), cap {cap}, {len(deferred)} deferred, "
                      f"{limit}; not starting new work: " + "; ".join(why))
             return ""
+        from . import recovery
+
         waiting = self.pending_specs()
         for n in self.candidates():
             if str(n) in waiting or any(names.issue_of(b) == str(n) for b in branches):
@@ -907,6 +978,9 @@ class Tick:
             if payload is None:
                 continue
             if spec.accept_pending(self.env, issue, listed=payload["comments"]):
+                self.recovered_issues[issue] = payload
+                return issue
+            if recovery.path(self.env, issue, issue).exists():
                 self.recovered_issues[issue] = payload
                 return issue
             role = spec.role_from(payload["comments"], self.env)

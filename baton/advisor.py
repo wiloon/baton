@@ -211,10 +211,16 @@ def call_deepseek(cfg, key, snapshot, actions, *, category=None):
     system = SYSTEM
     if category == 2:
         system += ("\nFor a CI judgement, retry_step means one bounded status poll of existing checks on the "
-                   "specified head. It cannot repair a check, rerun a job, update a branch or merge a PR.")
+                   "specified head. It cannot repair a check, rerun a job, update a branch or merge a PR."
+                   "\nFor a worker failure, retry_step means one more attempt of the same step with the same "
+                   "vendor when still eligible; retry_step_other_vendor means one attempt with an eligible "
+                   "alternate for that role. Neither invents new work or bypasses round limits.")
     elif category == 3:
         system += ("\nFor merge investigation, retry_step means reading and reconciling the existing PR state "
-                   "once. An open PR would have to pass all ordinary gates before any further merge attempt.")
+                   "once. An open PR would have to pass all ordinary gates before any further merge attempt."
+                   "\nFor a local investigation, retry_step means one more attempt of the failed local step "
+                   "(author seeding, verification, or worktree preparation) without resetting its budget. "
+                   "Preserve local work; do not force destructive cleanup.")
     body = json.dumps({
         "model": cfg.model,
         "temperature": 0,
@@ -396,6 +402,8 @@ def finish_episode(env, task_kind, item, result):
     points = {legacy}
     try:
         for decision in pending_decisions(env, task_kind, item):
+            if task_kind == "issue" and result == "accept" and not decision["point"].startswith("spec_"):
+                continue
             append(env, {**{key: decision[key] for key in ("point", "repo", "task_kind", "item", "episode", "decision_id")},
                          "kind": "outcome", "ts": int(time.time()), "result": result})
             points.add(decision["point"])
@@ -404,6 +412,11 @@ def finish_episode(env, task_kind, item, result):
             grant_path(env, reason, item).unlink(missing_ok=True)
     except OSError as error:
         notify.log(f"advisor {task_kind} #{item}: could not finish episode ({type(error).__name__})")
+    if result in ("merged", "closed"):
+        from . import recovery
+        recovery.clear_item(env, item)
+        if task_kind == "issue":
+            recovery.clear_episode(env, item)
 
 
 def handoff_note(decision):

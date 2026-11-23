@@ -495,20 +495,24 @@ def test_the_nit_rule_depends_on_the_follow_up_label(gh):
 
 def test_the_owner_feedback_is_what_came_after_the_last_fix(gh):
     gh.set(comments=[
-        {"author": {"login": "owner"}, "body": "old note", "createdAt": "2026-10-01T00:00:00Z"},
-        {"author": {"login": "owner"}, "body": "<!-- baton-fix by=claude -->\nfixed", "createdAt": "2026-10-02T00:00:00Z"},
-        {"author": {"login": "owner"}, "body": "<!-- baton-review round=1 -->", "createdAt": "2026-10-03T00:00:00Z"},
-        {"author": {"login": "stranger"}, "body": "ignore me", "createdAt": "2026-10-03T00:00:00Z"},
-        {"author": {"login": "owner"}, "body": "please rename", "createdAt": "2026-10-04T00:00:00Z"}],
-        reviews=[{"author": {"login": "owner"}, "body": "also this", "submittedAt": "2026-10-05T00:00:00Z"},
-                 {"author": {"login": "owner"}, "body": "older review", "submittedAt": "2026-10-01T00:00:00Z"}],
+        {"user": {"login": "owner"}, "body": "old note", "created_at": "2026-10-01T00:00:00Z"},
+        {"user": {"login": "owner"}, "body": "<!-- baton-fix by=claude -->\nfixed", "created_at": "2026-10-02T00:00:00Z"},
+        {"user": {"login": "owner"}, "body": "<!-- baton-review round=1 -->", "created_at": "2026-10-03T00:00:00Z"},
+        {"user": {"login": "stranger"}, "body": "ignore me", "created_at": "2026-10-03T00:00:00Z"},
+        {"user": {"login": "owner"}, "body": "please rename", "created_at": "2026-10-04T00:00:00Z"}],
+        reviews=[{"user": {"login": "owner"}, "body": "also this", "submitted_at": "2026-10-05T00:00:00Z"},
+                 {"user": {"login": "owner"}, "body": "older review", "submitted_at": "2026-10-01T00:00:00Z"}],
         inline=[{"user": {"login": "owner"}, "body": "here", "path": "a.go", "line": 3, "created_at": "2026-10-06T00:00:00Z"},
                 {"user": {"login": "owner"}, "body": "stale", "path": "a.go", "line": 3, "created_at": "2026-10-01T00:00:00Z"}])
-    assert review.human_feedback("owner/app", "owner", 5) == (
-        "Review (2026-10-05T00:00:00Z):\nalso this\n\n---\n\nComment (2026-10-04T00:00:00Z):\nplease rename\n"
-        "\n\n---\n\nInline comment on a.go:3:\nhere")
+    fb = review.human_feedback("owner/app", "owner", 5)
+    assert fb.owner == (
+        f"{review.OWNER_WORDS_NOTE}\n\n"
+        "Comment (2026-10-04T00:00:00Z):\nplease rename\n\n---\n\n"
+        "Review (2026-10-05T00:00:00Z):\nalso this\n\n---\n\n"
+        "Inline comment on a.go:3:\nhere")
+    assert fb.findings == ""
     gh.set(comments=[], reviews=[], inline=[])
-    assert review.human_feedback("owner/app", "owner", 5) == ""
+    assert review.human_feedback("owner/app", "owner", 5) == review.HumanFeedback()
 
 
 def test_the_agent_review_of_a_round_is_the_last_owner_comment_with_its_marker(gh):
@@ -1237,7 +1241,7 @@ def advised(loop, monkeypatch):
     monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="live"))
     loop.advice, loop.advice_calls = [], []
 
-    def call(cfg, key, snapshot, actions):
+    def call(cfg, key, snapshot, actions, **_):
         loop.advice_calls.append(snapshot)
         return loop.advice.pop(0), {}
     monkeypatch.setattr(advisor, "call_deepseek", call)
@@ -1245,9 +1249,10 @@ def advised(loop, monkeypatch):
 
     def view(pr, fields):
         if "headRefOid" in fields:
-            data = {"state": "OPEN", "headRefOid": sh(loop.wt, "git", "rev-parse", "HEAD")}
-            if "baseRefName" in fields:
-                data["baseRefName"] = loop.gh.pr.get("baseRefName") or "main"
+            data = real_view(pr, fields) or {}
+            data.setdefault("baseRefName", "main")
+            data.setdefault("headRefOid", sh(loop.wt, "git", "rev-parse", "HEAD"))
+            data.setdefault("labels", [])
             return data
         return real_view(pr, fields)
 
@@ -1352,18 +1357,23 @@ def test_a_failed_extra_round_does_not_extend_the_next_review_episode(advised, f
     advised.reviews[:] = ["changes", "changes"]
     if failure == "fix":
         advised.fix_plans[:] = [0, 1]
+        advised.advice = [{"action": "extra_round", "reason": "fixable", "evidence": []}]
     else:
         advised.reviews.append("RESULT: failed reviewer crashed")
-    advised.advice = [{"action": "extra_round", "reason": "fixable", "evidence": []}]
+        advised.advice = [
+            {"action": "extra_round", "reason": "fixable", "evidence": []},
+            {"action": "handoff", "reason": "still broken", "evidence": ["Decision point: review_run_failed"]},
+        ]
     assert advised.run(fixer="cursor") == 0
     assert not advised.checkpoint() and not advised.merged
-    assert len(advised.fixes) == 2 and len(advised.advice_calls) == 1
+    assert len(advised.fixes) == 2
+    assert len(advised.advice_calls) == (1 if failure == "fix" else 2)
 
     advised.review_text = "A different issue after the owner resumed review"
     advised.reviews[:] = ["changes", "changes", "changes"]
     advised.advice = [{"action": "handoff", "reason": "needs the owner", "evidence": []}]
     assert advised.run(fixer="cursor") == 0
-    assert len(advised.advice_calls) == 2
+    assert len(advised.advice_calls) == (2 if failure == "fix" else 3)
     assert len(advised.fixes) == 3 and advised.labelled("ready-for-human")
 
 
@@ -2169,6 +2179,255 @@ def test_review_feedback_transport_waits_and_lost_budget_hands_off_before_lookup
     assert not loop.fixes and loop.labelled("ready-for-human")
     assert len([args for args in loop.gh.calls() if args[:2] == ["pr", "edit"] and "--add-label" in args
                 and "ready-for-human" in args]) == 1
+
+
+def test_a_live_retry_step_re_runs_the_same_reviewer_once(advised):
+    """Category-2 live: review_run_failed may retry the same vendor once, then continue."""
+    advised.reviews[:] = ["RESULT: failed boom", "pass"]
+    advised.advice = [{"action": "retry_step", "reason": "transient agent failure",
+                       "evidence": ["Decision point: review_run_failed"]}]
+    assert advised.run(fixer="cursor", reviewer="claude") == 0
+    assert len(advised.advice_calls) == 1
+    assert [a["vendor"] for a in advised.agents if a["role"] == "review"] == ["claude", "claude"]
+    assert advised.merged == [PR] and not advised.labelled("ready-for-human")
+    assert len(advised.advice_calls) == 1
+    assert "review_run_failed" in advised.advice_calls[0]
+
+
+def test_a_live_alternate_vendor_retry_picks_another_reviewer(advised, monkeypatch):
+    advised.reviews[:] = ["RESULT: failed boom", "pass"]
+    advised.advice = [{"action": "retry_step_other_vendor", "reason": "try the other pool vendor",
+                       "evidence": ["Decision point: review_run_failed"]}]
+    assert advised.run(fixer="cursor", reviewer="claude") == 0
+    reviewers = [a["vendor"] for a in advised.agents if a["role"] == "review"]
+    assert reviewers == ["claude", "codex"]
+    assert advised.merged == [PR] and not advised.labelled("ready-for-human")
+
+
+def test_a_pinned_cursor_reviewer_cannot_switch_vendors(advised, monkeypatch):
+    from baton import advisor
+
+    advised.gh.set(headRefName="owner/issue-1", author={"login": "owner"})
+    advised.reviews[:] = ["RESULT: failed boom"]
+
+    def advise(cfg, key, snapshot, actions, **kwargs):
+        assert actions == ("handoff", "retry_step")
+        return {"action": "retry_step_other_vendor", "reason": "switch", "evidence": []}, {}
+
+    monkeypatch.setattr(advisor, "call_deepseek", advise)
+    assert advised.run(fixer="pool", reviewer="cursor") == 0
+    assert [run["vendor"] for run in advised.agents] == ["cursor"]
+    assert advised.labelled("ready-for-human")
+
+
+@pytest.mark.parametrize("action, vendors", [
+    ("retry_step", ["claude", "claude"]),
+    ("retry_step_other_vendor", ["claude", "codex"]),
+])
+def test_a_screenshot_retry_dispatches_the_granted_vendor(advised, action, vendors):
+    advised.reviews[:] = ["pass"]
+    advised.screens[:] = ["RESULT: failed boom", "pass"]
+    advised.advice = [{"action": action, "reason": "try the screenshot review again",
+                       "evidence": ["Decision point: screenshot_run_failed"]}]
+    assert screen_run(advised, reviewer="claude") == 0
+    assert [a["vendor"] for a in advised.agents if a["role"] == "screenshot_review"] == vendors
+    assert advised.merged == [PR]
+
+
+def test_screenshot_retry_refuses_changed_evidence(advised, monkeypatch):
+    from baton import advisor
+
+    shots = shoot(advised, "01-check-390.png")
+    advised.reviews[:] = ["pass"]
+    advised.screens[:] = ["RESULT: failed boom"]
+    advised.advice = [{"action": "retry_step", "reason": "try again",
+                       "evidence": ["Decision point: screenshot_run_failed"]}]
+    call = advisor.call_deepseek
+
+    def replace_evidence(*args, **kwargs):
+        path = shots / "01-check-390.png"
+        path.write_bytes(path.read_bytes() + b"changed")
+        return call(*args, **kwargs)
+
+    monkeypatch.setattr(advisor, "call_deepseek", replace_evidence)
+    assert screen_run(advised, reviewer="claude") == 0
+    assert roles(advised) == ["review", "screenshot_review"]
+    assert advised.labelled("ready-for-human") and not advised.merged
+
+
+def test_a_spent_review_retry_hands_off_on_the_same_reason(advised):
+    advised.reviews[:] = ["RESULT: failed boom", "RESULT: failed again"]
+    advised.advice = [{"action": "retry_step", "reason": "one more try",
+                       "evidence": ["Decision point: review_run_failed"]}]
+    assert advised.run(fixer="cursor", reviewer="claude") == 0
+    assert [a["vendor"] for a in advised.agents if a["role"] == "review"] == ["claude", "claude"]
+    assert advised.labelled("ready-for-human") and advised.merged == []
+    assert len(advised.advice_calls) == 1
+
+
+def test_a_blocked_review_alternate_resumes_before_dispatch(advised, monkeypatch):
+    from baton import advisor, recovery
+    from baton.common import Deferred
+
+    call = advisor.call_deepseek
+
+    def blocked(*args, **kwargs):
+        rest(advised, "codex", 60)
+        return call(*args, **kwargs)
+
+    def check_saved():
+        env = session.resolve(advised.env)
+        record = recovery.load(env, "297", PR)
+        assert record["action"] == "retry_step_other_vendor"
+        assert record["failed_vendor"] == "claude" and record["selected_vendor"] == "codex"
+
+    monkeypatch.setattr(advisor, "call_deepseek", blocked)
+    advised.reviews[:] = ["RESULT: failed boom", "pass"]
+    advised.advice = [{"action": "retry_step_other_vendor", "reason": "try another reviewer",
+                       "evidence": ["Decision point: review_run_failed"]}]
+    with pytest.raises(Deferred, match="codex"):
+        advised.run(fixer="cursor", reviewer="claude")
+    Path(advised.env["STATE"], "codex-cooldown-until").unlink()
+    advised.after["review"] = check_saved
+    assert advised.run(fixer="cursor", reviewer="claude") == 0
+    assert [a["vendor"] for a in advised.agents if a["role"] == "review"] == ["claude", "codex"]
+    assert len(advised.advice_calls) == 1
+
+
+def test_a_deferred_alternate_resumes_when_the_saved_reviewer_is_cursor(advised, monkeypatch):
+    """The saved reviewer says cursor (the alternate's own pin), but the grant was a pool pick."""
+    from baton import advisor, checkpoint
+
+    call = advisor.call_deepseek
+
+    def blocked(*args, **kwargs):
+        rest(advised, "codex", 60)
+        return call(*args, **kwargs)
+
+    monkeypatch.setattr(advisor, "call_deepseek", blocked)
+    advised.reviews[:] = ["RESULT: failed boom", "pass"]
+    advised.advice = [{"action": "retry_step_other_vendor", "reason": "try another reviewer",
+                       "evidence": ["Decision point: review_run_failed"]}]
+    with pytest.raises(Deferred, match="codex"):
+        advised.run(fixer="pool", reviewer="claude")
+    path = Path(advised.env["STATE"], f"review-pending-{PR}")
+    checkpoint.write(path, {**advised.checkpoint(), "reviewer": "cursor"})
+    Path(advised.env["STATE"], "codex-cooldown-until").unlink()
+    assert advised.run(fixer="pool", reviewer="cursor") == 0
+    assert [a["vendor"] for a in advised.agents if a["role"] == "review"] == ["claude", "codex"]
+    assert not advised.labelled("ready-for-human") and advised.merged == [PR]
+    assert len(advised.advice_calls) == 1
+
+
+def test_author_state_stale_grant_ends_in_one_handoff(advised, monkeypatch):
+    from baton import recovery, session
+
+    handoffs = []
+    real = review.Review.handoff
+    monkeypatch.setattr(review.Review, "handoff",
+                        lambda self, reason, title, text, **kw: (
+                            None if kw.get("fallback") else handoffs.append(reason),
+                            real(self, reason, title, text, **kw))[1])
+    monkeypatch.setattr(review.Review, "seed", lambda self: False)
+    advised.advice = [{"action": "retry_step", "reason": "transient seed failure",
+                       "evidence": ["Decision point: review_author_state_failed"]}]
+    real_match = recovery.fingerprint_matches
+    seen = {"revalidated": 0, "saved": []}
+
+    def match(record, current):
+        seen["revalidated"] += 1
+        return real_match(record, current) if not seen["saved"] else False
+
+    real_persist = recovery.persist_grant
+    monkeypatch.setattr(recovery, "persist_grant",
+                        lambda *a, **k: (seen["saved"].append(1), real_persist(*a, **k))[1])
+    monkeypatch.setattr(recovery, "fingerprint_matches", match)
+    advised.reviews[:] = ["pass"]
+    assert advised.run(fixer="cursor", reviewer="claude") == 0
+    assert seen["revalidated"] >= 1 and seen["saved"] == [1]   # the grant persisted, then resolve failed
+    assert handoffs == ["review_author_state_failed"]
+    assert not [a for a in advised.agents if a["role"] == "review"] and advised.merged == []
+
+
+def test_author_state_retry_reseeds_then_picks_reviewer(advised, monkeypatch):
+    advised.advice = [{"action": "retry_step", "reason": "transient seed failure",
+                       "evidence": ["Decision point: review_author_state_failed"]}]
+    order = []
+    attempts = iter([False, True, True])
+
+    def seed(self):
+        ok = next(attempts, True)
+        order.append("seed-ok" if ok else "seed-fail")
+        return ok
+
+    monkeypatch.setattr(review.Review, "seed", seed)
+    advised.reviews[:] = ["pass"]
+    assert advised.run(fixer="cursor", reviewer="claude") == 0
+    assert len(advised.advice_calls) == 1 and advised.merged == [PR]
+    assert order[:2] == ["seed-fail", "seed-ok"]          # re-seeded before any reviewer was picked
+    assert [a["vendor"] for a in advised.agents if a["role"] == "review"] == ["claude"]
+    from baton import session
+    assert recovery_load(advised) is None                 # the executed grant is cleared
+
+
+def recovery_load(loop):
+    from baton import recovery, session
+    return recovery.load(session.resolve(loop.env), "297", PR)
+
+
+def test_author_state_handoff_advice_ends_in_one_handoff(advised, monkeypatch):
+    handoffs = []
+    real = review.Review.handoff
+    monkeypatch.setattr(review.Review, "handoff",
+                        lambda self, reason, title, text, **kw: (
+                            None if kw.get("fallback") else handoffs.append(reason),   # fallback: no handoff
+                            real(self, reason, title, text, **kw))[1])
+    seeds = []
+    monkeypatch.setattr(review.Review, "seed", lambda self: seeds.append(1) and False)
+    advised.advice = [{"action": "handoff", "reason": "recording authors keeps failing",
+                       "evidence": ["Decision point: review_author_state_failed"]}]
+    advised.reviews[:] = ["pass"]
+    assert advised.run(fixer="cursor", reviewer="claude") == 0
+    assert handoffs == ["review_author_state_failed"]
+    assert len(seeds) == 1 and not [a for a in advised.agents if a["role"] == "review"]
+    assert advised.merged == []
+
+
+def test_fingerprint_mismatch_on_pending_review_recovery_hands_off(loop, monkeypatch):
+    from baton import advisor, recovery
+    from baton.config import Advisor
+    from baton import session
+    monkeypatch.setenv(advisor.KEY, "sk-" + "r" * 24)
+    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="live"))
+    remote = {"state": "OPEN", "headRefOid": "a" * 40, "baseRefName": "main", "headRefName": "cursor/issue-297",
+              "body": "Refs #297", "comments": [], "labels": [], "reviews": []}
+    monkeypatch.setattr(review.pr_helpers, "view", lambda pr, fields: dict(remote))
+    env = session.resolve(loop.env)
+    from baton import hooks as telemetry
+    hooks = telemetry.from_env(env, issue="297", pr=PR)
+    recovery.persist(env, {
+        "action": "retry_step", "failed_vendor": "claude", "exclusions": ["claude"],
+        "remaining_budget": {}, "fingerprint": recovery.worker_fingerprint(str(loop.wt), PR, round_s="1"),
+        "role": "reviewer", "episode": "297", "item": str(PR), "reason": "review_run_failed", "decision_id": "x",
+        "state": "granted", "pinned": False,
+    })
+    grant = advisor.grant_path(env, "review_run_failed", PR)
+    grant.parent.mkdir(parents=True, exist_ok=True)
+    grant.write_text("x\n")
+    remote["headRefOid"] = "b" * 40
+    r = review.Review(env, hooks, PR, loop.wt, issue="297")
+    assert r.loop("", fixer="cursor", reviewer="claude") == 0
+    assert loop.labelled("ready-for-human") and not loop.agents
+
+
+def test_the_alternate_fixer_cannot_take_the_sole_pool_reviewer(loop, monkeypatch):
+    from baton import fix
+    loop.env["VENDOR_POOL"] = "claude"
+    loop.reviews[:] = ["changes"]
+    seen = []
+    monkeypatch.setattr(fix, "fix_pr", lambda runner, *a, **k: (seen.append(list(runner.retry_exclusions)), 80)[1])
+    loop.run(fixer="cursor")
+    assert seen and "claude" in seen[0]
 
 
 # --- screenshot_comment_post_failed: the review's follow-up cases (#151) -----------------------
