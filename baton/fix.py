@@ -263,7 +263,10 @@ class Runner:
                     rest = pr_helpers.split_checks(pr, strip_markers(fix_file.read_text()), self.ctx)
                 except Exception:
                     rest = strip_markers(fix_file.read_text())
-                self.comment(pr, f"<!-- baton-fix by={fixer} -->\n{rest.rstrip(chr(10))}")
+                marker = (f"<!-- baton-fix by={fixer} outcome=needs-info -->"
+                          if outcome.startswith("RESULT: needs-info")
+                          else f"<!-- baton-fix by={fixer} -->")
+                self.comment(pr, f"{marker}\n{rest.rstrip(chr(10))}")
             self.hooks.fix(fixer, self.round or 0, out["reply"], str(fix_file))
         task_changed, description_rc, description_changed, description_reason = False, 0, False, ""
         if outcome.startswith("RESULT: fixed"):
@@ -362,7 +365,10 @@ class Runner:
             if reply_raw:
                 reply = pr_helpers.split_checks(pr, reply, self.ctx).rstrip("\n")
             if reply.strip():
-                self.comment(pr, f"<!-- baton-fix by=cursor -->\n{reply[:REPLY_CAP]}", f"PR #{pr}: posting Cursor's reply failed")
+                marker = ("<!-- baton-fix by=cursor outcome=needs-info -->"
+                          if outcome.startswith("RESULT: needs-info")
+                          else "<!-- baton-fix by=cursor -->")
+                self.comment(pr, f"{marker}\n{reply[:REPLY_CAP]}", f"PR #{pr}: posting Cursor's reply failed")
             if not outcome.startswith("RESULT: fixed"):
                 if outcome.startswith("RESULT: needs-info"):
                     return self.handoff(pr, "fix_needs_info", f"Cursor PR #{pr} has questions", url)

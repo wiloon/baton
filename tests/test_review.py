@@ -432,11 +432,15 @@ def test_the_owner_feedback_is_what_came_after_the_last_fix(gh):
                  {"author": {"login": "owner"}, "body": "older review", "submittedAt": "2026-10-01T00:00:00Z"}],
         inline=[{"user": {"login": "owner"}, "body": "here", "path": "a.go", "line": 3, "created_at": "2026-10-06T00:00:00Z"},
                 {"user": {"login": "owner"}, "body": "stale", "path": "a.go", "line": 3, "created_at": "2026-10-01T00:00:00Z"}])
-    assert review.human_feedback("owner/app", "owner", 5) == (
-        "Review (2026-10-05T00:00:00Z):\nalso this\n\n---\n\nComment (2026-10-04T00:00:00Z):\nplease rename\n"
-        "\n\n---\n\nInline comment on a.go:3:\nhere")
+    fb = review.human_feedback("owner/app", "owner", 5)
+    assert fb.owner == (
+        f"{review.OWNER_WORDS_NOTE}\n\n"
+        "Comment (2026-10-04T00:00:00Z):\nplease rename\n\n---\n\n"
+        "Review (2026-10-05T00:00:00Z):\nalso this\n\n---\n\n"
+        "Inline comment on a.go:3:\nhere")
+    assert fb.findings == ""
     gh.set(comments=[], reviews=[], inline=[])
-    assert review.human_feedback("owner/app", "owner", 5) == ""
+    assert review.human_feedback("owner/app", "owner", 5) == review.HumanFeedback()
 
 
 def test_the_agent_review_of_a_round_is_the_last_owner_comment_with_its_marker(gh):

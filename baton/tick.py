@@ -614,8 +614,21 @@ class Tick:
                 hooks=self.hooks(issue or "0", pr=pr))
             return 80
         feedback_file = self.state / f"owner-fix-feedback-{pr}"
-        feedback = feedback_file.read_text() if feedback_file.is_file() else review.human_feedback(self.gh_repo, self.owner, pr)
-        if not feedback.strip():
+        if feedback_file.is_file():
+            raw = feedback_file.read_text()
+            try:
+                cached = json.loads(raw)
+            except ValueError:
+                cached = None
+            if isinstance(cached, dict) and "owner" in cached and "findings" in cached:
+                owner_text, findings = cached["owner"], cached["findings"]
+            else:
+                # Legacy plain-text cache from an exit-75 deferral before #178.
+                owner_text, findings = raw, ""
+        else:
+            fb = review.human_feedback(self.gh_repo, self.owner, pr)
+            owner_text, findings = fb.owner, fb.findings
+        if not owner_text.strip():
             pr_helpers.gh("pr", "edit", pr, "-R", self.gh_repo, "--remove-label", "agent-fix")
             self.notify(f"PR #{pr}: nothing to fix", f"No new review feedback from {self.owner}.")
             return 80
@@ -626,10 +639,11 @@ class Tick:
             self.log(f"PR #{pr}: commit {commit} has no known vendor; not counted")
         fixer = self.pick_vendor("fixer", "contrib", self.all_vendors(), pr=pr, issue=issue)
         self.notify(f"PR #{pr}: {fixer} is addressing your review", url)
+        feedback = review.format_fix_feedback(owner_text, findings)
         # Posting a fix reply advances human_feedback's cutoff even when an edit defers.
         if not feedback_file.is_file():
             temp = feedback_file.with_suffix(".tmp")
-            temp.write_text(feedback)
+            temp.write_text(json.dumps({"owner": owner_text, "findings": findings}))
             temp.replace(feedback_file)
         # The label stays only on a deferral, so the fix resumes; any other outcome drops it.
         rc = self.fix_pr(pr, wt, fixer, f"{self.owner} (the repository owner)", feedback, issue)
@@ -639,7 +653,7 @@ class Tick:
         pr_helpers.gh("pr", "edit", pr, "-R", self.gh_repo, "--remove-label", "agent-fix")
         if rc != 0:
             return 80
-        rc = self.review_loop(pr, wt, f"""{fixer} just addressed this review feedback from {self.owner}. Check that each point is resolved or convincingly answered in its `<!-- baton-fix by={fixer}` comment, and review the new commits. The rest of the PR was reviewed before.
+        rc = self.review_loop(pr, wt, f"""{fixer} just addressed this review feedback from {self.owner}. Check that each of the owner's points is resolved or convincingly answered in its `<!-- baton-fix by={fixer}` comment, and review the new commits. The findings block is context: an item the owner did not ask for or expressly declined is not to be reopened. The rest of the PR was reviewed before.
 
 <feedback>
 {feedback}

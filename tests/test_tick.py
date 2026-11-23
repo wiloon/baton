@@ -402,7 +402,8 @@ def fix_ctx(ctx, worktree, monkeypatch, feedback="please rename", fixer="codex")
     ctx.gh.answers["pr list"] = [{"number": 20, "headRefName": "cursor/issue-297"}, {"number": 3, "headRefName": "feature/x"}]
     ctx.gh.answers["pr view"] = lambda a: "cursor/issue-297" if "headRefName" in a[-1] else json.dumps(
         {"headRefName": "cursor/issue-297", "author": {"login": "cursor"}}) if False else "cursor/issue-297"
-    monkeypatch.setattr(tick.review, "human_feedback", lambda repo, owner, pr: feedback)
+    monkeypatch.setattr(tick.review, "human_feedback",
+                        lambda repo, owner, pr: review.HumanFeedback(owner=feedback, findings=""))
     monkeypatch.setattr(tick.vendors, "seed_authors", lambda *args: 0)
     monkeypatch.setattr(tick.vendors, "seed_contrib", lambda *args: ["abc1234"])
     monkeypatch.setattr(tick.Tick, "pick_vendor", lambda self, *a, **k: fixer)
@@ -807,7 +808,8 @@ def test_an_agent_fix_deferred_in_vendor_selection_lends_its_slot(ctx, monkeypat
     ctx.gh.answers["pr list"] = lambda args: [{"number": 11, "headRefName": "agent/issue-5", "labels": []}]
     Path(ctx.env["WT_ROOT"], "agent-5").mkdir(parents=True)
     monkeypatch.setattr(tick.session, "run_process", lambda *a, **k: subprocess.CompletedProcess(a, 0, "", ""))
-    monkeypatch.setattr(tick.review, "human_feedback", lambda *a: "please fix")
+    monkeypatch.setattr(tick.review, "human_feedback",
+                        lambda *a: review.HumanFeedback(owner="please fix", findings=""))
     monkeypatch.setattr(tick.vendors, "seed_authors", lambda *a: 0)
     monkeypatch.setattr(tick.vendors, "seed_contrib", lambda *a: [])
     t = ctx.make()
