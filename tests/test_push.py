@@ -1,7 +1,15 @@
-"""common.push: the one way an agent's work leaves the host, signing off commits for DCO (#44)."""
+"""common.push: the one way an agent's work leaves the host, signing off commits for DCO (#44).
+
+Category-1 retries need enough stderr to tell a transport failure from a permanent one (#151).
+"""
+from subprocess import CompletedProcess
+
+import pytest
+
 from conftest import sh
 
-from baton.common import push
+from baton import session
+from baton.common import PushResult, push
 
 
 def commit(wt, name, message, author="Ann <ann@example.invalid>"):
@@ -83,4 +91,56 @@ def test_a_new_branch_is_pushed_with_its_upstream(worktree):
 def test_a_failed_push_reports_false(worktree):
     commit(worktree.wt, "c.txt", "fix: unsigned")
     sh(worktree.wt, "git", "remote", "set-url", "origin", "/nonexistent")
-    assert not push(worktree.wt, "HEAD", signoff=True)
+    result = push(worktree.wt, "HEAD", signoff=True)
+    assert isinstance(result, PushResult) and not result and not result.transient
+
+
+def test_a_successful_push_reports_an_ok_result(worktree):
+    head = commit(worktree.wt, "c.txt", "fix: ok")
+    result = push(worktree.wt, "HEAD")
+    assert result.ok and not result.transient and remote(worktree) == head
+
+
+@pytest.mark.parametrize("stderr", [
+    "fatal: unable to access 'https://example.invalid/': Could not resolve host: example.invalid",
+    "error: RPC failed; curl 56 Recv failure: Connection reset by peer",
+    "fatal: unable to access 'https://github.com/x/y.git/': The remote end hung up unexpectedly",
+    "fatal: unable to access 'https://github.com/x/y.git/': Failed to connect to github.com port 443",
+    "fatal: unable to access 'https://example.invalid/': The requested URL returned error: 503",
+    "error: RPC failed; HTTP 500 curl 22",
+    "remote: HTTP 503\nfatal: unable to access",
+    "fatal: early EOF\nerror: unexpected EOF",
+])
+def test_transport_and_5xx_push_failures_are_transient(worktree, monkeypatch, stderr):
+    commit(worktree.wt, "c.txt", "fix: transport")
+    monkeypatch.setattr(session, "run_process",
+                        lambda *a, **k: CompletedProcess(a[0] if a else [], 1, "", stderr))
+    result = push(worktree.wt, "HEAD")
+    assert not result.ok and result.transient and stderr.splitlines()[0] in result.detail
+
+
+@pytest.mark.parametrize("stderr", [
+    "remote: dependency timed out\n ! [remote rejected] HEAD -> feature (pre-receive hook declined)",
+    "fatal: Authentication failed; credential helper timed out",
+    " ! [rejected]        HEAD -> cursor/issue-297 (non-fast-forward)",
+    "remote: error: GH006: Protected branch update failed\nerror: failed to push some refs",
+    "fatal: Authentication failed for 'https://github.com/x/y.git/'",
+    "remote: Permission to x/y.git denied to someone.\nfatal: unable to access",
+    "error: failed to push some refs to 'origin'\nhook declined",
+    "",
+    "fatal: something unexplained happened",
+])
+def test_rejected_auth_hook_and_unclassified_push_failures_are_permanent(worktree, monkeypatch, stderr):
+    commit(worktree.wt, "c.txt", "fix: permanent")
+    monkeypatch.setattr(session, "run_process",
+                        lambda *a, **k: CompletedProcess(a[0] if a else [], 1, "", stderr))
+    result = push(worktree.wt, "HEAD")
+    assert not result.ok and not result.transient
+
+
+def test_a_signoff_failure_is_permanent(worktree, monkeypatch):
+    from baton import common
+    commit(worktree.wt, "c.txt", "fix: unsigned")
+    monkeypatch.setattr(common, "sign_off", lambda *_: False)
+    result = push(worktree.wt, "HEAD", signoff=True)
+    assert not result.ok and not result.transient and "sign-off" in result.detail

@@ -26,7 +26,7 @@ def run(gh, worktree, tmp_path, monkeypatch):
            "WT_ROOT": str(tmp_path / "worktrees"), "REPO_DIR": str(worktree.repo), "CI_FIXABLE_CHECKS": "golangci-lint\ngo test",
            "ISSUE": "297"}
     gh.set(headRefName="cursor/issue-297", body=CLEAN, commits=[], closingIssuesReferences=[{"number": 297}],
-           issues={"297": {"state": "OPEN"}})
+           issues={"297": {"state": "OPEN"}}, state="OPEN", labels=[])
     monkeypatch.setattr(pick.settle, "probe", lambda *args: None)
 
     class State:
@@ -783,6 +783,90 @@ def test_a_repair_failure_without_a_handoff_is_not_taken_for_one(repair):
     assert Path(repair.env["STATE"], f"ci-fix-{PR}-{HEAD}").exists()
 
 
+def save_waiting_push(repair, fixer="codex"):
+    """A deferred CI-repair push as the fix run saves it, with the repaired head noted."""
+    from baton import handoff, session
+    binding = {"commit": "d" * 40, "branch": "cursor/issue-297", "ref": "HEAD", "remote": "e" * 40,
+               "upstream": False, "wt": str(repair.wt), "issue": "297", "pr": str(PR), "next": "done",
+               "outcome": "", "handoff_reason": "", "description_rc": 0, "description_reason": "",
+               "who": "", "fixer": fixer, "clear_cursor": False, "feedback": "f" * 64,
+               "caller": "ci", "ci_head": HEAD}
+    assert handoff.prepare_retry(session.resolve(repair.env), "297", "fix_push_failed", str(PR), binding)
+    Path(repair.env["STATE"], f"fix-push-waiting-{PR}").write_text("1")
+
+
+def test_a_deferred_repair_push_keeps_the_repair_and_hands_nothing_off(repair, monkeypatch):
+    """The push wait leaves the merge step in place with no outer CI handoff."""
+    def waiting(runner, *args, **kwargs):
+        raise merge.Deferred("handoff-retry", "fix_push_failed", lends_slot=False)
+    monkeypatch.setattr(merge.fix, "fix_pr", waiting)
+    repair.greens[:] = [False]
+    with pytest.raises(merge.Deferred):
+        repair.go()
+    assert not repair.labelled("ready-for-human")
+
+
+def test_a_waiting_repair_push_resumes_before_any_ci_read_or_vendor_choice(repair, monkeypatch):
+    save_waiting_push(repair)
+    monkeypatch.setattr(merge.ci, "classify", lambda *a, **k: pytest.fail("classified CI before the push was due"))
+    monkeypatch.setattr(merge.pick, "choose", lambda *a, **k: pytest.fail("chose a vendor for a waiting push"))
+    repair.go()
+    assert repair.events.count("ci") == 1   # only the gate after the push, never before it
+    assert [f["fixer"] for f in repair.fixes] == ["codex"]
+    assert Path(repair.env["STATE"], f"ci-fix-{PR}-{HEAD}").exists()
+    assert repair.merged()
+
+
+def test_a_waiting_repair_push_whose_record_is_gone_hands_off_without_a_second_repair(repair):
+    Path(repair.env["STATE"], f"fix-push-waiting-{PR}").write_text("1")
+    repair.go()
+    assert repair.fixes == [] and repair.labelled("ready-for-human") and not repair.merged()
+
+
+def test_a_ci_repair_push_that_exhausts_retries_hands_off_once_at_the_merge_gate(run, monkeypatch):
+    from baton import common, handoff
+
+    monkeypatch.setattr(merge.Merger, "ci_fix_round", REAL_CI_FIX_ROUND)
+    monkeypatch.setattr(merge.pick, "choose", lambda *a, **k: "codex")
+    run.env["VERIFY_HOOK"] = ""
+    run.env["CI_COMMAND"] = "git diff --check {base}"
+    run.greens[:] = [False]
+    run.gh.set(headRefOid=sh(run.wt, "git", "rev-parse", "HEAD"),
+               checks=[{"name": "golangci-lint", "bucket": "fail", "link": "https://github.com/owner/app/actions/runs/123"}],
+               logs={"123": "golangci-lint: unused helper"})
+    clock = {"now": 1_000}
+    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
+    workers, pushes, reasons = [], [], []
+
+    def repair(vendor, role, prompt, tag, cwd, *args):
+        workers.append((vendor, role))
+        (Path(cwd) / "repair.txt").write_text("CI repair\n")
+        sh(cwd, "git", "add", "repair.txt")
+        sh(cwd, "git", "commit", "-qm", "Repair CI")
+        return {"rc": 0, "outcome": "RESULT: fixed", "reply": "RESULT: fixed", "model": "test"}
+
+    def refuse(*args, **kwargs):
+        pushes.append(clock["now"])
+        return common.PushResult(False, transient=True, detail="connection refused")
+
+    monkeypatch.setattr(merge.fix.dispatch, "dispatch", repair)
+    monkeypatch.setattr(merge.fix, "push", refuse)
+    monkeypatch.setattr(merge.telemetry.Telemetry, "task",
+                        lambda self, kind, *args: reasons.append(args[0]) if kind == "handoff" else None)
+    for now in (1_000, 1_059, 1_060, 1_359):
+        clock["now"] = now
+        with pytest.raises(merge.Deferred, match="fix_push_failed"):
+            run.go()
+        assert not reasons and not run.labelled("ready-for-human")
+
+    clock["now"] = 1_360
+    run.go()
+    assert workers == [("codex", "fix")] and pushes == [1_000, 1_060, 1_360]
+    assert reasons == ["fix_push_failed"]
+    assert sum(c[:2] == ["pr", "edit"] and "ready-for-human" in c for c in run.gh.calls()) == 1
+    assert not run.merged()
+
+
 # --- behind branches (#122) -----------------------------------------------------------------
 
 OLD = "a" * 40
@@ -999,3 +1083,23 @@ def test_without_owner_review_paths_the_file_list_is_not_read(run):
     run.go()
     assert run.merged()
     assert not any(c[:1] == ["api"] and c[-3].endswith("/files") for c in run.gh.calls() if len(c) > 3)
+
+
+@pytest.mark.parametrize("bad_head", ["", "not-a-sha"])
+def test_a_damaged_durable_ci_head_hands_off_before_replaying(repair, monkeypatch, bad_head):
+    from baton import handoff, session
+
+    save_waiting_push(repair)
+    env = session.resolve(repair.env)
+    for path in (handoff.retry_path(env, "297", handoff.FIX_PUSH, str(PR)),
+                 handoff.waiting_path(env, "297", handoff.FIX_PUSH, str(PR))):
+        data = json.loads(path.read_text())
+        if bad_head:
+            data["continuation"]["ci_head"] = bad_head
+        else:
+            del data["continuation"]["ci_head"]
+        path.write_text(json.dumps(data))
+    monkeypatch.setattr(merge.fix, "fix_pr", lambda *a, **kw: pytest.fail("replayed an invalid CI continuation"))
+    repair.go()
+    assert not repair.merged()
+    assert sum(c[:2] == ["pr", "edit"] and "ready-for-human" in c for c in repair.gh.calls()) == 1

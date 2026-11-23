@@ -38,6 +38,7 @@ SPEC_REVIEW_POST = "spec_review_comment_post_failed"
 SPEC_REPLY_POST = "spec_reply_post_failed"
 SPEC_PENDING_ACCEPT_POST = "spec_pending_accept_post_failed"
 SPEC_ACCEPT_POST = "spec_accept_post_failed"
+FIX_PUSH = "fix_push_failed"
 COMMENT_POSTS = (REVIEW_POST, SCREENSHOT_POST)
 SPEC_POSTS = (SPEC_REVIEW_POST, SPEC_REPLY_POST)
 SPEC_ACCEPT_POSTS = (SPEC_PENDING_ACCEPT_POST, SPEC_ACCEPT_POST)
@@ -45,7 +46,7 @@ SPEC_ACCEPT_POSTS = (SPEC_PENDING_ACCEPT_POST, SPEC_ACCEPT_POST)
 SPEC_WRITE_POSTS = (*SPEC_POSTS, *SPEC_ACCEPT_POSTS)
 RETRY_REASONS = frozenset({
     "review_comment_missing", "spec_comments_read_failed", "spec_pending_adr_read_failed",
-    *COMMENT_POSTS, *SPEC_WRITE_POSTS,
+    *COMMENT_POSTS, *SPEC_WRITE_POSTS, FIX_PUSH,
 })
 
 # Categories: 1 rule-decided, 2 judgement, 3 needs investigation, 4 owner-only.
@@ -285,6 +286,72 @@ def _spec_accept_post_valid(item, binding, *, reason):
             and bool(re.fullmatch(r"[0-9a-f]{64}", binding["feedback"])))
 
 
+def _push_binding_valid(item, binding, *, reason):
+    """A push of a known post-sign-off commit to a destination ref (#151)."""
+    commit, branch, remote = binding.get("commit"), binding.get("branch"), binding.get("remote")
+    ref, next_step = binding.get("ref"), binding.get("next")
+    if (not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit)
+            or not isinstance(branch, str) or not branch
+            or ref not in ("HEAD", branch)
+            or "remote" not in binding
+            or (remote is not None and not isinstance(remote, str))
+            or (remote and not re.fullmatch(r"[0-9a-f]{40}", remote))
+            or type(binding.get("upstream")) is not bool
+            or not isinstance(binding.get("wt"), str) or not binding["wt"]
+            or next_step not in ("done", "handoff", "recover")):
+        return False
+    if (binding.get("pr") != item or not isinstance(binding.get("issue"), str)
+            or (binding["issue"] and not binding["issue"].isdecimal())):
+        return False
+    if not isinstance(binding.get("feedback"), str) or not re.fullmatch(r"[0-9a-f]{64}", binding["feedback"]):
+        return False
+    caller, ci_head = binding.get("caller"), binding.get("ci_head")
+    if caller == "ci":
+        if not isinstance(ci_head, str) or not re.fullmatch(r"[0-9a-f]{40}", ci_head):
+            return False
+    elif caller not in ("standalone", "review") or ci_head != "":
+        return False
+    description_rc = binding.get("description_rc")
+    if (type(description_rc) is not int or description_rc not in (0, 1, 2)
+            or not isinstance(binding.get("description_reason"), str)
+            or not isinstance(binding.get("fixer"), str) or not binding["fixer"]
+            or (binding["fixer"] == "cursor" and description_rc == 1)):
+        return False
+    if next_step in ("handoff", "recover"):
+        if binding.get("handoff_reason") not in ("fix_run_failed", "fix_needs_info"):
+            return False
+        if not isinstance(binding.get("outcome"), str) or not binding["outcome"]:
+            return False
+        if (binding["outcome"].startswith("RESULT: fixed")
+                or binding["outcome"].startswith("RESULT: needs-info") != (binding["handoff_reason"] == "fix_needs_info")):
+            return False
+        if description_rc != 0 or binding["description_reason"]:
+            return False
+    elif (binding.get("handoff_reason") != "" or binding.get("outcome") != ""
+          or bool(description_rc) != bool(binding["description_reason"])):
+        return False
+    if next_step == "recover":
+        if binding["handoff_reason"] != "fix_run_failed" or not _push_recovery_valid(binding.get("recovery")):
+            return False
+    elif "recovery" in binding:
+        return False
+    return (isinstance(binding.get("who"), str)
+            and type(binding.get("clear_cursor")) is bool)
+
+
+def _push_recovery_valid(context):
+    if (not isinstance(context, dict)
+            or not all(isinstance(context.get(key), str) for key in ("source", "feedback", "head"))
+            or type(context.get("owner_triggered")) is not bool
+            or not isinstance(context.get("authors"), list)
+            or not all(isinstance(author, str) for author in context["authors"])
+            or "start" not in context):
+        return False
+    start = context["start"]
+    return start is None or (isinstance(start, dict) and all(
+        isinstance(start.get(key), str) for key in ("base", "head_ref", "feedback", "remote_head")))
+
+
 def _binding_valid(reason, item, binding):
     if not isinstance(binding, dict):
         return False
@@ -307,6 +374,8 @@ def _binding_valid(reason, item, binding):
         return _spec_comment_post_valid(item, binding, reason=reason)
     if reason in SPEC_ACCEPT_POSTS:
         return _spec_accept_post_valid(item, binding, reason=reason)
+    if reason == FIX_PUSH:
+        return _push_binding_valid(item, binding, reason=reason)
     return (binding.get("pr") == item and type(binding.get("round")) is int and binding["round"] > 0
             and all(isinstance(binding.get(key), str) for key in
                     ("head", "base", "digest", "issue", "screenshot_digest"))
@@ -328,12 +397,26 @@ def load_retry(env, episode, reason, item=""):
         raise RetryUnreadable(f"incomplete retry operation {path.name}")
     binding = data.get("continuation")
     expected = {"episode": episode, "item": item, "reason": reason, "continuation": binding}
-    if waiting != expected or any(data.get(key) != value for key, value in expected.items()):
+    if any(data.get(key) != value for key, value in expected.items()):
         raise RetryUnreadable(f"mismatched retry operation {path.name}")
+    if waiting != expected:
+        # A due fix push can learn its baseline before the retry copy is replaced.
+        observed = waiting.get("continuation")
+        if (reason != FIX_PUSH or not isinstance(binding, dict) or not isinstance(observed, dict)
+                or "remote" not in binding or binding["remote"] is not None or observed.get("remote") is None
+                or type(data.get("attempts")) is not int or data["attempts"] < 1
+                or waiting != {**expected, "continuation": {**binding, "remote": observed["remote"]}}):
+            raise RetryUnreadable(f"mismatched retry operation {path.name}")
+        binding = observed
+        data = {**data, "continuation": binding}
     if not _binding_valid(reason, item, binding):
         raise RetryUnreadable(f"invalid continuation in {path.name}")
     if "confirmed" in data and (reason not in (*SPEC_POSTS, SPEC_ACCEPT_POST) or data["confirmed"] is not True):
         raise RetryUnreadable(f"invalid confirmed-post phase in {path.name}")
+    if "phase" in data and (reason != FIX_PUSH or data["phase"] not in ("landed", "finished")
+                            or binding["remote"] is None
+                            or (data["phase"] == "finished" and binding["next"] != "done")):
+        raise RetryUnreadable(f"invalid push phase in {path.name}")
     attempts, due, scheduled = data.get("attempts"), data.get("due"), data.get("scheduled")
     if type(attempts) is not int or not (0 <= attempts <= MAX_ATTEMPTS):
         raise RetryUnreadable(f"out-of-range attempts in {path.name}")
@@ -353,6 +436,15 @@ def restore_retry(env, episode, reason, item, pending):
     atomic_json(retry_path(env, episode, reason, item), pending)
 
 
+def save_push_baseline(env, episode, item, pending, remote):
+    """Record the first observed remote in both copies before issuing any push."""
+    binding = {**pending["continuation"], "remote": remote}
+    waiting = {"episode": episode, "item": item, "reason": FIX_PUSH, "continuation": binding}
+    atomic_json(waiting_path(env, episode, FIX_PUSH, item), waiting)
+    restore_retry(env, episode, FIX_PUSH, item, {**pending, "continuation": binding})
+    return binding
+
+
 def prepare_retry(env, episode, reason, item, binding):
     """Save a new operation with its first deadline, before a write or after a failed read."""
     episode, item = str(episode), str(item)
@@ -369,7 +461,10 @@ def prepare_retry(env, episode, reason, item, binding):
 
 def comment_post_episodes(env, reason=None):
     """Find review or screenshot comment-post operations by PR number."""
-    reasons = (reason,) if reason else COMMENT_POSTS
+    return operation_episodes(env, (reason,) if reason else COMMENT_POSTS)
+
+
+def operation_episodes(env, reasons):
     found = {}
     for name in reasons:
         for path in Path(env.dirs.state).glob(f"handoff-*-{name}.json"):
@@ -379,6 +474,49 @@ def comment_post_episodes(env, reason=None):
                 episode, item = match.groups()
                 found.setdefault(item or episode, set()).add(episode)
     return found
+
+
+def observe_remote(wt, branch):
+    """(sha, transient): the SHA at origin/BRANCH, '' when absent, None when unreadable;
+    transient says whether an unreadable ref looks like a transport failure."""
+    from . import session
+    from .common import push_transient
+    done = session.run_process(
+        ["git", "-C", str(wt), "ls-remote", "origin", f"refs/heads/{branch}"],
+        capture_output=True, text=True)
+    if done.returncode != 0:
+        return None, push_transient((done.stderr or "") + (done.stdout or ""))
+    line = (done.stdout or "").strip().splitlines()
+    return (line[0].split()[0] if line else ""), False
+
+
+def push_destination(wt, ref):
+    """The branch name a push of REF updates on origin."""
+    from .common import git
+    if ref == "HEAD":
+        return git(wt, "branch", "--show-current") or ""
+    return ref
+
+
+def check_push_local(binding):
+    from .common import git
+    wt = binding["wt"]
+    return (git(wt, "rev-parse", "HEAD") == binding["commit"]
+            and git(wt, "branch", "--show-current") == binding["branch"])
+
+
+def check_push_landed(binding):
+    """Whether origin already holds the saved post-sign-off commit (#151)."""
+    if not check_push_local(binding):
+        return "changed"
+    current, transient = observe_remote(binding["wt"], binding["branch"])
+    if current is None:
+        return "retry" if transient else "failed"
+    if current == binding["commit"]:
+        return "landed"
+    if current == binding["remote"]:
+        return "absent"
+    return "changed"
 
 
 def _clear_path(path):
@@ -415,11 +553,15 @@ def label_ready(env, kind, number, remove=()):
 def _finish(env, reason, entry, *, kind, number, title, text, hooks, remove, item, episode,
             after_labels, decision=None, before_labels=None):
     """The one terminal handoff: outcomes, labels, telemetry, notify, log."""
-    clear_episode(env, episode, item or number)
-    recovery.clear_episode(env, episode)
-    if kind == "pr":
-        # Retire the continuation before publishing the handoff or releasing its grant.
-        Path(env.dirs.state, f"review-pending-{number}").unlink(missing_ok=True)
+    finishing_push = (kind == "pr" and reason in ("fix_run_failed", "fix_needs_info", "fix_checks_refresh_failed")
+                      and Path(env.dirs.state, f"fix-push-waiting-{number}").exists())
+    if not finishing_push:
+        if kind == "pr":
+            # Retire the continuation before publishing the handoff or releasing its grant.
+            Path(env.dirs.state, f"review-pending-{number}").unlink(missing_ok=True)
+            Path(env.dirs.state, f"fix-push-waiting-{number}").unlink(missing_ok=True)
+        clear_episode(env, episode, item or number)
+        recovery.clear_episode(env, episode)
     if before_labels:
         before_labels()   # the comment that explains the failure goes up before the label
     result = label_ready(env, kind, number, remove=remove)
@@ -432,6 +574,10 @@ def _finish(env, reason, entry, *, kind, number, title, text, hooks, remove, ite
         body += advisor.handoff_note(decision)
     notify.notify(title, body)
     notify.log(f"handoff {reason} category={entry.category}")
+    if finishing_push:
+        Path(env.dirs.state, f"review-pending-{number}").unlink(missing_ok=True)
+        Path(env.dirs.state, f"fix-push-waiting-{number}").unlink(missing_ok=True)
+        clear_episode(env, episode, item or number)
     return Result(HANDOFF, decision, True)
 
 

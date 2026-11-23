@@ -167,17 +167,59 @@ def git(cwd, *args):
     return r.stdout.rstrip("\n") if r.returncode == 0 else None
 
 
-def push(wt, ref, *, upstream=False, signoff=False):
-    """Push an agent's work: `git push origin REF` from worktree WT; True when it pushed.
+# Transport and GitHub edge failures are worth a later attempt; everything else is permanent (#151).
+PUSH_TRANSIENT = re.compile(
+    r"TLS handshake timeout|connection reset|connection refused|i/o timeout|unexpected EOF"
+    r"|Could not resolve host|Failed to connect|The remote end hung up|early EOF"
+    r"|(?:HTTP |The requested URL returned error: )5\d\d\b|timed out", re.IGNORECASE)
+PUSH_REJECTED = re.compile(
+    r"\[(?:remote )?rejected\]|hook declined|authentication failed|permission (?:to .* )?denied"
+    r"|could not read username|invalid username or password|protected branch update failed",
+    re.IGNORECASE)
 
-    Every rule about what may leave the host lives here (#44). With SIGNOFF (the repository's
-    DCO), the unpushed commits first get a Signed-off-by for their author where they lack it.
+
+@dataclass(frozen=True)
+class PushResult:
+    """Outcome of one push: OK is truthy; TRANSIENT marks a category-1 retry (#151)."""
+    ok: bool
+    transient: bool = False
+    detail: str = ""
+
+    def __bool__(self):
+        return self.ok
+
+
+def push_transient(stderr):
+    """True when STDERR is a transport or 5xx failure; empty or unclassified stderr is permanent."""
+    text = stderr or ""
+    if PUSH_REJECTED.search(text):
+        return False
+    if re.search(r"(?:HTTP |The requested URL returned error: )4\d\d\b", text, re.IGNORECASE) and not re.search(
+            r"secondary rate limit", text, re.IGNORECASE):
+        return False
+    return bool(PUSH_TRANSIENT.search(text))
+
+
+def push(wt, ref, *, upstream=False, signoff=False):
+    """Push an agent's work: `git push origin REF` from worktree WT.
+
+    Returns a PushResult (truthy on success). Every rule about what may leave the host lives
+    here (#44). With SIGNOFF (the repository's DCO), the unpushed commits first get a
+    Signed-off-by for their author where they lack it. Failures report enough for category-1
+    classification (#151): transport and 5xx are transient; a rejected ref, authentication,
+    hook, sign-off or unclassified failure is permanent.
     """
     from . import session
     if signoff and not sign_off(wt):
-        return False
+        return PushResult(False, detail="sign-off failed")
     cmd = ["git", "-C", str(wt), "push", "-q", *(["-u"] if upstream else []), "origin", ref]
-    return session.run_process(cmd).returncode == 0
+    done = session.run_process(cmd, capture_output=True, text=True)
+    if done.returncode == 0:
+        return PushResult(True)
+    stderr = (done.stderr or "") + (done.stdout or "")
+    lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+    detail = " | ".join(lines[-3:]) if lines else ""
+    return PushResult(False, transient=push_transient(stderr), detail=detail)
 
 
 def sign_off(wt):

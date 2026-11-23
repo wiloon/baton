@@ -423,6 +423,27 @@ def test_an_agent_fix_label_runs_the_fix_then_the_review(ctx, worktree, monkeypa
     assert "PR #20: commit abc1234 has no known vendor; not counted" in ctx.log()
 
 
+def test_a_waiting_fix_push_resumes_with_its_saved_fixer_before_any_read_or_notice(ctx, worktree, monkeypatch):
+    from baton import handoff
+    fix_ctx(ctx, worktree, monkeypatch)
+    t = ctx.make()
+    binding = {"commit": "d" * 40, "branch": "cursor/issue-297", "ref": "HEAD", "remote": "e" * 40,
+               "upstream": False, "wt": str(worktree.wt), "issue": "297", "pr": "20", "next": "done",
+               "outcome": "", "handoff_reason": "", "description_rc": 0, "description_reason": "",
+               "who": "", "fixer": "claude", "clear_cursor": False, "feedback": "f" * 64,
+               "caller": "standalone", "ci_head": ""}
+    assert handoff.prepare_retry(t.env, "297", "fix_push_failed", "20", binding)
+    Path(t.env.config.paths.state, "fix-push-waiting-20").write_text("1")
+    Path(t.env.config.paths.state, "owner-fix-feedback-20").write_text("please rename")
+    forbidden = lambda *a, **k: pytest.fail("read, notified or chose a vendor before the push was due")
+    monkeypatch.setattr(tick.review, "human_feedback", forbidden)
+    monkeypatch.setattr(tick.vendors, "seed_authors", forbidden)
+    monkeypatch.setattr(tick.Tick, "pick_vendor", forbidden)
+    monkeypatch.setattr(tick.Tick, "notify", forbidden)
+    assert t.pick_fix() == 0
+    assert ctx.loops[0][0] == "fix" and ctx.loops[0][1][2] == "claude"
+
+
 def test_an_agent_fix_review_excludes_every_attempt_author(ctx, worktree, monkeypatch):
     from types import SimpleNamespace
 
@@ -1004,6 +1025,10 @@ def test_a_second_tick_finishes_a_deferred_description_edit(ctx, worktree, monke
     ctx.gh.answers["pr view"] = view
     ctx.gh.answers["pr edit"] = edit
     ctx.gh.answers["pr comment"] = comment
+    ctx.gh.answers[f"api repos/owner/app/issues/{pr}/comments"] = lambda args: [[
+        {**row, "user": row["author"], "id": i} for i, row in enumerate(comments, 1)]]
+    for endpoint in ("reviews", "comments"):
+        ctx.gh.answers[f"api repos/owner/app/pulls/{pr}/{endpoint}"] = [[]]
     ctx.gh.answers["pr list"] = lambda args: (
         [{"number": int(pr), "headRefName": worktree.branch}] if labelled and "agent-fix" in args else [])
     monkeypatch.setattr(review, "read_rows", lambda repo, route, number, resource: (
@@ -1016,7 +1041,11 @@ def test_a_second_tick_finishes_a_deferred_description_edit(ctx, worktree, monke
     monkeypatch.setattr(fix.Runner, "verify", lambda self, wt, *args: verified.append(sh(wt, "git", "rev-parse", "HEAD")) or (0, "", 0))
     monkeypatch.setattr(merge.Merger, "merge_or_handoff", lambda *args: reviewed.append(True))
     monkeypatch.setattr(review.Review, "review_vendor", lambda self, reviewer: "claude")
-    monkeypatch.setattr(review.Review, "run_review", lambda *args: "REVIEW: pass")
+    def passing_review(self, round, note, reviewer):
+        self.save_binding(reviewed_head=sh(self.wt, "git", "rev-parse", "HEAD"))
+        return "REVIEW: pass"
+
+    monkeypatch.setattr(review.Review, "run_review", passing_review)
     if route == "switch-review":
         def review_with_changes(self, round, note, reviewer):
             comments.append({"author": {"login": "owner"}, "createdAt": "2026-11-20T00:00:02Z",
@@ -1030,7 +1059,7 @@ def test_a_second_tick_finishes_a_deferred_description_edit(ctx, worktree, monke
     if resumes_review:
         checkpoint(ctx, pr=pr, step="fix", wt=str(worktree.wt), ISSUE="297", fix_head=remote_before,
                    feedback=comments[0]["body"], extra="1" if route == "switch-review" else "")
-        monkeypatch.setattr(tick.Tick, "review_loop", ORIGINAL_REVIEW_LOOP)
+    monkeypatch.setattr(tick.Tick, "review_loop", ORIGINAL_REVIEW_LOOP)
 
     assert ctx.make().run() == 0, ctx.log()
     fix_head = sh(worktree.wt, "git", "rev-parse", "HEAD")
@@ -2189,3 +2218,93 @@ def test_tick_resumes_pending_adr_even_with_agent_wip_and_no_vendor(ctx, monkeyp
     assert reads == [1_000, 1_060, 1_060]
     assert [body_of(call) for call in ctx.gh.ran("issue", "comment")] == [verdict]
     assert len(started) == 1   # the accept went straight on to dev, not back to the queue
+
+
+@pytest.mark.parametrize("changed", ["branch", "remote", "interrupted continuation", None])
+def test_a_forced_fix_push_without_a_label_is_resumed_by_the_scheduler(ctx, worktree, monkeypatch, changed):
+    from baton import common, handoff
+
+    monkeypatch.setattr(tick.review, "human_feedback", lambda *a: tick.review.HumanFeedback(owner="please rename", findings=""))
+    monkeypatch.setattr(tick.vendors, "seed_authors", lambda *a: 0)
+    monkeypatch.setattr(tick.vendors, "seed_contrib", lambda *a: [])
+    monkeypatch.setattr(tick.Tick, "pick_vendor", lambda *a, **kw: "codex")
+    monkeypatch.setattr(fix.Runner, "verify", lambda *a: (0, "", 0))
+    ctx.gh.answers["pr list"] = []
+
+    def view(args):
+        if "--jq" in args and ".headRefName" in args:
+            return worktree.branch if args[2] == "20" else "feature/unrelated"
+        return {"state": "OPEN", "labels": [], "headRefName": worktree.branch}
+
+    ctx.gh.answers["pr view"] = view
+    ctx.gh.answers["issue view"] = {"state": "OPEN", "labels": []}
+    for route in ("issues/20/comments", "pulls/20/reviews", "pulls/20/comments"):
+        ctx.gh.answers[f"api repos/owner/app/{route}"] = [[]]
+    clock, workers, pushes = [1_000], [], []
+    monkeypatch.setattr(handoff, "clock", lambda: clock[0])
+
+    def worker(vendor, role, prompt, tag, cwd, *args):
+        workers.append(vendor)
+        sh(cwd, "git", "commit", "-qm", "Worker fix", "--allow-empty")
+        return {"rc": 0, "outcome": "RESULT: fixed", "reply": "", "model": "test"}
+
+    def push(*args, **kwargs):
+        pushes.append(clock[0])
+        if clock[0] == 1_000:
+            return common.PushResult(False, transient=True, detail="connection refused")
+        return common.push(*args, **kwargs)
+
+    monkeypatch.setattr(fix.dispatch, "dispatch", worker)
+    monkeypatch.setattr(fix, "push", push)
+    monkeypatch.setattr(fix.Runner, "refresh_checks", lambda *a: 0)
+    assert ctx.make("pr", "20").run() == 75
+    if changed == "branch":
+        sh(worktree.wt, "git", "checkout", "-qb", "unrelated")
+    if changed == "remote":
+        old = sh(worktree.wt, "git", "rev-parse", "HEAD~1")
+        tree = sh(worktree.wt, "git", "rev-parse", "HEAD^{tree}")
+        other = sh(worktree.wt, "git", "commit-tree", tree, "-p", old, "-m", "Remote fix")
+        sh(worktree.wt, "git", "push", "-q", "origin", f"{other}:refs/heads/{worktree.branch}")
+    head = sh(worktree.wt, "git", "rev-parse", "HEAD")
+    branch = sh(worktree.wt, "git", "branch", "--show-current")
+    clock[0] = 1_059
+    ctx.make().run()
+    assert sh(worktree.wt, "git", "rev-parse", "HEAD") == head
+    assert sh(worktree.wt, "git", "branch", "--show-current") == branch
+    assert pushes == [1_000] and "handoff fix_" not in ctx.log()
+    clock[0] = 1_060
+    assert ctx.make("pr", "21").run() == 2
+    assert pushes == [1_000] and "handoff fix_" not in ctx.log()
+    if changed == "interrupted continuation":
+        def interrupt(*args):
+            raise InterruptedError("stopped during checks refresh")
+
+        with monkeypatch.context() as stopped:
+            stopped.setattr(fix.Runner, "refresh_checks", interrupt)
+            assert ctx.make().run() == 1
+        assert json.loads(ctx.path("owner-fix-feedback-20").read_text()) == {"owner": "please rename", "findings": ""}
+    ctx.make().run()
+    assert workers == ["codex"]
+    if changed in ("branch", "remote"):
+        assert pushes == [1_000] and "handoff fix_push_failed" in ctx.log()
+    else:
+        assert pushes == [1_000, 1_060] and len(ctx.loops) == 1
+        assert ctx.loops[0][0][-2:] == ("codex", "297")
+        assert "<feedback>\nplease rename\n</feedback>" in ctx.loops[0][0][2]
+
+
+def test_a_push_wait_ends_a_previous_quota_slot_loan(ctx, monkeypatch):
+    pr_state(ctx)
+    flight(ctx, wip=[5], ready=[issue(12)], prs={5: 11})
+    defer_loop(monkeypatch)
+    deferred_review(ctx, [11])
+    no_vendor_blocked(monkeypatch)
+    assert ctx.make().next_issue() == "12"
+
+    def awaiting_push(*args, **kwargs):
+        raise Deferred("handoff-retry", "fix_push_failed", lends_slot=False)
+
+    monkeypatch.setattr(tick.Tick, "review_loop", awaiting_push)
+    ctx.make().pending_reviews()
+    assert ctx.make().next_issue() == ""
+    assert not ctx.path("slot-deferred-11").exists()

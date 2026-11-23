@@ -376,12 +376,21 @@ def accept_post_binding(issue="7", *, pending=False):
             "next": next_step}
 
 
+def push_binding(item="1"):
+    return {"commit": "a" * 40, "branch": "agent/issue-1", "ref": "HEAD", "remote": "b" * 40,
+            "upstream": False, "wt": "/tmp/wt", "issue": "9", "pr": item, "next": "done",
+            "outcome": "", "handoff_reason": "", "description_rc": 0, "description_reason": "",
+            "who": "", "fixer": "claude", "clear_cursor": False, "feedback": "f" * 64,
+               "caller": "standalone", "ci_head": ""}
+
+
 def test_every_category_1_reason_is_rule_mode_with_retry_budget():
     assert handoff.RETRY_REASONS == {
         "review_comment_missing", "spec_comments_read_failed", "spec_pending_adr_read_failed",
         "review_comment_post_failed", "screenshot_comment_post_failed",
         "spec_review_comment_post_failed", "spec_reply_post_failed",
         "spec_pending_accept_post_failed", "spec_accept_post_failed",
+        "fix_push_failed",
     }
     for reason in handoff.RETRY_REASONS:
         entry = handoff.REASONS[reason]
@@ -399,9 +408,10 @@ def test_every_category_1_reason_is_rule_mode_with_retry_budget():
     ("spec_reply_post_failed", spec_post_binding("1", reply=True)),
     ("spec_pending_accept_post_failed", accept_post_binding("1", pending=True)),
     ("spec_accept_post_failed", accept_post_binding("1")),
+    ("fix_push_failed", push_binding("1")),
 ])
 def test_each_category_1_reason_defers_then_hands_off_through_perform(env, monkeypatch, reason, binding):
-    """Every replayed read or comment post shares the same budget: no advisor, two later attempts, then handoff."""
+    """Every replayed read, comment post or push shares the same budget: no advisor, two later attempts, then handoff."""
     labelled, calls = [], []
     hooks, _ = _hooks()
     clock = {"now": 1_000}

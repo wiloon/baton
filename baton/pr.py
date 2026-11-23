@@ -393,10 +393,11 @@ def fixer_gave_checks(ctx, pr):
         return False
 
 
-def apply_checks(pr, ctx):
+def apply_checks(pr, ctx, *, consume=True):
     """After a fix, the fixer's re-check of the whole PR replaces the body's
     checks section; none given reads "Not re-checked", which the merge gate hands
-    off. Returns (rc, changed, log): rc 1 while GitHub may still hold the old section."""
+    off. A durable continuation can keep the input until its caller acknowledges the push.
+    Returns (rc, changed, log): rc 1 while GitHub may still hold the old section."""
     file = checks_file(ctx, pr)
     try:
         checks = json.loads(file.read_text())["checks"]
@@ -411,7 +412,8 @@ def apply_checks(pr, ctx):
         result = gh("pr", "edit", str(pr), "-R", session.resolve().repo.gh_repo, "--body-file", "-", input=updated + "\n")
         if result.returncode != 0:
             return 1, False, ""
-    file.unlink(missing_ok=True)
+    if consume:
+        file.unlink(missing_ok=True)
     return 0, changed, f"PR #{pr}: checks refreshed after the fix" if changed else ""
 
 
