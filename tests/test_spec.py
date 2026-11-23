@@ -3,6 +3,7 @@ memory and stubs for the agent runs. Ported from tests/spec-round.sh (the round 
 the spec_loop of run.sh."""
 import json
 import os
+import re
 from contextvars import ContextVar
 from pathlib import Path
 import subprocess
@@ -359,6 +360,81 @@ def test_adr_edits_are_pushed_as_a_docs_pr_that_merges_on_accept(loop):
     reply, = loop.gh.posted("<!-- baton-spec-reply round=1 by=")
     assert "\nADR revisions: #77\n" in reply
     assert "docs PR #77" in loop.runs[2]["prompt"]
+
+
+def test_a_transient_adr_push_defers_then_recovers_without_a_second_worker(loop, monkeypatch):
+    """spec_adr_push_failed: no early replay, one reviser, landed after 60s (#151)."""
+    from baton import common
+
+    clock = _spec_clock(monkeypatch)
+    pushes, real = [], common.push
+
+    def flaky(wt, ref, *, upstream=False, signoff=False):
+        pushes.append(clock["now"])
+        if clock["now"] < 1_060:
+            return common.PushResult(False, transient=True, detail="connection refused")
+        return real(wt, ref, upstream=upstream, signoff=signoff)
+
+    monkeypatch.setattr(spec, "push", flaky)
+    loop.script = [CHANGES, reviser(commit=True), ACCEPT]
+    with pytest.raises(Deferred, match="spec_adr_push_failed"):
+        loop.run()
+    assert [run["role"] for run in loop.runs] == ["spec_review", "spec"]
+    assert not loop.gh.ran("pr", "create") and not loop.gh.posted("<!-- baton-spec-reply")
+    saved = handoff.load_retry(session.resolve(loop.env), N, "spec_adr_push_failed")
+    assert saved["attempts"] == 0 and re.fullmatch(r"[0-9a-f]{40}", saved["continuation"]["commit"])
+    clock["now"] = 1_059
+    before = len(pushes)
+    with pytest.raises(Deferred, match="spec_adr_push_failed"):
+        loop.run()
+    assert len(pushes) == before and [run["role"] for run in loop.runs] == ["spec_review", "spec"]
+    clock["now"] = 1_060
+    assert loop.run() is True
+    assert [run["role"] for run in loop.runs] == ["spec_review", "spec", "spec_review"]
+    assert set(pushes) == {1_000, 1_060}
+    assert loop.gh.ran("pr", "create") and len(loop.gh.posted("<!-- baton-spec-reply round=1 by=")) == 1
+    assert not list(Path(loop.env["STATE"]).glob("handoff-*-*spec_adr_push_failed.json"))
+
+
+def test_a_lost_adr_push_response_is_recognized_without_a_second_write(loop, monkeypatch):
+    """A push that landed before its answer was lost counts as success (#151)."""
+    from baton import common
+
+    pushes, real = [], common.push
+
+    def write_then_fail(wt, ref, *, upstream=False, signoff=False):
+        pushes.append(ref)
+        result = real(wt, ref, upstream=upstream, signoff=signoff)
+        assert result.ok
+        return common.PushResult(False, transient=True, detail="connection reset")
+
+    monkeypatch.setattr(spec, "push", write_then_fail)
+    loop.script = [CHANGES, reviser(commit=True), ACCEPT]
+    assert loop.run() is True
+    assert len(pushes) == 1 and loop.gh.ran("pr", "create")
+
+
+def test_an_exhausted_adr_push_hands_off_exactly_once(loop, monkeypatch):
+    from baton import common
+
+    clock = _spec_clock(monkeypatch)
+    sent = []
+    monkeypatch.setattr(spec.notify, "notify", lambda title, text="": sent.append((title, text)))
+    monkeypatch.setattr(spec, "push",
+                        lambda *a, **k: common.PushResult(False, transient=True, detail="connection refused"))
+    loop.script = [CHANGES, reviser(commit=True)]
+    with pytest.raises(Deferred, match="spec_adr_push_failed"):
+        loop.run()
+    for now in (1_060, 1_360):
+        clock["now"] = now
+        if now == 1_360:
+            assert loop.run() is False
+        else:
+            with pytest.raises(Deferred, match="spec_adr_push_failed"):
+                loop.run()
+    assert "ready-for-human" in loop.gh.labels and len(loop.runs) == 2
+    assert sum("spec_adr_push_failed" in text for _, text in sent) == 1
+    assert not list(Path(loop.env["STATE"]).glob("handoff-*-*spec_adr_push_failed.json"))
 
 
 def test_an_accept_with_a_red_adr_pr_goes_to_the_owner(loop):

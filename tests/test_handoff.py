@@ -384,13 +384,24 @@ def push_binding(item="1"):
                "caller": "standalone", "ci_head": ""}
 
 
+def issue_push_binding(item, *, reason="dev_push_failed"):
+    core = {"commit": "a" * 40, "branch": "agent/issue-1", "ref": "agent/issue-1", "remote": "b" * 40,
+            "upstream": True, "wt": "/tmp/wt", "issue": item, "feedback": "f" * 64}
+    if reason == "dev_push_failed":
+        return {**core, "vendor": "codex", "title": "Add it", "body_text": "Summary\n\nRefs #1",
+                "base": "c" * 40, "model": "gpt-x", "gate_result": "", "attempts": [["codex", "gpt-x", "c" * 40, "a" * 40]]}
+    return {**core, "reviser": "claude", "round": 1, "issue_body": "d" * 64, "reply": "done",
+            "mode_note": "", "model": "", "human": "", "next": "review", "max_rounds": 3,
+            "limit_why": "n/a", "pr": "", "comment_ids": [1], "author": "owner"}
+
+
 def test_every_category_1_reason_is_rule_mode_with_retry_budget():
     assert handoff.RETRY_REASONS == {
         "review_comment_missing", "spec_comments_read_failed", "spec_pending_adr_read_failed",
         "review_comment_post_failed", "screenshot_comment_post_failed",
         "spec_review_comment_post_failed", "spec_reply_post_failed",
         "spec_pending_accept_post_failed", "spec_accept_post_failed",
-        "fix_push_failed",
+        "fix_push_failed", "dev_push_failed", "spec_adr_push_failed",
     }
     for reason in handoff.RETRY_REASONS:
         entry = handoff.REASONS[reason]
@@ -409,6 +420,8 @@ def test_every_category_1_reason_is_rule_mode_with_retry_budget():
     ("spec_pending_accept_post_failed", accept_post_binding("1", pending=True)),
     ("spec_accept_post_failed", accept_post_binding("1")),
     ("fix_push_failed", push_binding("1")),
+    ("dev_push_failed", issue_push_binding("1")),
+    ("spec_adr_push_failed", issue_push_binding("1", reason="spec_adr_push_failed")),
 ])
 def test_each_category_1_reason_defers_then_hands_off_through_perform(env, monkeypatch, reason, binding):
     """Every replayed read, comment post or push shares the same budget: no advisor, two later attempts, then handoff."""

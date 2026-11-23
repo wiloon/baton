@@ -291,6 +291,219 @@ def live_issue_binding(tick, env, wt, issue, branch):
     return issue_binding(wt, issue, branch, fresh)
 
 
+def push_flag(tick, issue):
+    return tick.state / f"dev-push-waiting-{issue}"
+
+
+def owner_feedback_digest(owner, comments):
+    rows = [
+        (row["id"], row["body"])
+        for row in comments
+        if (row["author"] or {}).get("login") == owner and not row["body"].startswith("<!-- baton")
+    ]
+    return owner_handoff.body_digest(json.dumps(sorted(rows)))
+
+
+def check_dev_push(tick, env, binding):
+    # Use the backed-off `gh` path (not once/call): tick tests patch `gh`, and a disposition
+    # check after resume must not treat a missing `call` stub as a permanent failure.
+    data, transient = spec.read_issue(env, binding["issue"])
+    if data is None:
+        return "retry" if transient else "failed"
+    if data["state"] == "CLOSED":
+        return "superseded"
+    labels = {label["name"] for label in data["labels"]}
+    if "ready-for-human" in labels:
+        return "paused"
+    # An open PR for this branch means another path already finished the push.
+    listed = tick.gh_json("pr", "list", "-R", tick.gh_repo, "--state", "open", "--head", binding["branch"],
+                          "--json", "number")
+    if listed is None:
+        return "retry"
+    if listed:
+        return "superseded"
+    if owner_feedback_digest(env.owner, data["comments"]) != binding["feedback"]:
+        return "changed"
+    return "ok"
+
+
+def finish_dev_push(tick, binding):
+    """Continuation after a landed dev push: open the PR from the saved description (#151)."""
+    issue, wt, branch = binding["issue"], binding["wt"], binding["branch"]
+    session.run_process(
+        ["git", "-C", wt, "fetch", "-q", "origin",
+         f"+refs/heads/{branch}:refs/remotes/origin/{branch}"],
+        capture_output=True, text=True)
+    intent = {"issue": str(issue), "branch": branch, "wt": str(wt), "base": binding["base"],
+              "head": binding["commit"], "vendor": binding["vendor"],
+              "model": binding["model"], "attempts": binding["attempts"], "pr": ""}
+    Path(f"/tmp/baton-dev-{issue}.pr.md").write_text(binding["title"] + "\n\n" + binding["body_text"] + "\n")
+    save_opening(opening_path(tick, issue), intent)
+    recovery.clear(tick.env, issue, issue)
+    attempts_path(tick, issue).unlink(missing_ok=True)
+    owner_handoff.clear_retry(tick.env, issue, owner_handoff.DEV_PUSH)
+    push_flag(tick, issue).unlink(missing_ok=True)
+    created = pr_helpers.gh("pr", "create", "-R", tick.gh_repo, "--head", branch, "--base", "main",
+                            "--title", binding["title"], "--body", binding["body_text"])
+    if created.returncode != 0:
+        tick.log(f"#{issue}: PR create returned an error; saved intent will be reconciled on the next tick"
+                 f"{pr_helpers.why(created)}")
+        tick.notify(f"#{issue}: PR creation needs reconciliation",
+                    f"branch {branch} is pushed. https://github.com/{tick.gh_repo}/issues/{issue}")
+        return 1
+    pr = created.stdout.strip().rsplit("/", 1)[-1]
+    if not pr.isdecimal():
+        tick.log(f"#{issue}: PR create returned an unexpected URL; saved intent will be reconciled")
+        return 1
+    intent["pr"] = pr
+    save_opening(opening_path(tick, issue), intent)
+    return finish_opening(tick, intent, opening_path(tick, issue))
+
+
+def push_with_retry(tick, env, issue, wt, branch, *, vendor, title, body_text, base, attempts, model,
+                    gate_result, feedback, pending=None):
+    """Save before pushing the implementation branch, or consume a due attempt (#151)."""
+    reason = owner_handoff.DEV_PUSH
+    url = f"https://github.com/{tick.gh_repo}/issues/{issue}"
+    title_msg = f"#{issue}: pushing {vendor}'s branch failed"
+    text = f"#{issue}: pushing {vendor}'s branch failed"
+    initial = pending is None
+
+    def handoff(message):
+        push_flag(tick, issue).unlink(missing_ok=True)
+        return stop(tick, issue, reason, title_msg, f"{message} {url}")
+
+    try:
+        found = owner_handoff.load_retry(env, issue, reason)
+    except owner_handoff.RetryUnreadable as exc:
+        return handoff(f"Could not read the saved push operation: {exc}")
+    if initial:
+        if found is not None:
+            raise Deferred("handoff-retry", reason, lends_slot=False)
+        if env.repo.signoff:
+            from .common import sign_off
+            if not sign_off(wt):
+                return handoff(f"{branch} is committed in {wt}; sign-off failed.")
+        dest = owner_handoff.push_destination(wt, branch) or branch
+        commit = git(wt, "rev-parse", "HEAD")
+        if not dest or not commit or not re.fullmatch(r"[0-9a-f]{40}", commit):
+            return handoff(f"{branch} is committed in {wt}; local commit or branch missing.")
+        remote, unreadable_transient = owner_handoff.observe_remote(wt, dest)
+        if remote is None and not unreadable_transient:
+            return handoff(f"{branch} is committed in {wt}; could not observe the remote ref.")
+        binding = {
+            "issue": str(issue), "commit": commit, "branch": dest, "ref": dest,
+            "remote": remote, "upstream": True, "wt": str(wt), "feedback": feedback,
+            "vendor": vendor, "title": title, "body_text": body_text, "base": base,
+            "model": model, "gate_result": gate_result or "", "attempts": attempts,
+        }
+        push_flag(tick, issue).write_text(str(issue))
+        pending = owner_handoff.prepare_retry(env, issue, reason, issue, binding)
+        if pending is None:
+            return handoff(f"{branch} is committed in {wt}; the push inputs could not be saved.")
+    else:
+        if found is None:
+            if push_flag(tick, issue).exists():
+                return handoff("The saved push operation is missing; not running the implementer again.")
+            return handoff("The saved push operation is missing.")
+        pending = found
+        binding = pending["continuation"]
+        if not pending.get("phase") and int(owner_handoff.clock()) < pending["due"]:
+            raise Deferred("handoff-retry", reason, lends_slot=False)
+        disposition = check_dev_push(tick, env, binding)
+        if disposition == "superseded":
+            advisor.finish_episode(env, "issue", issue, "superseded")
+            owner_handoff.clear_retry(env, issue, reason)
+            push_flag(tick, issue).unlink(missing_ok=True)
+            return 80
+        if disposition == "paused":
+            raise Deferred("handoff-retry", reason, lends_slot=False)
+        if disposition == "changed":
+            return handoff(f"{binding['branch']} is committed in {binding['wt']}; owner feedback changed.")
+        if pending.get("phase"):
+            if disposition == "ok" and owner_handoff.check_push_landed(binding) == "landed":
+                return finish_dev_push(tick, binding)
+            return handoff(f"{binding['branch']} is committed in {binding['wt']}; could not confirm the landed push.")
+        if pending["attempts"] < owner_handoff.MAX_ATTEMPTS:
+            result = stop(tick, issue, reason, title_msg, f"{text}. {url}", resume=True)
+            if isinstance(result, owner_handoff.Result):
+                if result.action == owner_handoff.DEFER:
+                    raise Deferred("handoff-retry", reason, lends_slot=False)
+                if result.action != owner_handoff.RETRY:
+                    push_flag(tick, issue).unlink(missing_ok=True)
+                    return 80
+                binding = result.continuation
+            else:
+                return result
+        if disposition != "ok":
+            if pending["attempts"] + 1 < owner_handoff.MAX_ATTEMPTS:
+                raise Deferred("handoff-retry", reason, lends_slot=False)
+            return handoff(f"{binding['branch']} is committed in {binding['wt']}; could not verify the owner inputs.")
+        if binding["remote"] is None:
+            if not owner_handoff.check_push_local(binding):
+                return handoff(f"{binding['branch']} is committed in {binding['wt']}; local inputs changed.")
+            remote, unreadable_transient = owner_handoff.observe_remote(binding["wt"], binding["branch"])
+            if remote is not None:
+                consumed = owner_handoff.load_retry(env, issue, reason)
+                binding = owner_handoff.save_push_baseline(
+                    env, issue, issue, consumed, remote, reason=reason)
+                pending = {**pending, "continuation": binding}
+            elif not unreadable_transient:
+                return handoff(f"{binding['branch']} is committed in {binding['wt']}; could not observe the remote ref.")
+
+    binding = pending["continuation"] if initial else binding
+    if not initial:
+        pr_helpers.gh("issue", "edit", issue, "-R", tick.gh_repo, "--add-label", "agent-wip")
+    pushed = None
+    if binding["remote"] is None:
+        status = "retry"
+    else:
+        status = owner_handoff.check_push_landed(binding)
+    if status == "absent" and (initial or pending["attempts"] < owner_handoff.MAX_ATTEMPTS):
+        pushed = push(binding["wt"], f"{binding['commit']}:refs/heads/{binding['branch']}",
+                      upstream=binding["upstream"], signoff=False)
+        if pushed:
+            status = "landed"
+        else:
+            status = owner_handoff.check_push_landed(binding)
+            if status != "landed" and not pushed.transient:
+                detail = pushed.detail or "permanent push failure"
+                return handoff(f"{binding['branch']} is committed in {binding['wt']}; {detail}.")
+            if status == "absent":
+                status = "retry"
+    if status == "landed":
+        landed = {**owner_handoff.load_retry(env, issue, reason), "phase": "landed"}
+        owner_handoff.restore_retry(env, issue, reason, issue, landed)
+        return finish_dev_push(tick, binding)
+    if status in ("changed", "failed"):
+        return handoff(f"{binding['branch']} is committed in {binding['wt']}; inputs changed or the remote is unreadable.")
+    if status == "retry":
+        attempts_n = pending["attempts"] + (0 if initial else 1)
+        if attempts_n < owner_handoff.MAX_ATTEMPTS:
+            now = int(owner_handoff.clock())
+            owner_handoff.restore_retry(
+                env, issue, reason, issue,
+                {**pending, "attempts": attempts_n, "scheduled": now,
+                 "due": now + owner_handoff.DELAYS[attempts_n]})
+            raise Deferred("handoff-retry", reason, lends_slot=False)
+    detail = getattr(pushed, "detail", "") or status
+    return handoff(f"{binding['branch']} is committed in {binding['wt']}; {detail}.")
+
+
+def waiting_dev_push(tick, env, issue):
+    try:
+        found = owner_handoff.load_retry(env, issue, owner_handoff.DEV_PUSH)
+    except owner_handoff.RetryUnreadable as exc:
+        return stop(tick, issue, owner_handoff.DEV_PUSH,
+                    f"#{issue}: pushing branch failed",
+                    f"Could not read the saved push operation: {exc}")
+    if found is None and push_flag(tick, issue).exists():
+        return stop(tick, issue, owner_handoff.DEV_PUSH,
+                    f"#{issue}: pushing branch failed",
+                    "The saved push operation is missing; not running the implementer again.")
+    return found
+
+
 def run(tick, issue):
     env, repo = tick.env.with_runtime(issue=str(issue)), tick.gh_repo
     branch, wt = names.for_issue(tick.wt_root, issue)
@@ -299,6 +512,18 @@ def run(tick, issue):
     url = f"https://github.com/{repo}/issues/{issue}"
     tick.active["issue"] = issue
     hooks = tick.hooks(issue)
+    waiting = waiting_dev_push(tick, env, issue)
+    if isinstance(waiting, dict):
+        return push_with_retry(tick, env, issue, wt, branch, vendor=waiting["continuation"]["vendor"],
+                               title=waiting["continuation"]["title"],
+                               body_text=waiting["continuation"]["body_text"],
+                               base=waiting["continuation"]["base"],
+                               attempts=waiting["continuation"]["attempts"],
+                               model=waiting["continuation"]["model"],
+                               gate_result=waiting["continuation"]["gate_result"],
+                               feedback=waiting["continuation"]["feedback"], pending=waiting)
+    if waiting is not None:
+        return 80
     runner = spec.Spec(env, hooks, issue)
     payload = tick.recovered_issues.pop(str(issue), None)
     if payload is None:
@@ -449,10 +674,6 @@ def run(tick, issue):
         if rc:
             explain(rounds)
             return stop(tick, issue, reason, title, url)
-    if not push(wt, branch, upstream=True, signoff=tick.env.repo.signoff):
-        stop(tick, issue, "dev_push_failed", f"#{issue}: pushing {dev_vendor}'s branch failed",
-             f"{branch} is committed in {wt}. {url}")
-        return 1
     lines = Path(body).read_text().split("\n")
     try:
         text = pr_body(check_section.canonicalize(Path(body).read_text()), issue)
@@ -465,23 +686,9 @@ def run(tick, issue):
         for attempt in attempts:
             if attempt[0] == dev_vendor:
                 attempt[1] = "unknown"
-    intent = {"issue": str(issue), "branch": branch, "wt": str(wt), "base": base,
-              "head": git(wt, "rev-parse", "HEAD"), "vendor": dev_vendor,
-              "model": attempts[-1][1], "attempts": attempts, "pr": ""}
-    save_opening(opening_path(tick, issue), intent)
-    recovery.clear(env, issue, issue)
-    attempts_path(tick, issue).unlink(missing_ok=True)
-    created = pr_helpers.gh("pr", "create", "-R", repo, "--head", branch, "--base", "main", "--title", lines[0], "--body", text)
-    if created.returncode != 0:
-        # A lost GitHub response may still have created the PR; leave the intent to reconcile.
-        tick.log(f"#{issue}: PR create returned an error; saved intent will be reconciled on the next tick"
-                 f"{pr_helpers.why(created)}")
-        tick.notify(f"#{issue}: PR creation needs reconciliation", f"branch {branch} is pushed. {url}")
-        return 1
-    pr = created.stdout.strip().rsplit("/", 1)[-1]
-    if not pr.isdecimal():
-        tick.log(f"#{issue}: PR create returned an unexpected URL; saved intent will be reconciled")
-        return 1
-    intent["pr"] = pr
-    save_opening(opening_path(tick, issue), intent)
-    return finish_opening(tick, intent, opening_path(tick, issue))
+    feedback = owner_feedback_digest(env.owner, payload["comments"])
+    model = attempts[-1][1] if attempts else "unknown"
+    return push_with_retry(
+        tick, env, issue, wt, branch, vendor=dev_vendor, title=lines[0], body_text=text,
+        base=base, attempts=attempts, model=model, gate_result=verifier.gate_result or "",
+        feedback=feedback)

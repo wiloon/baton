@@ -39,14 +39,19 @@ SPEC_REPLY_POST = "spec_reply_post_failed"
 SPEC_PENDING_ACCEPT_POST = "spec_pending_accept_post_failed"
 SPEC_ACCEPT_POST = "spec_accept_post_failed"
 FIX_PUSH = "fix_push_failed"
+DEV_PUSH = "dev_push_failed"
+SPEC_ADR_PUSH = "spec_adr_push_failed"
 COMMENT_POSTS = (REVIEW_POST, SCREENSHOT_POST)
 SPEC_POSTS = (SPEC_REVIEW_POST, SPEC_REPLY_POST)
 SPEC_ACCEPT_POSTS = (SPEC_PENDING_ACCEPT_POST, SPEC_ACCEPT_POST)
 # Spec comment posts and accept/pending-accept posts share tick discovery.
 SPEC_WRITE_POSTS = (*SPEC_POSTS, *SPEC_ACCEPT_POSTS)
+# Dev and ADR pushes are issue-scoped; fix pushes are PR-scoped.
+ISSUE_PUSHES = (DEV_PUSH, SPEC_ADR_PUSH)
+PUSH_REASONS = frozenset({FIX_PUSH, *ISSUE_PUSHES})
 RETRY_REASONS = frozenset({
     "review_comment_missing", "spec_comments_read_failed", "spec_pending_adr_read_failed",
-    *COMMENT_POSTS, *SPEC_WRITE_POSTS, FIX_PUSH,
+    *COMMENT_POSTS, *SPEC_WRITE_POSTS, *PUSH_REASONS,
 })
 
 # Categories: 1 rule-decided, 2 judgement, 3 needs investigation, 4 owner-only.
@@ -286,24 +291,28 @@ def _spec_accept_post_valid(item, binding, *, reason):
             and bool(re.fullmatch(r"[0-9a-f]{64}", binding["feedback"])))
 
 
-def _push_binding_valid(item, binding, *, reason):
-    """A push of a known post-sign-off commit to a destination ref (#151)."""
+def _push_core_valid(binding):
+    """Shared fields for a saved post-sign-off push to a destination ref (#151)."""
     commit, branch, remote = binding.get("commit"), binding.get("branch"), binding.get("remote")
-    ref, next_step = binding.get("ref"), binding.get("next")
-    if (not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit)
-            or not isinstance(branch, str) or not branch
-            or ref not in ("HEAD", branch)
-            or "remote" not in binding
-            or (remote is not None and not isinstance(remote, str))
-            or (remote and not re.fullmatch(r"[0-9a-f]{40}", remote))
-            or type(binding.get("upstream")) is not bool
-            or not isinstance(binding.get("wt"), str) or not binding["wt"]
-            or next_step not in ("done", "handoff", "recover")):
+    ref = binding.get("ref")
+    return (isinstance(commit, str) and bool(re.fullmatch(r"[0-9a-f]{40}", commit))
+            and isinstance(branch, str) and bool(branch)
+            and ref in ("HEAD", branch)
+            and "remote" in binding
+            and (remote is None or isinstance(remote, str))
+            and (not remote or bool(re.fullmatch(r"[0-9a-f]{40}", remote)))
+            and type(binding.get("upstream")) is bool
+            and isinstance(binding.get("wt"), str) and bool(binding["wt"])
+            and isinstance(binding.get("feedback"), str)
+            and bool(re.fullmatch(r"[0-9a-f]{64}", binding["feedback"])))
+
+
+def _fix_push_binding_valid(item, binding):
+    next_step = binding.get("next")
+    if next_step not in ("done", "handoff", "recover"):
         return False
     if (binding.get("pr") != item or not isinstance(binding.get("issue"), str)
             or (binding["issue"] and not binding["issue"].isdecimal())):
-        return False
-    if not isinstance(binding.get("feedback"), str) or not re.fullmatch(r"[0-9a-f]{64}", binding["feedback"]):
         return False
     caller, ci_head = binding.get("caller"), binding.get("ci_head")
     if caller == "ci":
@@ -337,6 +346,55 @@ def _push_binding_valid(item, binding, *, reason):
         return False
     return (isinstance(binding.get("who"), str)
             and type(binding.get("clear_cursor")) is bool)
+
+
+def _dev_push_binding_valid(item, binding):
+    attempts = binding.get("attempts")
+    return (binding.get("issue") == item
+            and binding.get("vendor") in ("claude", "codex", "cursor")
+            and isinstance(binding.get("title"), str) and bool(binding["title"])
+            and isinstance(binding.get("body_text"), str)
+            and isinstance(binding.get("base"), str) and bool(re.fullmatch(r"[0-9a-f]{40}", binding["base"]))
+            and isinstance(binding.get("model"), str)
+            and isinstance(binding.get("gate_result"), str)
+            and isinstance(attempts, list)
+            and all(isinstance(row, list) and len(row) == 4
+                    and all(isinstance(cell, str) for cell in row) for row in attempts))
+
+
+def _spec_adr_push_binding_valid(item, binding):
+    boundary = binding.get("comment_ids")
+    return (binding.get("issue") == item
+            and binding.get("reviser") in ("claude", "codex", "cursor")
+            and type(binding.get("round")) is int and binding["round"] > 0
+            and isinstance(binding.get("issue_body"), str)
+            and bool(re.fullmatch(r"[0-9a-f]{64}", binding["issue_body"]))
+            and isinstance(binding.get("reply"), str)
+            and isinstance(binding.get("mode_note"), str)
+            and isinstance(binding.get("model"), str)
+            and binding.get("human") in ("", " human")
+            and binding.get("next") in ("review", "human")
+            and type(binding.get("max_rounds")) is int and binding["max_rounds"] > 0
+            and isinstance(binding.get("limit_why"), str) and bool(binding["limit_why"])
+            and isinstance(binding.get("pr"), str)
+            and (binding["pr"] == "" or binding["pr"].isdecimal())
+            and isinstance(boundary, list)
+            and all(type(value) is int and value > 0 for value in boundary)
+            and len(set(boundary)) == len(boundary)
+            and isinstance(binding.get("author"), str) and bool(binding["author"]))
+
+
+def _push_binding_valid(item, binding, *, reason):
+    """A push of a known post-sign-off commit to a destination ref (#151)."""
+    if not _push_core_valid(binding):
+        return False
+    if reason == FIX_PUSH:
+        return _fix_push_binding_valid(item, binding)
+    if reason == DEV_PUSH:
+        return _dev_push_binding_valid(item, binding)
+    if reason == SPEC_ADR_PUSH:
+        return _spec_adr_push_binding_valid(item, binding)
+    return False
 
 
 def _push_recovery_valid(context):
@@ -374,7 +432,7 @@ def _binding_valid(reason, item, binding):
         return _spec_comment_post_valid(item, binding, reason=reason)
     if reason in SPEC_ACCEPT_POSTS:
         return _spec_accept_post_valid(item, binding, reason=reason)
-    if reason == FIX_PUSH:
+    if reason in PUSH_REASONS:
         return _push_binding_valid(item, binding, reason=reason)
     return (binding.get("pr") == item and type(binding.get("round")) is int and binding["round"] > 0
             and all(isinstance(binding.get(key), str) for key in
@@ -402,7 +460,7 @@ def load_retry(env, episode, reason, item=""):
     if waiting != expected:
         # A due fix push can learn its baseline before the retry copy is replaced.
         observed = waiting.get("continuation")
-        if (reason != FIX_PUSH or not isinstance(binding, dict) or not isinstance(observed, dict)
+        if (reason not in PUSH_REASONS or not isinstance(binding, dict) or not isinstance(observed, dict)
                 or "remote" not in binding or binding["remote"] is not None or observed.get("remote") is None
                 or type(data.get("attempts")) is not int or data["attempts"] < 1
                 or waiting != {**expected, "continuation": {**binding, "remote": observed["remote"]}}):
@@ -413,10 +471,12 @@ def load_retry(env, episode, reason, item=""):
         raise RetryUnreadable(f"invalid continuation in {path.name}")
     if "confirmed" in data and (reason not in (*SPEC_POSTS, SPEC_ACCEPT_POST) or data["confirmed"] is not True):
         raise RetryUnreadable(f"invalid confirmed-post phase in {path.name}")
-    if "phase" in data and (reason != FIX_PUSH or data["phase"] not in ("landed", "finished")
-                            or binding["remote"] is None
-                            or (data["phase"] == "finished" and binding["next"] != "done")):
-        raise RetryUnreadable(f"invalid push phase in {path.name}")
+    if "phase" in data:
+        finished_ok = (reason == FIX_PUSH and binding.get("next") == "done") or reason in ISSUE_PUSHES
+        if (reason not in PUSH_REASONS or data["phase"] not in ("landed", "finished")
+                or binding["remote"] is None
+                or (data["phase"] == "finished" and not finished_ok)):
+            raise RetryUnreadable(f"invalid push phase in {path.name}")
     attempts, due, scheduled = data.get("attempts"), data.get("due"), data.get("scheduled")
     if type(attempts) is not int or not (0 <= attempts <= MAX_ATTEMPTS):
         raise RetryUnreadable(f"out-of-range attempts in {path.name}")
@@ -436,12 +496,12 @@ def restore_retry(env, episode, reason, item, pending):
     atomic_json(retry_path(env, episode, reason, item), pending)
 
 
-def save_push_baseline(env, episode, item, pending, remote):
+def save_push_baseline(env, episode, item, pending, remote, reason=FIX_PUSH):
     """Record the first observed remote in both copies before issuing any push."""
     binding = {**pending["continuation"], "remote": remote}
-    waiting = {"episode": episode, "item": item, "reason": FIX_PUSH, "continuation": binding}
-    atomic_json(waiting_path(env, episode, FIX_PUSH, item), waiting)
-    restore_retry(env, episode, FIX_PUSH, item, {**pending, "continuation": binding})
+    waiting = {"episode": episode, "item": item, "reason": reason, "continuation": binding}
+    atomic_json(waiting_path(env, episode, reason, item), waiting)
+    restore_retry(env, episode, reason, item, {**pending, "continuation": binding})
     return binding
 
 
@@ -532,6 +592,10 @@ def clear_retry(env, episode, reason, item=""):
             _clear_path(path)
         except OSError as exc:
             notify.log(f"could not clear {path.name}: {exc}")
+    if reason == DEV_PUSH:
+        Path(env.dirs.state, f"dev-push-waiting-{episode}").unlink(missing_ok=True)
+    elif reason == SPEC_ADR_PUSH:
+        Path(env.dirs.state, f"spec-adr-push-waiting-{episode}").unlink(missing_ok=True)
 
 
 def clear_episode(env, episode, item=""):

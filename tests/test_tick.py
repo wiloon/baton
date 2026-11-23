@@ -5,6 +5,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import time
@@ -12,7 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from baton import capacity, dev, fix, merge, notify, pick, review, scan, spec, tick
+from baton import capacity, dev, fix, handoff, merge, notify, pick, review, scan, spec, tick
 from baton.common import Deferred
 from conftest import issue_snapshot_pages, sh
 
@@ -1964,6 +1965,75 @@ def test_a_dirty_worktree_is_not_pushed(devrun):
     devrun.go()
     assert "left uncommitted or untracked files" in body_of(devrun.gh.ran("issue", "comment")[0])
     assert "agent/issue-300" not in sh(devrun.repo, "git", "ls-remote", "--heads", "origin")
+
+
+def test_a_transient_dev_push_defers_then_recovers_without_a_second_worker(devrun, monkeypatch):
+    """dev_push_failed: no early replay, one worker, landed after 60s (#151)."""
+    from baton import common, handoff, session
+
+    clock = {"now": 1_000}
+    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
+    pushes, real = [], common.push
+
+    def flaky(wt, ref, *, upstream=False, signoff=False):
+        pushes.append(clock["now"])
+        if clock["now"] < 1_060:
+            return common.PushResult(False, transient=True, detail="connection refused")
+        return real(wt, ref, upstream=upstream, signoff=signoff)
+
+    monkeypatch.setattr(dev, "push", flaky)
+    devrun.script = [implements()]
+    t, rc = devrun.go()
+    assert rc == 75 and not devrun.gh.ran("pr", "create") and len(devrun.runs) == 1
+    saved = handoff.load_retry(session.resolve(devrun.env), "300", "dev_push_failed")
+    assert saved["attempts"] == 0 and re.fullmatch(r"[0-9a-f]{40}", saved["continuation"]["commit"])
+    clock["now"] = 1_059
+    before = len(pushes)
+    t, rc = devrun.go()
+    assert rc == 75 and len(pushes) == before and len(devrun.runs) == 1
+    clock["now"] = 1_060
+    t, rc = devrun.go()
+    assert rc == 80 and len(devrun.runs) == 1 and set(pushes) == {1_000, 1_060}
+    assert devrun.gh.ran("pr", "create")
+    assert handoff.load_retry(session.resolve(devrun.env), "300", "dev_push_failed") is None
+
+
+def test_a_lost_dev_push_response_is_recognized_without_a_second_write(devrun, monkeypatch):
+    from baton import common
+
+    pushes, real = [], common.push
+
+    def write_then_fail(wt, ref, *, upstream=False, signoff=False):
+        pushes.append(ref)
+        result = real(wt, ref, upstream=upstream, signoff=signoff)
+        assert result.ok
+        return common.PushResult(False, transient=True, detail="connection reset")
+
+    monkeypatch.setattr(dev, "push", write_then_fail)
+    devrun.script = [implements()]
+    t, rc = devrun.go()
+    assert rc == 80 and len(pushes) == 1 and devrun.gh.ran("pr", "create")
+
+
+def test_an_exhausted_dev_push_hands_off_exactly_once(devrun, monkeypatch):
+    from baton import common, handoff, session
+
+    clock = {"now": 1_000}
+    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
+    sent = []
+    monkeypatch.setattr(handoff.notify, "notify", lambda title, text="": sent.append((title, text)))
+    monkeypatch.setattr(dev, "push",
+                        lambda *a, **k: common.PushResult(False, transient=True, detail="connection refused"))
+    devrun.script = [implements()]
+    t, rc = devrun.go()
+    assert rc == 75
+    for now in (1_060, 1_360):
+        clock["now"] = now
+        t, rc = devrun.go()
+        assert rc == (80 if now == 1_360 else 75)
+    assert len(devrun.runs) == 1 and not devrun.gh.ran("pr", "create")
+    assert sum("dev_push_failed" in f"{title} {text}" for title, text in sent) == 1
+    assert handoff.load_retry(session.resolve(devrun.env), "300", "dev_push_failed") is None
 
 
 def test_failed_verification_posts_the_failure(devrun):
