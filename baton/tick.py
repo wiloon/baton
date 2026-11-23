@@ -347,7 +347,10 @@ class Tick:
         return (out or "").strip()
 
     def cleanup(self):
+        waiting_posts = {issue for issue, reason in self.pending_specs().items() if reason in owner_handoff.SPEC_POSTS}
         for n, path in names.worktrees(self.wt_root):
+            if n in waiting_posts:
+                continue
             wt = str(path)
             if self.state_of("issue", n) == "CLOSED":
                 advisor.finish_episode(self.env, "issue", n, "closed")
@@ -360,6 +363,8 @@ class Tick:
         for wt in sorted(glob.glob(str(self.wt_root / "spec-*/"))):
             wt = wt.rstrip("/")
             n = os.path.basename(wt).removeprefix("spec-")
+            if n in waiting_posts:
+                continue
             if self.state_of("issue", n) == "CLOSED":
                 advisor.finish_episode(self.env, "issue", n, "closed")
                 merge.remove_worktree(self.repo_dir, wt)
@@ -642,9 +647,10 @@ class Tick:
 
     # --- pick work: an issue for the pipeline ------------------------------------------------------
     def pending_specs(self):
-        """Resume durable spec reads before new work can be blocked by admission or labels."""
+        """Resume durable spec reads and comment posts before new work can be blocked by admission or labels."""
         found = {}
-        for reason in ("spec_comments_read_failed", "spec_pending_adr_read_failed"):
+        for reason in ("spec_comments_read_failed", "spec_pending_adr_read_failed",
+                       *owner_handoff.SPEC_POSTS):
             for prefix in ("waiting", "retry"):
                 for path in self.state.glob(f"handoff-{prefix}-*-{reason}.json"):
                     issue = path.name.removeprefix(f"handoff-{prefix}-").removesuffix(f"-{reason}.json")
@@ -653,7 +659,8 @@ class Tick:
         return found
 
     def resume_spec(self, issue):
-        self.spec_loop(issue)
+        if self.spec_loop(issue):
+            return dev.run(self, issue)   # an accept after a resumed post goes straight to dev
         return 80
 
     def pick_issue(self):
@@ -668,6 +675,17 @@ class Tick:
         for issue in sorted(pending, key=int):
             if self.force_issue and self.force_issue != issue:
                 continue
+            reason = pending[issue]
+            if reason in owner_handoff.SPEC_POSTS:
+                try:
+                    post = owner_handoff.load_retry(self.env, issue, reason)
+                except owner_handoff.RetryUnreadable:
+                    post = None  # Let the spec loop handle damaged state.
+                if (post and (post.get("reads") is not None or not post.get("confirmed") and post["attempts"] < owner_handoff.MAX_ATTEMPTS)
+                        and owner_handoff.clock() < post["due"]):
+                    if self.force_issue:
+                        return self.defer("handoff-retry", reason)
+                    continue
             data = self.gh_json("issue", "view", issue, "-R", self.gh_repo, "--json", "state,labels")
             if not isinstance(data, dict) or data.get("state") not in ("OPEN", "CLOSED"):
                 continue
@@ -678,7 +696,7 @@ class Tick:
             if not isinstance(labels, list) or any(not isinstance(label, dict) or label.get("name") == "ready-for-human"
                                                   for label in labels):
                 continue
-            if pending[issue] == "spec_pending_adr_read_failed":
+            if reason in ("spec_pending_adr_read_failed", *owner_handoff.SPEC_POSTS):
                 done = self.after_item(self.item(lambda: self.resume_spec(issue)))
             else:
                 done = self.after_item(self.item(lambda: dev.run(self, issue)))

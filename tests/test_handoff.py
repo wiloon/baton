@@ -306,10 +306,21 @@ def test_damage_to_a_waiting_review_hands_off_once(env, monkeypatch, damage):
     assert handoff.load_retry(env, "9", reason, "3") is None
 
 
+def spec_post_binding(issue="7", *, reply=False):
+    marker = "baton-spec-reply" if reply else "baton-spec-review"
+    body = f"<!-- {marker} round=1 by=claude -->\npoints"
+    return {"issue": issue, "pr": "", "round": 1, "reviewer": "claude", "author": "owner",
+            "body": body, "digest": handoff.body_digest(body), "issue_body": "c" * 64,
+            "adr_head": "", "feedback": "d" * 64, "comment_ids": [],
+            "next": "review" if reply else "revise", "reply": "points", "max_rounds": 3,
+            "mode_note": "", "limit_why": "still has points", "run_id": ""}
+
+
 def test_every_category_1_reason_is_rule_mode_with_retry_budget():
     assert handoff.RETRY_REASONS == {
         "review_comment_missing", "spec_comments_read_failed", "spec_pending_adr_read_failed",
         "review_comment_post_failed", "screenshot_comment_post_failed",
+        "spec_review_comment_post_failed", "spec_reply_post_failed",
     }
     for reason in handoff.RETRY_REASONS:
         entry = handoff.REASONS[reason]
@@ -323,6 +334,8 @@ def test_every_category_1_reason_is_rule_mode_with_retry_budget():
     ("review_comment_post_failed", post_binding("1")),
     ("screenshot_comment_post_failed",
      post_binding("1", body="<!-- baton-screenshot-review round=1 by=claude -->\npass")),
+    ("spec_review_comment_post_failed", spec_post_binding("1")),
+    ("spec_reply_post_failed", spec_post_binding("1", reply=True)),
 ])
 def test_each_category_1_reason_defers_then_hands_off_through_perform(env, monkeypatch, reason, binding):
     """Every replayed read or comment post shares the same budget: no advisor, two later attempts, then handoff."""

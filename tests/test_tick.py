@@ -14,7 +14,7 @@ import pytest
 
 from baton import capacity, dev, fix, merge, notify, pick, review, scan, spec, tick
 from baton.common import Deferred
-from conftest import sh
+from conftest import issue_snapshot_pages, sh
 
 REAL_CURSOR_PLAN = spec.cursor_plan   # the devrun fixture stubs it
 
@@ -31,17 +31,21 @@ class FakeGH:
 
     def __call__(self, *args, input=None):
         self.calls.append(list(args))
-        head = " ".join(args[:2])
+        graphql = args[:2] == ("api", "graphql")
+        head = "issue view" if graphql else " ".join(args[:2])
         if head in self.fails:
             return subprocess.CompletedProcess(args, 1, "", "boom")
         answer = self.answers.get(head, "[]" if list(args[1:2]) == ["list"] else "")
         if callable(answer):
-            answer = answer(args)
-        if args[:2] == ("issue", "view") and "title,body,comments" in args and (
+            issue = next(arg.removeprefix("issue=") for arg in args if arg.startswith("issue=")) if graphql else None
+            answer = answer(("issue", "view", issue, "--json", "title,body,comments") if graphql else args)
+        if graphql and (
                 "issue view" not in self.answers or isinstance(answer, dict) and "comments" not in answer):
             answer = {"title": "Issue", "body": "Body", **(answer if isinstance(answer, dict) else {}), "comments": [
                 {"author": {"login": "owner"}, "body": "<!-- baton-verdict: accept -->\nPlan"}
             ]}
+        if graphql and isinstance(answer, dict) and "comments" in answer:
+            answer = issue_snapshot_pages(answer)
         if isinstance(answer, subprocess.CompletedProcess):
             return answer
         if not isinstance(answer, str):
@@ -1843,9 +1847,11 @@ def test_tick_run_counts_comment_reads_across_both_delays(ctx, monkeypatch, forc
             if clock["now"] < 1_360:
                 return subprocess.CompletedProcess(args, 1, "", "HTTP 503 boom")
             return {"title": "Recovered title", "body": "Recovered body", "comments": [
-                {"author": {"login": "owner"}, "body": "<!-- baton-spec-reply round=2 by=claude -->\nRecovered reply"}
+                {"id": 1, "author": {"login": "owner"},
+                 "body": "<!-- baton-spec-reply round=2 by=claude -->\nRecovered reply"}
             ]}
-        return {"labels": [{"name": "ready-for-agent"}], "author": {"login": "owner"}, "state": "OPEN"}
+        return {"labels": [{"name": "ready-for-agent"}], "author": {"login": "owner"},
+                "state": "OPEN", "body": "Recovered body"}
 
     def worker(vendor, role, prompt, tag, *args, **kwargs):
         context, = Path(ctx.env["CTX"]).glob("issue-12-spec-3-review-*.md")
@@ -1878,10 +1884,13 @@ def test_tick_resumes_pending_adr_even_with_agent_wip_and_no_vendor(ctx, monkeyp
     pending = f"<!-- baton-spec-accept-pending pr=77 head={'a' * 40} -->\n{verdict}"
 
     def read_issue(args):
+        posted = [{"author": {"login": "owner"}, "body": body_of(call)} for call in ctx.gh.ran("issue", "comment")]
         return {"title": "Plan", "body": "Body", "state": "OPEN", "labels": ready["labels"], "comments": [
-            {"author": {"login": "owner"}, "body": pending}]}
+            {"author": {"login": "owner"}, "body": pending}, *posted]}
 
     def read_pr(args):
+        if "state,headRefOid" not in args:   # dev's own look-up after the resumed accept
+            return {}
         reads.append(now)
         if len(reads) == 1:
             return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
@@ -1889,6 +1898,8 @@ def test_tick_resumes_pending_adr_even_with_agent_wip_and_no_vendor(ctx, monkeyp
 
     ctx.gh.answers.update({"issue view": read_issue, "pr view": read_pr})
     monkeypatch.setattr(tick.Tick, "pick_vendor", lambda *a, **k: pytest.fail("acceptance needs no worker"))
+    started = []
+    monkeypatch.setattr(dev, "setup_worktree", lambda *a: started.append(a) or ("", False))
     ctx.make().run()
     assert reads == [1_000]
     ready["labels"].append({"name": "agent-wip"})
@@ -1901,3 +1912,4 @@ def test_tick_resumes_pending_adr_even_with_agent_wip_and_no_vendor(ctx, monkeyp
     ctx.make().run()
     assert reads == [1_000, 1_060]
     assert [body_of(call) for call in ctx.gh.ran("issue", "comment")] == [verdict]
+    assert len(started) == 1   # the accept went straight on to dev, not back to the queue
