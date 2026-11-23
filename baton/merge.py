@@ -23,7 +23,7 @@ import subprocess
 import sys
 import time
 
-from . import advisor, after_merge, check_verdicts, checks, ci, fix, hooks as telemetry, names, notify, pick, pr as pr_helpers
+from . import advisor, after_merge, check_verdicts, checkpoint, checks, ci, fix, hooks as telemetry, names, notify, pick, pr as pr_helpers
 from .common import Deferred, git
 
 
@@ -60,11 +60,12 @@ class Merger:
     @session.scoped
     def __init__(self, env, hooks, pr, issue=""):
         env = session.resolve(env)
-        self.env, self.hooks, self.pr, self.issue = env, hooks, pr, issue
+        self.env, self.hooks, self.pr, self.issue = env.with_runtime(issue=issue), hooks, pr, issue
         self.state, self.ctx, self.repo = str(env.dirs.state), str(env.dirs.ctx), env.repo.gh_repo
         self.url = f"https://github.com/{self.repo}/pull/{pr}"
         self.last_ci = ("", 0, 0)
         self.merge_head = ""
+        self.approved_head = ""
 
     def label(self, *options):
         pr_helpers.gh("pr", "edit", str(self.pr), "-R", self.repo, *options)
@@ -149,14 +150,21 @@ class Merger:
         waiting = runner.waiting_push(pr)   # before any CI read or vendor choice (#151)
         if waiting == "unreadable":
             return HANDED_OFF if runner.handed_off else 1
-        head_file = Path(self.state, f"ci-fix-waiting-{pr}")
         if waiting is not None:
-            head = head_file.read_text().strip() if head_file.is_file() else ""
+            binding = waiting["continuation"]
+            if binding["caller"] != "ci":
+                runner.handoff(pr, "fix_push_failed", f"PR #{pr}: pushing fix failed",
+                               "The saved push does not belong to a CI repair.")
+                return HANDED_OFF
+            head = binding["ci_head"]
         else:
             found = ci.classify(str(pr), self.state, list(self.env.repo.ci_fixable_checks))
-            if found is None or not re.fullmatch(r"[a-f0-9]{40,64}", found["head"]):
+            if found is None or not re.fullmatch(r"[a-f0-9]{40}", found["head"]):
                 return 1
             head = found["head"]
+            if self.approved_head and head != self.approved_head:
+                return 1
+        runner.ci_failed_head = head
         try:
             if waiting is not None:
                 # Resume the saved push without picking another fixer (#151).
@@ -167,24 +175,32 @@ class Merger:
                 fixer = pick.choose(self.env, "fixer", "agent", "contrib", pick.all_vendors(self.env),
                                     pr=str(pr), issue=self.issue)
                 notify.log(f"PR #{pr}: code-only CI failure on {head}; one repair round by {fixer}")
-                head_file.write_text(head)
                 rc = fix.fix_pr(runner, pr, wt, fixer, "CI code checks", found["feedback"])
         except Deferred as deferred:
             # Category-1 push waits keep the repair; a vendor deferral still hands the head off (#151).
             if deferred.vendor == "handoff-retry":
                 raise
-            head_file.unlink(missing_ok=True)
             rc = 75
-        head_file.unlink(missing_ok=True)
         if rc == 75:
             notify.log(f"PR #{pr}: CI repair deferred; handing off this head")
             return 1
-        if head:
-            Path(self.state, f"ci-fix-{pr}-{head}").touch()   # one repair round for this PR head, even across ticks
+        if rc == fix.PUSH_SUPERSEDED:
+            return HANDED_OFF
+        Path(self.state, f"ci-fix-{pr}-{head}").touch()   # one repair round for this PR head, even across ticks
         if rc != 0:
             # Only a real handoff by the repair run ends here; any other failure (e.g. recording
             # authorship) falls through to the merge gate's own CI handoff.
             return HANDED_OFF if runner.handed_off else 1
+        if completed := runner.waiting_push(pr):
+            if completed == "unreadable":
+                return HANDED_OFF
+            repaired_head = completed["continuation"]["commit"]
+            if self.approved_head:
+                path = Path(self.state, f"review-pending-{pr}")
+                saved = checkpoint.read(path)
+                checkpoint.write(path, {**saved, "merge_head": repaired_head})
+                self.approved_head = repaired_head
+            runner.acknowledge_push(pr)
         self.hooks.task("ci_fix", f"pr:{pr}:{head}", "--agent", fixer, "--head-sha", head)
         return 0
 
@@ -308,10 +324,12 @@ class Merger:
         Returns {"ok": True} or {"ok": False, "reason": ..., "detail": ..., "gate": ...}.
         """
         pr, repo = str(self.pr), self.repo
-        updates, match_sha = 0, None
+        updates, match_sha = 0, self.approved_head or None
         data = self.pr_merge_state()
         while True:
             self.merge_head = (data or {}).get("headRefOid") or ""
+            if self.approved_head and self.merge_head != self.approved_head:
+                return {"ok": False, "reason": "head_changed", "detail": " The approved head changed."}
             status = (data or {}).get("mergeStateStatus")
             if status == "BEHIND":
                 if updates >= 3:
@@ -329,6 +347,8 @@ class Merger:
                             "detail": " branch head did not change after update-branch"}
                 updates += 1
                 match_sha = new_sha
+                if self.approved_head:
+                    self.approved_head = new_sha
                 self.merge_head = new_sha
                 if not self.ci_green(minutes):
                     return {"ok": False, "reason": "ci_after_update_not_green", "detail": ""}
@@ -345,7 +365,7 @@ class Merger:
             data = self.pr_merge_state()   # carried into the next iteration, never re-read
             if (data or {}).get("mergeStateStatus") != "BEHIND":
                 return {"ok": False, "reason": "merge_failed", "detail": pr_helpers.why(merged)}
-            match_sha = None
+            match_sha = self.approved_head or None
 
     # --- owner-review paths (#131) ---
     def owner_paths_touched(self):
@@ -381,7 +401,10 @@ class Merger:
             if not deferred and (body is None or not pr_helpers.checks_none(body)):
                 notify.send_shots(pr, note="Checks for you" if left is None else "", left=owed)
             return
-        if Path(self.state, f"fix-push-waiting-{pr}").exists() or not self.ci_green(45):
+        waiting = fix.Runner(self.env, self.hooks, pr, "ci").waiting_push(pr)
+        if waiting == "unreadable":
+            return
+        if waiting or not self.ci_green(45):
             repaired = self.ci_fix_round(wt)
             if repaired == HANDED_OFF:
                 return

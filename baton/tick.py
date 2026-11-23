@@ -146,13 +146,15 @@ class Tick:
             Path(item).unlink(missing_ok=True)
         a, state = self.active, self.state
         if rc != 75:
-            if a.get("pr"):   # a non-deferred attempt ends the PR's slot loan
-                (state / f"slot-deferred-{a['pr']}").unlink(missing_ok=True)
-            if a["review"]:
+            pr = a.get("pr")
+            if pr:   # a non-deferred attempt ends the PR's slot loan
+                (state / f"slot-deferred-{pr}").unlink(missing_ok=True)
+            push_pending = pr and pr in self.fix_push_episodes()
+            if a["review"] and not push_pending:
                 (state / f"review-pending-{a['review']}").unlink(missing_ok=True)
             if a["spec"]:
                 (state / f"spec-paused-{a['spec']}").unlink(missing_ok=True)
-            if a["cursor_fix"]:
+            if a["cursor_fix"] and not push_pending:
                 n = a["cursor_fix"]
                 for path in (state / f"cursor-fix-base-{n}", state / f"pr-body-base-{n}",
                              state / f"cursor-fix-task-{n}", state / f"owner-fix-feedback-{n}",
@@ -193,6 +195,8 @@ class Tick:
         cooldown lends its max_pending_prs slot (state file slot-deferred-<pr>). A lease-only
         deferral (the vendor's capacity is reserved for a moment) does not."""
         pr = self.active.get("pr")
+        if pr and deferred.vendor == "handoff-retry" and deferred.reason == owner_handoff.FIX_PUSH:
+            (self.state / f"slot-deferred-{pr}").unlink(missing_ok=True)
         if not pr or not deferred.lends_slot:
             return
         info = self.gh_json("pr", "view", str(pr), "-R", self.gh_repo, "--json", "state,headRefName,labels")
@@ -299,6 +303,7 @@ class Tick:
             return self.scan_command()
         self.file_merged_follow_ups()
         if (self.force_pr and not self.comment_post_pending(self.force_pr)
+                and self.force_pr not in self.fix_push_episodes()
                 and not self.is_agent_branch(self.force_pr)):
             print("python -m baton pr N takes an agent/issue-N PR; for the owner's own PR use python -m baton review N", file=sys.stderr)
             return 2
@@ -349,8 +354,10 @@ class Tick:
     def cleanup(self):
         waiting_posts = {issue for issue, reason in self.pending_specs().items()
                          if reason in owner_handoff.SPEC_WRITE_POSTS}
+        waiting_pushes = self.fix_push_episodes()
+        waiting_issues = set().union(*waiting_pushes.values())
         for n, path in names.worktrees(self.wt_root):
-            if n in waiting_posts:
+            if n in waiting_posts or n in waiting_issues:
                 continue
             wt = str(path)
             if self.state_of("issue", n) == "CLOSED":
@@ -374,6 +381,8 @@ class Tick:
         for wt in sorted(glob.glob(str(self.wt_root / "pr-*/"))):
             wt = wt.rstrip("/")
             n = os.path.basename(wt).removeprefix("pr-")
+            if n in waiting_pushes:
+                continue
             state = self.state_of("pr", n)
             if state in ("MERGED", "CLOSED"):
                 advisor.finish_episode(self.env, "pr", n, state.lower())
@@ -510,7 +519,10 @@ class Tick:
         if not saved:
             return 0
         post = post_episodes or saved.get("post_waiting") or saved.get("post_outcome")
-        if not post and (saved.get("step") != "fix" or not (saved.get("reviewed_head") or saved.get("feedback_waiting"))):
+        push = pr in self.fix_push_episodes()
+        if push:
+            (self.state / f"slot-deferred-{pr}").unlink(missing_ok=True)
+        if not post and not push and (saved.get("step") != "fix" or not (saved.get("reviewed_head") or saved.get("feedback_waiting"))):
             state = self.state_of("pr", pr)
             if state not in ("OPEN", "MERGED", "CLOSED"):
                 return 0
@@ -531,10 +543,14 @@ class Tick:
         if self.force_issue or self.force_pr:
             return None
         pr = self.force_review
+        pushes = self.fix_push_episodes()
+        if pr in pushes:
+            return None
         if not pr:
             listed = self.gh_json("pr", "list", "-R", self.gh_repo, "--state", "open", "--label", "agent-review",
                                   "--limit", "20", "--json", "number") or []
-            pr = str(min((p["number"] for p in listed if not self.comment_post_pending(str(p["number"]))),
+            pr = str(min((p["number"] for p in listed if str(p["number"]) not in pushes
+                          and not self.comment_post_pending(str(p["number"]))),
                          default=""))
         if not pr:
             return None
@@ -576,10 +592,32 @@ class Tick:
         return 75 if rc == 75 else 80
 
     # --- pick work: an agent PR the owner labelled agent-fix --------------------------------------
+    def fix_push_episodes(self):
+        found = owner_handoff.operation_episodes(self.env, (owner_handoff.FIX_PUSH,))
+        for flag in self.state.glob("fix-push-waiting-*"):
+            pr = flag.name.removeprefix("fix-push-waiting-")
+            if not pr.isdecimal() or pr in found:
+                continue
+            try:
+                issue = flag.read_text().strip()
+            except (OSError, ValueError):
+                issue = ""
+            found[pr] = {issue if issue.isdecimal() else pr}
+        return found
+
     def pick_fix(self):
         """The owner's review comments go to the vendor that changed the fewest lines of the PR and
         can run now (pick_by_contrib), then the review loop runs again."""
-        if self.force_issue:
+        if self.force_issue or self.force_review:
+            return None
+        pushes = self.fix_push_episodes()
+        for pr, episodes in sorted(pushes.items(), key=lambda pair: int(pair[0])):
+            if (self.force_pr and self.force_pr != pr) or (self.state / f"review-pending-{pr}").exists():
+                continue
+            done = self.after_item(self.item(lambda pr=pr, episodes=episodes: self.resume_standalone_push(pr, episodes)))
+            if done is not None:
+                return done
+        if self.force_pr in pushes:
             return None
         if self.force_pr:
             pr = self.force_pr
@@ -588,6 +626,7 @@ class Tick:
             listed = self.gh_json("pr", "list", "-R", self.gh_repo, "--state", "open", "--label", "agent-fix",
                                   "--limit", "20", "--json", "number,headRefName") or []
             listed = sorted((p for p in listed if names.issue_of(p["headRefName"])
+                             and str(p["number"]) not in pushes
                              and not self.comment_post_pending(str(p["number"]))), key=lambda p: p["number"])
             pr, head_ref = (str(listed[0]["number"]), listed[0]["headRefName"]) if listed else ("", "")
         if not pr:
@@ -597,6 +636,8 @@ class Tick:
     def fix_item(self, pr, head_ref):
         self.active["cursor_fix"] = self.active["pr"] = str(pr)
         issue = names.issue_of(head_ref)
+        if episodes := self.fix_push_episodes().get(pr):
+            return self.resume_standalone_push(pr, episodes)
         wt = str(names.worktree_for(self.wt_root, head_ref))
         url = f"https://github.com/{self.gh_repo}/pull/{pr}"
         if not os.path.isdir(wt) and session.run_process(["git", "-C", self.repo_dir, "worktree", "add", "-q", "-B", head_ref, wt,
@@ -614,45 +655,71 @@ class Tick:
                 hooks=self.hooks(issue or "0", pr=pr))
             return 80
         feedback_file = self.state / f"owner-fix-feedback-{pr}"
-        # A saved push resumes first: no reads, notifications or vendor choice before it is due (#151).
-        waiting = fix.Runner(self.env.with_runtime(issue=issue, pr=str(pr)), self.hooks(issue, pr), pr, "").waiting_push(pr)
-        if waiting is not None:
-            feedback = feedback_file.read_text() if feedback_file.is_file() else ""
-            fixer = "claude" if waiting == "unreadable" else waiting["continuation"].get("fixer") or "claude"
-            rc = 1 if waiting == "unreadable" else self.fix_pr(pr, wt, fixer, f"{self.owner} (the repository owner)", feedback, issue)
-            if rc == 75:
-                return 75
-        else:
-            feedback = feedback_file.read_text() if feedback_file.is_file() else review.human_feedback(self.gh_repo, self.owner, pr)
-            if not feedback.strip():
+        feedback = feedback_file.read_text() if feedback_file.is_file() else review.human_feedback(self.gh_repo, self.owner, pr)
+        if not feedback.strip():
+            pr_helpers.gh("pr", "edit", pr, "-R", self.gh_repo, "--remove-label", "agent-fix")
+            self.notify(f"PR #{pr}: nothing to fix", f"No new review feedback from {self.owner}.")
+            return 80
+        if vendors.seed_authors(str(self.state), pr, self.gh_repo, self.env.config.scheduling.cursor_branch_re, self.cursor_login):
+            self.log(f"PR #{pr}: recording authors failed")
+            return 1
+        for commit in vendors.seed_contrib(str(self.state), pr, wt):
+            self.log(f"PR #{pr}: commit {commit} has no known vendor; not counted")
+        fixer = self.pick_vendor("fixer", "contrib", self.all_vendors(), pr=pr, issue=issue)
+        self.notify(f"PR #{pr}: {fixer} is addressing your review", url)
+        # Posting a fix reply advances human_feedback's cutoff even when an edit defers.
+        if not feedback_file.is_file():
+            temp = feedback_file.with_suffix(".tmp")
+            temp.write_text(feedback)
+            temp.replace(feedback_file)
+        rc = self.fix_pr(pr, wt, fixer, f"{self.owner} (the repository owner)", feedback, issue)
+        return self.finish_standalone_fix(pr, wt, fixer, feedback, issue, rc)
+
+    def resume_standalone_push(self, pr, episodes):
+        self.active["cursor_fix"] = self.active["pr"] = pr
+        episode = min(episodes, key=int)
+        issue = episode if episode != pr else ""
+        runner = fix.Runner(self.env.with_runtime(issue=issue, pr=pr), self.hooks(issue, pr), pr)
+        waiting = runner.waiting_push(pr)
+        if waiting is None or waiting == "unreadable":
+            if waiting == "unreadable":
                 pr_helpers.gh("pr", "edit", pr, "-R", self.gh_repo, "--remove-label", "agent-fix")
-                self.notify(f"PR #{pr}: nothing to fix", f"No new review feedback from {self.owner}.")
-                return 80
-            if vendors.seed_authors(str(self.state), pr, self.gh_repo, self.env.config.scheduling.cursor_branch_re, self.cursor_login):
-                self.log(f"PR #{pr}: recording authors failed")
-                return 1
-            for commit in vendors.seed_contrib(str(self.state), pr, wt):
-                self.log(f"PR #{pr}: commit {commit} has no known vendor; not counted")
-            fixer = self.pick_vendor("fixer", "contrib", self.all_vendors(), pr=pr, issue=issue)
-            self.notify(f"PR #{pr}: {fixer} is addressing your review", url)
-            # Posting a fix reply advances human_feedback's cutoff even when an edit defers.
-            if not feedback_file.is_file():
-                temp = feedback_file.with_suffix(".tmp")
-                temp.write_text(feedback)
-                temp.replace(feedback_file)
-            # The label stays only on a deferral, so the fix resumes; any other outcome drops it.
-            rc = self.fix_pr(pr, wt, fixer, f"{self.owner} (the repository owner)", feedback, issue)
-            if rc == 75:
-                return 75
-        feedback_file.unlink(missing_ok=True)
+            return 80
+        binding = waiting["continuation"]
+        if len(episodes) != 1 or binding["caller"] != "standalone":
+            for key in episodes - {episode}:
+                owner_handoff.clear_retry(self.env, key, owner_handoff.FIX_PUSH, pr)
+            runner.handoff(pr, owner_handoff.FIX_PUSH, f"PR #{pr}: pushing fix failed",
+                           "The saved push has no matching caller.")
+            return self.finish_standalone_fix(pr, "", "", "", issue, 1)
+        issue, wt, fixer = binding["issue"], binding["wt"], binding["fixer"]
+        feedback_file = self.state / f"owner-fix-feedback-{pr}"
+        feedback = feedback_file.read_text() if feedback_file.is_file() else ""
+        rc = self.fix_pr(pr, wt, fixer, f"{self.owner} (the repository owner)", feedback, issue)
+        return self.finish_standalone_fix(pr, wt, fixer, feedback, issue, rc)
+
+    def finish_standalone_fix(self, pr, wt, fixer, feedback, issue, rc):
+        if rc == 75:
+            return 75
+        if rc == fix.PUSH_SUPERSEDED:
+            return 80
         pr_helpers.gh("pr", "edit", pr, "-R", self.gh_repo, "--remove-label", "agent-fix")
         if rc != 0:
             return 80
-        rc = self.review_loop(pr, wt, f"""{fixer} just addressed this review feedback from {self.owner}. Check that each point is resolved or convincingly answered in its `<!-- baton-fix by={fixer}` comment, and review the new commits. The rest of the PR was reviewed before.
+        note = f"""{fixer} just addressed this review feedback from {self.owner}. Check that each point is resolved or convincingly answered in its `<!-- baton-fix by={fixer}` comment, and review the new commits. The rest of the PR was reviewed before.
 
 <feedback>
 {feedback}
-</feedback>""", "agent", "pool", fixer, issue)
+</feedback>"""
+        runner = fix.Runner(self.env.with_runtime(issue=issue, pr=pr), self.hooks(issue, pr), pr)
+        if runner.push_flag(pr).exists():
+            loop = review.Review(runner.env, runner.hooks, pr, wt, issue, fixer)
+            loop.values = {"note": note, "fixer": "agent", "reviewer": "pool", "step": "review",
+                           "round": 1, "push_completed": "1"}
+            loop.save()
+            runner.acknowledge_push(pr)
+        (self.state / f"owner-fix-feedback-{pr}").unlink(missing_ok=True)
+        rc = self.review_loop(pr, wt, note, "agent", "pool", fixer, issue)
         return 75 if rc == 75 else 80
 
     # --- pick work: an issue for the pipeline ------------------------------------------------------

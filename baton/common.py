@@ -171,7 +171,11 @@ def git(cwd, *args):
 PUSH_TRANSIENT = re.compile(
     r"TLS handshake timeout|connection reset|connection refused|i/o timeout|unexpected EOF"
     r"|Could not resolve host|Failed to connect|The remote end hung up|early EOF"
-    r"|HTTP 50[234]|timed out", re.IGNORECASE)
+    r"|(?:HTTP |The requested URL returned error: )5\d\d\b|timed out", re.IGNORECASE)
+PUSH_REJECTED = re.compile(
+    r"\[(?:remote )?rejected\]|hook declined|authentication failed|permission (?:to .* )?denied"
+    r"|could not read username|invalid username or password|protected branch update failed",
+    re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -188,7 +192,10 @@ class PushResult:
 def push_transient(stderr):
     """True when STDERR is a transport or 5xx failure; empty or unclassified stderr is permanent."""
     text = stderr or ""
-    if re.search(r"HTTP 4\d\d", text) and not re.search(r"secondary rate limit", text, re.IGNORECASE):
+    if PUSH_REJECTED.search(text):
+        return False
+    if re.search(r"(?:HTTP |The requested URL returned error: )4\d\d\b", text, re.IGNORECASE) and not re.search(
+            r"secondary rate limit", text, re.IGNORECASE):
         return False
     return bool(PUSH_TRANSIENT.search(text))
 

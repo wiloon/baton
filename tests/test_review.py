@@ -19,6 +19,7 @@ from baton.common import Deferred
 from conftest import sh
 
 REAL_MERGE = merge.Merger.merge_or_handoff
+REAL_FIX = review.fix.fix_pr
 
 BIN = Path(__file__).resolve().parents[1] / "bin"
 PR = 987654
@@ -309,12 +310,13 @@ def test_a_deferred_fixer_leaves_a_checkpoint_and_the_resume_goes_straight_to_th
     assert loop.fixes[1]["head"] == loop.fixes[0]["head"]
 
 
-def save_waiting_fix_push(loop, fixer):
+def save_waiting_fix_push(loop, fixer, ci_head=""):
     from baton import handoff
     binding = {"commit": "d" * 40, "branch": "cursor/issue-297", "ref": "HEAD", "remote": "e" * 40,
                "upstream": False, "wt": str(loop.wt), "issue": "297", "pr": str(PR), "next": "done",
                "outcome": "", "handoff_reason": "", "description_rc": 0, "description_reason": "",
-               "who": "", "fixer": fixer, "clear_cursor": False}
+               "who": "", "fixer": fixer, "clear_cursor": False, "feedback": "f" * 64,
+               "caller": "ci" if ci_head else "review", "ci_head": ci_head}
     assert handoff.prepare_retry(session.resolve(loop.env), "297", "fix_push_failed", str(PR), binding)
     Path(loop.env["STATE"], f"fix-push-waiting-{PR}").write_text("1")
 
@@ -367,13 +369,14 @@ def test_a_deferred_merge_step_keeps_the_checkpoint_and_resumes_at_the_merge(loo
     expected = {"checks": "- The library at 390 px and 1280 px.",
                 "comment": screenshot_comments(loop)[0]} if screenshots else None
     assert loop.checkpoint()["step"] == "merge" and attempts == [expected]
+    save_waiting_fix_push(loop, "codex", loop.checkpoint()["merge_head"])
     clock["now"] = 1_059
     with monkeypatch.context() as early:
         early.setattr(review.pr_helpers, "gh", lambda *a, **k: pytest.fail("read GitHub before the push was due"))
         assert run(loop) == 75
     clock["now"] = 1_060
     assert run(loop) == 0
-    assert attempts == [expected] * 3 and loop.merged == [PR]
+    assert attempts == [expected] * 2 and loop.merged == [PR]
     assert roles(loop) == (["review", "screenshot_review"] if screenshots else ["review"])
     assert not Path(loop.env["STATE"], f"review-pending-{PR}").exists()
 
@@ -2455,3 +2458,71 @@ def test_an_older_identical_screenshot_comment_does_not_count_as_this_post(loop,
     loop.gh.set(comments=[{"id": 5, "user": {"login": author}, "author": {"login": author}, "body": body}])
     assert screen_run(loop) == 0
     assert len(screenshot_comments(loop)) == 1
+
+
+def test_an_unrelated_head_after_saving_the_merge_checkpoint_hands_off(loop, monkeypatch):
+    loop.reviews[:] = ["pass"]
+
+    def interrupt(*args, **kwargs):
+        raise InterruptedError("stopped after saving the merge checkpoint")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(merge.Merger, "merge_or_handoff", interrupt)
+        with pytest.raises(InterruptedError, match="after saving"):
+            loop.run(fixer="cursor", reviewer="codex")
+    assert loop.checkpoint()["step"] == "merge"
+    loop.gh.set(headRefOid="f" * 40)
+    assert loop.run(fixer="cursor", reviewer="codex") == 0
+    assert not loop.merged and loop.labelled("ready-for-human")
+    assert not loop.checkpoint()
+
+
+def test_a_landed_ci_repair_advances_the_approved_head_across_restart(loop, monkeypatch):
+    from baton import common, handoff
+
+    approved = sh(loop.wt, "git", "rev-parse", "HEAD")
+    loop.reviews[:] = ["pass"]
+    real_dispatch = review.dispatch.dispatch
+    now, workers, pushes = [1_000], [], []
+    monkeypatch.setattr(handoff, "clock", lambda: now[0])
+    monkeypatch.setattr(review.fix, "fix_pr", REAL_FIX)
+    monkeypatch.setattr(review.fix.Runner, "verify", lambda *a: (0, "", 0))
+    monkeypatch.setattr(merge.ci, "classify", lambda *a: {"head": approved, "feedback": "Repair CI"})
+    choose = merge.pick.choose
+    monkeypatch.setattr(merge.pick, "choose", lambda *a, **kw: "claude" if a[1] == "fixer" else choose(*a, **kw))
+
+    def worker(vendor, role, prompt, tag, cwd, *args):
+        if role != "fix":
+            return real_dispatch(vendor, role, prompt, tag, cwd, *args)
+        workers.append(vendor)
+        sh(cwd, "git", "commit", "-qm", "Repair CI", "--allow-empty")
+        return {"rc": 0, "outcome": "RESULT: fixed", "reply": "", "model": "test"}
+
+    def push(*args, **kwargs):
+        pushes.append(now[0])
+        if now[0] == 1_000:
+            return common.PushResult(False, transient=True, detail="connection refused")
+        result = common.push(*args, **kwargs)
+        if result:
+            loop.gh.set(headRefOid=sh(loop.wt, "git", "rev-parse", "HEAD"))
+        return result
+
+    def repair_then_stop(self, wt, screenshot=None):
+        assert self.ci_fix_round(wt) == 0
+        raise InterruptedError("stopped after advancing the approved head")
+
+    monkeypatch.setattr(review.dispatch, "dispatch", worker)
+    monkeypatch.setattr(review.fix, "push", push)
+    monkeypatch.setattr(merge.Merger, "merge_or_handoff", repair_then_stop)
+    assert loop.run(fixer="cursor", reviewer="codex") == 75
+    assert loop.checkpoint()["merge_head"] == approved
+    now[0] = 1_060
+    with pytest.raises(InterruptedError, match="advancing the approved head"):
+        loop.run(fixer="cursor", reviewer="codex")
+    repaired = sh(loop.wt, "git", "rev-parse", "HEAD")
+    assert repaired != approved and loop.checkpoint()["merge_head"] == repaired
+    assert Path(loop.env["STATE"], f"ci-fix-{PR}-{approved}").exists()
+    monkeypatch.setattr(merge.Merger, "merge_or_handoff",
+                        lambda self, wt, screenshot=None: loop.merged.append(self.approved_head))
+    assert loop.run(fixer="cursor", reviewer="codex") == 0
+    assert loop.merged == [repaired] and workers == ["claude"] and pushes == [1_000, 1_060]

@@ -106,6 +106,8 @@ def test_a_successful_push_reports_an_ok_result(worktree):
     "error: RPC failed; curl 56 Recv failure: Connection reset by peer",
     "fatal: unable to access 'https://github.com/x/y.git/': The remote end hung up unexpectedly",
     "fatal: unable to access 'https://github.com/x/y.git/': Failed to connect to github.com port 443",
+    "fatal: unable to access 'https://example.invalid/': The requested URL returned error: 503",
+    "error: RPC failed; HTTP 500 curl 22",
     "remote: HTTP 503\nfatal: unable to access",
     "fatal: early EOF\nerror: unexpected EOF",
 ])
@@ -118,6 +120,8 @@ def test_transport_and_5xx_push_failures_are_transient(worktree, monkeypatch, st
 
 
 @pytest.mark.parametrize("stderr", [
+    "remote: dependency timed out\n ! [remote rejected] HEAD -> feature (pre-receive hook declined)",
+    "fatal: Authentication failed; credential helper timed out",
     " ! [rejected]        HEAD -> cursor/issue-297 (non-fast-forward)",
     "remote: error: GH006: Protected branch update failed\nerror: failed to push some refs",
     "fatal: Authentication failed for 'https://github.com/x/y.git/'",

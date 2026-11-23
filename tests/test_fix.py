@@ -46,7 +46,7 @@ def run(gh, tmp_path, monkeypatch):
         if path.is_file():
             (selfdir / path.name).symlink_to(path)
     (selfdir / "verify.sh").unlink()
-    gh.set(body=BODY, headRefName="cursor/issue-419")
+    gh.set(body=BODY, headRefName="cursor/issue-419", state="OPEN", labels=[])
     for name, value in (("SELF_DIR", str(selfdir)), ("MAX_VERIFY_FIXES", "2"), ("ISSUE", "419"), ("ROUND", "0")):
         monkeypatch.setenv(name, value)
 
@@ -616,7 +616,7 @@ def test_an_exhausted_partial_push_hands_off_once_with_the_workers_outcome(run, 
     assert len(sent) == 1 and "ran out of time" in sent[0][1]
 
 
-@pytest.mark.parametrize("damage", ["invalid JSON", "missing remote"])
+@pytest.mark.parametrize("damage", ["invalid JSON", "missing remote", "invalid description status"])
 def test_a_damaged_fix_push_record_hands_off_without_replay(run, monkeypatch, damage):
     from baton import common, handoff, session
 
@@ -638,11 +638,14 @@ def test_a_damaged_fix_push_record_hands_off_without_replay(run, monkeypatch, da
     else:
         for record in (path, handoff.waiting_path(env, "419", "fix_push_failed", str(PR))):
             data = json.loads(record.read_text())
-            del data["continuation"]["remote"]
+            if damage == "missing remote":
+                del data["continuation"]["remote"]
+            else:
+                data["continuation"]["description_rc"] = -1
             record.write_text(json.dumps(data))
     clock["now"] = 1_060
     assert run.fix()["rc"] == 1 and run.labelled() and len(run.agent_calls) == 1
-    assert pushes == [1_000]
+    assert pushes == [1_000] and not run.comments()
 
 
 def test_a_remote_change_during_fix_push_wait_hands_off(run, monkeypatch):
@@ -1309,3 +1312,142 @@ def test_without_screenshot_review_the_fix_prompt_names_no_screenshots_dir(run):
     run.agent(dict(CHECKED))
     run.fix("claude")
     assert f"pr-{PR}-shots" not in run.prompts[0]
+
+
+def test_a_rejected_push_with_an_unreadable_lookup_hands_off_without_replay(run, monkeypatch):
+    from baton import common, session
+
+    pushes = []
+    real = session.run_process
+
+    def lookup(cmd, **kwargs):
+        if "ls-remote" in cmd and pushes:
+            return subprocess.CompletedProcess(cmd, 1, "", "connection refused")
+        return real(cmd, **kwargs)
+
+    def reject(*args, **kwargs):
+        pushes.append(1)
+        return common.PushResult(False, detail="pre-receive hook declined")
+
+    monkeypatch.setattr(session, "run_process", lookup)
+    monkeypatch.setattr(fix, "push", reject)
+    run.agent({})
+    assert run.fix()["rc"] == 1
+    assert pushes == [1] and run.labelled()
+    assert sum("handoff fix_push_failed" in line for line in run.runner_log()) == 1
+
+
+@pytest.mark.parametrize("outcome", ["RESULT: failed timed out", "RESULT: needs-info a question"])
+@pytest.mark.parametrize("recover", [True, False])
+def test_cursor_partial_commits_use_the_saved_push(run, monkeypatch, outcome, recover):
+    from baton import common, handoff
+
+    now, pushes = [1_000], []
+    monkeypatch.setattr(handoff, "clock", lambda: now[0])
+
+    def push(*args, **kwargs):
+        pushes.append(now[0])
+        if recover and now[0] == 1_060:
+            return common.push(*args, **kwargs)
+        return common.PushResult(False, transient=recover, detail="push failed")
+
+    notices = []
+    monkeypatch.setattr(handoff.notify, "notify", lambda title, text: notices.append(text))
+    monkeypatch.setattr(fix, "push", push)
+    run.agent({"outcome": outcome})
+    if recover:
+        assert run.fix("cursor")["rc"] == 75 and not run.labelled()
+        now[0] = 1_060
+    assert run.fix("cursor")["rc"] == 1 and run.labelled()
+    assert run.pushed() is recover
+    assert pushes == ([1_000, 1_060] if recover else [1_000])
+    assert len(run.agent_calls) == len(notices) == 1 and outcome in notices[0]
+
+
+@pytest.mark.parametrize("partial", [False, True])
+def test_a_restart_during_a_landed_fix_continuation_skips_the_worker_and_push(run, monkeypatch, partial):
+    from baton import common
+
+    pushes = []
+
+    def push(*args, **kwargs):
+        pushes.append(1)
+        return common.push(*args, **kwargs)
+
+    monkeypatch.setattr(fix, "push", push)
+    run.agent({"outcome": "RESULT: failed ran out of time"} if partial else {})
+
+    def interrupt(*args, **kwargs):
+        raise InterruptedError("stopped during continuation")
+
+    with monkeypatch.context() as patch:
+        if partial:
+            patch.setattr(fix.Runner, "handoff", interrupt)
+        else:
+            patch.setattr(fix.Runner, "refresh_checks", interrupt)
+        with pytest.raises(InterruptedError, match="during continuation"):
+            run.fix()
+    assert run.pushed() and not run.labelled()
+    assert run.fix()["rc"] == int(partial)
+    assert len(run.agent_calls) == len(pushes) == 1
+    assert run.labelled() is partial
+
+
+@pytest.mark.parametrize("change", ["feedback", "paused", "closed", "issue closed", "landed plus feedback"])
+def test_a_waiting_review_push_revalidates_owner_inputs_before_replay_or_continuation(run, monkeypatch, change):
+    from baton import common, handoff, session
+
+    now, pushes = [1_000], []
+    monkeypatch.setattr(handoff, "clock", lambda: now[0])
+
+    def fail(*args, **kwargs):
+        pushes.append(now[0])
+        return common.PushResult(False, transient=True, detail="connection refused")
+
+    monkeypatch.setattr(fix, "push", fail)
+    monkeypatch.setenv("ROUND", "1")
+    run.agent({})
+    assert run.fix()["rc"] == 75
+    if change in ("feedback", "landed plus feedback"):
+        run.fake_gh.set(comments=[{"author": {"login": "owner"}, "body": "Please stop"}])
+    if change == "landed plus feedback":
+        assert common.push(run.worktree, "HEAD")
+    if change == "paused":
+        run.fake_gh.set(labels=[{"name": "ready-for-human"}])
+    if change == "closed":
+        run.fake_gh.set(state="CLOSED")
+    if change == "issue closed":
+        run.fake_gh.set(issues={"419": {"state": "CLOSED"}})
+    now[0] = 1_060
+    if change == "paused":
+        assert run.fix()["rc"] == 75 and pushes == [1_000] and not run.labelled()
+        saved = handoff.load_retry(session.resolve(), "419", handoff.FIX_PUSH, str(PR))
+        assert saved["attempts"] == 0
+        run.fake_gh.set(labels=[])
+        monkeypatch.setattr(fix, "push", common.push)
+        assert run.fix()["rc"] == 0 and run.pushed() and len(run.agent_calls) == 1
+        return
+    assert run.fix()["rc"] != 75
+    assert pushes == [1_000] and len(run.agent_calls) == 1
+    assert handoff.load_retry(session.resolve(), "419", handoff.FIX_PUSH, str(PR)) is None
+    assert run.labelled() is (change in ("feedback", "landed plus feedback"))
+
+
+def test_restart_after_refreshing_checks_preserves_the_fixers_check_section(run, monkeypatch):
+    from baton import handoff
+
+    run.agent({"file": "## Must fix\nnone\n\n## Checks to verify\n- View the updated button\n\nRESULT: fixed\n"})
+    restore = handoff.restore_retry
+
+    def interrupt(env, episode, reason, item, pending):
+        if pending.get("phase") == "finished":
+            raise InterruptedError("stopped after refreshing checks")
+        return restore(env, episode, reason, item, pending)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(handoff, "restore_retry", interrupt)
+        with pytest.raises(InterruptedError, match="after refreshing checks"):
+            run.fix()
+    assert section(run.body(), "Checks to verify") == "- View the updated button"
+    assert run.fix()["rc"] == 0 and len(run.agent_calls) == 1
+    assert section(run.body(), "Checks to verify") == "- View the updated button"

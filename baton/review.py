@@ -228,6 +228,41 @@ def combined_feedback(code, screenshot, limit):
     return f"{fit(code, code_parts, first)}\n\n{fit(screenshot, shot_parts, second)}"
 
 
+def read_feedback_history(repo, pr, request):
+    data = {}
+    for field, route, resource in (("comments", "issues", "comments"), ("reviews", "pulls", "reviews"),
+                                   ("inline", "pulls", "comments")):
+        result = request("api", f"repos/{repo}/{route}/{pr}/{resource}", "--paginate", "--slurp")
+        if result.returncode != 0:
+            return None
+        try:
+            pages = json.loads(result.stdout)
+            if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+                return None
+            rows = [row for page in pages for row in page]
+            if any(type(row["id"]) is not int or row["id"] <= 0
+                   or (row["user"] is not None and not isinstance(row["user"]["login"], str))
+                   or (not isinstance(row["body"], str) and not (field == "reviews" and row["body"] is None))
+                   or (field == "reviews" and not isinstance(row["state"], str)) for row in rows):
+                return None
+            if len({row["id"] for row in rows}) != len(rows):
+                return None
+            data[field] = [{**row, "author": row["user"], "body": row["body"] or ""} for row in rows]
+        except (ValueError, KeyError, TypeError):
+            return None
+    return data
+
+
+def owner_feedback_digest(owner, data):
+    rows = [
+        (kind, row["id"], row["state"] if kind == "reviews" else "", row["body"])
+        for kind in ("comments", "reviews", "inline")
+        for row in data[kind]
+        if (row["author"] or {}).get("login") == owner and not row["body"].startswith("<!-- baton")
+    ]
+    return owner_handoff.body_digest(json.dumps(sorted(rows)))
+
+
 def human_feedback(repo, owner, pr):
     """The owner's reviews, comments and inline comments since the last agent fix. Public
     repo: only the owner's words reach an agent as instructions."""
@@ -306,37 +341,8 @@ class Review:
             return None, "retry"
         if any(label.get("name") == "ready-for-human" for label in labels):
             return None, "paused"
-        request = pr_helpers.call if once else pr_helpers.gh
-        for field, route, resource in (("comments", "issues", "comments"), ("reviews", "pulls", "reviews"),
-                                       ("inline", "pulls", "comments")):
-            result = request("api", f"repos/{self.repo}/{route}/{self.pr}/{resource}", "--paginate", "--slurp")
-            if result.returncode != 0:
-                return None, "retry"
-            try:
-                pages = json.loads(result.stdout)
-                if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
-                    return None, "retry"
-                rows = [row for page in pages for row in page]
-                if any(type(row["id"]) is not int or row["id"] <= 0
-                       or (row["user"] is not None and not isinstance(row["user"]["login"], str))
-                       or (not isinstance(row["body"], str) and not (field == "reviews" and row["body"] is None))
-                       or (field == "reviews" and not isinstance(row["state"], str)) for row in rows):
-                    return None, "retry"
-                if len({row["id"] for row in rows}) != len(rows):
-                    return None, "retry"
-                data[field] = [{**row, "author": row["user"], "body": row["body"] or ""} for row in rows]
-            except (ValueError, KeyError, TypeError):
-                return None, "retry"
-        return data, "ok"
-
-    def owner_feedback_digest(self, data):
-        rows = [
-            (kind, row["id"], row["state"] if kind == "reviews" else "", row["body"])
-            for kind in ("comments", "reviews", "inline")
-            for row in data[kind]
-            if (row["author"] or {}).get("login") == self.owner and not row["body"].startswith("<!-- baton")
-        ]
-        return owner_handoff.body_digest(json.dumps(sorted(rows)))
+        history = read_feedback_history(self.repo, self.pr, pr_helpers.call if once else pr_helpers.gh)
+        return ({**data, **history}, "ok") if history is not None else (None, "retry")
 
     def comment_post_binding(self, body, round, outcome, reviewer, head, data):
         return {
@@ -344,7 +350,7 @@ class Review:
             "head": head, "base": data["baseRefName"], "issue": data["linked_issue"],
             "body": body, "digest": owner_handoff.body_digest(body),
             "description": owner_handoff.body_digest(data["body"]),
-            "feedback": self.owner_feedback_digest(data),
+            "feedback": owner_feedback_digest(self.owner, data),
             "comment_ids": [row["id"] for row in data["comments"]],
             "outcome": outcome, "run_id": self.hooks.last_run_id(),
         }
@@ -360,7 +366,7 @@ class Review:
                 or (data["headRefOid"], data["baseRefName"], data["linked_issue"]) !=
                     (binding["head"], binding["base"], binding["issue"])
                 or owner_handoff.body_digest(data["body"]) != binding["description"]
-                or self.owner_feedback_digest(data) != binding["feedback"]):
+                or owner_feedback_digest(self.owner, data) != binding["feedback"]):
             return "changed"
         boundary = set(binding["comment_ids"])
         matches = []
@@ -819,6 +825,46 @@ class Review:
     def drop(self):
         self.checkpoint.unlink(missing_ok=True)
 
+    def finish_review(self, saved):
+        pr, wt = self.pr, self.wt
+        approved = saved.get("merge_head", "")
+        runner = fix.Runner(self.env, self.hooks, pr, "ci")
+        waiting = runner.waiting_push(pr)
+        if waiting == "unreadable":
+            return 0
+        relevant_repair = (waiting and waiting["continuation"]["caller"] == "ci"
+                           and (approved == waiting["continuation"]["ci_head"]
+                                or (waiting.get("phase") == "finished"
+                                    and approved == waiting["continuation"]["commit"])))
+        if relevant_repair and not waiting.get("phase") and int(owner_handoff.clock()) < waiting["due"]:
+            return 75
+        if waiting and not relevant_repair:
+            runner.handoff(pr, owner_handoff.FIX_PUSH, f"PR #{pr} needs you",
+                           f"The saved CI repair does not match the approved head. {self.url}")
+            return 0
+        if not waiting:
+            try:
+                data = pr_helpers.view(pr, "state,headRefOid")
+            except ValueError:
+                data = None
+            if isinstance(data, dict) and data.get("state") in ("MERGED", "CLOSED"):
+                self.drop()
+                return 0
+            if (not approved or not isinstance(data, dict) or data.get("headRefOid") != approved
+                    or git(wt, "rev-parse", "HEAD") != approved):
+                self.handoff("merge_failed", f"PR #{pr} needs you", f"The approved head could not be confirmed. {self.url}")
+                return 0
+        shots = ({"checks": saved.get("screenshot_checks", ""), "comment": saved.get("screenshot_comment", "")}
+                 if saved.get("screenshot") else None)
+        merger = merge.Merger(self.env, self.hooks, pr, self.issue)
+        merger.approved_head = approved
+        try:
+            merger.merge_or_handoff(wt, shots)
+        except Deferred:
+            return 75
+        self.drop()
+        return 0
+
     # --- the round limit: the advisor may grant one more round (#17 / #125) ---
     def limit_snapshot(self, round, reviewer, fixer):
         """(snapshot, revalidate) for the review_limit decision point."""
@@ -864,8 +910,11 @@ class Review:
             checks = saved.get("screenshot_checks", "")
             extra = 1 if saved.get("extra") == "1" else 0
             self.fixed_by, self.issue = saved.get("fixed_by", ""), saved.get("ISSUE", "")
+            self.env = self.env.with_runtime(issue=self.issue)
             self.binding_fields = {k: saved.get(k, "") for k in
                                    self.BINDING_FIELDS}
+            if step == "review" and saved.get("push_completed"):
+                fix.Runner(self.env, self.hooks, pr, str(round)).acknowledge_push(pr)
         else:
             self.binding_fields = {}
         pending_post = self.post_pending()
@@ -884,17 +933,11 @@ class Review:
             return 0
         resuming_fix = step == "fix"
         if step == "merge":
-            # A category-1 CI-repair push deferred after the review passed (#151).
-            shots = {"checks": checks, "comment": saved.get("screenshot_comment", "")} if screenshot else None
-            try:
-                merge.Merger(self.env, self.hooks, pr, self.issue).merge_or_handoff(wt, shots)
-            except Deferred:
-                return 75
-            self.drop()
-            return 0
+            return self.finish_review(saved)
         if not (resuming_fix or pending_post) and self.seed():
             self.seed_contrib()
-        if not saved and not pending_post:
+        starting_review = not saved or (step == "review" and round == 1 and saved.get("push_completed"))
+        if starting_review and not pending_post:
             self.label("--remove-label", "ready-for-human")
         while True:
             self.hooks.round = round
@@ -1037,6 +1080,9 @@ class Review:
             resuming_fix = False
             if rc == 75:
                 return 75
+            if rc == fix.PUSH_SUPERSEDED:
+                self.drop()
+                return 0
             if rc != 0:
                 if not runner.handed_off:   # e.g. authorship recording failed: the owner still needs one handoff
                     runner.handoff(pr, "fix_run_unfinished", f"PR #{pr} needs you",
@@ -1046,20 +1092,20 @@ class Review:
             self.fixed_by = fixer
             round, step = round + 1, "review"
             code_verdict = screenshot = checks = ""
+            if runner.push_flag(pr).exists():
+                self.values.update(round=round, step=step, code_verdict="", screenshot="",
+                                   screenshot_checks="", push_completed="1")
+                self.save()
+                runner.acknowledge_push(pr)
         # Keep the checkpoint through merge so a category-1 CI-repair push can resume (#151).
         step = "merge"
         # The last round's screenshot verdicts decide which manual checks still need the owner (#92).
         comment = agent_comment(self.repo, self.owner, pr, "baton-screenshot-review", round) if screenshot else ""
         self.values.update(step=step, code_verdict=code_verdict, screenshot=screenshot,
+                           merge_head=self.binding_fields.get("reviewed_head", ""),
                            screenshot_checks=checks, screenshot_comment=comment)
         self.save()
-        shots = {"checks": checks, "comment": comment} if screenshot else None
-        try:
-            merge.Merger(self.env, self.hooks, pr, self.issue).merge_or_handoff(wt, shots)
-        except Deferred:
-            return 75
-        self.drop()
-        return 0
+        return self.finish_review(self.values)
 
 
 @session.scoped

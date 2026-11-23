@@ -334,7 +334,8 @@ def push_binding(item="1"):
     return {"commit": "a" * 40, "branch": "agent/issue-1", "ref": "HEAD", "remote": "b" * 40,
             "upstream": False, "wt": "/tmp/wt", "issue": "9", "pr": item, "next": "done",
             "outcome": "", "handoff_reason": "", "description_rc": 0, "description_reason": "",
-            "who": "", "fixer": "claude", "clear_cursor": False}
+            "who": "", "fixer": "claude", "clear_cursor": False, "feedback": "f" * 64,
+               "caller": "standalone", "ci_head": ""}
 
 
 def test_every_category_1_reason_is_rule_mode_with_retry_budget():

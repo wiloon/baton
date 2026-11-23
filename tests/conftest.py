@@ -170,7 +170,10 @@ elif args[:2] == ["issue", "view"] and "--jq" in args:
 elif args[:2] == ["issue", "view"] and "title" in args[args.index("--json") + 1]:
     print(json.dumps(pr.get("issues", {}).get(args[2], {})))
 elif args[:2] == ["issue", "view"]:
-    print(json.dumps({"labels": [{"name": n} for n in pr.get("issue_labels", {}).get(args[2], [])]}))
+    data = {"labels": [{"name": n} for n in pr.get("issue_labels", {}).get(args[2], [])]}
+    if "state" in args[args.index("--json") + 1].split(","):
+        data["state"] = pr.get("issues", {}).get(args[2], {}).get("state", "OPEN")
+    print(json.dumps(data))
 elif args[:2] == ["issue", "comment"]:
     if fails("issue-comment"):
         if (root / "issue-comment-stderr").exists():

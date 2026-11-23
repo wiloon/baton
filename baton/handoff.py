@@ -292,7 +292,7 @@ def _push_binding_valid(item, binding, *, reason):
     ref, next_step = binding.get("ref"), binding.get("next")
     if (not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit)
             or not isinstance(branch, str) or not branch
-            or not isinstance(ref, str) or not ref
+            or ref not in ("HEAD", branch)
             or "remote" not in binding
             or (remote is not None and not isinstance(remote, str))
             or (remote and not re.fullmatch(r"[0-9a-f]{40}", remote))
@@ -300,17 +300,37 @@ def _push_binding_valid(item, binding, *, reason):
             or not isinstance(binding.get("wt"), str) or not binding["wt"]
             or next_step not in ("done", "handoff")):
         return False
-    if binding.get("pr") != item or not isinstance(binding.get("issue"), str):
+    if (binding.get("pr") != item or not isinstance(binding.get("issue"), str)
+            or (binding["issue"] and not binding["issue"].isdecimal())):
+        return False
+    if not isinstance(binding.get("feedback"), str) or not re.fullmatch(r"[0-9a-f]{64}", binding["feedback"]):
+        return False
+    caller, ci_head = binding.get("caller"), binding.get("ci_head")
+    if caller == "ci":
+        if not isinstance(ci_head, str) or not re.fullmatch(r"[0-9a-f]{40}", ci_head):
+            return False
+    elif caller not in ("standalone", "review") or ci_head != "":
+        return False
+    description_rc = binding.get("description_rc")
+    if (type(description_rc) is not int or description_rc not in (0, 1, 2)
+            or not isinstance(binding.get("description_reason"), str)
+            or not isinstance(binding.get("fixer"), str) or not binding["fixer"]
+            or (binding["fixer"] == "cursor" and description_rc == 1)):
         return False
     if next_step == "handoff":
         if binding.get("handoff_reason") not in ("fix_run_failed", "fix_needs_info"):
             return False
         if not isinstance(binding.get("outcome"), str) or not binding["outcome"]:
             return False
+        if (binding["outcome"].startswith("RESULT: fixed")
+                or binding["outcome"].startswith("RESULT: needs-info") != (binding["handoff_reason"] == "fix_needs_info")):
+            return False
+        if description_rc != 0 or binding["description_reason"]:
+            return False
+    elif (binding.get("handoff_reason") != "" or binding.get("outcome") != ""
+          or bool(description_rc) != bool(binding["description_reason"])):
+        return False
     return (isinstance(binding.get("who"), str)
-            and type(binding.get("description_rc")) is int
-            and isinstance(binding.get("description_reason"), str)
-            and isinstance(binding.get("fixer"), str)
             and type(binding.get("clear_cursor")) is bool)
 
 
@@ -375,6 +395,10 @@ def load_retry(env, episode, reason, item=""):
         raise RetryUnreadable(f"invalid continuation in {path.name}")
     if "confirmed" in data and (reason not in (*SPEC_POSTS, SPEC_ACCEPT_POST) or data["confirmed"] is not True):
         raise RetryUnreadable(f"invalid confirmed-post phase in {path.name}")
+    if "phase" in data and (reason != FIX_PUSH or data["phase"] not in ("landed", "finished")
+                            or binding["remote"] is None
+                            or (data["phase"] == "finished" and binding["next"] != "done")):
+        raise RetryUnreadable(f"invalid push phase in {path.name}")
     attempts, due, scheduled = data.get("attempts"), data.get("due"), data.get("scheduled")
     if type(attempts) is not int or not (0 <= attempts <= MAX_ATTEMPTS):
         raise RetryUnreadable(f"out-of-range attempts in {path.name}")
@@ -419,7 +443,10 @@ def prepare_retry(env, episode, reason, item, binding):
 
 def comment_post_episodes(env, reason=None):
     """Find review or screenshot comment-post operations by PR number."""
-    reasons = (reason,) if reason else COMMENT_POSTS
+    return operation_episodes(env, (reason,) if reason else COMMENT_POSTS)
+
+
+def operation_episodes(env, reasons):
     found = {}
     for name in reasons:
         for path in Path(env.dirs.state).glob(f"handoff-*-{name}.json"):
@@ -453,23 +480,21 @@ def push_destination(wt, ref):
     return ref
 
 
+def check_push_local(binding):
+    from .common import git
+    wt = binding["wt"]
+    return (git(wt, "rev-parse", "HEAD") == binding["commit"]
+            and git(wt, "branch", "--show-current") == binding["branch"])
+
+
 def check_push_landed(binding):
     """Whether origin already holds the saved post-sign-off commit (#151)."""
-    from . import session
-    from .common import git, push_transient
-    wt, branch, commit = binding["wt"], binding["branch"], binding["commit"]
-    local = git(wt, "rev-parse", "HEAD")
-    current_branch = git(wt, "branch", "--show-current")
-    if local != commit or current_branch != branch:
+    if not check_push_local(binding):
         return "changed"
-    done = session.run_process(
-        ["git", "-C", str(wt), "ls-remote", "origin", f"refs/heads/{branch}"],
-        capture_output=True, text=True)
-    if done.returncode != 0:
-        return "retry" if push_transient((done.stderr or "") + (done.stdout or "")) else "failed"
-    line = (done.stdout or "").strip().splitlines()
-    current = line[0].split()[0] if line else ""
-    if current == commit:
+    current, transient = observe_remote(binding["wt"], binding["branch"])
+    if current is None:
+        return "retry" if transient else "failed"
+    if current == binding["commit"]:
         return "landed"
     if current == binding["remote"]:
         return "absent"
@@ -510,10 +535,14 @@ def label_ready(env, kind, number, remove=()):
 def _finish(env, reason, entry, *, kind, number, title, text, hooks, remove, item, episode,
             after_labels, decision=None):
     """The one terminal handoff: outcomes, labels, telemetry, notify, log."""
-    clear_episode(env, episode, item or number)
-    if kind == "pr":
-        # Retire the continuation before publishing the handoff or releasing its grant.
-        Path(env.dirs.state, f"review-pending-{number}").unlink(missing_ok=True)
+    finishing_push = (kind == "pr" and reason in ("fix_run_failed", "fix_needs_info", "fix_checks_refresh_failed")
+                      and Path(env.dirs.state, f"fix-push-waiting-{number}").exists())
+    if not finishing_push:
+        if kind == "pr":
+            # Retire the continuation before publishing the handoff or releasing its grant.
+            Path(env.dirs.state, f"review-pending-{number}").unlink(missing_ok=True)
+            Path(env.dirs.state, f"fix-push-waiting-{number}").unlink(missing_ok=True)
+        clear_episode(env, episode, item or number)
     result = label_ready(env, kind, number, remove=remove)
     if after_labels:
         after_labels(result)
@@ -524,6 +553,10 @@ def _finish(env, reason, entry, *, kind, number, title, text, hooks, remove, ite
         body += advisor.handoff_note(decision)
     notify.notify(title, body)
     notify.log(f"handoff {reason} category={entry.category}")
+    if finishing_push:
+        Path(env.dirs.state, f"review-pending-{number}").unlink(missing_ok=True)
+        Path(env.dirs.state, f"fix-push-waiting-{number}").unlink(missing_ok=True)
+        clear_episode(env, episode, item or number)
     return Result(HANDOFF, decision, True)
 
 

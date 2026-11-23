@@ -26,7 +26,7 @@ def run(gh, worktree, tmp_path, monkeypatch):
            "WT_ROOT": str(tmp_path / "worktrees"), "REPO_DIR": str(worktree.repo), "CI_FIXABLE_CHECKS": "golangci-lint\ngo test",
            "ISSUE": "297"}
     gh.set(headRefName="cursor/issue-297", body=CLEAN, commits=[], closingIssuesReferences=[{"number": 297}],
-           issues={"297": {"state": "OPEN"}})
+           issues={"297": {"state": "OPEN"}}, state="OPEN", labels=[])
     monkeypatch.setattr(pick.settle, "probe", lambda *args: None)
 
     class State:
@@ -755,14 +755,14 @@ def save_waiting_push(repair, fixer="codex"):
     binding = {"commit": "d" * 40, "branch": "cursor/issue-297", "ref": "HEAD", "remote": "e" * 40,
                "upstream": False, "wt": str(repair.wt), "issue": "297", "pr": str(PR), "next": "done",
                "outcome": "", "handoff_reason": "", "description_rc": 0, "description_reason": "",
-               "who": "", "fixer": fixer, "clear_cursor": False}
+               "who": "", "fixer": fixer, "clear_cursor": False, "feedback": "f" * 64,
+               "caller": "ci", "ci_head": HEAD}
     assert handoff.prepare_retry(session.resolve(repair.env), "297", "fix_push_failed", str(PR), binding)
     Path(repair.env["STATE"], f"fix-push-waiting-{PR}").write_text("1")
-    Path(repair.env["STATE"], f"ci-fix-waiting-{PR}").write_text(HEAD)
 
 
 def test_a_deferred_repair_push_keeps_the_repair_and_hands_nothing_off(repair, monkeypatch):
-    """The push wait leaves the merge step in place: no outer CI handoff, the head note stays."""
+    """The push wait leaves the merge step in place with no outer CI handoff."""
     def waiting(runner, *args, **kwargs):
         raise merge.Deferred("handoff-retry", "fix_push_failed", lends_slot=False)
     monkeypatch.setattr(merge.fix, "fix_pr", waiting)
@@ -770,7 +770,6 @@ def test_a_deferred_repair_push_keeps_the_repair_and_hands_nothing_off(repair, m
     with pytest.raises(merge.Deferred):
         repair.go()
     assert not repair.labelled("ready-for-human")
-    assert Path(repair.env["STATE"], f"ci-fix-waiting-{PR}").read_text() == HEAD
 
 
 def test_a_waiting_repair_push_resumes_before_any_ci_read_or_vendor_choice(repair, monkeypatch):
@@ -781,7 +780,6 @@ def test_a_waiting_repair_push_resumes_before_any_ci_read_or_vendor_choice(repai
     assert repair.events.count("ci") == 1   # only the gate after the push, never before it
     assert [f["fixer"] for f in repair.fixes] == ["codex"]
     assert Path(repair.env["STATE"], f"ci-fix-{PR}-{HEAD}").exists()
-    assert not Path(repair.env["STATE"], f"ci-fix-waiting-{PR}").exists()
     assert repair.merged()
 
 
@@ -1038,3 +1036,23 @@ def test_without_owner_review_paths_the_file_list_is_not_read(run):
     run.go()
     assert run.merged()
     assert not any(c[:1] == ["api"] and c[-3].endswith("/files") for c in run.gh.calls() if len(c) > 3)
+
+
+@pytest.mark.parametrize("bad_head", ["", "not-a-sha"])
+def test_a_damaged_durable_ci_head_hands_off_before_replaying(repair, monkeypatch, bad_head):
+    from baton import handoff, session
+
+    save_waiting_push(repair)
+    env = session.resolve(repair.env)
+    for path in (handoff.retry_path(env, "297", handoff.FIX_PUSH, str(PR)),
+                 handoff.waiting_path(env, "297", handoff.FIX_PUSH, str(PR))):
+        data = json.loads(path.read_text())
+        if bad_head:
+            data["continuation"]["ci_head"] = bad_head
+        else:
+            del data["continuation"]["ci_head"]
+        path.write_text(json.dumps(data))
+    monkeypatch.setattr(merge.fix, "fix_pr", lambda *a, **kw: pytest.fail("replayed an invalid CI continuation"))
+    repair.go()
+    assert not repair.merged()
+    assert sum(c[:2] == ["pr", "edit"] and "ready-for-human" in c for c in repair.gh.calls()) == 1
