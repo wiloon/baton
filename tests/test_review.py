@@ -1714,9 +1714,20 @@ def test_author_state_stale_grant_ends_in_one_handoff(advised, monkeypatch):
     monkeypatch.setattr(review.Review, "seed", lambda self: False)
     advised.advice = [{"action": "retry_step", "reason": "transient seed failure",
                        "evidence": ["Decision point: review_author_state_failed"]}]
-    monkeypatch.setattr(recovery, "fingerprint_matches", lambda *a, **k: False)
+    real_match = recovery.fingerprint_matches
+    seen = {"revalidated": 0, "saved": []}
+
+    def match(record, current):
+        seen["revalidated"] += 1
+        return real_match(record, current) if not seen["saved"] else False
+
+    real_persist = recovery.persist_grant
+    monkeypatch.setattr(recovery, "persist_grant",
+                        lambda *a, **k: (seen["saved"].append(1), real_persist(*a, **k))[1])
+    monkeypatch.setattr(recovery, "fingerprint_matches", match)
     advised.reviews[:] = ["pass"]
     assert advised.run(fixer="cursor", reviewer="claude") == 0
+    assert seen["revalidated"] >= 1 and seen["saved"] == [1]   # the grant persisted, then resolve failed
     assert handoffs == ["review_author_state_failed"]
     assert not [a for a in advised.agents if a["role"] == "review"] and advised.merged == []
 
