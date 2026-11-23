@@ -395,12 +395,28 @@ def issue_push_binding(item, *, reason="dev_push_failed"):
             "limit_why": "n/a", "pr": "", "comment_ids": [1], "author": "owner"}
 
 
+def body_edit_binding(item="1"):
+    return {"issue": item, "reviser": "claude", "round": 1, "intended": "Goal\nNew step\n",
+            "original": "a" * 64, "reply": "done", "mode_note": "", "model": "", "human": "",
+            "next": "review", "max_rounds": 3, "limit_why": "n/a", "feedback": "f" * 64,
+            "comment_ids": [1], "author": "owner", "has_commits": False, "wt": "/tmp/wt"}
+
+
+def adr_open_binding(item="1"):
+    return {"issue": item, "reviser": "claude", "round": 1, "reply": "done", "mode_note": "",
+            "model": "", "human": "", "next": "review", "max_rounds": 3, "limit_why": "n/a",
+            "feedback": "f" * 64, "comment_ids": [1], "author": "owner",
+            "issue_body": "d" * 64, "commit": "a" * 40, "branch": "docs/spec-issue-1",
+            "base": "main", "wt": "/tmp/wt", "applied": "Goal\nNew step\n"}
+
+
 def test_every_category_1_reason_is_rule_mode_with_retry_budget():
     assert handoff.RETRY_REASONS == {
         "review_comment_missing", "spec_comments_read_failed", "spec_pending_adr_read_failed",
         "review_comment_post_failed", "screenshot_comment_post_failed",
         "spec_review_comment_post_failed", "spec_reply_post_failed",
         "spec_pending_accept_post_failed", "spec_accept_post_failed",
+        "spec_body_edit_failed", "spec_adr_open_failed",
         "fix_push_failed", "dev_push_failed", "spec_adr_push_failed",
     }
     for reason in handoff.RETRY_REASONS:
@@ -419,6 +435,8 @@ def test_every_category_1_reason_is_rule_mode_with_retry_budget():
     ("spec_reply_post_failed", spec_post_binding("1", reply=True)),
     ("spec_pending_accept_post_failed", accept_post_binding("1", pending=True)),
     ("spec_accept_post_failed", accept_post_binding("1")),
+    ("spec_body_edit_failed", body_edit_binding("1")),
+    ("spec_adr_open_failed", adr_open_binding("1")),
     ("fix_push_failed", push_binding("1")),
     ("dev_push_failed", issue_push_binding("1")),
     ("spec_adr_push_failed", issue_push_binding("1", reason="spec_adr_push_failed")),
