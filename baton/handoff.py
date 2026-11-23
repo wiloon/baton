@@ -245,13 +245,15 @@ def label_ready(env, kind, number, remove=()):
 
 
 def _finish(env, reason, entry, *, kind, number, title, text, hooks, remove, item, episode,
-            after_labels, decision=None):
+            after_labels, decision=None, before_labels=None):
     """The one terminal handoff: outcomes, labels, telemetry, notify, log."""
     clear_episode(env, episode, item or number)
     recovery.clear_episode(env, episode)
     if kind == "pr":
         # Retire the continuation before publishing the handoff or releasing its grant.
         Path(env.dirs.state, f"review-pending-{number}").unlink(missing_ok=True)
+    if before_labels:
+        before_labels()   # the comment that explains the failure goes up before the label
     result = label_ready(env, kind, number, remove=remove)
     if after_labels:
         after_labels(result)
@@ -317,7 +319,7 @@ def _category1(env, reason, entry, *, kind, number, title, text, hooks, remove, 
 
 def perform(env, reason, *, kind, number, title, text, hooks, remove=(), item="", episode="",
             snapshot="", revalidate=None, after_labels=None, observed_actions=None,
-            transient=False, continuation=None, resume=False, fallback=False):
+            transient=False, continuation=None, resume=False, fallback=False, before_labels=None):
     """Validate REASON, apply its rule or advisor action, and on handoff run labels/telemetry/notify.
 
     KIND is "pr" or "issue". REMOVE is labels to drop before adding ready-for-human. AFTER_LABELS
@@ -325,7 +327,8 @@ def perform(env, reason, *, kind, number, title, text, hooks, remove=(), item=""
     than handoff are returned for the caller to execute; handoff side effects have already run.
     For eligible category-1 reads, TRANSIENT schedules a deferred attempt and RESUME consumes
     a due attempt (RETRY) or waits (DEFER). Review lookup also accepts a missing expected comment.
-    FALLBACK lets the caller apply its normal rule when no grant is made.
+    FALLBACK lets the caller apply its normal rule when no grant is made. BEFORE_LABELS runs
+    just before the terminal handoff labels the item (the explaining comment goes first).
     Raises UnknownReason before any side effect when REASON is not in the table.
     """
     entry = REASONS.get(reason)
@@ -338,7 +341,7 @@ def perform(env, reason, *, kind, number, title, text, hooks, remove=(), item=""
             return Result(HANDOFF, decision, False)
         return _finish(env, reason, entry, kind=kind, number=number, title=title, text=text, hooks=hooks,
                        remove=remove, item=item, episode=episode, after_labels=after_labels,
-                       decision=decision)
+                       decision=decision, before_labels=before_labels)
 
     if reason in RETRY_REASONS:
         return _category1(env, reason, entry, kind=kind, number=number, title=title, text=text,

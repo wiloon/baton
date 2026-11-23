@@ -261,12 +261,16 @@ class Spec:
         so the revision takes the other one. A later review already ran on the followup model."""
         return round == 1 and reviser == "claude" and last_vendor == "claude"
 
-    def agent(self, vendor, role, prompt, tag, settings, output="", followup=False):
+    def agent(self, vendor, role, prompt, tag, settings, output="", followup=False, round_s=""):
         env = self.env.with_runtime(spec_followup=followup)
-        out = dispatch.dispatch(vendor, role, prompt, tag, str(self.wt), str(self.self_dir / settings), output, env,
-                                self.hooks)
-        if out["rc"] == 75:
-            raise Deferred(vendor, out["defer"])
+        saved_role = {"spec_review": "spec_reviewer", "spec": "reviser"}.get(role)
+        # A saved grant is consumed before the step runs; a short block settles it (recovery.dispatching).
+        with recovery.dispatching(self.env, self.issue, self.issue, lambda: self.retry_binding(round_s),
+                                  role=saved_role):
+            out = dispatch.dispatch(vendor, role, prompt, tag, str(self.wt), str(self.self_dir / settings), output,
+                                    env, self.hooks)
+            if out["rc"] == 75:
+                raise Deferred(vendor, out["defer"])
         return out
 
     def gh(self, *args):
@@ -346,9 +350,9 @@ class Spec:
             str(self.wt), self.issue, base=self.base,
             issue_body=issue_body, comment_digest=trusted_comment_digest(listed, self.env.owner, login_re),
             round_s=round_s, adr_head=getattr(self, "adr_head", "") or "")
-        fingerprint["base_head"] = git(self.wt, "rev-parse", self.base)
+        # The workers do not rebase on resume: main's tip is not an input of a spec retry.
         if (fingerprint["branch"] != self.branch or not fingerprint["local_head"]
-                or not fingerprint["clean"] or not fingerprint["base_head"]):
+                or not fingerprint["clean"]):
             return None
         return fingerprint
 
@@ -382,7 +386,7 @@ class Spec:
         return recovery.resume(
             self.env, self.issue, self.issue, lambda saved: saved.startswith("spec_"),
             lambda: self.retry_binding(round),
-            lambda text: self.handoff(text, reason),
+            lambda text: self.handoff(text, reason), role=role,
             **self.retry_picker(role, other_model, spec_followup))
 
     def retry_read(self, read, why, reason, *, continuation=None):
@@ -538,7 +542,7 @@ class Spec:
                 self.self_dir / "spec-review-prompt.md", VENDOR=reviewer, ISSUE=n, GH_REPO=self.repo, WORKTREE=str(wt),
                 BRANCH=self.branch, ROUND=str(round), MAX_ROUNDS=str(max_rounds), CONTEXT_FILE=str(context),
                 ADR_NOTE=adr_note, ROUND_NOTE=self.round_note(round)), tag, "review-settings.json",
-                followup=self.followup(round, reviewer, last_vendor))
+                followup=self.followup(round, reviewer, last_vendor), round_s=str(round))
             outcome, model = out["outcome"], out["model"] or ""
             if self.unverified(reviewer, last_vendor, model, other_model):
                 self.handoff("Codex spec reviewer model was not verified as different from the reviser model.",
@@ -777,7 +781,8 @@ class Spec:
             for suffix in (".body", ".comment"):
                 Path(f"{out_base}{suffix}").unlink(missing_ok=True)
             tag = f"issue-{n}-spec-reply-{round}" + (f"-retry{attempt}" if attempt else "")
-            out = self.agent(reviser, "spec", prompt, tag, "spec-settings.json", out_base, followup=followup)
+            out = self.agent(reviser, "spec", prompt, tag, "spec-settings.json", out_base, followup=followup,
+                             round_s=str(round))
             denied = permission_denials(out.get("log", "")) if out["outcome"].startswith("RESULT: failed") else []
             if denied and not denied_spent:
                 denied_spent = True
@@ -785,7 +790,7 @@ class Spec:
                 for suffix in (".body", ".comment"):
                     Path(f"{out_base}{suffix}").unlink(missing_ok=True)
                 out = self.agent(reviser, "spec", prompt + DENIED_NOTE.format(command=denied[0]), f"{tag}-rerun",
-                                 "spec-settings.json", out_base, followup=followup)
+                                 "spec-settings.json", out_base, followup=followup, round_s=str(round))
                 denied = permission_denials(out.get("log", "")) if out["outcome"].startswith("RESULT: failed") else []
             outcome, model = out["outcome"], out["model"] or ""
             if (self.unverified(reviser, last_vendor, model, other_model)

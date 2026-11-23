@@ -118,6 +118,20 @@ def opening_path(tick, issue):
     return tick.state / f"pr-opening-{issue}.json"
 
 
+def attempts_path(tick, issue):
+    return tick.state / f"dev-attempts-{issue}.json"
+
+
+def load_attempts(tick, issue):
+    """Author ranges of earlier runs: they survive a deferral or a stop, with the advisor off too."""
+    try:
+        rows = json.loads(attempts_path(tick, issue).read_text())
+    except (OSError, ValueError):
+        return []
+    ok = isinstance(rows, list) and all(isinstance(row, list) and len(row) == 4 for row in rows)
+    return rows if ok else []
+
+
 def save_opening(path, intent):
     """Keep the PR creation intent across a crash, without leaving partial JSON."""
     temp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
@@ -253,8 +267,9 @@ def worker_failure(fail, outcome):
 
 
 def issue_binding(wt, issue, branch, payload):
-    current = recovery.issue_fingerprint(wt, issue, base=git(wt, "rev-parse", "origin/main"))
-    if current["branch"] != branch or not current["clean"] or not current["local_head"] or not current["base"]:
+    # The worker does not rebase on resume, so main's tip is not an input of its retry.
+    current = recovery.issue_fingerprint(wt, issue, base="origin/main")
+    if current["branch"] != branch or not current["clean"] or not current["local_head"]:
         return None
     comments = [comment for comment in payload["comments"]
                 if not comment["body"].startswith("<!-- baton-note by=")]
@@ -313,22 +328,35 @@ def run(tick, issue):
     binding = lambda: live_issue_binding(tick, env, wt, issue, branch)
     pending = recovery.resume(
         env, issue, issue, lambda reason: reason.startswith("dev_") and reason != "dev_verify_failed",
-        binding, lambda text: stop(tick, issue, "dev_run_failed", f"#{issue} needs you", text), **picker)
+        binding, lambda text: stop(tick, issue, "dev_run_failed", f"#{issue} needs you", text), role="dev", **picker)
     if pending is None:
         pending = recovery.resume(
             env, issue, issue, lambda reason: reason == "dev_verify_failed", binding,
-            lambda text: stop(tick, issue, "dev_verify_failed", f"#{issue} needs you", text), local=True)
+            lambda text: stop(tick, issue, "dev_verify_failed", f"#{issue} needs you", text), role="dev", local=True)
     if pending is False:
         return 80
-    attempts = list(pending[0]["remaining_budget"].get("attempts", ())) if pending else []
+    attempts = load_attempts(tick, issue)
+    if pending and pending[0]["remaining_budget"].get("base_sha"):
+        base = pending[0]["remaining_budget"]["base_sha"]   # a verification retry checks the same base
     dev_vendor = pending[1] if pending else tick.pick_vendor("dev", "contrib", tick.all_vendors(), issue=issue)
 
-    def ask(reason, title, detail, *, budget=None, local=False):
+    def ask(reason, title, detail, *, budget=None, local=False, before_labels=None):
         return recovery.request(
             env, issue, issue, reason, "dev", dev_vendor, detail,
             issue_binding(wt, issue, branch, payload), binding,
-            lambda text=detail, **kw: stop(tick, issue, reason, title, text, **kw),
-            budget={"attempts": attempts, **(budget or {})}, local=local, **picker)
+            lambda text=detail, **kw: stop(tick, issue, reason, title, text, before_labels=before_labels, **kw),
+            budget=budget or {}, local=local, **picker)
+
+    def note_attempt(vendor, model, start):
+        """Record the range of an attempt that committed, also when it was cut short."""
+        end = git(wt, "rev-parse", "HEAD")
+        if end == start:   # an attempt that wrote nothing is not an author
+            return end
+        # The first range also covers commits retained from before any was recorded.
+        first = (git(wt, "merge-base", "HEAD", "origin/main") or start) if not attempts else start
+        attempts.append([vendor, model, first, end])
+        save_opening(attempts_path(tick, issue), attempts)
+        return end
 
     def implement():
         start = git(wt, "rev-parse", "HEAD")
@@ -339,13 +367,14 @@ def run(tick, issue):
         if pending and pending[0]["reason"] == "dev_task_invalid":
             note += "\nCorrect the task relation in the PR description. Retain the existing commits."
             note += f" Validation error: {pending[0]['remaining_budget'].get('validation_error', '')}"
-        fail, outcome, out = run_dev_worker(tick, issue, dev_vendor, wt, branch, body, base, plan, payload,
-                                            note, hooks, env)
-        end = git(wt, "rev-parse", "HEAD")
-        if end != start:   # an attempt that wrote nothing is not an author
-            # The first range also covers commits retained from an earlier deferred run.
-            first = (git(wt, "merge-base", "HEAD", "origin/main") or start) if not attempts else start
-            attempts.append([dev_vendor, out.get("model") or "unknown", first, end])
+        try:
+            with recovery.dispatching(env, issue, issue, binding, role="dev"):
+                fail, outcome, out = run_dev_worker(tick, issue, dev_vendor, wt, branch, body, base, plan, payload,
+                                                    note, hooks, env)
+        except Deferred:
+            note_attempt(dev_vendor, "unknown", start)
+            raise
+        note_attempt(dev_vendor, out.get("model") or "unknown", start)
         reason = worker_failure(fail, outcome)
         if reason:
             return reason, fail
@@ -353,12 +382,15 @@ def run(tick, issue):
             pr_body(check_section.canonicalize(Path(body).read_text()), issue)
         except ValueError as error:
             return "dev_task_invalid", str(error)
+        # The worker step is complete: a later deferral continues with verification, not the worker.
+        recovery.update_budget(env, issue, issue, worker_done=True, body=Path(body).read_text())
         return "", ""
 
     pr_helpers.gh("issue", "edit", issue, "-R", repo, "--add-label", "agent-wip")
     tick.notify(f"#{issue} started ({dev_vendor})", url)
     verification = pending and pending[0]["reason"] == "dev_verify_failed"
-    if not verification:
+    worker_done = bool(pending and pending[0]["remaining_budget"].get("worker_done"))
+    if not verification and not worker_done:
         while True:
             reason, fail = implement()
             if not reason:
@@ -378,36 +410,45 @@ def run(tick, issue):
     verifier = fix.Runner(env, hooks)
     verifier.gate_applies = not is_partial(Path(body).read_text(), issue)
     start = git(wt, "rev-parse", "HEAD")
-    if verification:
-        rc, failure, rounds = verifier.verify_retry(str(wt), base, dev_vendor, "issue", issue,
-                                                    repairs=budget["verify_repairs"], repairs_before=budget["repairs_used"])
-    else:
-        rc, failure, rounds = verifier.verify(str(wt), base, dev_vendor, "issue", issue)
-    end = git(wt, "rev-parse", "HEAD")
-    if end != start:
-        attempts.append([dev_vendor, "unknown", start, end])
+    try:
+        if verification:
+            rc, failure, rounds = verifier.verify_retry(
+                str(wt), base, dev_vendor, "issue", issue, binding=binding,
+                repairs=budget["verify_repairs"], repairs_before=budget["repairs_used"])
+        else:
+            with recovery.dispatching(env, issue, issue, binding, role="dev"):
+                rc, failure, rounds = verifier.verify(str(wt), base, dev_vendor, "issue", issue)
+    except Deferred:
+        note_attempt(dev_vendor, "unknown", start)
+        raise
+    end = note_attempt(dev_vendor, "unknown", start)
     if rc != 0:
         retry = None
         reason = "dev_verify_failed"
         title = f"#{issue}: local CI verification failed"
         max_repairs = int(env.config.scheduling.max_verify_fixes or 2)
+        def explain(used):
+            pr_helpers.gh("issue", "comment", issue, "-R", repo, "--body",
+                          f"<!-- baton-note by={dev_vendor} -->\nLocal CI verification failed before push after {used} of "
+                          f"{max_repairs} fix rounds. Nothing was pushed.\n\n{failure[:REPLY_CAP]}")
         if not verification:
             remaining = max(0, max_repairs - rounds)
             retry = ask(reason, title, recovery.verify_status(repairs_used=rounds, max_repairs=max_repairs,
                                                               failure=failure),
-                        budget={"verify_repairs": remaining, "repairs_used": rounds,
-                                "body": Path(body).read_text()}, local=True)
-            if retry:
-                rc, failure, rounds = verifier.verify_retry(str(wt), base, dev_vendor, "issue", issue,
-                                                            repairs=remaining, repairs_before=rounds)
-                head = git(wt, "rev-parse", "HEAD")
-                if head != end:
-                    attempts.append([dev_vendor, "unknown", end, head])
+                        budget={"verify_repairs": remaining, "repairs_used": rounds, "base_sha": base,
+                                "body": Path(body).read_text()}, local=True,
+                        before_labels=lambda: explain(rounds))   # the comment goes up before the label
+            if not retry:
+                return 80
+            try:
+                rc, failure, rounds = verifier.verify_retry(
+                    str(wt), base, dev_vendor, "issue", issue, binding=binding,
+                    repairs=remaining, repairs_before=rounds)
+            finally:
+                note_attempt(dev_vendor, "unknown", end)
         if rc:
-            pr_helpers.gh("issue", "comment", issue, "-R", repo, "--body",
-                          f"<!-- baton-note by={dev_vendor} -->\nLocal CI verification failed before push after {rounds} of "
-                          f"{max_repairs} fix rounds. Nothing was pushed.\n\n{failure[:REPLY_CAP]}")
-            return 80 if not verification and not retry else stop(tick, issue, reason, title, url)
+            explain(rounds)
+            return stop(tick, issue, reason, title, url)
     if not push(wt, branch, upstream=True, signoff=tick.env.repo.signoff):
         stop(tick, issue, "dev_push_failed", f"#{issue}: pushing {dev_vendor}'s branch failed",
              f"{branch} is committed in {wt}. {url}")
@@ -429,6 +470,7 @@ def run(tick, issue):
               "model": attempts[-1][1], "attempts": attempts, "pr": ""}
     save_opening(opening_path(tick, issue), intent)
     recovery.clear(env, issue, issue)
+    attempts_path(tick, issue).unlink(missing_ok=True)
     created = pr_helpers.gh("pr", "create", "-R", repo, "--head", branch, "--base", "main", "--title", lines[0], "--body", text)
     if created.returncode != 0:
         # A lost GitHub response may still have created the PR; leave the intent to reconcile.

@@ -1678,10 +1678,23 @@ def test_dev_retry_keeps_all_attempt_authors(advised_dev):
         implements()(cwd, output)
         return {**DONE, "outcome": "RESULT: failed after committing"}
 
-    advised_dev.script = [failed, implements(commit=False)]
+    def second(cwd, output):
+        Path(cwd, "second.txt").write_text("second\n")
+        sh(cwd, "git", "add", "-A")
+        sh(cwd, "git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "-m", "more")
+        return implements(commit=False)(cwd, output)
+
+    advised_dev.script = [failed, second]
     _, rc = advised_dev.go()
     assert rc == 80 and advised_dev.gh.ran("pr", "create")
     assert set(advised_dev.path("pr-301-authors").read_text().split()) == {"codex", "claude"}
+
+
+def test_dev_attempt_without_a_commit_is_not_an_author(advised_dev):
+    advised_dev.script = [lambda cwd, output: {**DONE, "outcome": "RESULT: failed boom"}, implements()]
+    _, rc = advised_dev.go()
+    assert rc == 80 and advised_dev.gh.ran("pr", "create")
+    assert advised_dev.path("pr-301-authors").read_text().split() == ["claude"]
 
 
 def test_dev_verification_retry_resumes_after_deferral(advised_dev, monkeypatch):

@@ -78,10 +78,11 @@ class Runner:
                     issue=self.env.runtime.issue)
 
     def recover(self, pr, reason, title, detail, vendor, *, wt, repairs_used=0, head="",
-                validation_error="", pushed=False):
+                validation_error="", pushed=False, before_labels=None):
         episode = self.env.runtime.issue or str(pr)
         budget = {"verify_repairs": max(0, self.max_verify - repairs_used),
                   "repairs_used": repairs_used, "authors": self.attempt_authors, "head": head,
+                  "base_sha": getattr(self, "verified_base", ""),
                   "validation_error": validation_error}
         def binding():
             current = self.retry_binding(wt, pr)
@@ -99,34 +100,34 @@ class Runner:
 
         result = recovery.request(
             self.env, episode, pr, reason, "fixer", vendor, detail, binding(), binding,
-            lambda text=detail, **kw: self.handoff(pr, reason, title, text, **kw),
+            lambda text=detail, **kw: self.handoff(
+                pr, reason, title, text, **({"before_labels": before_labels} if before_labels else {}), **kw),
             budget=budget, local=reason == "fix_verify_failed",
             exclusions=getattr(self, "retry_exclusions", ()), **self.retry_picker(pr))
         return (result[0]["action"], result[1], budget["verify_repairs"]) if result else ("handoff", vendor, 0)
 
     def resume(self, pr, wt):
-        try:
-            pending = recovery.load(self.env, self.env.runtime.issue or pr, pr)
-        except recovery.RecoveryUnreadable as error:
-            self.handoff(pr, "fix_run_failed", f"PR #{pr} needs you", str(error))
-            return False
-        if not pending or not pending["reason"].startswith("fix_"):
-            return None
-        try:
-            selected = recovery.resolve(
-                self.env, pending, lambda: self.retry_binding(wt, pr),
-                local=pending["reason"] == "fix_verify_failed", **self.retry_picker(pr))
-        except (Exhausted, recovery.RecoveryUnreadable) as error:
-            self.handoff(pr, pending["reason"], f"PR #{pr} needs you", str(error))
-            return False
-        self.attempt_authors = list(pending["remaining_budget"].get("authors", ()))
+        selected = recovery.resume(
+            self.env, self.env.runtime.issue or pr, pr, lambda reason: reason.startswith("fix_"),
+            lambda: self.retry_binding(wt, pr),
+            lambda text: self.handoff(pr, "fix_run_failed", f"PR #{pr} needs you", text),
+            role="fixer", local=lambda record: record["reason"] == "fix_verify_failed", **self.retry_picker(pr))
+        if selected:
+            self.attempt_authors = list(selected[0]["remaining_budget"].get("authors", ()))
         return selected
 
-    def verify_retry(self, wt, base, vendor, kind, number, *, repairs, repairs_before):
-        self.verification_progress = recovery.verification_progress(
-            self.env, self.env.runtime.issue or number, number, vendor)
+    def dispatching(self, pr, wt):
+        """Consume a saved grant before the step it allows runs (see recovery.dispatching)."""
+        return recovery.dispatching(self.env, self.env.runtime.issue or pr, pr,
+                                    lambda: self.retry_binding(wt, pr), role="fixer")
+
+    def verify_retry(self, wt, base, vendor, kind, number, *, repairs, repairs_before, binding=None):
+        episode = self.env.runtime.issue or number
+        self.verification_progress = recovery.verification_progress(self.env, episode, number, vendor)
+        binding = binding or (lambda: self.retry_binding(wt, number))
         try:
-            return self.verify(wt, base, vendor, kind, number, repairs=repairs, repairs_before=repairs_before)
+            with recovery.dispatching(self.env, episode, number, binding):
+                return self.verify(wt, base, vendor, kind, number, repairs=repairs, repairs_before=repairs_before)
         finally:
             self.verification_progress = None
 
@@ -183,6 +184,7 @@ class Runner:
         REPAIRS caps how many verification-fix runs may follow a red check. REPAIRS_BEFORE
         counts repairs already consumed earlier in the episode (#125 point 12).
         """
+        self.verified_base = git(wt, "rev-parse", base) or base   # a retry verifies the same commit
         try:
             gate = self.e2e_gate(kind, number)
         except ValueError as error:
@@ -431,11 +433,11 @@ class Runner:
                                                         f"PR #{pr}: local CI verification failed",
                                                         recovery.verify_status(repairs_used=rounds, max_repairs=self.max_verify,
                                                                                failure=failure), fixer, wt=wt,
-                                                        repairs_used=rounds, head=head)
+                                                        repairs_used=rounds, head=head,
+                                                        before_labels=lambda: self.verify_failed(pr, failure, rounds))
                 if action == "handoff":
-                    self.verify_failed(pr, failure, rounds)
                     return 1
-                rc, failure, more = self.verify_retry(wt, "origin/main", fixer, "pr", pr, repairs=remaining,
+                rc, failure, more = self.verify_retry(wt, self.verified_base, fixer, "pr", pr, repairs=remaining,
                                                 repairs_before=rounds)
                 rounds = more
                 if rc != 0:
@@ -573,12 +575,12 @@ class Runner:
                                                       f"Cursor PR #{pr}: local CI verification failed",
                                                       recovery.verify_status(repairs_used=rounds, max_repairs=self.max_verify,
                                                                              failure=failure), "cursor", wt=wt,
-                                                      repairs_used=rounds, head=head)
+                                                      repairs_used=rounds, head=head,
+                                                      before_labels=lambda: self.verify_failed(pr, failure, rounds))
                 if action == "handoff":
-                    self.verify_failed(pr, failure, rounds)
                     return 1
                 vendor = alt if alt != "cursor" else "cursor"
-                rc, failure, more = self.verify_retry(wt, "origin/main", vendor, "pr", pr, repairs=remaining,
+                rc, failure, more = self.verify_retry(wt, self.verified_base, vendor, "pr", pr, repairs=remaining,
                                                 repairs_before=rounds)
                 rounds = more
                 if rc != 0:
@@ -607,10 +609,29 @@ class Runner:
 
     def dispatch_fixer(self, pr, wt, fixer, source, feedback, head):
         self.last_fixer = fixer
-        if fixer != "cursor":
-            return self.fix_pr(pr, wt, fixer, source, feedback, head)
-        rc = self.cursor_fix(pr, wt, source, feedback, head)
+        with self.dispatching(pr, wt):
+            if fixer != "cursor":
+                return self.fix_pr(pr, wt, fixer, source, feedback, head)
+            rc = self.cursor_fix(pr, wt, source, feedback, head)
+            if rc == 75:   # a short block reported by return value, e.g. a description update
+                recovery.settle(self.env, self.env.runtime.issue or pr, pr, lambda: self.retry_binding(wt, pr))
         self.hooks.fix("cursor", self.round or 0, self.reply)
+        return rc
+
+    def finish_progressed(self, pr, wt, fixer, head, budget):
+        """Continue a completed worker step (its commits and reply exist) with its verification."""
+        self.last_fixer = fixer
+        rc, failure, rounds = self.verify_retry(
+            wt, budget.get("base_sha") or "origin/main", fixer, "pr", pr,
+            repairs=budget.get("verify_repairs", self.max_verify), repairs_before=budget.get("repairs_used", 0))
+        if rc:
+            self.verify_failed(pr, failure, rounds)
+            return self.handoff(pr, "fix_verify_failed", f"PR #{pr}: local CI verification failed", failure)
+        if not self.record(pr, fixer, wt, head, "unknown", ""):
+            return 1
+        rc = self.finish_verified(pr, wt, fixer)
+        if rc == 0:
+            recovery.clear(self.env, self.env.runtime.issue or pr, pr)
         return rc
 
 
@@ -636,7 +657,7 @@ def fix_pr(runner, pr, wt, fixer, source, feedback, head=""):
     head = budget.get("head") or head
     if record["reason"] == "fix_verify_failed":
         runner.last_fixer = fixer
-        rc, failure, rounds = runner.verify_retry(wt, "origin/main", fixer, "pr", pr,
+        rc, failure, rounds = runner.verify_retry(wt, budget.get("base_sha") or "origin/main", fixer, "pr", pr,
                                                   repairs=budget["verify_repairs"],
                                             repairs_before=budget["repairs_used"])
         if rc:
@@ -646,9 +667,12 @@ def fix_pr(runner, pr, wt, fixer, source, feedback, head=""):
         runner.clear_cursor_request(pr)
         recovery.clear(runner.env, runner.env.runtime.issue or pr, pr)
         return rc
+    if record["state"] == "progressed" and fixer != "cursor" and runner.head(wt) != head:
+        return runner.finish_progressed(pr, wt, fixer, head, budget)
     if record["reason"] == "fix_task_invalid":
         feedback = correction(feedback, budget.get("validation_error", ""))
-    runner.clear_cursor_request(pr, keep_base=True)
+    if record["state"] != "progressed":   # a completed Cursor step reconciles from its saved request
+        runner.clear_cursor_request(pr, keep_base=True)
     return runner.dispatch_fixer(pr, wt, fixer, source, feedback, head)
 
 

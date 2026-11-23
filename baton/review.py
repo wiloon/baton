@@ -737,6 +737,14 @@ class Review:
                 action, _ = self.recover_worker(
                     seed_reason, f"PR #{pr} needs you",
                     "RESULT: failed recording PR authors", "", role="reviewer", fallback=True)
+                if (action == owner_handoff.HANDOFF and advisor.enabled(self.env)
+                        and advisor.settings(self.env).mode == "live"):
+                    # Live: a handoff advice or a grant that failed revalidation ends it, with one
+                    # handoff. Only off and observe keep the old continuation below.
+                    self.handoff(seed_reason, f"PR #{pr} needs you",
+                                 f"RESULT: failed recording PR authors {self.url}")
+                    self.drop()
+                    return 0
                 if action != owner_handoff.HANDOFF and not self.seed():
                     self.handoff(seed_reason, f"PR #{pr} needs you",
                                  f"RESULT: failed recording PR authors after retry {self.url}")

@@ -1707,7 +1707,7 @@ def test_fingerprint_mismatch_on_pending_review_recovery_hands_off(loop, monkeyp
         "action": "retry_step", "failed_vendor": "claude", "exclusions": ["claude"],
         "remaining_budget": {}, "fingerprint": recovery.worker_fingerprint(str(loop.wt), PR, round_s="1"),
         "role": "reviewer", "episode": "297", "item": str(PR), "reason": "review_run_failed", "decision_id": "x",
-        "dispatched": False,
+        "state": "granted", "pinned": False,
     })
     grant = advisor.grant_path(env, "review_run_failed", PR)
     grant.parent.mkdir(parents=True, exist_ok=True)

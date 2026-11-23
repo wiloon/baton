@@ -4,6 +4,7 @@ A recovery record holds the granted action, failed vendor, picker exclusions, re
 budget, state fingerprint, and advisor decision id. It is written before alternate
 vendor selection so a deferral or restart cannot lose dispatch constraints.
 """
+import contextlib
 import hashlib
 import json
 from pathlib import Path
@@ -11,13 +12,16 @@ import re
 
 from . import notify, pick, vendors
 from . import pr as pr_helpers
-from .common import Exhausted, git
+from .common import Deferred, Exhausted, git
 from .quota import atomic_json
 
 REQUIRED = frozenset({
     "action", "failed_vendor", "exclusions", "remaining_budget", "fingerprint",
-    "role", "episode", "item", "reason", "decision_id",
+    "role", "episode", "item", "reason", "decision_id", "state", "pinned",
 })
+# granted: not dispatched yet. dispatched: the step may have run. progressed: a short block
+# interrupted a step that had already changed the saved inputs, which are checkpointed.
+STATES = ("granted", "dispatched", "progressed")
 
 
 class RecoveryUnreadable(ValueError):
@@ -39,6 +43,8 @@ def _valid(record):
     if not all(isinstance(record[key], str) for key in ("failed_vendor", "role", "episode", "item", "reason", "decision_id")):
         return False
     if record["action"] not in ("retry_step", "retry_step_other_vendor"):
+        return False
+    if record["state"] not in STATES or not isinstance(record["pinned"], bool):
         return False
     entry = REASONS.get(record["reason"])
     if not entry or entry.mode != "live" or record["action"] not in entry.actions:
@@ -72,12 +78,15 @@ def load(env, episode, item):
 
 
 def pending_fix(env, episode, item):
-    """True when a saved record is a fix retry (or unreadable, so the fix resume can hand it off)."""
+    """The vendor of a saved fix retry, "" when none (a review record is not one). An unreadable
+    record answers "agent", so the fix resume can hand it off."""
     try:
         record = load(env, episode, item)
     except RecoveryUnreadable:
-        return True
-    return bool(record and record["reason"].startswith("fix_"))
+        return "agent"
+    if not record or record["role"] != "fixer" or not record["reason"].startswith("fix_"):
+        return ""
+    return record.get("selected_vendor") or record["failed_vendor"]
 
 
 def persist(env, record):
@@ -219,7 +228,8 @@ def decision_id(env, reason, item):
         return ""
 
 
-def persist_grant(env, result, *, role, failed_vendor, exclusions, budget, fingerprint, episode, item, reason):
+def persist_grant(env, result, *, role, failed_vendor, exclusions, budget, fingerprint, episode, item, reason,
+                  pinned=False):
     """Write the recovery record after the advisor grants a non-handoff action."""
     if result.handed_off or result.action == "handoff":
         return None
@@ -234,6 +244,8 @@ def persist_grant(env, result, *, role, failed_vendor, exclusions, budget, finge
         "item": str(item),
         "reason": reason,
         "decision_id": decision_id(env, reason, item),
+        "state": "granted",
+        "pinned": bool(pinned),
     }
     persist(env, record)
     return record
@@ -243,6 +255,7 @@ def select_vendor(env, record, *, mode, candidates, pr="", issue="", fixed_by=""
                   spec_followup=False, pinned=False):
     """Select from the role's candidates with strict recovery constraints."""
     role, failed = record["role"], record["failed_vendor"]
+    pinned = record["pinned"]   # the first pick's constraint, not the saved alternate's
     exclusions = [v for v in record["exclusions"] if v]
     same = record["action"] == "retry_step"
     if not same:
@@ -303,13 +316,15 @@ def worker_fingerprint(wt, pr, *, round_s="", extra=None, head_ref="", required_
     return current
 
 
-def resume(env, episode, item, match, binding, handoff, *, local=False, **picker):
-    """Load before the normal step. A deferral leaves the action and budget intact."""
+def resume(env, episode, item, match, binding, handoff, *, role=None, local=False, **picker):
+    """Load before the normal step. A deferral leaves the action and budget intact.
+
+    ROLE keeps a record of another role (a spec reviewer's for the reviser) from being taken over."""
     try:
         record = load(env, episode, item)
-        if record is None or not match(record["reason"]):
+        if record is None or not match(record["reason"]) or role and record["role"] != role:
             return None
-        return resolve(env, record, binding, local=local, **picker)
+        return resolve(env, record, binding, local=local(record) if callable(local) else local, **picker)
     except (RecoveryUnreadable, Exhausted) as error:
         handoff(str(error))
         return False
@@ -323,6 +338,10 @@ def resolve(env, record, binding, *, local=False, **picker):
         raise RecoveryUnreadable("Saved recovery inputs changed or could not be read.")
     if not record["decision_id"] or record["decision_id"] != decision_id(env, record["reason"], record["item"]):
         raise RecoveryUnreadable("Saved recovery grant could not be confirmed.")
+    if record["state"] == "dispatched":
+        raise RecoveryUnreadable("A saved retry was already dispatched and its outcome is unknown.")
+    if record["state"] == "progressed":   # a completed step: continue, never pick or replay it
+        return record, record.get("selected_vendor") or record["failed_vendor"]
     vendor = record["failed_vendor"] if local else select_vendor(env, record, **picker)
     if not local and not fingerprint_matches(record, binding()):
         raise RecoveryUnreadable("Saved recovery inputs changed during selection.")
@@ -342,13 +361,63 @@ def verification_progress(env, episode, item, vendor):
     def checkpoint(used, remaining, head):
         budget["repairs_used"] = used
         budget["verify_repairs"] = remaining
-        previous = record["fingerprint"]["local_head"]
-        if "attempts" in budget and head != previous:
-            budget["attempts"].append([vendor, "unknown", previous, head])
         record["fingerprint"]["local_head"] = head
         persist(env, record)
 
     return checkpoint
+
+
+# Fields that hold what the owner or the world supplied; a change there is never our own progress.
+FOREIGN = frozenset({"feedback", "issue_evidence", "issue_body", "comment_digest", "base", "head_ref", "branch"})
+
+
+def _readable(env, episode, item):
+    try:
+        return load(env, episode, item)
+    except RecoveryUnreadable:
+        return None
+
+
+def update_budget(env, episode, item, **fields):
+    """Checkpoint facts about the granted step (for example a finished worker) on the record."""
+    record = _readable(env, episode, item)
+    if record:
+        record["remaining_budget"].update(fields)
+        persist(env, record)
+
+
+@contextlib.contextmanager
+def dispatching(env, episode, item, binding, *, role=None):
+    """Consume the grant before the step runs; settle it when a short block interrupts the step.
+
+    A restart that finds "dispatched" cannot tell whether the step ran, so it hands off. A
+    deferral without progress gives the grant back; one after progress (a commit, our own reply)
+    checkpoints the new inputs so the normal resume continues instead of handing off."""
+    record = _readable(env, episode, item)
+    if not record or role and record["role"] != role or record["state"] == "dispatched":
+        yield
+        return
+    if record["state"] == "granted":
+        persist(env, {**record, "state": "dispatched"})
+    try:
+        yield
+    except Deferred:
+        settle(env, episode, item, binding)
+        raise
+
+
+def settle(env, episode, item, binding):
+    """A short block interrupted the dispatched step: give the grant back or checkpoint its progress."""
+    fresh = _readable(env, episode, item)
+    if fresh and fresh["state"] in ("dispatched", "progressed"):
+        current = binding() or {}
+        saved = fresh["fingerprint"]
+        changed = {key for key in {*current, *saved} if current.get(key) != saved.get(key)}
+        if current and changed and not changed & FOREIGN:
+            fresh.update(state="progressed", fingerprint=current)
+        elif fresh["state"] == "dispatched":
+            fresh["state"] = "granted"
+        persist(env, fresh)
 
 
 def request(env, episode, item, reason, role, vendor, detail, fingerprint, binding, handoff,
@@ -378,7 +447,7 @@ def request(env, episode, item, reason, role, vendor, detail, fingerprint, bindi
     try:
         record = persist_grant(env, result, role=role, failed_vendor=vendor, exclusions=exclusions,
                                budget=budget or {}, fingerprint=fingerprint, episode=episode,
-                               item=item, reason=reason)
+                               item=item, reason=reason, pinned=picker.get("pinned", False))
         return resolve(env, record, binding, local=local, **picker)
     except (RecoveryUnreadable, Exhausted) as error:
         handoff(text=str(error))

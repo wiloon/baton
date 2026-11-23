@@ -203,6 +203,9 @@ class Merger:
                     return False
             if gh("issue", "edit", issue, "--remove-label", "agent-wip", "--add-label", "ready-for-agent").returncode != 0:
                 return False
+            # This slice is done: close its dev grants with their outcome so the next slice
+            # starts clean (the issue episode stays open until the issue is, but its grants do not).
+            advisor.finish_episode(self.env, "issue", issue, "merged")
             Path(state_dir, f"last-slice-{issue}").write_text(f"{pr}\n")
             Path(self.env.config.paths.state, "chain-next").touch()   # global: the next pass may be any repository's
             notify.log(f"PR #{pr}: partial slice merged; #{issue} ready for its next slice")

@@ -616,7 +616,7 @@ class Tick:
             return 1
         for commit in vendors.seed_contrib(str(self.state), pr, wt):
             self.log(f"PR #{pr}: commit {commit} has no known vendor; not counted")
-        fixer = "agent" if recovery.pending_fix(self.env, episode, pr) else self.pick_vendor(
+        fixer = recovery.pending_fix(self.env, episode, pr) or self.pick_vendor(
             "fixer", "contrib", self.all_vendors(), pr=pr, issue=issue)
         self.notify(f"PR #{pr}: {fixer} is addressing your review", url)
         # Posting a fix reply advances human_feedback's cutoff even when an edit defers.
