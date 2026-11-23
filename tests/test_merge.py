@@ -644,6 +644,29 @@ def test_a_merged_partial_pr_releases_its_task_once(run):
     assert Path(run.env["STATE"], "last-slice-297").read_text() == f"{PR}\n"
 
 
+def test_a_merged_slice_closes_its_dev_grants_but_not_the_next_slices_on_reentry(run):
+    from baton import session
+    env = session.resolve(run.env)
+    stale = advisor.grant_path(env, "dev_verify_failed", "297")
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text("slice-one")
+
+    def decide(decision_id):
+        advisor.append(env, {"kind": "decision", "ts": 100, "point": "dev_verify_failed", "repo": "owner/app",
+                             "task_kind": "issue", "item": "297", "episode": "297", "decision_id": decision_id,
+                             "advised": "retry_step", "executed": "retry_step", "rule": "handoff"})
+    decide("one")
+    run.gh.set(open_prs=[], body=PARTIAL)
+    sh(run.wt, "git", "push", "-q", "origin", "HEAD:main")
+    sh(run.repo, "git", "fetch", "-q", "origin")
+    assert run.merger().finish_merged_task()
+    assert not stale.exists()                      # slice one's grant is closed with the merge
+    stale.write_text("slice-two")                  # the next slice's grant
+    decide("two")
+    assert run.merger().finish_merged_task()       # re-entry for slice one: the marker returns early
+    assert stale.read_text() == "slice-two"
+
+
 def test_a_later_slice_owning_the_task_leaves_it_alone(run):
     run.gh.set(open_prs=[{"number": 400}], body=PARTIAL)
     assert run.merger().finish_merged_task()
@@ -704,6 +727,7 @@ def repair(run, monkeypatch):
 
     def fix_pr(runner, pr, wt, fixer, source, feedback, head=""):
         run.fixes.append({"fixer": fixer, "source": source, "feedback": feedback, "round": runner.round})
+        runner.last_fixer = getattr(run, "effective_fixer", "")
         if run.fix_rc and run.fix_hands_off:
             runner.handed_off = True
         return run.fix_rc
@@ -720,6 +744,16 @@ def test_a_code_check_failure_gets_one_repair_round_per_head(repair):
     assert repair.fixes[0]["round"] == "ci" and Path(repair.env["STATE"], f"ci-fix-{PR}-{HEAD}").exists()
     assert repair.merger().ci_fix_round(str(repair.wt)) == 1   # the same head is not repaired twice
     assert len(repair.fixes) == 1
+
+
+def test_ci_repair_event_uses_the_effective_fixer(repair, monkeypatch):
+    seen = []
+    repair.effective_fixer = "codex"
+    merger = repair.merger()
+    monkeypatch.setattr(merger.hooks, "task", lambda *args: seen.append(args))
+    monkeypatch.setattr(merge.pick, "choose", lambda *args, **kwargs: "claude")
+    assert merger.ci_fix_round(str(repair.wt)) == 0
+    assert seen == [("ci_fix", f"pr:{PR}:{HEAD}", "--agent", "codex", "--head-sha", HEAD)]
 
 
 def test_an_image_build_failure_is_not_sent_to_a_code_fixer(repair):
@@ -928,6 +962,19 @@ def test_a_pr_touching_an_owner_review_path_goes_to_the_owner_after_ci(run):
     assert run.events[-1] == "notify PR #335 review and CI passed" and "ci" in run.events
     assert "bin/guard.sh" in run.texts["PR #335 review and CI passed"]
     assert "README.md" not in run.texts["PR #335 review and CI passed"]
+
+
+def test_a_live_owner_path_handoff_makes_no_provider_call(run, monkeypatch):
+    observing = []
+    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="live", snapshot_chars=1000))
+    monkeypatch.setenv(advisor.KEY, "fake-advisor-key")
+    monkeypatch.setattr(advisor, "call_deepseek", lambda *a, **k: observing.append(1) or ({}, {}))
+    run.gh.set(files_api=[{"filename": "bin/guard.sh"}])
+    run.go(OWNER_REVIEW_PATHS="bin/guard.sh")
+    assert observing == []                                    # zero provider requests, live mode
+    assert not run.merged() and "bin/guard.sh" in run.texts["PR #335 review and CI passed"]
+    assert run.events.count("notify PR #335 review and CI passed") == 1   # one handoff
+    assert "owner_review_path" in run.texts["PR #335 review and CI passed"] or run.labelled("ready-for-human")
 
 
 def test_a_pr_touching_no_owner_review_path_merges(run):

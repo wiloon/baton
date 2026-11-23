@@ -334,7 +334,10 @@ output_chars = 20000
 budget_usd = 1.0
 
 # Optional routine advisor (ADR 0008): "off" makes no call. "observe" records advice and runs the
-# handoff rule. "live" allows one extra review or spec round per task episode. CI and merge
+# existing rule. "live" allows one extra review or spec round per task episode and at most one
+# retry per failure reason per episode. Failed review, fix, spec, implementation, verification
+# and worktree steps send redacted context for retry_step or retry_step_other_vendor when
+# eligible. Verification retains its repair budget. CI and merge
 # recommendations for implementation and ADR PRs stay in observation in either enabled mode.
 # Decisions go to STATE/advisor/decisions.jsonl and a daily digest. A [[repos]] entry with
 # advisor = false keeps that repository's text off the provider.

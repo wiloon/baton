@@ -165,7 +165,7 @@ class Merger:
             # Only a real handoff by the repair run ends here; any other failure (e.g. recording
             # authorship) falls through to the merge gate's own CI handoff.
             return HANDED_OFF if runner.handed_off else 1
-        self.hooks.task("ci_fix", f"pr:{pr}:{head}", "--agent", fixer, "--head-sha", head)
+        self.hooks.task("ci_fix", f"pr:{pr}:{head}", "--agent", runner.last_fixer or fixer, "--head-sha", head)
         return 0
 
     # --- the task behind the PR ---
@@ -203,6 +203,9 @@ class Merger:
                     return False
             if gh("issue", "edit", issue, "--remove-label", "agent-wip", "--add-label", "ready-for-agent").returncode != 0:
                 return False
+            # This slice is done: close its dev grants with their outcome so the next slice
+            # starts clean (the issue episode stays open until the issue is, but its grants do not).
+            advisor.finish_episode(self.env, "issue", issue, "merged")
             Path(state_dir, f"last-slice-{issue}").write_text(f"{pr}\n")
             Path(self.env.config.paths.state, "chain-next").touch()   # global: the next pass may be any repository's
             notify.log(f"PR #{pr}: partial slice merged; #{issue} ready for its next slice")

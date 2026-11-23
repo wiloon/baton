@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
-from . import advisor, notify
+from . import advisor, notify, recovery
 from . import pr as pr_helpers
 from .quota import atomic_json
 
@@ -413,12 +413,15 @@ def label_ready(env, kind, number, remove=()):
 
 
 def _finish(env, reason, entry, *, kind, number, title, text, hooks, remove, item, episode,
-            after_labels, decision=None):
+            after_labels, decision=None, before_labels=None):
     """The one terminal handoff: outcomes, labels, telemetry, notify, log."""
     clear_episode(env, episode, item or number)
+    recovery.clear_episode(env, episode)
     if kind == "pr":
         # Retire the continuation before publishing the handoff or releasing its grant.
         Path(env.dirs.state, f"review-pending-{number}").unlink(missing_ok=True)
+    if before_labels:
+        before_labels()   # the comment that explains the failure goes up before the label
     result = label_ready(env, kind, number, remove=remove)
     if after_labels:
         after_labels(result)
@@ -479,7 +482,7 @@ def _category1(env, reason, entry, *, kind, number, title, text, hooks, remove, 
 
 def perform(env, reason, *, kind, number, title, text, hooks, remove=(), item="", episode="",
             snapshot="", revalidate=None, after_labels=None, observed_actions=None,
-            transient=False, continuation=None, resume=False):
+            transient=False, continuation=None, resume=False, fallback=False, before_labels=None):
     """Validate REASON, apply its rule or advisor action, and on handoff run labels/telemetry/notify.
 
     KIND is "pr" or "issue". REMOVE is labels to drop before adding ready-for-human. AFTER_LABELS
@@ -487,6 +490,8 @@ def perform(env, reason, *, kind, number, title, text, hooks, remove=(), item=""
     than handoff are returned for the caller to execute; handoff side effects have already run.
     For eligible category-1 reads, TRANSIENT schedules a deferred attempt and RESUME consumes
     a due attempt (RETRY) or waits (DEFER). Review lookup also accepts a missing expected comment.
+    FALLBACK lets the caller apply its normal rule when no grant is made. BEFORE_LABELS runs
+    just before the terminal handoff labels the item (the explaining comment goes first).
     Raises UnknownReason before any side effect when REASON is not in the table.
     """
     entry = REASONS.get(reason)
@@ -495,9 +500,11 @@ def perform(env, reason, *, kind, number, title, text, hooks, remove=(), item=""
     episode = str(episode or item or number)
 
     def finish(decision=None):
+        if fallback:
+            return Result(HANDOFF, decision, False)
         return _finish(env, reason, entry, kind=kind, number=number, title=title, text=text, hooks=hooks,
                        remove=remove, item=item, episode=episode, after_labels=after_labels,
-                       decision=decision)
+                       decision=decision, before_labels=before_labels)
 
     if reason in RETRY_REASONS:
         return _category1(env, reason, entry, kind=kind, number=number, title=title, text=text,
@@ -505,18 +512,28 @@ def perform(env, reason, *, kind, number, title, text, hooks, remove=(), item=""
                           after_labels=after_labels, transient=transient,
                           continuation=continuation, resume=resume)
 
-    # The observation caller supplies only the actions the current evidence supports.
-    observing = entry.mode == "observe" and observed_actions is not None
-    if entry.category in (1, 4) or (not observing and "extra_round" not in entry.actions):
+    # Callers that have not opted in keep today's handoff. Observation always passes the
+    # actions the current evidence supports; live worker/investigation retries do the same
+    # once wired. The #17 round limits still offer extra_round without that opt-in.
+    if entry.category in (1, 4) or not entry.actions:
         return finish()
-    offered = tuple(a for a in entry.actions if a in observed_actions) if observing else ("extra_round",)
+    if observed_actions is not None:
+        offered = tuple(a for a in entry.actions if a in observed_actions)
+        if not offered and entry.mode != "observe":
+            return finish()
+    elif entry.mode == "live" and "extra_round" in entry.actions:
+        offered = ("extra_round",)
+    else:
+        prior = advisor.saved_attempt(env, reason, number, kind)
+        return finish(prior)
     cfg = advisor.settings(env)
     mode = capped_mode(cfg.mode if advisor.enabled(env) else "off", entry.mode)
-    if mode == "off":   # still explain an earlier recovery of this episode
+    if mode == "off":
         return finish(advisor.saved_attempt(env, reason, number, kind))
+    typed = entry.mode == "observe" or any(action != "extra_round" for action in offered)
     decision = advisor.advise(env, reason, number, snapshot, offered, task_kind=kind,
                              revalidate=revalidate, rule=HANDOFF, mode=mode,
-                             category=entry.category if observing else None)
+                             category=entry.category if typed else None)
     if decision.action == HANDOFF:
         return finish(decision)
     return Result(decision.action, decision, False)

@@ -21,8 +21,8 @@ import subprocess
 import sys
 import time
 
-from . import agents, dispatch, e2e_gate, hooks as telemetry, notify, pr as pr_helpers, pr_contract, prompts, vendors
-from .common import Deferred, child_env, git, push, strip_markers
+from . import agents, dispatch, e2e_gate, hooks as telemetry, notify, pick, pr as pr_helpers, pr_contract, prompts, recovery, vendors
+from .common import Deferred, Exhausted, child_env, git, push, strip_markers
 
 REPLY_CAP = 60000
 # The verify output a repair run gets in its prompt: the tail, where the errors are. The whole
@@ -47,17 +47,107 @@ class Runner:
         self.pr, self.reply, self.gate_result = pr, "", ""
         self.gate_applies = True   # dev.run clears it for a partial slice
         self.handed_off = False    # set once handoff() labels the PR; callers tell it apart from rc 1
+        self.last_fixer = ""
+        self.attempt_authors = []
+        self.retry_context = {}
+        self.retry_start = None
+        self.required_retry_label = ""
+        self.owner_triggered = False   # fix_pr sets it; dispatch_fixer keeps the owner scope on retries
+        self.verification_progress = None
         self.hooks = hooks or telemetry.from_env(env, issue=env.runtime.issue, pr=pr, round=round)
 
     # --- the owner handoff every gate shares ---
-    def handoff(self, pr, reason, title, text):
-        """Label the PR for the owner, record why, say so on Telegram; always rc 1."""
+    def handoff(self, pr, reason, title, text, **recovery_kw):
+        """Label the PR for the owner, record why, say so on Telegram; rc 1 on handoff."""
         from . import handoff as owner_handoff
-        owner_handoff.perform(
+        episode = self.env.runtime.issue or str(pr)
+        result = owner_handoff.perform(
             self.env, reason, kind="pr", number=pr,
-            title=title, text=text, hooks=self.hooks)
-        self.handed_off = True
-        return 1
+            title=title, text=text, hooks=self.hooks, item=str(pr), episode=str(episode), **recovery_kw)
+        if result.handed_off:
+            self.handed_off = True
+            recovery.clear(self.env, str(episode), str(pr))
+            return 1
+        return result
+
+    def retry_binding(self, wt, pr):
+        return recovery.worker_fingerprint(wt, pr, round_s=self.round, extra=self.retry_context,
+                                           required_label=self.required_retry_label)
+
+    def retry_picker(self, pr):
+        return dict(mode="contrib", candidates=pick.all_vendors(self.env), pr=str(pr),
+                    issue=self.env.runtime.issue)
+
+    def recover(self, pr, reason, title, detail, vendor, *, wt, repairs_used=0, head="",
+                validation_error="", pushed=False, before_labels=None):
+        episode = self.env.runtime.issue or str(pr)
+        budget = {"verify_repairs": max(0, self.max_verify - repairs_used),
+                  "repairs_used": repairs_used, "authors": self.attempt_authors, "head": head,
+                  "base_sha": getattr(self, "verified_base", ""),
+                  "validation_error": validation_error}
+        def binding():
+            current = self.retry_binding(wt, pr)
+            start = self.retry_start
+            if not start or not current:
+                return None
+            heads = {start["remote_head"]}
+            if pushed:
+                heads.add(current["local_head"])
+            if current["remote_head"] not in heads or any(
+                current[key] != start[key] for key in ("base", "head_ref", "feedback")
+            ):
+                return None
+            return current
+
+        result = recovery.request(
+            self.env, episode, pr, reason, "fixer", vendor, detail, binding(), binding,
+            lambda text=detail, **kw: self.handoff(
+                pr, reason, title, text, **({"before_labels": before_labels} if before_labels else {}), **kw),
+            budget=budget, local=reason == "fix_verify_failed",
+            exclusions=getattr(self, "retry_exclusions", ()), **self.retry_picker(pr))
+        return (result[0]["action"], result[1], budget["verify_repairs"]) if result else ("handoff", vendor, 0)
+
+    def resume(self, pr, wt):
+        episode = self.env.runtime.issue or pr
+        try:
+            saved = recovery.load(self.env, episode, pr)
+        except recovery.RecoveryUnreadable:
+            saved = None
+        saved_reason = saved["reason"] if saved and saved["reason"].startswith("fix_") else "fix_run_failed"
+        selected = recovery.resume(
+            self.env, episode, pr, lambda reason: reason.startswith("fix_"),
+            lambda: self.retry_binding(wt, pr),
+            lambda text: self.handoff(pr, saved_reason, f"PR #{pr} needs you", text),
+            role="fixer", local=lambda record: record["reason"] == "fix_verify_failed", **self.retry_picker(pr))
+        if selected:
+            self.attempt_authors = list(selected[0]["remaining_budget"].get("authors", ()))
+        return selected
+
+    def dispatching(self, pr, wt):
+        """Consume a saved grant before the step it allows runs (see recovery.dispatching)."""
+        return recovery.dispatching(self.env, self.env.runtime.issue or pr, pr,
+                                    lambda: self.retry_binding(wt, pr), role="fixer")
+
+    def verify_retry(self, wt, base, vendor, kind, number, *, repairs, repairs_before, binding=None):
+        episode = self.env.runtime.issue or number
+        self.verification_progress = recovery.verification_progress(self.env, episode, number, vendor)
+        binding = binding or (lambda: self.retry_binding(wt, number))
+        try:
+            with recovery.dispatching(self.env, episode, number, binding):
+                return self.verify(wt, base, vendor, kind, number, repairs=repairs, repairs_before=repairs_before)
+        finally:
+            self.verification_progress = None
+
+    def finish_verified(self, pr, wt, fixer, *, prefix=""):
+        url = f"https://github.com/{self.repo}/pull/{pr}"
+        ref = (git(wt, "branch", "--show-current") or "HEAD") if fixer == "cursor" else "HEAD"
+        if not push(wt, ref, signoff=self.env.repo.signoff):
+            return self.handoff(pr, "fix_push_failed", f"PR #{pr}: pushing fix failed", url)
+        return self.refresh_checks(pr, prefix, url)
+
+    def add_author(self, vendor):
+        if vendor not in self.attempt_authors:
+            self.attempt_authors.append(vendor)
 
     def comment(self, pr, body, failed=""):
         posted = pr_helpers.gh("pr", "comment", str(pr), "-R", self.repo, "--body", body)
@@ -95,8 +185,13 @@ class Runner:
             issue = marker.group(1)
         return e2e_gate.parse(view("issue", issue), self.env.repo)
 
-    def verify(self, wt, base, vendor, kind, number):
-        """(rc, failure, rounds): rc 0 passed, 1 failed or refused, 75 deferred (Deferred)."""
+    def verify(self, wt, base, vendor, kind, number, *, repairs=None, repairs_before=0):
+        """(rc, failure, rounds): rc 0 passed, 1 failed or refused, 75 deferred (Deferred).
+
+        REPAIRS caps how many verification-fix runs may follow a red check. REPAIRS_BEFORE
+        counts repairs already consumed earlier in the episode (#125 point 12).
+        """
+        self.verified_base = git(wt, "rev-parse", base) or base   # a retry verifies the same commit
         try:
             gate = self.e2e_gate(kind, number)
         except ValueError as error:
@@ -106,10 +201,12 @@ class Runner:
         failure_file = Path(self.ctx, f"{kind}-{number}-verify-failure.txt")
         # Under /tmp, the one place outside the worktree guard.sh lets a fixer write (#38).
         reply_file = Path("/tmp", f"baton-{self.repo.replace('/', '-')}-{kind}-{number}-verify-fix.md")
-        attempt, failure = 0, ""
+        local_repairs, failure = 0, ""
+        budget = self.max_verify if repairs is None else int(repairs)
+        total_rounds = int(repairs_before)
 
         def dirty():
-            return bool(git(wt, "status", "--porcelain"))
+            return git(wt, "status", "--porcelain") != ""
 
         def event(result, started):
             self.hooks.task("verify", f"{kind}:{number}:{git(wt, 'rev-parse', 'HEAD')}:{result}",
@@ -118,11 +215,12 @@ class Runner:
             if dirty():
                 failure = "Verification refused: uncommitted or untracked files remain."
                 notify.log(f"{kind} #{number}: {failure}")
-                return 1, failure, attempt
+                return 1, failure, total_rounds + local_repairs
             started = time.monotonic()
             repo = self.env.repo
+            tag_round = total_rounds + local_repairs
             done = session.run_process([str(self.self_dir / "verify.sh"), str(wt), base], text=True, capture_output=True,
-                                  env=child_env(VERIFY_TAG=f"{kind}-{number}-verify-{attempt}", LOGS=str(self.env.dirs.logs),
+                                  env=child_env(VERIFY_TAG=f"{kind}-{number}-verify-{tag_round}", LOGS=str(self.env.dirs.logs),
                                                 RUNNER_LOG=str(self.env.config.paths.logs / "runner.log"), RUNNER_LOG_LABEL=notify.label(self.env),
                                                 E2E_GATE=gate, CI_COMMAND=repo.ci_command.replace("{base}", base),
                                                 VERIFY_HOOK=str(repo.verify_hook or ""), GATE_HOOK=str(repo.gate_hook or "")))
@@ -135,31 +233,43 @@ class Runner:
                     if self.gate_result and kind != "issue":
                         self.comment(number, f"<!-- baton-e2e-gate -->\n{self.gate_result}, on {git(wt, 'rev-parse', '--short', 'HEAD')}. "
                                      "The runner ran this.", f"PR #{number}: posting the E2E gate result failed")
-                    return 0, failure, attempt
+                    return 0, failure, total_rounds + local_repairs
                 failure = "CI checks passed but left uncommitted or untracked files."
             failure_file.write_text(failure + "\n")
-            notify.log(f"{kind} #{number}: verify failed (attempt {attempt} of {self.max_verify})")
+            notify.log(f"{kind} #{number}: verify failed (repair {local_repairs} of {budget} in this call)")
             event("failure", started)
-            if attempt >= self.max_verify:
-                return 1, failure, attempt
+            if local_repairs >= budget:
+                return 1, failure, total_rounds + local_repairs
             if not self.env.config.allows(vendor, "fixer"):
-                return 1, failure, attempt
-            attempt += 1
+                return 1, failure, total_rounds + local_repairs
+            local_repairs += 1
             head = git(wt, "rev-parse", "HEAD")
             reply_file.unlink(missing_ok=True)
-            out = self.agent(vendor, "fix", self.render("verify-fix-prompt.md", VENDOR=vendor, WORKTREE=str(wt), BASE=base,
-                                                        FAILURE_FILE=str(failure_file), REPLY_FILE=str(reply_file),
-                                                        FAILURE=failure_excerpt(failure)),
-                             f"{kind}-{number}-verify-fix-{attempt}", wt, str(reply_file),
-                             self.env.with_runtime(fix_followup=False))
+            prompt = self.render("verify-fix-prompt.md", VENDOR=vendor, WORKTREE=str(wt), BASE=base,
+                                 FAILURE_FILE=str(failure_file), REPLY_FILE=str(reply_file), FAILURE=failure_excerpt(failure))
+            if self.verification_progress:
+                self.verification_progress(total_rounds + local_repairs, budget - local_repairs, head)
+            try:
+                out = self.agent(vendor, "fix", prompt, f"{kind}-{number}-verify-fix-{total_rounds + local_repairs}",
+                                 wt, str(reply_file), self.env.with_runtime(fix_followup=False))
+            except Deferred:
+                if self.verification_progress and not dirty() and git(wt, "rev-parse", "HEAD") == head:
+                    self.verification_progress(total_rounds + local_repairs - 1, budget - local_repairs + 1, head)
+                raise
+            current_head = git(wt, "rev-parse", "HEAD")
+            if self.verification_progress and current_head and not dirty():
+                if kind == "pr" and current_head != head:
+                    if not self.record(number, vendor, wt, head, "unknown", ""):
+                        return 1, "Recording verification repair authorship failed.", total_rounds + local_repairs
+                self.verification_progress(total_rounds + local_repairs, budget - local_repairs, current_head)
             if not out["outcome"].startswith("RESULT: fixed") or dirty():
                 notify.log(f"{kind} #{number}: {vendor} verification fix failed or left the tree dirty")
-                return 1, failure, attempt
-            if git(wt, "rev-parse", "HEAD") == head:   # fixed outside the repo: verify.sh still judges it
+                return 1, failure, total_rounds + local_repairs
+            if current_head == head:   # fixed outside the repo: verify.sh still judges it
                 notify.log(f"{kind} #{number}: {vendor} verification fix made no commit; checking again")
                 continue
-            self.hooks.task("ci_fix", f"{kind}:{number}:{attempt}:{git(wt, 'rev-parse', 'HEAD')}",
-                            "--agent", vendor, "--round", attempt)
+            self.hooks.task("ci_fix", f"{kind}:{number}:{total_rounds + local_repairs}:{git(wt, 'rev-parse', 'HEAD')}",
+                            "--agent", vendor, "--round", total_rounds + local_repairs)
 
     def verify_failed(self, pr, failure, rounds):
         self.comment(pr, f"<!-- baton-verify-failed -->\nLocal CI verification failed before push after {rounds} of "
@@ -169,12 +279,14 @@ class Runner:
     def record(self, pr, fixer, wt, agent_head, model, cursor_base):
         """Who wrote what (author, author model, lines); False when the records failed."""
         try:
-            if cursor_base and cursor_base != agent_head:
+            if cursor_base and cursor_base != agent_head and "cursor" not in self.attempt_authors:
+                self.add_author("cursor")
                 vendors.record_author(self.state, pr, "cursor")
                 vendors.record_contrib(self.state, pr, "cursor", str(wt), cursor_base, agent_head)
             if self.head(wt) != agent_head:
                 if agents.ADAPTERS[fixer].RECORDS_AUTHOR_MODEL:
                     vendors.record_author_model(self.state, pr, fixer, model)
+                self.add_author(fixer)
                 vendors.record_author(self.state, pr, fixer)
                 vendors.record_contrib(self.state, pr, fixer, str(wt), agent_head)
         except OSError:
@@ -224,6 +336,7 @@ class Runner:
 
     # --- a Claude or Codex fixer ---
     def fix_pr(self, pr, wt, fixer, source, feedback, head="", *, owner_triggered=False):
+        self.last_fixer = fixer
         url = f"https://github.com/{self.repo}/pull/{pr}"
         fix_file = Path(f"/tmp/baton-fix-{pr}.md")
         base_file = Path(self.state, f"cursor-fix-base-{pr}")
@@ -284,19 +397,33 @@ class Runner:
                 if log:
                     notify.log(log)
                 if rc != 0 and (rc != 2 or description_rc != 2):
-                    return self.handoff(pr, "fix_task_write_failed" if rc == 1 else "fix_task_invalid",
-                                        f"PR #{pr}: task completion change failed ({fixer})", url)
-        elif self.head(wt) != head:
+                    reason = "fix_task_write_failed" if rc == 1 else "fix_task_invalid"
+                    if rc == 1:
+                        return self.handoff(pr, reason, f"PR #{pr}: task completion change failed ({fixer})", url)
+                    if not self.record(pr, fixer, wt, agent_head, model, cursor_base):
+                        return 1
+                    action, fixer, _ = self.recover(pr, reason, f"PR #{pr}: task completion change failed ({fixer})",
+                                                    f"Invalid task relation from {fixer}. {url}", fixer, wt=wt, head=head,
+                                                    validation_error=log)
+                    if action == "handoff":
+                        return 1
+                    return self.dispatch_fixer(pr, wt, fixer, source, correction(feedback, log), head)
+        pushed = not outcome.startswith("RESULT: fixed") and self.head(wt) != head
+        if pushed:
             # Anything but a fix goes to the owner, who must see the partial work ("commit
             # what is done" in the fix prompts): push it unverified. Only a fix is gated below.
             if not self.record(pr, fixer, wt, agent_head, model, cursor_base):
                 return 1
             if not push(wt, "HEAD", signoff=self.env.repo.signoff):
-                outcome = "RESULT: failed pushing fix"
+                return self.handoff(pr, "fix_push_failed", f"PR #{pr}: pushing fix failed", url)
         if not outcome.startswith("RESULT: fixed"):
             if outcome.startswith("RESULT: needs-info"):
                 return self.handoff(pr, "fix_needs_info", f"PR #{pr} has questions", url)
-            return self.handoff(pr, "fix_run_failed", f"PR #{pr} fix failed ({fixer})", f"{outcome} {url}")
+            action, fixer, _ = self.recover(pr, "fix_run_failed", f"PR #{pr} fix failed ({fixer})",
+                                              f"{outcome} {url}", fixer, wt=wt, head=head, pushed=pushed)
+            if action == "handoff":
+                return 1
+            return self.dispatch_fixer(pr, wt, fixer, source, feedback, head)
         if self.head(wt) == head:
             rc, checks_changed = self.recheck_without_commit(pr, "", url, description_changed)
             if rc != 0:
@@ -304,22 +431,38 @@ class Runner:
             if description_rc != 0:
                 self.description_discarded(pr, fixer, description_reason)
             if not task_changed and not checks_changed and not description_changed:
-                return self.handoff(pr, "fix_no_commit", f"PR #{pr} needs you", f"The fix run made no commit; stopping the loop. {url}")
+                action, fixer, _ = self.recover(pr, "fix_no_commit", f"PR #{pr} needs you",
+                                                f"The fix run made no commit; stopping the loop. {url}", fixer, wt=wt, head=head)
+                if action == "handoff":
+                    return 1
+                return self.dispatch_fixer(pr, wt, fixer, source, feedback, head)
         if self.head(wt) != head:
             rc, failure, rounds = self.verify(wt, "origin/main", fixer, "pr", pr)
-            if rc != 0:
-                self.verify_failed(pr, failure, rounds)
-                return self.handoff(pr, "fix_verify_failed", f"PR #{pr}: local CI verification failed", url)
             if not self.record(pr, fixer, wt, agent_head, model if rounds == 0 else "unknown", cursor_base):
                 return 1
-            if not push(wt, "HEAD", signoff=self.env.repo.signoff):
-                return self.handoff(pr, "fix_push_failed", f"PR #{pr}: pushing fix failed", url)
-            rc = self.refresh_checks(pr, "", url)
+            if rc != 0:
+                action, fixer, remaining = self.recover(pr, "fix_verify_failed",
+                                                        f"PR #{pr}: local CI verification failed",
+                                                        recovery.verify_status(repairs_used=rounds, max_repairs=self.max_verify,
+                                                                               failure=failure), fixer, wt=wt,
+                                                        repairs_used=rounds, head=head,
+                                                        before_labels=lambda: self.verify_failed(pr, failure, rounds))
+                if action == "handoff":
+                    return 1
+                rc, failure, more = self.verify_retry(wt, self.verified_base, fixer, "pr", pr, repairs=remaining,
+                                                repairs_before=rounds)
+                rounds = more
+                if rc != 0:
+                    self.verify_failed(pr, failure, rounds)
+                    return self.handoff(pr, "fix_verify_failed", f"PR #{pr}: local CI verification failed", url)
+            rc = self.finish_verified(pr, wt, fixer)
             if rc != 0:
                 return rc
             if description_rc != 0:
                 self.description_discarded(pr, fixer, description_reason)
         base_file.unlink(missing_ok=True)
+        episode = self.env.runtime.issue or str(pr)
+        recovery.clear(self.env, str(episode), str(pr))
         return 0
 
     # --- a Cursor fixer ---
@@ -331,6 +474,7 @@ class Runner:
             Path(self.state, f"cursor-fix-base-{pr}").unlink(missing_ok=True)
 
     def cursor_fix(self, pr, wt, source, feedback, head="", *, owner_triggered=False):
+        agent_head = self.head(wt)
         url = f"https://github.com/{self.repo}/pull/{pr}"
         branch = git(wt, "branch", "--show-current") or ""
         base_file = Path(self.state, f"cursor-fix-base-{pr}")
@@ -375,7 +519,13 @@ class Runner:
             if not outcome.startswith("RESULT: fixed"):
                 if outcome.startswith("RESULT: needs-info"):
                     return self.handoff(pr, "fix_needs_info", f"Cursor PR #{pr} has questions", url)
-                return self.handoff(pr, "fix_run_failed", f"Cursor PR #{pr} fix failed", f"{outcome} {url}")
+                if not self.record(pr, "cursor", wt, agent_head, "", ""):
+                    return 1
+                action, alt, _ = self.recover(pr, "fix_run_failed", f"Cursor PR #{pr} fix failed", f"{outcome} {url}",
+                                              "cursor", wt=wt, head=head)
+                if action == "handoff":
+                    return 1
+                return self.dispatch_fixer(pr, wt, alt, source, feedback, head)
             if request.exists() or request.is_symlink() or want:
                 # Publish the fixed attempt after saving its checks, before any GitHub edit.
                 temp = task_file.with_suffix(".tmp")
@@ -401,9 +551,21 @@ class Runner:
                 notify.log(f"PR #{pr}: description update deferred after GitHub failure")
                 return 75
             if rc != 0 and (rc != 2 or description_rc != 2):
-                return self.handoff(pr, "fix_task_write_failed" if rc == 1 else "fix_task_invalid",
-                                    f"PR #{pr}: task completion change failed (cursor)", url)
+                reason = "fix_task_write_failed" if rc == 1 else "fix_task_invalid"
+                if rc == 1:
+                    return self.handoff(pr, reason, f"PR #{pr}: task completion change failed (cursor)", url)
+                start = agent_head if self.attempt_authors else head
+                if not self.record(pr, "cursor", wt, start, "", ""):
+                    return 1
+                action, alt, _ = self.recover(pr, reason, f"PR #{pr}: task completion change failed (cursor)",
+                                              f"Invalid task relation from cursor. {url}", "cursor", wt=wt, head=head,
+                                              validation_error=log)
+                if action == "handoff":
+                    return 1
+                self.clear_cursor_request(pr, keep_base=True)
+                return self.dispatch_fixer(pr, wt, alt, source, correction(feedback, log), head)
         moved = self.head(wt) != head
+        recorded_before_retry = False
         if not moved:
             rc, checks_changed = self.recheck_without_commit(pr, "Cursor ", url, body_changed)
             if rc != 0:
@@ -411,18 +573,43 @@ class Runner:
             if discarded:
                 self.description_discarded(pr, "cursor", description_reason)
             if not (body_changed or task_changed or checks_changed):
-                self.clear_cursor_request(pr)
-                return self.handoff(pr, "fix_no_commit", f"Cursor PR #{pr} needs you", f"Cursor's fix run made no commit. {url}")
+                action, alt, _ = self.recover(pr, "fix_no_commit", f"Cursor PR #{pr} needs you",
+                                                f"Cursor's fix run made no commit. {url}", "cursor", wt=wt, head=head)
+                if action == "handoff":
+                    self.clear_cursor_request(pr)
+                    return 1
+                self.clear_cursor_request(pr, keep_base=True)
+                return self.dispatch_fixer(pr, wt, alt, source, feedback, head)
         else:
             rc, failure, rounds = self.verify(wt, "origin/main", "cursor", "pr", pr)
             if rc != 0:
-                self.verify_failed(pr, failure, rounds)
-                return self.handoff(pr, "fix_verify_failed", f"Cursor PR #{pr}: local CI verification failed", url)
+                start = agent_head if self.attempt_authors else head
+                if not self.record(pr, "cursor", wt, start, "", ""):
+                    return 1
+                recorded_before_retry = True
+                action, alt, remaining = self.recover(pr, "fix_verify_failed",
+                                                      f"Cursor PR #{pr}: local CI verification failed",
+                                                      recovery.verify_status(repairs_used=rounds, max_repairs=self.max_verify,
+                                                                             failure=failure), "cursor", wt=wt,
+                                                      repairs_used=rounds, head=head,
+                                                      before_labels=lambda: self.verify_failed(pr, failure, rounds))
+                if action == "handoff":
+                    return 1
+                vendor = alt if alt != "cursor" else "cursor"
+                rc, failure, more = self.verify_retry(wt, self.verified_base, vendor, "pr", pr, repairs=remaining,
+                                                repairs_before=rounds)
+                rounds = more
+                if rc != 0:
+                    self.verify_failed(pr, failure, rounds)
+                    return self.handoff(pr, "fix_verify_failed", f"Cursor PR #{pr}: local CI verification failed", url)
         try:
             vendors.record_author(self.state, pr, "cursor")
         except OSError:
             return 1
-        vendors.record_contrib(self.state, pr, "cursor", str(wt), head)
+        if not recorded_before_retry:
+            start = agent_head if self.attempt_authors else head
+            self.add_author("cursor")
+            vendors.record_contrib(self.state, pr, "cursor", str(wt), start)
         if moved:
             if not push(wt, branch, signoff=self.env.repo.signoff):
                 return self.handoff(pr, "fix_push_failed", f"Cursor PR #{pr}: push failed", url)
@@ -431,7 +618,43 @@ class Runner:
         if discarded and moved:
             self.description_discarded(pr, "cursor", description_reason)
         self.clear_cursor_request(pr)
+        episode = self.env.runtime.issue or str(pr)
+        recovery.clear(self.env, str(episode), str(pr))
         return 0
+
+
+    def dispatch_fixer(self, pr, wt, fixer, source, feedback, head):
+        self.last_fixer = fixer
+        scope = {"owner_triggered": self.owner_triggered}
+        with self.dispatching(pr, wt):
+            if fixer != "cursor":
+                return self.fix_pr(pr, wt, fixer, source, feedback, head, **scope)
+            rc = self.cursor_fix(pr, wt, source, feedback, head, **scope)
+            if rc == 75:   # a short block reported by return value, e.g. a description update
+                recovery.settle(self.env, self.env.runtime.issue or pr, pr, lambda: self.retry_binding(wt, pr))
+        self.hooks.fix("cursor", self.round or 0, self.reply)
+        return rc
+
+    def finish_progressed(self, pr, wt, fixer, head, budget):
+        """Continue a completed worker step (its commits and reply exist) with its verification."""
+        self.last_fixer = fixer
+        rc, failure, rounds = self.verify_retry(
+            wt, budget.get("base_sha") or "origin/main", fixer, "pr", pr,
+            repairs=budget.get("verify_repairs", self.max_verify), repairs_before=budget.get("repairs_used", 0))
+        if rc:
+            self.verify_failed(pr, failure, rounds)
+            return self.handoff(pr, "fix_verify_failed", f"PR #{pr}: local CI verification failed", failure)
+        if not self.record(pr, fixer, wt, head, "unknown", ""):
+            return 1
+        rc = self.finish_verified(pr, wt, fixer)
+        if rc == 0:
+            recovery.clear(self.env, self.env.runtime.issue or pr, pr)
+        return rc
+
+
+def correction(feedback, error):
+    return f"{feedback}\n\nCorrect the task relation in the previous attempt's reply or description. " \
+           f"Retain the existing commits. Validation error: {error or 'invalid task relation'}"
 
 
 def fix_scope(fixer, owner_triggered):
@@ -444,13 +667,40 @@ def fix_scope(fixer, owner_triggered):
 
 
 def fix_pr(runner, pr, wt, fixer, source, feedback, head="", *, owner_triggered=False):
-    """The fix run for any fixer, with its fix telemetry; rc 0 done, 1 handed off, 75 deferred
-    (Deferred when a vendor cannot run now)."""
-    if fixer == "cursor":
-        rc = runner.cursor_fix(pr, wt, source, feedback, head, owner_triggered=owner_triggered)
-        runner.hooks.fix("cursor", runner.round or 0, runner.reply)
+    """Resume a saved fix step or dispatch the requested adapter."""
+    from . import advisor
+
+    runner.owner_triggered = owner_triggered
+    runner.retry_context = {"fix_feedback": recovery.feedback_digest(feedback), "fix_source": source}
+    pending = runner.resume(pr, wt)
+    if pending is False:
+        return 1
+    if advisor.enabled(runner.env):
+        runner.retry_start = runner.retry_binding(wt, pr)
+    if not pending:
+        return runner.dispatch_fixer(pr, wt, fixer, source, feedback, head)
+    record, fixer = pending
+    budget = record["remaining_budget"]
+    head = budget.get("head") or head
+    if record["reason"] == "fix_verify_failed":
+        runner.last_fixer = fixer
+        rc, failure, rounds = runner.verify_retry(wt, budget.get("base_sha") or "origin/main", fixer, "pr", pr,
+                                                  repairs=budget["verify_repairs"],
+                                            repairs_before=budget["repairs_used"])
+        if rc:
+            runner.verify_failed(pr, failure, rounds)
+            return runner.handoff(pr, "fix_verify_failed", f"PR #{pr}: local CI verification failed", failure)
+        rc = runner.finish_verified(pr, wt, fixer, prefix="Cursor " if fixer == "cursor" else "")
+        runner.clear_cursor_request(pr)
+        recovery.clear(runner.env, runner.env.runtime.issue or pr, pr)
         return rc
-    return runner.fix_pr(pr, wt, fixer, source, feedback, head, owner_triggered=owner_triggered)
+    if record["state"] == "progressed" and fixer != "cursor" and runner.head(wt) != head:
+        return runner.finish_progressed(pr, wt, fixer, head, budget)
+    if record["reason"] == "fix_task_invalid":
+        feedback = correction(feedback, budget.get("validation_error", ""))
+    if record["state"] != "progressed":   # a completed Cursor step reconciles from its saved request
+        runner.clear_cursor_request(pr, keep_base=True)
+    return runner.dispatch_fixer(pr, wt, fixer, source, feedback, head)
 
 
 def result(rc, **extra):
@@ -466,8 +716,9 @@ def run(command, args, env=None, feedback=""):
         if command == "verify":
             rc, failure, rounds = runner.verify(args.wt, args.base, args.vendor, args.kind, args.number)
             return result(rc, failure=failure, rounds=rounds)
-        return result(fix_pr(runner, args.pr, args.wt, args.fixer, args.source, feedback, args.head,
-                             owner_triggered=getattr(args, "owner_triggered", False)))
+        rc = fix_pr(runner, args.pr, args.wt, args.fixer, args.source, feedback, args.head,
+                    owner_triggered=getattr(args, "owner_triggered", False))
+        return result(rc, fixer=runner.last_fixer, authors=runner.attempt_authors)
     except Deferred as deferred:
         return result(75, defer_vendor=deferred.vendor, defer=deferred.reason)
 

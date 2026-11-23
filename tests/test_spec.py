@@ -405,6 +405,19 @@ def test_a_reject_is_a_note_and_a_handoff(loop, spec_handoffs):
     assert note.endswith("round 1: reject\n\nno") and "ready-for-human" in loop.gh.labels
 
 
+def test_a_live_spec_reject_makes_no_provider_call_and_one_handoff(loop, spec_handoffs, monkeypatch):
+    from baton import advisor
+    from baton.config import Advisor
+    calls = []
+    monkeypatch.setenv(advisor.KEY, "sk-" + "s" * 24)
+    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="live"))
+    monkeypatch.setattr(advisor, "call_deepseek", lambda *a, **k: calls.append(1) or ({}, {}))
+    loop.script = [{"rc": 0, "status": "success", "outcome": "SPEC: reject", "reply": "no\nSPEC: reject", "model": "", "defer": ""}]
+    assert loop.run() is False
+    assert calls == []
+    spec_handoffs("spec_rejected")                            # exactly one handoff, with its reason
+
+
 def test_a_failed_review_run_is_a_handoff(loop):
     loop.script = [{"rc": 1, "status": "failure", "outcome": "RESULT: failed claude failure rc=1", "reply": "", "model": "", "defer": ""}]
     assert loop.run() is False
@@ -1504,13 +1517,13 @@ def test_a_failed_extra_review_does_not_extend_the_next_spec_episode(advised):
     advised.script = [CHANGES, reviser(), CHANGES, reviser(), CHANGES, reviser(), failed]
     advised.advice = [{"action": "extra_round", "reason": "fixable", "evidence": []}]
     assert advised.run() is False
-    assert "ready-for-human" in advised.gh.labels and len(advised.advice_calls) == 1
+    assert "ready-for-human" in advised.gh.labels and len(advised.advice_calls) == 2
 
     advised.gh.labels.remove("ready-for-human")
     advised.script = [CHANGES, reviser(), CHANGES, reviser(), CHANGES]
     advised.advice = [{"action": "handoff", "reason": "needs the owner", "evidence": []}]
     assert advised.run() is False
-    assert len(advised.advice_calls) == 2
+    assert len(advised.advice_calls) == 3
     assert len(advised.runs) == 10 and "ready-for-human" in advised.gh.labels
 
 
@@ -1519,6 +1532,71 @@ def test_an_advised_spec_handoff_keeps_todays_handoff(advised):
     advised.advice = [{"action": "handoff", "reason": "needs a product decision", "evidence": []}]
     assert advised.run() is False
     assert len(advised.runs) == 5 and "ready-for-human" in advised.gh.labels
+
+
+def test_spec_review_run_failed_live_retry_step_same_vendor_once(advised):
+    failed = {**CHANGES, "rc": 1, "status": "failure", "outcome": "RESULT: failed reviewer crashed"}
+    advised.script = [failed, ACCEPT]
+    advised.advice = [{"action": "retry_step", "reason": "transient",
+                       "evidence": ["Decision point: spec_review_run_failed"]}]
+    assert advised.run() is True
+    reviewers = [r for r in advised.runs if r["role"] == "spec_review"]
+    assert len(reviewers) == 2 and reviewers[0]["vendor"] == reviewers[1]["vendor"]
+    assert len(advised.advice_calls) == 1
+
+
+def test_round_two_retry_cannot_switch_to_the_latest_reviser(advised):
+    failed = {**CHANGES, "rc": 1, "status": "failure", "outcome": "RESULT: failed reviewer crashed"}
+    advised.script = [CHANGES, reviser(), failed, ACCEPT]
+    advised.advice = [{"action": "retry_step_other_vendor", "reason": "try the reviser",
+                       "evidence": ["Decision point: spec_review_run_failed"]}]
+    assert advised.run() is True
+    assert [run["vendor"] for run in advised.runs[1:]] == ["codex", "claude", "cursor"]
+
+
+def test_spec_retry_rejects_an_owner_edit_during_advice(advised, monkeypatch):
+    from baton import advisor
+
+    failed = {**CHANGES, "rc": 1, "status": "failure", "outcome": "RESULT: failed reviewer crashed"}
+    advised.script = [failed, ACCEPT]
+    advised.advice = [{"action": "retry_step", "reason": "transient",
+                       "evidence": ["Decision point: spec_review_run_failed"]}]
+    call = advisor.call_deepseek
+
+    def edited(*args, **kwargs):
+        advised.gh.body += "\nOwner changed the requested outcome."
+        return call(*args, **kwargs)
+
+    monkeypatch.setattr(advisor, "call_deepseek", edited)
+    assert advised.run() is False
+    assert len(advised.runs) == 1
+    assert "ready-for-human" in advised.gh.labels
+
+
+def test_alternate_reviser_renders_its_prompt_and_clears_failed_artifacts(advised):
+    advised.gh.comments = [{"author": {"login": "owner"},
+                            "body": "<!-- baton-spec-review round=1 by=cursor -->\nChange the goal"}]
+    advised.script = [reviser(comment="stale reply", body="stale body", outcome="RESULT: failed"),
+                      dict(REVISED)]
+    advised.advice = [{"action": "retry_step_other_vendor", "reason": "try a different reviser",
+                       "evidence": ["Decision point: spec_revision_run_failed"]}]
+    assert advised.run() is False
+    first, second = advised.runs
+    assert {first["vendor"], second["vendor"]} == {"claude", "codex"}
+    assert first["prompt"].splitlines()[0] != second["prompt"].splitlines()[0]
+    assert advised.gh.body == "Goal\nOld step\n"
+    assert not advised.gh.posted("<!-- baton-spec-reply")
+
+
+def test_spec_revision_denied_spent_across_recovery(advised, tmp_path, monkeypatch):
+    denied = denied_failure(tmp_path)
+    advised.script = [CHANGES, denied, denied, denied]
+    advised.advice = [
+        {"action": "retry_step", "reason": "one more", "evidence": ["Decision point: spec_revision_run_failed"]},
+    ]
+    assert advised.run() is False
+    assert len([r for r in advised.runs if r["tag"].endswith("-rerun")]) == 1
+    assert len(advised.advice_calls) == 1
 
 
 # --- spec comment posts: category-1 retries (#151) ---------------------------------------------
