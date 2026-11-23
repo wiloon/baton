@@ -1677,6 +1677,50 @@ def test_a_blocked_review_alternate_resumes_before_dispatch(advised, monkeypatch
     assert len(advised.advice_calls) == 1
 
 
+def test_a_deferred_alternate_resumes_when_the_saved_reviewer_is_cursor(advised, monkeypatch):
+    """The saved reviewer says cursor (the alternate's own pin), but the grant was a pool pick."""
+    from baton import advisor, checkpoint
+
+    call = advisor.call_deepseek
+
+    def blocked(*args, **kwargs):
+        rest(advised, "codex", 60)
+        return call(*args, **kwargs)
+
+    monkeypatch.setattr(advisor, "call_deepseek", blocked)
+    advised.reviews[:] = ["RESULT: failed boom", "pass"]
+    advised.advice = [{"action": "retry_step_other_vendor", "reason": "try another reviewer",
+                       "evidence": ["Decision point: review_run_failed"]}]
+    with pytest.raises(Deferred, match="codex"):
+        advised.run(fixer="pool", reviewer="claude")
+    path = Path(advised.env["STATE"], f"review-pending-{PR}")
+    checkpoint.write(path, {**advised.checkpoint(), "reviewer": "cursor"})
+    Path(advised.env["STATE"], "codex-cooldown-until").unlink()
+    assert advised.run(fixer="pool", reviewer="cursor") == 0
+    assert [a["vendor"] for a in advised.agents if a["role"] == "review"] == ["claude", "codex"]
+    assert not advised.labelled("ready-for-human") and advised.merged == [PR]
+    assert len(advised.advice_calls) == 1
+
+
+def test_author_state_stale_grant_ends_in_one_handoff(advised, monkeypatch):
+    from baton import recovery, session
+
+    handoffs = []
+    real = review.Review.handoff
+    monkeypatch.setattr(review.Review, "handoff",
+                        lambda self, reason, title, text, **kw: (
+                            None if kw.get("fallback") else handoffs.append(reason),
+                            real(self, reason, title, text, **kw))[1])
+    monkeypatch.setattr(review.Review, "seed", lambda self: False)
+    advised.advice = [{"action": "retry_step", "reason": "transient seed failure",
+                       "evidence": ["Decision point: review_author_state_failed"]}]
+    monkeypatch.setattr(recovery, "fingerprint_matches", lambda *a, **k: False)
+    advised.reviews[:] = ["pass"]
+    assert advised.run(fixer="cursor", reviewer="claude") == 0
+    assert handoffs == ["review_author_state_failed"]
+    assert not [a for a in advised.agents if a["role"] == "review"] and advised.merged == []
+
+
 def test_author_state_retry_reseeds_then_picks_reviewer(advised, monkeypatch):
     advised.advice = [{"action": "retry_step", "reason": "transient seed failure",
                        "evidence": ["Decision point: review_author_state_failed"]}]

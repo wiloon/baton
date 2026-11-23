@@ -107,10 +107,16 @@ class Runner:
         return (result[0]["action"], result[1], budget["verify_repairs"]) if result else ("handoff", vendor, 0)
 
     def resume(self, pr, wt):
+        episode = self.env.runtime.issue or pr
+        try:
+            saved = recovery.load(self.env, episode, pr)
+        except recovery.RecoveryUnreadable:
+            saved = None
+        saved_reason = saved["reason"] if saved and saved["reason"].startswith("fix_") else "fix_run_failed"
         selected = recovery.resume(
-            self.env, self.env.runtime.issue or pr, pr, lambda reason: reason.startswith("fix_"),
+            self.env, episode, pr, lambda reason: reason.startswith("fix_"),
             lambda: self.retry_binding(wt, pr),
-            lambda text: self.handoff(pr, "fix_run_failed", f"PR #{pr} needs you", text),
+            lambda text: self.handoff(pr, saved_reason, f"PR #{pr} needs you", text),
             role="fixer", local=lambda record: record["reason"] == "fix_verify_failed", **self.retry_picker(pr))
         if selected:
             self.attempt_authors = list(selected[0]["remaining_budget"].get("authors", ()))

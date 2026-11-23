@@ -1112,8 +1112,35 @@ def test_a_restart_after_the_retry_was_dispatched_hands_off_instead_of_dispatchi
         RuntimeError("killed")))
     with pytest.raises(RuntimeError):
         advised_fix.fix()
+    reasons = []
+    handoff = fix.Runner.handoff
+    monkeypatch.setattr(fix.Runner, "handoff", lambda self, pr, reason, *a, **k: reasons.append(reason) or handoff(self, pr, reason, *a, **k))
     assert advised_fix.fix()["rc"] == 1 and advised_fix.labelled()
+    assert reasons == ["fix_run_failed"]
     assert len(advised_fix.agent_calls) == 2 and len(advised_fix.advice_calls) == 1
+
+
+def test_a_restart_after_a_verify_retry_dispatched_hands_off_with_the_saved_reason(advised_fix, monkeypatch):
+    advised_fix.verify_script("lint broke")
+    advised_fix.advice = [{"action": "retry_step", "reason": "flaky local check",
+                           "evidence": ["Decision point: fix_verify_failed"]}]
+    advised_fix.agent({"commit": True}, {"commit": True}, {"commit": True})
+    verify = fix.Runner.verify
+
+    def die_in_retry(self, *args, **kwargs):
+        if kwargs.get("repairs") == 0:
+            raise RuntimeError("killed")
+        return verify(self, *args, **kwargs)
+
+    monkeypatch.setattr(fix.Runner, "verify", die_in_retry)
+    with pytest.raises(RuntimeError):
+        advised_fix.fix()
+    monkeypatch.setattr(fix.Runner, "verify", verify)
+    reasons = []
+    handoff = fix.Runner.handoff
+    monkeypatch.setattr(fix.Runner, "handoff", lambda self, pr, reason, *a, **k: reasons.append(reason) or handoff(self, pr, reason, *a, **k))
+    assert advised_fix.fix()["rc"] == 1 and advised_fix.labelled()
+    assert reasons == ["fix_verify_failed"]
 
 
 def test_a_verification_retry_checks_the_base_it_failed_on(advised_fix, monkeypatch):
@@ -1229,6 +1256,28 @@ def test_a_live_verify_retry_rechecks_within_the_same_budget(advised_fix):
     assert "fix_verify_failed" in advised_fix.advice_calls[0][0]
     assert "repairs 2 of 2" in advised_fix.advice_calls[0][0]
     assert advised_fix.advice_calls[0][1] == ("handoff", "retry_step")
+
+
+def test_a_live_verify_retry_still_red_hands_off_without_a_fresh_budget(advised_fix):
+    advised_fix.verify_script("lint broke")
+    advised_fix.advice = [{"action": "retry_step", "reason": "flaky local check",
+                           "evidence": ["Decision point: fix_verify_failed"]}]
+    advised_fix.agent({"commit": True, "reply": "RESULT: fixed"},
+                      {"outcome": "RESULT: fixed", "commit": True},
+                      {"outcome": "RESULT: fixed", "commit": True})
+    assert advised_fix.fix()["rc"] == 1 and advised_fix.labelled()
+    assert len(advised_fix.agent_calls) == 3 and len(advised_fix.advice_calls) == 1
+
+
+def test_a_live_handoff_advice_at_fix_verify_hands_off(advised_fix):
+    advised_fix.verify_script("lint broke")
+    advised_fix.advice = [{"action": "handoff", "reason": "needs a human",
+                           "evidence": ["Decision point: fix_verify_failed"]}]
+    advised_fix.agent({"commit": True, "reply": "RESULT: fixed"},
+                      {"outcome": "RESULT: fixed", "commit": True},
+                      {"outcome": "RESULT: fixed", "commit": True})
+    assert advised_fix.fix()["rc"] == 1 and advised_fix.labelled()
+    assert len(advised_fix.agent_calls) == 3 and len(advised_fix.advice_calls) == 1
 
 
 def test_verify_still_red_with_zero_remaining_rechecks_once(run):
