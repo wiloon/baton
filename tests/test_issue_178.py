@@ -156,6 +156,7 @@ def test_owner_request_to_fix_one_item_keeps_others_as_context(ctx, worktree, mo
             comment("owner", "fix item 2 only", "2026-11-03T00:00:00Z"),
         ])
     assert run_fix_item(ctx, worktree) == 80
+    assert captured[0][2]["owner_triggered"] is True
     prompt = fixer_prompt(captured)
     note = review_note(ctx)
     assert "fix item 2 only" in prompt.split("<findings>")[0]
@@ -276,15 +277,31 @@ def test_feedback_cli_prints_only_owner_words(gh, capsys):
 # --- review round 1 ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("fixer", ["claude", "codex", "cursor"])
-def test_rendered_fix_prompts_scope_an_owner_triggered_fix_to_the_owners_words(run, fixer):
-    feedback = review.format_fix_feedback("fix item 2 only", "## Must fix\n1. a\n2. b")
+@pytest.mark.parametrize("mode", ["ordinary", "owner_with_findings", "owner_without_findings"])
+def test_rendered_fix_prompts_apply_only_the_scope_for_the_current_run(run, fixer, mode):
+    findings = "## Must fix\n1. a\n2. b\n\n## Nits\n- file.py:8 tidy a name"
+    owner_triggered = mode != "ordinary"
+    feedback = (review.format_fix_feedback("fix item 2 only", findings if mode == "owner_with_findings" else "")
+                if owner_triggered else findings)
     run.agent({"file": "## Must fix\nnone\n\nRESULT: fixed\n", "reply": "RESULT: fixed"})
-    run.fix(fixer, feedback=feedback)
+    run.fix(fixer, feedback=feedback, owner_triggered=owner_triggered)
     prompt = run.prompts[0]
-    assert "handle only the points they ask for" in prompt
-    assert "answer only the Must fix items the owner's words ask for" in prompt
-    if fixer != "cursor":
-        assert "Handle every point" in prompt   # the ordinary-review rule stays
+    assert "each Must fix item in scope" in prompt
+    assert "each nit in scope" in prompt
+    assert "write `none` when there are no items in scope for that section" in prompt
+    assert "keeping the review's numbering" in prompt
+    assert "Answer every point" not in prompt
+    assert "list each point" not in prompt
+    if owner_triggered:
+        assert "The owner's words set the scope" in prompt
+        assert "Any `<findings>` block is context only" in prompt
+        assert "Handle every" not in prompt
+        assert "All review nits are in scope for the reply" not in prompt
+    else:
+        assert ("Handle every Must fix point" if fixer == "cursor" else "Handle every point") in prompt
+        assert "All review nits are in scope for the reply" in prompt
+        assert "The owner's words set the scope" not in prompt
+        assert "Any `<findings>` block is context only" not in prompt
 
 
 def test_marked_inline_comment_alone_dispatches_nothing(ctx, worktree, monkeypatch):

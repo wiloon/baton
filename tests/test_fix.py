@@ -80,8 +80,9 @@ def run(gh, tmp_path, monkeypatch):
             """The next agent runs: {outcome, reply, commit, file, rc, model}."""
             self.plans[:] = list(plans)
 
-        def fix(self, fixer="claude", feedback="feedback", head="", source="reviewer"):
-            args = type("A", (), {"pr": PR, "wt": str(wt), "fixer": fixer, "source": source, "head": head})
+        def fix(self, fixer="claude", feedback="feedback", head="", source="reviewer", owner_triggered=False):
+            args = type("A", (), {"pr": PR, "wt": str(wt), "fixer": fixer, "source": source, "head": head,
+                                  "owner_triggered": owner_triggered})
             return fix.run("pr", args, os.environ, feedback)
 
         def verify(self, vendor="claude"):

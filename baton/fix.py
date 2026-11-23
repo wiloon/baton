@@ -223,7 +223,7 @@ class Runner:
         )
 
     # --- a Claude or Codex fixer ---
-    def fix_pr(self, pr, wt, fixer, source, feedback, head=""):
+    def fix_pr(self, pr, wt, fixer, source, feedback, head="", *, owner_triggered=False):
         url = f"https://github.com/{self.repo}/pull/{pr}"
         fix_file = Path(f"/tmp/baton-fix-{pr}.md")
         base_file = Path(self.state, f"cursor-fix-base-{pr}")
@@ -252,7 +252,8 @@ class Runner:
                           "worktree clean.")
             env = self.env.with_runtime(shots_dir=str(shots))
         out = self.agent(fixer, "fix", self.render(template, PR=str(pr), ISSUE=self.env.runtime.issue or "unknown",
-                                                   GH_REPO=self.repo, WORKTREE=str(wt), SOURCE=source, FEEDBACK=feedback,
+                                                   GH_REPO=self.repo, WORKTREE=str(wt), SOURCE=source,
+                                                   FIX_SCOPE=fix_scope(fixer, owner_triggered), FEEDBACK=feedback,
                                                    PR_DESCRIPTION_FILE=str(description), SHOTS_NOTE=shots_note),
                          f"pr-{pr}-fix{f'-{self.round}' if self.round else ''}", wt, str(fix_file), env)
         outcome, model = out["outcome"], out["model"] or "unknown"
@@ -329,7 +330,7 @@ class Runner:
         if not keep_base:
             Path(self.state, f"cursor-fix-base-{pr}").unlink(missing_ok=True)
 
-    def cursor_fix(self, pr, wt, source, feedback, head=""):
+    def cursor_fix(self, pr, wt, source, feedback, head="", *, owner_triggered=False):
         url = f"https://github.com/{self.repo}/pull/{pr}"
         branch = git(wt, "branch", "--show-current") or ""
         base_file = Path(self.state, f"cursor-fix-base-{pr}")
@@ -358,6 +359,7 @@ class Runner:
             out = self.agent("cursor", "fix", self.render(
                 "cursor-fix-prompt.md", PR=str(pr), ISSUE=self.env.runtime.issue or "unknown", GH_REPO=self.repo,
                 WORKTREE=str(wt), BRANCH=branch, SOURCE=source, FEEDBACK_FILE=str(feedback_file),
+                FIX_SCOPE=fix_scope("cursor", owner_triggered),
                 SHOTS_DIR=str(shots), PR_BODY_FILE=str(request)), f"pr-{pr}-cursor-fix", wt)
             outcome, reply_raw = out["outcome"], out["reply"] or ""
             self.reply = reply_raw
@@ -432,14 +434,23 @@ class Runner:
         return 0
 
 
-def fix_pr(runner, pr, wt, fixer, source, feedback, head=""):
+def fix_scope(fixer, owner_triggered):
+    if owner_triggered:
+        return ("The owner's words set the scope for the edits and the reply. Any `<findings>` block is context only. "
+                "Handle only the requests the owner makes, including the whole review if the owner asks for it. "
+                "Include only those requests in your reply.")
+    action = "Handle every Must fix point. Fixing nits is optional." if fixer == "cursor" else "Handle every point."
+    return f"{action} All review nits are in scope for the reply."
+
+
+def fix_pr(runner, pr, wt, fixer, source, feedback, head="", *, owner_triggered=False):
     """The fix run for any fixer, with its fix telemetry; rc 0 done, 1 handed off, 75 deferred
     (Deferred when a vendor cannot run now)."""
     if fixer == "cursor":
-        rc = runner.cursor_fix(pr, wt, source, feedback, head)
+        rc = runner.cursor_fix(pr, wt, source, feedback, head, owner_triggered=owner_triggered)
         runner.hooks.fix("cursor", runner.round or 0, runner.reply)
         return rc
-    return runner.fix_pr(pr, wt, fixer, source, feedback, head)
+    return runner.fix_pr(pr, wt, fixer, source, feedback, head, owner_triggered=owner_triggered)
 
 
 def result(rc, **extra):
@@ -455,7 +466,8 @@ def run(command, args, env=None, feedback=""):
         if command == "verify":
             rc, failure, rounds = runner.verify(args.wt, args.base, args.vendor, args.kind, args.number)
             return result(rc, failure=failure, rounds=rounds)
-        return result(fix_pr(runner, args.pr, args.wt, args.fixer, args.source, feedback, args.head))
+        return result(fix_pr(runner, args.pr, args.wt, args.fixer, args.source, feedback, args.head,
+                             owner_triggered=getattr(args, "owner_triggered", False)))
     except Deferred as deferred:
         return result(75, defer_vendor=deferred.vendor, defer=deferred.reason)
 
@@ -467,6 +479,7 @@ def main(argv=None):
     for name in ("pr", "wt", "fixer", "source"):
         fix.add_argument(f"--{name}", required=True)
     fix.add_argument("--head", default="")
+    fix.add_argument("--owner-triggered", action="store_true", help="limit the fix to the owner's requests")
     check = sub.add_parser("verify")
     for name in ("wt", "base", "vendor", "kind", "number"):
         check.add_argument(f"--{name}", required=True)

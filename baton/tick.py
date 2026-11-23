@@ -256,10 +256,10 @@ class Tick:
         loop = review.Review(self.env.with_runtime(issue=issue), self.hooks(issue, pr), pr, wt, issue, fixed_by)
         return loop.loop(note, fixer, reviewer)
 
-    def fix_pr(self, pr, wt, fixer, source, feedback, issue="", head=""):
+    def fix_pr(self, pr, wt, fixer, source, feedback, issue="", head="", *, owner_triggered=False):
         self.active["cursor_fix"] = str(pr)
         runner = fix.Runner(self.env.with_runtime(issue=issue, pr=str(pr)), self.hooks(issue, pr), pr, "")
-        return fix.fix_pr(runner, pr, wt, fixer, source, feedback, head)
+        return fix.fix_pr(runner, pr, wt, fixer, source, feedback, head, owner_triggered=owner_triggered)
 
     def spec_loop(self, issue):
         self.active["spec"] = self.active["issue"] = str(issue)
@@ -651,7 +651,8 @@ class Tick:
             temp.write_text(json.dumps({"owner": owner_text, "findings": findings}))
             temp.replace(feedback_file)
         # The label stays only on a deferral, so the fix resumes; any other outcome drops it.
-        rc = self.fix_pr(pr, wt, fixer, f"{self.owner} (the repository owner)", feedback, issue)
+        rc = self.fix_pr(pr, wt, fixer, f"{self.owner} (the repository owner)", feedback, issue,
+                         owner_triggered=True)
         if rc == 75:
             return 75
         feedback_file.unlink(missing_ok=True)
