@@ -3096,6 +3096,41 @@ def test_live_grounded_spec_answers_post_once_and_resume_revision(advised, monke
     assert "<advisor-answer" in ctx and excerpt in ctx
 
 
+def test_a_deferred_adr_push_resumes_revision_after_grounded_answers(advised, monkeypatch):
+    from baton import common
+
+    clock = _spec_clock(monkeypatch)
+    real_push = common.push
+
+    def flaky(wt, ref, *, upstream=False, signoff=False):
+        if clock["now"] < 1_060:
+            return common.PushResult(False, transient=True, detail="connection refused")
+        return real_push(wt, ref, upstream=upstream, signoff=signoff)
+
+    monkeypatch.setattr(spec, "push", flaky)
+    monkeypatch.setattr(dev, "setup_worktree", lambda *a, **k: ("", False))
+    advised.gh.body = f"Goal\n{EXCERPT}\n"
+    advised.script = [CHANGES, reviser(QUESTIONS, outcome="SPEC: human", commit=True),
+                      reviser("adopted the gate path"), ACCEPT]
+    advised.advice = advice(grounded())
+
+    with pytest.raises(Deferred, match="spec_adr_push_failed"):
+        advised.run()
+    assert not advised.gh.posted("<!-- baton-spec-reply")
+    assert not advised.gh.posted("<!-- baton-advisor-answer")
+    assert [run["role"] for run in advised.runs] == ["spec_review", "spec"]
+
+    clock["now"] = 1_060
+    assert advised.run() is True
+    answer, = advised.gh.posted("<!-- baton-advisor-answer")
+    assert EXCERPT in answer
+    revision, review = advised.runs[2:]
+    assert (revision["role"], revision["tag"]) == ("spec", f"issue-{N}-spec-reply-1")
+    assert (review["role"], review["tag"]) == ("spec_review", f"issue-{N}-spec-2")
+    assert revision["vendor"] != review["vendor"]
+    assert advised.gh.posted("<!-- baton-verdict: accept")
+
+
 def test_observe_and_mixed_answer_sets_hand_off_without_an_answer_comment(advised, monkeypatch):
     from baton.config import Advisor
     excerpt = "Manual checks use the existing gate path."

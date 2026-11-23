@@ -1954,15 +1954,20 @@ class Spec:
             if issue_payload is None:
                 return False
         if resume_push is not None:
+            binding = resume_push["continuation"]
             outcome = self.push_adr(None, initial=False, pending=resume_push)
-            if outcome == "revised":
-                step, round = "review", resume_push["continuation"]["round"] + 1
+            if outcome == "answered":
+                answer_intent = self.answer_intent
+                step, round = "revise", binding["round"]
+            elif outcome == "revised":
+                step, round = "review", binding["round"] + 1
             else:
                 return outcome == "accept"
-            max_rounds = resume_push["continuation"]["max_rounds"]
-            issue_payload, self.fresh_payload = self.fresh_payload or self.issue_payload(), None
-            if issue_payload is None:
-                return False
+            max_rounds = binding["max_rounds"]
+            if answer_intent is None:
+                issue_payload, self.fresh_payload = self.fresh_payload or self.issue_payload(), None
+                if issue_payload is None:
+                    return False
             if git(self.repo_dir, "rev-parse", "-q", "--verify", f"origin/{self.branch}") is not None:
                 self.base = f"origin/{self.branch}"
             if not self.worktree():
