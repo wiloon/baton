@@ -493,15 +493,16 @@ class Spec:
             binding = pending["continuation"]
         confirmed = pending is not None and pending.get("confirmed", False)
         consumed = False
-        if confirmed and not initial and pending.get("reads"):
+        if confirmed and not initial and pending.get("reads") is not None:
             # Consume the due read first, so a restart never allows another (#151).
             reads = pending["reads"]
             if reads >= owner_handoff.MAX_ATTEMPTS:
                 return stop("The comment landed, but its continuation could not be read.")
             reads += 1
-            now = int(owner_handoff.clock())
-            pending = {**pending, "reads": reads, "scheduled": now,
-                       "due": now + owner_handoff.DELAYS[reads - 1]}
+            pending = {**pending, "reads": reads}
+            if reads < owner_handoff.MAX_ATTEMPTS:
+                now = int(owner_handoff.clock())
+                pending.update(scheduled=now, due=now + owner_handoff.DELAYS[reads])
             owner_handoff.restore_retry(self.env, n, reason, n, pending)
             consumed = True
         if not initial and not confirmed:
@@ -593,7 +594,7 @@ class Spec:
             else:
                 now = int(owner_handoff.clock())
                 owner_handoff.restore_retry(self.env, n, reason, n,
-                                            {**pending, "reads": 1, "scheduled": now,
+                                            {**pending, "reads": 0, "scheduled": now,
                                              "due": now + owner_handoff.DELAYS[0]})
                 raise Deferred("handoff-retry", reason, lends_slot=False)
         return stop(f"Reconciliation: {status}." + (pr_helpers.why(posted) if posted is not None else ""))
