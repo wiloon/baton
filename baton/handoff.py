@@ -10,6 +10,7 @@ transient failure schedules at most two later attempts (due after 60s then 300s)
 consumed before it runs so a restart cannot reset the budget. Permanent failures and exhaustion
 hand off. Deferrals yield the tick without sleeping (#151).
 """
+import hashlib
 import json
 import re
 import stat
@@ -30,9 +31,21 @@ READY = "ready-for-human"
 DELAYS = (60, 300)
 MAX_ATTEMPTS = len(DELAYS)
 clock = time.time
-# Read retries wired in this slice; write retries stay direct handoff until a later slice.
+# Category-1 reads and comment posts share the budget.
+REVIEW_POST = "review_comment_post_failed"
+SCREENSHOT_POST = "screenshot_comment_post_failed"
+SPEC_REVIEW_POST = "spec_review_comment_post_failed"
+SPEC_REPLY_POST = "spec_reply_post_failed"
+SPEC_PENDING_ACCEPT_POST = "spec_pending_accept_post_failed"
+SPEC_ACCEPT_POST = "spec_accept_post_failed"
+COMMENT_POSTS = (REVIEW_POST, SCREENSHOT_POST)
+SPEC_POSTS = (SPEC_REVIEW_POST, SPEC_REPLY_POST)
+SPEC_ACCEPT_POSTS = (SPEC_PENDING_ACCEPT_POST, SPEC_ACCEPT_POST)
+# Spec comment posts and accept/pending-accept posts share tick discovery.
+SPEC_WRITE_POSTS = (*SPEC_POSTS, *SPEC_ACCEPT_POSTS)
 RETRY_REASONS = frozenset({
     "review_comment_missing", "spec_comments_read_failed", "spec_pending_adr_read_failed",
+    *COMMENT_POSTS, *SPEC_WRITE_POSTS,
 })
 
 # Categories: 1 rule-decided, 2 judgement, 3 needs investigation, 4 owner-only.
@@ -160,6 +173,118 @@ def _read_record(path):
         raise RetryUnreadable(f"unreadable retry record {path.name}") from exc
 
 
+def body_digest(body):
+    return hashlib.sha256(body.encode()).hexdigest()
+
+
+def _comment_post_valid(item, binding, *, marker):
+    """A trusted review or screenshot comment and the inputs it was produced from (#151)."""
+    body = binding.get("body")
+    reviewer, round = binding.get("reviewer"), binding.get("round")
+    if (reviewer not in ("claude", "codex", "cursor") or type(round) is not int or round <= 0
+            or not isinstance(body, str)
+            or not body.startswith(f"<!-- {marker} round={round} by={reviewer} -->\n")):
+        return False
+    try:
+        if binding.get("digest") != body_digest(body):
+            return False
+    except UnicodeEncodeError:
+        return False
+    boundary = binding.get("comment_ids")
+    return (binding.get("pr") == item
+            and isinstance(boundary, list) and all(type(value) is int and value > 0 for value in boundary)
+            and len(set(boundary)) == len(boundary)
+            and all(isinstance(binding.get(key), str) for key in
+                    ("head", "base", "issue", "description", "feedback", "outcome", "author", "run_id"))
+            and bool(binding["base"]) and bool(binding["author"])
+            and bool(re.fullmatch(r"[0-9a-f]{40}", binding["head"]))
+            and bool(re.fullmatch(r"[0-9a-f]{64}", binding["description"]))
+            and bool(re.fullmatch(r"[0-9a-f]{64}", binding["feedback"]))
+            and binding["outcome"].startswith(("REVIEW: pass", "REVIEW: changes"))
+            and (binding["issue"] == "" or binding["issue"].isascii() and binding["issue"].isdecimal()))
+
+
+def _spec_comment_post_valid(item, binding, *, reason):
+    """A trusted spec review or reply comment and the inputs it was produced from (#151)."""
+    body, reviewer, round = binding.get("body"), binding.get("reviewer"), binding.get("round")
+    if reviewer not in ("claude", "codex", "cursor") or type(round) is not int or round <= 0 or not isinstance(body, str):
+        return False
+    if reason == SPEC_REVIEW_POST:
+        if not body.startswith(f"<!-- baton-spec-review round={round} by={reviewer} -->\n"):
+            return False
+        if binding.get("next") != "revise":
+            return False
+    else:
+        if not re.match(rf"<!-- baton-spec-reply round={round}( human)? by={re.escape(reviewer)} -->\n", body):
+            return False
+        if binding.get("next") not in ("review", "human"):
+            return False
+    try:
+        if binding.get("digest") != body_digest(body):
+            return False
+    except UnicodeEncodeError:
+        return False
+    boundary = binding.get("comment_ids")
+    return (binding.get("issue") == item
+            and isinstance(boundary, list) and all(type(value) is int and value > 0 for value in boundary)
+            and len(set(boundary)) == len(boundary)
+            and all(isinstance(binding.get(key), str) for key in
+                    ("author", "issue_body", "adr_head", "feedback", "reply", "limit_why", "pr"))
+            and bool(binding["author"]) and bool(binding["limit_why"])
+            and bool(re.fullmatch(r"[0-9a-f]{64}", binding["issue_body"]))
+            and bool(re.fullmatch(r"[0-9a-f]{64}", binding["feedback"]))
+            and (binding["adr_head"] == "" or bool(re.fullmatch(r"[0-9a-f]{40}", binding["adr_head"])))
+            and (binding["pr"] == "" or binding["pr"].isdecimal())
+            and type(binding.get("max_rounds")) is int and binding["max_rounds"] > 0)
+
+
+def _spec_accept_post_valid(item, binding, *, reason):
+    """A trusted accept or pending-accept comment and the inputs it was produced from (#151)."""
+    body, reviewer, round = binding.get("body"), binding.get("reviewer"), binding.get("round")
+    if reviewer not in ("claude", "codex", "cursor") or type(round) is not int or round <= 0 or not isinstance(body, str):
+        return False
+    verdict = binding.get("verdict")
+    if not isinstance(verdict, str) or not verdict.startswith(f"<!-- baton-verdict: accept by={reviewer} -->\n"):
+        return False
+    if f"round {round}: accept" not in verdict.split("\n", 2)[1]:
+        return False
+    if reason == SPEC_PENDING_ACCEPT_POST:
+        pr = binding.get("pr")
+        if not isinstance(pr, str) or not pr.isdecimal():
+            return False
+        head = binding.get("adr_head")
+        if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
+            return False
+        expected = f"<!-- baton-spec-accept-pending pr={pr} head={head} -->\n{verdict}"
+        if body != expected or binding.get("next") != "merge":
+            return False
+    else:
+        if body != verdict or binding.get("next") != "transition":
+            return False
+        pr = binding.get("pr")
+        if not isinstance(pr, str) or (pr != "" and not pr.isdecimal()):
+            return False
+        head = binding.get("adr_head")
+        # Older records may omit the head. Reconciliation requires a matching revision for any saved PR.
+        if not isinstance(head, str) or (head != "" and not re.fullmatch(r"[0-9a-f]{40}", head)):
+            return False
+        if head and not pr:
+            return False
+    try:
+        if binding.get("digest") != body_digest(body):
+            return False
+    except UnicodeEncodeError:
+        return False
+    boundary = binding.get("comment_ids")
+    return (binding.get("issue") == item
+            and isinstance(boundary, list) and all(type(value) is int and value > 0 for value in boundary)
+            and len(set(boundary)) == len(boundary)
+            and all(isinstance(binding.get(key), str) for key in ("author", "issue_body", "feedback"))
+            and bool(binding["author"])
+            and bool(re.fullmatch(r"[0-9a-f]{64}", binding["issue_body"]))
+            and bool(re.fullmatch(r"[0-9a-f]{64}", binding["feedback"])))
+
+
 def _binding_valid(reason, item, binding):
     if not isinstance(binding, dict):
         return False
@@ -174,6 +299,14 @@ def _binding_valid(reason, item, binding):
                 and isinstance(binding.get("issue_body"), str)
                 and isinstance(binding.get("adr_head"), str)
                 and (binding["adr_head"] == "" or bool(re.fullmatch(r"[0-9a-f]{40}", binding["adr_head"]))))
+    if reason == REVIEW_POST:
+        return _comment_post_valid(item, binding, marker="baton-review")
+    if reason == SCREENSHOT_POST:
+        return _comment_post_valid(item, binding, marker="baton-screenshot-review")
+    if reason in SPEC_POSTS:
+        return _spec_comment_post_valid(item, binding, reason=reason)
+    if reason in SPEC_ACCEPT_POSTS:
+        return _spec_accept_post_valid(item, binding, reason=reason)
     return (binding.get("pr") == item and type(binding.get("round")) is int and binding["round"] > 0
             and all(isinstance(binding.get(key), str) for key in
                     ("head", "base", "digest", "issue", "screenshot_digest"))
@@ -199,18 +332,53 @@ def load_retry(env, episode, reason, item=""):
         raise RetryUnreadable(f"mismatched retry operation {path.name}")
     if not _binding_valid(reason, item, binding):
         raise RetryUnreadable(f"invalid continuation in {path.name}")
+    if "confirmed" in data and (reason not in (*SPEC_POSTS, SPEC_ACCEPT_POST) or data["confirmed"] is not True):
+        raise RetryUnreadable(f"invalid confirmed-post phase in {path.name}")
     attempts, due, scheduled = data.get("attempts"), data.get("due"), data.get("scheduled")
     if type(attempts) is not int or not (0 <= attempts <= MAX_ATTEMPTS):
         raise RetryUnreadable(f"out-of-range attempts in {path.name}")
+    reads = data.get("reads")
+    if "reads" in data and (reason not in SPEC_POSTS or data.get("confirmed") is not True
+                            or type(reads) is not int or not 0 <= reads <= MAX_ATTEMPTS):
+        raise RetryUnreadable(f"out-of-range reads in {path.name}")
+    index = min(attempts if reads is None else reads, MAX_ATTEMPTS - 1)
     if (type(due) is not int or type(scheduled) is not int or not 0 <= scheduled <= int(clock())
-            or due != scheduled + DELAYS[min(attempts, MAX_ATTEMPTS - 1)]):
+            or due != scheduled + DELAYS[index]):
         raise RetryUnreadable(f"out-of-range due in {path.name}")
     return data
 
 
 def restore_retry(env, episode, reason, item, pending):
-    """Keep a due attempt waiting when the authoritative read reports an owner pause."""
+    """Update the budget while keeping the saved operation unchanged."""
     atomic_json(retry_path(env, episode, reason, item), pending)
+
+
+def prepare_retry(env, episode, reason, item, binding):
+    """Save a new operation with its first deadline, before a write or after a failed read."""
+    episode, item = str(episode), str(item)
+    if not _binding_valid(reason, item, binding):
+        return None
+    waiting = {"reason": reason, "episode": episode, "item": item, "continuation": binding}
+    now = int(clock())
+    pending = {**waiting, "attempts": 0, "scheduled": now, "due": now + DELAYS[0]}
+    atomic_json(waiting_path(env, episode, reason, item), waiting)
+    restore_retry(env, episode, reason, item, pending)
+    notify.log(f"handoff-retry {reason} scheduled in {DELAYS[0]}s attempt=0/{MAX_ATTEMPTS} episode={episode}")
+    return pending
+
+
+def comment_post_episodes(env, reason=None):
+    """Find review or screenshot comment-post operations by PR number."""
+    reasons = (reason,) if reason else COMMENT_POSTS
+    found = {}
+    for name in reasons:
+        for path in Path(env.dirs.state).glob(f"handoff-*-{name}.json"):
+            match = re.fullmatch(rf"handoff-(?:waiting|retry)-([0-9]+)(?:-([0-9]+))?-{re.escape(name)}\.json",
+                                 path.name)
+            if match:
+                episode, item = match.groups()
+                found.setdefault(item or episode, set()).add(episode)
+    return found
 
 
 def _clear_path(path):
@@ -307,13 +475,8 @@ def _category1(env, reason, entry, *, kind, number, title, text, hooks, remove, 
         return Result(DEFER, handed_off=False, continuation=pending["continuation"])
 
     binding = continuation if continuation is not None else {}
-    if not _binding_valid(reason, item, binding):
+    if prepare_retry(env, episode, reason, item, binding) is None:
         return finish()
-    waiting = {"reason": reason, "episode": episode, "item": item, "continuation": binding}
-    delay = DELAYS[0]
-    atomic_json(waiting_path(env, episode, reason, item), waiting)
-    atomic_json(path, {**waiting, "attempts": 0, "scheduled": now, "due": now + delay})
-    notify.log(f"handoff-retry {reason} scheduled in {delay}s attempt=0/{MAX_ATTEMPTS} episode={episode}")
     return Result(DEFER, handed_off=False, continuation=binding)
 
 

@@ -98,6 +98,13 @@ fix                        reads both, answers Must fix and design findings, re-
   cap (Cursor's `REPLY_CAP`) cuts only the text outside the reply's `## Design findings`
   section, which is kept whole first; if that section alone does not fit, the fix hands off
   (`fix_failed`) instead of posting a partial answer that would parse as a complete one.
+- A fix comment whose run the runner saw end in `RESULT: needs-info` carries `outcome=needs-info`
+  in its marker (`<!-- baton-fix by=<vendor> … outcome=needs-info -->`), written by the runner from
+  the outcome it observed, never by the agent. Collecting the owner's feedback for a fix, the
+  runner treats only owner-authored fix comments without that attribute (including every older,
+  unmarked one) as the point after which feedback is new; a `needs-info` reply does not move it,
+  so the owner's decision before the stop still reaches the next fixer. A run that posts no reply
+  (empty reply, or the post fails) leaves no marker and so moves nothing either.
 
 ## Revision record
 
@@ -126,3 +133,6 @@ fix                        reads both, answers Must fix and design findings, re-
 - Issue #96, round 6: the reply window is also scoped to the active loop by a loop id in the fix
   comment's marker, because a new review loop on the same PR restarts its rounds at 1 and an
   earlier loop's `D1.1` answer would otherwise collide with the new loop's `D1.1`.
+- Issue #178: a fix comment records a runner-observed `needs-info` outcome in its marker, and such
+  a comment does not end the owner feedback window, because both posting paths drop the agent's
+  `RESULT:` line and a label-only retry after a question otherwise lost the owner's decision.

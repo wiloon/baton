@@ -8,7 +8,7 @@ import subprocess
 import pytest
 
 from baton import after_merge, config, credentials, dev, fix, initialization, notify, session, spec, tick
-from conftest import sh
+from conftest import issue_snapshot_pages, sh
 
 ROOT = Path(__file__).resolve().parents[1]
 TEXT = (ROOT / "config.example.toml").read_text()
@@ -99,6 +99,11 @@ def test_the_environment_alone_needs_no_file(tmp_path):
     environ = {"TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_CHAT_ID": "1"}
     assert credentials.load(tmp_path / "missing.env", KEYS, environ) == environ
     assert credentials.load(tmp_path / "missing.env", KEYS, {}) == {}
+
+
+def test_a_directory_as_the_file_is_a_credential_error(tmp_path):
+    with pytest.raises(credentials.CredentialError, match="cannot be read"):
+        credentials.load(tmp_path, KEYS, {})
 
 
 @pytest.mark.parametrize("mode", [0o640, 0o604, 0o644])
@@ -204,7 +209,9 @@ def test_without_linear_owner_actions_go_to_a_github_issue(bound, monkeypatch):
     bound()
     fake = GH({"pr view": "## Before release\n- Rotate the webhook secret\n",
                "issue create": "https://github.com/acme/app/issues/9\n"})
+    from baton import pr as pr_mod
     monkeypatch.setattr(after_merge, "gh", fake)
+    monkeypatch.setattr(pr_mod, "gh", fake)   # create_issue recovers labels through pr.gh
     monkeypatch.setattr(after_merge.urllib.request, "urlopen", no_network)
     monkeypatch.setattr(after_merge, "pr_body", lambda pr: "## Before release\n- Rotate the webhook secret\n")
     after_merge.owner_actions(5, "7")
@@ -260,8 +267,8 @@ def test_a_minimal_config_runs_a_tick_end_to_end(bound, monkeypatch, tmp_path):
     fake = GH({"issue list": lambda args: [ready] if "ready-for-agent" in args else [],
                "api repos/acme/app/issues/12/events?per_page=100": [[
                    {"id": 1, "event": "labeled", "actor": {"login": "acme-owner"}, "label": {"name": "ready-for-agent"}}]],
-               "issue view": {"title": "A title", "body": "A body", "comments": [
-                   {"author": {"login": "acme-owner"}, "body": "<!-- baton-verdict: accept -->\nThe plan"}]},
+               "api graphql": issue_snapshot_pages({"title": "A title", "body": "A body", "comments": [
+                   {"author": {"login": "acme-owner"}, "body": "<!-- baton-verdict: accept -->\nThe plan"}]}),
                "pr create": "https://github.com/acme/app/pull/13\n"})
     monkeypatch.setattr(tick.pr_helpers, "gh", fake)
     for module in (notify, after_merge):

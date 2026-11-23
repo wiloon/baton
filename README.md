@@ -83,7 +83,8 @@ Create these labels in each watched repository (see the quick start).
 | `agent-review` | owner | review an eligible same-repository PR by the owner or configured Cursor account |
 | `agent-fix` | owner | the owner left feedback on an agent PR; fix it |
 | `claude-found` | baton | an issue a code scan filed |
-| `needs-triage` | baton | with `claude-found`: waiting for Cursor's or the owner's verdict |
+| `needs-triage` | baton | a scan issue or a side bug the runner filed, waiting for triage |
+| `follow-up` | baton | non-blocking nits from a merged PR; a PR that implements a follow-up issue files no further nits |
 
 The unattended queue accepts issues opened by `owner` or the configured Cursor accounts.
 It also accepts external issues after the configured `owner` applies `ready-for-agent`; the
@@ -142,7 +143,7 @@ cp config.example.toml config.toml
 git clone https://github.com/OWNER/NAME ~/baton/repos/OWNER/NAME
 
 # 3. Create the labels in that repository
-for l in ready-for-agent agent-wip ready-for-human needs-info agent-review agent-fix claude-found needs-triage; do
+for l in ready-for-agent agent-wip ready-for-human needs-info agent-review agent-fix claude-found needs-triage follow-up; do
   gh label create "$l" -R OWNER/NAME 2>/dev/null || true
 done
 

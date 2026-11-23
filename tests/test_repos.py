@@ -7,7 +7,7 @@ import subprocess
 import pytest
 
 from baton import bootstrap, config, initialization, migrate, nightly, session, tick
-from conftest import full_text, sh
+from conftest import full_text, issue_snapshot_pages, sh
 
 ROOT = Path(__file__).resolve().parents[1]
 TEXT = full_text()
@@ -190,6 +190,9 @@ class ByRepo:
 
     def __call__(self, *args, input=None):
         repo = args[args.index("-R") + 1] if "-R" in args else ""
+        if args[:2] == ("api", "graphql"):
+            fields = dict(value.split("=", 1) for flag, value in zip(args, args[1:]) if flag == "-f")
+            repo = f"{fields['owner']}/{fields['repo']}"
         label = args[args.index("--label") + 1] if "--label" in args else ""
         answer = self.answers.get((repo, " ".join(args[:2]), label), [] if args[1:2] == ("list",) else "")
         return subprocess.CompletedProcess(args, 0, answer if isinstance(answer, str) else json.dumps(answer), "")
@@ -206,8 +209,8 @@ def test_pending_prs_are_counted_per_repository(two, monkeypatch):
                                        "milestone": {"title": "Now"}}],
         ("", "api repos/acme/shop/issues/7/events?per_page=100", ""): [[
             {"id": 1, "event": "labeled", "actor": {"login": "alice"}, "label": {"name": "ready-for-agent"}}]],
-        ("acme/shop", "issue view", ""): {"title": "T", "body": "B", "comments": [
-            {"author": {"login": "alice"}, "body": "<!-- baton-verdict: accept -->\nPlan"}]},
+        ("acme/shop", "api graphql", ""): issue_snapshot_pages({"title": "T", "body": "B", "comments": [
+            {"author": {"login": "alice"}, "body": "<!-- baton-verdict: accept -->\nPlan"}]}),
     }))
     monkeypatch.setattr(tick.Tick, "pick_vendor", lambda self, *a, **k: "claude")
     app, shop = ticks()

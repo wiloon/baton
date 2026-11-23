@@ -52,6 +52,7 @@ class Runner:
         self.retry_context = {}
         self.retry_start = None
         self.required_retry_label = ""
+        self.owner_triggered = False   # fix_pr sets it; dispatch_fixer keeps the owner scope on retries
         self.verification_progress = None
         self.hooks = hooks or telemetry.from_env(env, issue=env.runtime.issue, pr=pr, round=round)
 
@@ -334,7 +335,7 @@ class Runner:
         )
 
     # --- a Claude or Codex fixer ---
-    def fix_pr(self, pr, wt, fixer, source, feedback, head=""):
+    def fix_pr(self, pr, wt, fixer, source, feedback, head="", *, owner_triggered=False):
         self.last_fixer = fixer
         url = f"https://github.com/{self.repo}/pull/{pr}"
         fix_file = Path(f"/tmp/baton-fix-{pr}.md")
@@ -364,7 +365,8 @@ class Runner:
                           "worktree clean.")
             env = self.env.with_runtime(shots_dir=str(shots))
         out = self.agent(fixer, "fix", self.render(template, PR=str(pr), ISSUE=self.env.runtime.issue or "unknown",
-                                                   GH_REPO=self.repo, WORKTREE=str(wt), SOURCE=source, FEEDBACK=feedback,
+                                                   GH_REPO=self.repo, WORKTREE=str(wt), SOURCE=source,
+                                                   FIX_SCOPE=fix_scope(fixer, owner_triggered), FEEDBACK=feedback,
                                                    PR_DESCRIPTION_FILE=str(description), SHOTS_NOTE=shots_note),
                          f"pr-{pr}-fix{f'-{self.round}' if self.round else ''}", wt, str(fix_file), env)
         outcome, model = out["outcome"], out["model"] or "unknown"
@@ -375,7 +377,11 @@ class Runner:
                     rest = pr_helpers.split_checks(pr, strip_markers(fix_file.read_text()), self.ctx)
                 except Exception:
                     rest = strip_markers(fix_file.read_text())
-                self.comment(pr, f"<!-- baton-fix by={fixer} -->\n{rest.rstrip(chr(10))}")
+                marker = (f"<!-- baton-fix by={fixer} outcome=needs-info -->"
+                          if outcome.startswith("RESULT: needs-info")
+                          else f"<!-- baton-fix by={fixer} -->")
+                if any(line.strip() and not line.startswith("RESULT: ") for line in rest.split("\n")):   # a checks-only reply has nothing to post; a bare marker would move the cutoff
+                    self.comment(pr, f"{marker}\n{rest.rstrip(chr(10))}")
             self.hooks.fix(fixer, self.round or 0, out["reply"], str(fix_file))
         task_changed, description_rc, description_changed, description_reason = False, 0, False, ""
         if outcome.startswith("RESULT: fixed"):
@@ -467,7 +473,7 @@ class Runner:
         if not keep_base:
             Path(self.state, f"cursor-fix-base-{pr}").unlink(missing_ok=True)
 
-    def cursor_fix(self, pr, wt, source, feedback, head=""):
+    def cursor_fix(self, pr, wt, source, feedback, head="", *, owner_triggered=False):
         agent_head = self.head(wt)
         url = f"https://github.com/{self.repo}/pull/{pr}"
         branch = git(wt, "branch", "--show-current") or ""
@@ -497,6 +503,7 @@ class Runner:
             out = self.agent("cursor", "fix", self.render(
                 "cursor-fix-prompt.md", PR=str(pr), ISSUE=self.env.runtime.issue or "unknown", GH_REPO=self.repo,
                 WORKTREE=str(wt), BRANCH=branch, SOURCE=source, FEEDBACK_FILE=str(feedback_file),
+                FIX_SCOPE=fix_scope("cursor", owner_triggered),
                 SHOTS_DIR=str(shots), PR_BODY_FILE=str(request)), f"pr-{pr}-cursor-fix", wt)
             outcome, reply_raw = out["outcome"], out["reply"] or ""
             self.reply = reply_raw
@@ -505,7 +512,10 @@ class Runner:
             if reply_raw:
                 reply = pr_helpers.split_checks(pr, reply, self.ctx).rstrip("\n")
             if reply.strip():
-                self.comment(pr, f"<!-- baton-fix by=cursor -->\n{reply[:REPLY_CAP]}", f"PR #{pr}: posting Cursor's reply failed")
+                marker = ("<!-- baton-fix by=cursor outcome=needs-info -->"
+                          if outcome.startswith("RESULT: needs-info")
+                          else "<!-- baton-fix by=cursor -->")
+                self.comment(pr, f"{marker}\n{reply[:REPLY_CAP]}", f"PR #{pr}: posting Cursor's reply failed")
             if not outcome.startswith("RESULT: fixed"):
                 if outcome.startswith("RESULT: needs-info"):
                     return self.handoff(pr, "fix_needs_info", f"Cursor PR #{pr} has questions", url)
@@ -615,10 +625,11 @@ class Runner:
 
     def dispatch_fixer(self, pr, wt, fixer, source, feedback, head):
         self.last_fixer = fixer
+        scope = {"owner_triggered": self.owner_triggered}
         with self.dispatching(pr, wt):
             if fixer != "cursor":
-                return self.fix_pr(pr, wt, fixer, source, feedback, head)
-            rc = self.cursor_fix(pr, wt, source, feedback, head)
+                return self.fix_pr(pr, wt, fixer, source, feedback, head, **scope)
+            rc = self.cursor_fix(pr, wt, source, feedback, head, **scope)
             if rc == 75:   # a short block reported by return value, e.g. a description update
                 recovery.settle(self.env, self.env.runtime.issue or pr, pr, lambda: self.retry_binding(wt, pr))
         self.hooks.fix("cursor", self.round or 0, self.reply)
@@ -646,10 +657,20 @@ def correction(feedback, error):
            f"Retain the existing commits. Validation error: {error or 'invalid task relation'}"
 
 
-def fix_pr(runner, pr, wt, fixer, source, feedback, head=""):
+def fix_scope(fixer, owner_triggered):
+    if owner_triggered:
+        return ("The owner's words set the scope for the edits and the reply. Any `<findings>` block is context only. "
+                "Handle only the requests the owner makes, including the whole review if the owner asks for it. "
+                "Include only those requests in your reply.")
+    action = "Handle every Must fix point. Fixing nits is optional." if fixer == "cursor" else "Handle every point."
+    return f"{action} All review nits are in scope for the reply."
+
+
+def fix_pr(runner, pr, wt, fixer, source, feedback, head="", *, owner_triggered=False):
     """Resume a saved fix step or dispatch the requested adapter."""
     from . import advisor
 
+    runner.owner_triggered = owner_triggered
     runner.retry_context = {"fix_feedback": recovery.feedback_digest(feedback), "fix_source": source}
     pending = runner.resume(pr, wt)
     if pending is False:
@@ -695,7 +716,8 @@ def run(command, args, env=None, feedback=""):
         if command == "verify":
             rc, failure, rounds = runner.verify(args.wt, args.base, args.vendor, args.kind, args.number)
             return result(rc, failure=failure, rounds=rounds)
-        rc = fix_pr(runner, args.pr, args.wt, args.fixer, args.source, feedback, args.head)
+        rc = fix_pr(runner, args.pr, args.wt, args.fixer, args.source, feedback, args.head,
+                    owner_triggered=getattr(args, "owner_triggered", False))
         return result(rc, fixer=runner.last_fixer, authors=runner.attempt_authors)
     except Deferred as deferred:
         return result(75, defer_vendor=deferred.vendor, defer=deferred.reason)
@@ -708,6 +730,7 @@ def main(argv=None):
     for name in ("pr", "wt", "fixer", "source"):
         fix.add_argument(f"--{name}", required=True)
     fix.add_argument("--head", default="")
+    fix.add_argument("--owner-triggered", action="store_true", help="limit the fix to the owner's requests")
     check = sub.add_parser("verify")
     for name in ("wt", "base", "vendor", "kind", "number"):
         check.add_argument(f"--{name}", required=True)

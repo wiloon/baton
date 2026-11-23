@@ -10,6 +10,26 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 
+
+def issue_snapshot_pages(*issues):
+    """GraphQL wire format for issue snapshots. Each input supplies one page of comments."""
+    pages = []
+    for index, issue in enumerate(issues):
+        labels = issue.get("labels", [])
+        row = {
+            "title": issue.get("title", "Issue"), "body": issue.get("body", "Body"),
+            "state": issue.get("state", "OPEN"),
+            "labels": {"totalCount": len(labels), "nodes": labels},
+            "comments": {
+                "nodes": [{"fullDatabaseId": str(row.get("id", i)), "body": row["body"],
+                           "author": row.get("author")}
+                          for i, row in enumerate(issue["comments"], 1)],
+                "pageInfo": {"hasNextPage": index + 1 < len(issues), "endCursor": str(index)},
+            },
+        }
+        pages.append({"data": {"repository": {"issue": row}}})
+    return pages
+
 # When baton works on itself, this suite runs inside a baton run (the verify hook, an agent's own
 # check) and inherits what that run hands its children: the real runner log, the hooks and CI
 # command, and the telemetry context. Tests must never see those (#73, #74).
@@ -129,11 +149,20 @@ elif args[:1] == ["api"] and any(a.endswith("/files") for a in args):
         print(f["filename"])
         if f.get("previous_filename"):
             print(f["previous_filename"])
+elif args[:1] == ["api"] and "--slurp" in args and args[1].endswith(("/comments", "/reviews")):
+    field = "reviews" if args[1].endswith("/reviews") else "comments" if "/issues/" in args[1] else "inline"
+    rows = pr.get(field, [])
+    comments = [{**row, "id": row.get("id", i + 1), "user": row.get("user", row.get("author"))}
+                for i, row in enumerate(rows)]
+    print(json.dumps([comments[i:i+100] for i in range(0, len(comments), 100)] or [[]]))
 elif args[:1] == ["api"]:
     print(json.dumps(pr.get("inline", [])))
 elif args[:2] == ["issue", "list"]:
     # A just-created issue is listed at once but not yet in the search index (#52).
     issues = [t if isinstance(t, dict) else {"title": t} for t in pr.get("open_issues", [])]
+    if "--label" in args:
+        want = args[args.index("--label") + 1]
+        issues = [t for t in issues if want in (t.get("labels") or [])]
     print(json.dumps([{k: v for k, v in t.items() if k != "unindexed"} for t in issues
                       if not ("--search" in args and t.get("unindexed"))]))
 elif args[:2] == ["issue", "view"] and "--jq" in args:
@@ -142,14 +171,56 @@ elif args[:2] == ["issue", "view"] and "title" in args[args.index("--json") + 1]
     print(json.dumps(pr.get("issues", {}).get(args[2], {})))
 elif args[:2] == ["issue", "view"]:
     print(json.dumps({"labels": [{"name": n} for n in pr.get("issue_labels", {}).get(args[2], [])]}))
+elif args[:2] == ["issue", "comment"]:
+    if fails("issue-comment"):
+        if (root / "issue-comment-stderr").exists():
+            print((root / "issue-comment-stderr").read_text(), file=sys.stderr, end="")
+        sys.exit(1)
+    sys.exit(0)
+elif args[:2] == ["label", "create"]:
+    name = args[2]
+    labels = json.loads((root / "labels.json").read_text())
+    if fails("label-create") or fails(f"label-create-{name}"):
+        err = (root / "label-create-stderr").read_text() if (root / "label-create-stderr").exists() else f"failed to create label '{name}'"
+        print(err, file=sys.stderr)
+        sys.exit(1)
+    if name in labels and "--force" not in args:
+        print(f"label '{name}' already exists; use --force to recreate", file=sys.stderr)
+        sys.exit(1)
+    meta = pr.get("label_meta", {}).get(name, {})
+    labels[name] = {"color": meta.get("color", "ededed"), "description": meta.get("description", "")}
+    (root / "labels.json").write_text(json.dumps(labels))
+    sys.exit(0)
 elif args[:2] == ["issue", "create"]:
     if fails("issue-create"):
+        err = (root / "issue-create-stderr").read_text() if (root / "issue-create-stderr").exists() else ""
+        if err:
+            print(err, file=sys.stderr, end="")
         sys.exit(1)
-    number = 900 + sum(1 for c in (root / "calls").read_text().splitlines() if json.loads(c)[:2] == ["issue", "create"]) - 1
-    pr.setdefault("open_issues", []).append({"number": number, "title": args[args.index("--title") + 1], "unindexed": True})
+    requested = [args[i + 1] for i, a in enumerate(args) if a == "--label"]
+    labels = json.loads((root / "labels.json").read_text())
+    for name in requested:
+        if name not in labels:
+            print(f"could not add label: '{name}' not found", file=sys.stderr)
+            sys.exit(1)
+    title = args[args.index("--title") + 1]
+    body = args[args.index("--body") + 1] if "--body" in args else pathlib.Path(args[args.index("--body-file") + 1]).read_text()
+    created_path = root / "created-issues.jsonl"
+    number = 900 + (len(created_path.read_text().splitlines()) if created_path.exists() else 0)
+    record = {"title": title, "body": body, "labels": requested, "label": requested[0] if requested else ""}
+    with open(created_path, "a") as f:
+        f.write(json.dumps(record) + "\n")
+    pr.setdefault("open_issues", []).append(
+        {"number": number, "title": title, "labels": list(requested), "unindexed": True})
     (root / "pr.json").write_text(json.dumps(pr))
     print(f"https://github.com/owner/app/issues/{number}")
 '''
+
+
+DEFAULT_LABELS = (
+    "ready-for-agent", "agent-wip", "ready-for-human", "needs-info", "agent-review", "agent-fix",
+    "claude-found", "needs-triage", "follow-up",
+)
 
 
 class FakeGitHub:
@@ -171,14 +242,28 @@ class FakeGitHub:
         path = self.root / f"{name}-fails"
         path.touch() if on else path.unlink(missing_ok=True)
 
+    def labels(self):
+        return json.loads((self.root / "labels.json").read_text())
+
+    def set_labels(self, *names, **meta):
+        """Replace the label inventory; META maps a name to {color, description}."""
+        inventory = {name: {"color": "ededed", "description": ""} for name in names}
+        for name, info in meta.items():
+            inventory[name] = {"color": info.get("color", "ededed"), "description": info.get("description", "")}
+        (self.root / "labels.json").write_text(json.dumps(inventory))
+        self.set(label_meta={**self.pr.get("label_meta", {}), **meta})
+
+    def stderr(self, name, text):
+        (self.root / f"{name}-stderr").write_text(text)
+
     def calls(self):
         path = self.root / "calls"
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
     def created(self):
-        """{"title", "body", "label"} of each `gh issue create`."""
-        return [{key: call[call.index(f"--{key}") + 1] for key in ("title", "body", "label")}
-                for call in self.calls() if call[:2] == ["issue", "create"]]
+        """Successful `gh issue create` records: title, body, label, labels (possibly empty)."""
+        path = self.root / "created-issues.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
 
 @pytest.fixture
@@ -192,6 +277,8 @@ def gh(tmp_path, monkeypatch):
     root.mkdir()
     (root / "pr.json").write_text("{}")
     (root / "watches.json").write_text("[]")
+    (root / "labels.json").write_text(json.dumps(
+        {name: {"color": "ededed", "description": ""} for name in DEFAULT_LABELS}))
     for name in ("state", "ctx", "logs"):
         (tmp_path / name).mkdir()
     for name in ("STATE", "CTX", "LOGS"):
@@ -328,3 +415,15 @@ def typed_legacy_test_inputs(request, monkeypatch):
         return session.Session(config, rt, env, home, env.get('MATT_SKILLS_DIR',''),
                                tuple(Path(v) for v in env.get('CODEX_CACHE_DIRS','').split()), repo, dirs)
     monkeypatch.setattr(session, 'resolve', resolve)
+
+
+@pytest.fixture
+def child_token(monkeypatch):
+    """A token only the bound session's child environment holds; the process env lacks it."""
+    from baton import session
+    opaque = "child-env-gh-token-secret"
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    current = session.resolve()
+    current.tools["GH_TOKEN"] = opaque
+    monkeypatch.setattr(session, "resolve", lambda value=None: current)
+    return opaque

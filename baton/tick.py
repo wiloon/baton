@@ -256,12 +256,12 @@ class Tick:
         loop = review.Review(self.env.with_runtime(issue=issue), self.hooks(issue, pr), pr, wt, issue, fixed_by)
         return loop.loop(note, fixer, reviewer)
 
-    def fix_pr(self, pr, wt, fixer, source, feedback, issue="", head=""):
+    def fix_pr(self, pr, wt, fixer, source, feedback, issue="", head="", *, owner_triggered=False):
         self.active["cursor_fix"] = str(pr)
         runner = fix.Runner(self.env.with_runtime(issue=issue, pr=str(pr)), self.hooks(issue, pr), pr, "")
         runner.required_retry_label = "agent-fix"
         self.fix_runner = runner
-        return fix.fix_pr(runner, pr, wt, fixer, source, feedback, head)
+        return fix.fix_pr(runner, pr, wt, fixer, source, feedback, head, owner_triggered=owner_triggered)
 
     def spec_loop(self, issue):
         self.active["spec"] = self.active["issue"] = str(issue)
@@ -300,7 +300,8 @@ class Tick:
         if self.scan_cmd:
             return self.scan_command()
         self.file_merged_follow_ups()
-        if self.force_pr and not self.is_agent_branch(self.force_pr):
+        if (self.force_pr and not self.comment_post_pending(self.force_pr)
+                and not self.is_agent_branch(self.force_pr)):
             print("python -m baton pr N takes an agent/issue-N PR; for the owner's own PR use python -m baton review N", file=sys.stderr)
             return 2
         for step in (self.pending_openings, self.pending_reviews, self.pick_review, self.pick_fix, self.pick_issue):
@@ -348,7 +349,11 @@ class Tick:
         return (out or "").strip()
 
     def cleanup(self):
+        waiting_posts = {issue for issue, reason in self.pending_specs().items()
+                         if reason in owner_handoff.SPEC_WRITE_POSTS}
         for n, path in names.worktrees(self.wt_root):
+            if n in waiting_posts:
+                continue
             wt = str(path)
             if self.state_of("issue", n) == "CLOSED":
                 advisor.finish_episode(self.env, "issue", n, "closed")
@@ -361,6 +366,8 @@ class Tick:
         for wt in sorted(glob.glob(str(self.wt_root / "spec-*/"))):
             wt = wt.rstrip("/")
             n = os.path.basename(wt).removeprefix("spec-")
+            if n in waiting_posts:
+                continue
             if self.state_of("issue", n) == "CLOSED":
                 advisor.finish_episode(self.env, "issue", n, "closed")
                 merge.remove_worktree(self.repo_dir, wt)
@@ -458,20 +465,54 @@ class Tick:
     def pending_reviews(self):
         """Even after its trigger label was removed, or after Cursor opened a PR: re-enter at the
         saved review/fix step."""
-        for path in sorted(glob.glob(str(self.state / "review-pending-*"))):
-            done = self.after_item(self.item(lambda path=path: self.pending_review(Path(path))))
+        posts = owner_handoff.comment_post_episodes(self.env)
+        paths = set(self.state.glob("review-pending-*"))
+        paths.update(self.state / f"review-pending-{pr}" for pr in posts)
+        for path in sorted(paths):
+            pr = path.name.removeprefix("review-pending-")
+            done = self.after_item(self.item(lambda: self.pending_review(path, posts.get(pr, set()))))
             if done is not None:
                 return done
         return None
 
-    def pending_review(self, path):
-        saved = checkpoint.read(path)
-        if self.force_issue or self.scan_cmd or saved is None:
+    def comment_post_pending(self, pr):
+        if pr in owner_handoff.comment_post_episodes(self.env):
+            return True
+        saved = checkpoint.read(self.state / f"review-pending-{pr}") or {}
+        return bool(saved.get("post_waiting") or saved.get("post_outcome"))
+
+    def pending_review(self, path, post_episodes=None):
+        pr = path.name.removeprefix("review-pending-")
+        if self.force_issue or self.scan_cmd:
             return 0
-        pr = saved.get("pr", "")
         if (self.force_pr or self.force_review) and pr != self.force_pr + self.force_review:
             return 0
-        if saved.get("step") != "fix" or not (saved.get("reviewed_head") or saved.get("feedback_waiting")):
+        if post_episodes is None:
+            post_episodes = owner_handoff.comment_post_episodes(self.env).get(pr, set())
+        try:
+            saved = checkpoint.read(path) or {}
+        except (OSError, ValueError):
+            if not post_episodes:
+                raise
+            saved = {}
+        episode = saved.get("ISSUE") or pr
+        if post_episodes and (saved.get("pr") != pr or not saved.get("wt") or post_episodes != {episode}):
+            self.active["pr"] = pr
+            reason = next((name for name in owner_handoff.COMMENT_POSTS
+                           if pr in owner_handoff.comment_post_episodes(self.env, name)),
+                          owner_handoff.REVIEW_POST)
+            for key in post_episodes:
+                for name in owner_handoff.COMMENT_POSTS:
+                    owner_handoff.clear_retry(self.env, key, name, pr)
+            owner_handoff.perform(self.env, reason, kind="pr", number=pr, item=pr,
+                                  episode=episode, title=f"PR #{pr} comment post failed",
+                                  text="The saved comment post has no matching review checkpoint.",
+                                  hooks=self.hooks(saved.get("ISSUE", ""), pr))
+            return 80
+        if not saved:
+            return 0
+        post = post_episodes or saved.get("post_waiting") or saved.get("post_outcome")
+        if not post and (saved.get("step") != "fix" or not (saved.get("reviewed_head") or saved.get("feedback_waiting"))):
             state = self.state_of("pr", pr)
             if state not in ("OPEN", "MERGED", "CLOSED"):
                 return 0
@@ -495,7 +536,8 @@ class Tick:
         if not pr:
             listed = self.gh_json("pr", "list", "-R", self.gh_repo, "--state", "open", "--label", "agent-review",
                                   "--limit", "20", "--json", "number") or []
-            pr = str(min((p["number"] for p in listed), default="")) if listed else ""
+            pr = str(min((p["number"] for p in listed if not self.comment_post_pending(str(p["number"]))),
+                         default=""))
         if not pr:
             return None
         return self.after_item(self.item(lambda: self.review_item(pr)))
@@ -547,7 +589,8 @@ class Tick:
         else:
             listed = self.gh_json("pr", "list", "-R", self.gh_repo, "--state", "open", "--label", "agent-fix",
                                   "--limit", "20", "--json", "number,headRefName") or []
-            listed = sorted((p for p in listed if names.issue_of(p["headRefName"])), key=lambda p: p["number"])
+            listed = sorted((p for p in listed if names.issue_of(p["headRefName"])
+                             and not self.comment_post_pending(str(p["number"]))), key=lambda p: p["number"])
             pr, head_ref = (str(listed[0]["number"]), listed[0]["headRefName"]) if listed else ("", "")
         if not pr:
             return None
@@ -606,8 +649,26 @@ class Tick:
         if pending:
             recovery.clear(self.env, episode, pr)
         feedback_file = self.state / f"owner-fix-feedback-{pr}"
-        feedback = feedback_file.read_text() if feedback_file.is_file() else review.human_feedback(self.gh_repo, self.owner, pr)
-        if not feedback.strip():
+        if feedback_file.is_file():
+            raw = feedback_file.read_text()
+            try:
+                cached = json.loads(raw)
+            except ValueError:
+                cached = None
+            if (isinstance(cached, dict) and isinstance(cached.get("owner"), str)
+                    and isinstance(cached.get("findings"), str)):
+                owner_text, findings = cached["owner"], cached["findings"]
+            else:
+                # Legacy plain-text cache from an exit-75 deferral before #178.
+                owner_text, findings = raw, ""
+        else:
+            fb = review.human_feedback(self.gh_repo, self.owner, pr)
+            if fb is None:
+                # Keep agent-fix: dropping it or reporting "nothing to fix" would lose the feedback.
+                self.log(f"PR #{pr}: could not read the review comments completely; retrying later")
+                return 75
+            owner_text, findings = fb.owner, fb.findings
+        if not owner_text.strip():
             pr_helpers.gh("pr", "edit", pr, "-R", self.gh_repo, "--remove-label", "agent-fix")
             self.notify(f"PR #{pr}: nothing to fix", f"No new review feedback from {self.owner}.")
             return 80
@@ -619,14 +680,16 @@ class Tick:
         fixer = recovery.pending_fix(self.env, episode, pr) or self.pick_vendor(
             "fixer", "contrib", self.all_vendors(), pr=pr, issue=issue)
         self.notify(f"PR #{pr}: {fixer} is addressing your review", url)
+        feedback = review.format_fix_feedback(owner_text, findings)
         # Posting a fix reply advances human_feedback's cutoff even when an edit defers.
         if not feedback_file.is_file():
             temp = feedback_file.with_suffix(".tmp")
-            temp.write_text(feedback)
+            temp.write_text(json.dumps({"owner": owner_text, "findings": findings}))
             temp.replace(feedback_file)
         # The label stays only on a deferral, so the fix resumes; any other outcome drops it.
         self.fix_runner = None
-        rc = self.fix_pr(pr, wt, fixer, f"{self.owner} (the repository owner)", feedback, issue)
+        rc = self.fix_pr(pr, wt, fixer, f"{self.owner} (the repository owner)", feedback, issue,
+                         owner_triggered=True)
         if rc == 75:
             return 75
         feedback_file.unlink(missing_ok=True)
@@ -636,7 +699,7 @@ class Tick:
         if self.fix_runner:
             fixer = self.fix_runner.last_fixer or fixer
         fixed_by = " ".join(dict.fromkeys([*(self.fix_runner.attempt_authors if self.fix_runner else []), fixer]))
-        rc = self.review_loop(pr, wt, f"""{fixer} just addressed this review feedback from {self.owner}. Check that each point is resolved or convincingly answered in its `<!-- baton-fix by={fixer}` comment, and review the new commits. The rest of the PR was reviewed before.
+        rc = self.review_loop(pr, wt, f"""{fixer} just addressed this review feedback from {self.owner}. Check that each of the owner's points is resolved or convincingly answered in its `<!-- baton-fix by={fixer}` comment, and review the new commits. The findings block is context: an item the owner did not ask for or expressly declined is not to be reopened. The rest of the PR was reviewed before.
 
 <feedback>
 {feedback}
@@ -645,9 +708,10 @@ class Tick:
 
     # --- pick work: an issue for the pipeline ------------------------------------------------------
     def pending_specs(self):
-        """Resume durable spec reads before new work can be blocked by admission or labels."""
+        """Resume durable spec reads and comment posts before new work can be blocked by admission or labels."""
         found = {}
-        for reason in ("spec_comments_read_failed", "spec_pending_adr_read_failed"):
+        for reason in ("spec_comments_read_failed", "spec_pending_adr_read_failed",
+                       *owner_handoff.SPEC_WRITE_POSTS):
             for prefix in ("waiting", "retry"):
                 for path in self.state.glob(f"handoff-{prefix}-*-{reason}.json"):
                     issue = path.name.removeprefix(f"handoff-{prefix}-").removesuffix(f"-{reason}.json")
@@ -656,7 +720,8 @@ class Tick:
         return found
 
     def resume_spec(self, issue):
-        self.spec_loop(issue)
+        if self.spec_loop(issue):
+            return dev.run(self, issue)   # an accept after a resumed post goes straight to dev
         return 80
 
     def pick_issue(self):
@@ -671,17 +736,32 @@ class Tick:
         for issue in sorted(pending, key=int):
             if self.force_issue and self.force_issue != issue:
                 continue
-            data = self.gh_json("issue", "view", issue, "-R", self.gh_repo, "--json", "state,labels")
-            if not isinstance(data, dict) or data.get("state") not in ("OPEN", "CLOSED"):
-                continue
-            if data["state"] == "CLOSED":
-                owner_handoff.clear_episode(self.env, issue)
-                continue
-            labels = data.get("labels")
-            if not isinstance(labels, list) or any(not isinstance(label, dict) or label.get("name") == "ready-for-human"
-                                                  for label in labels):
-                continue
-            if pending[issue] == "spec_pending_adr_read_failed":
+            reason = pending[issue]
+            accept_post = reason in owner_handoff.SPEC_ACCEPT_POSTS
+            if reason in owner_handoff.SPEC_WRITE_POSTS:
+                try:
+                    post = owner_handoff.load_retry(self.env, issue, reason)
+                except owner_handoff.RetryUnreadable:
+                    post = None  # Let the spec loop handle damaged state.
+                if (post and (post.get("reads") is not None
+                              or (accept_post or not post.get("confirmed"))
+                              and post["attempts"] < owner_handoff.MAX_ATTEMPTS)
+                        and owner_handoff.clock() < post["due"]):
+                    if self.force_issue:
+                        return self.defer("handoff-retry", reason)
+                    continue
+            if not accept_post:
+                data = self.gh_json("issue", "view", issue, "-R", self.gh_repo, "--json", "state,labels")
+                if not isinstance(data, dict) or data.get("state") not in ("OPEN", "CLOSED"):
+                    continue
+                if data["state"] == "CLOSED":
+                    owner_handoff.clear_episode(self.env, issue)
+                    continue
+                labels = data.get("labels")
+                if not isinstance(labels, list) or any(not isinstance(label, dict)
+                                                      or label.get("name") == "ready-for-human" for label in labels):
+                    continue
+            if reason in ("spec_pending_adr_read_failed", *owner_handoff.SPEC_WRITE_POSTS):
                 done = self.after_item(self.item(lambda: self.resume_spec(issue)))
             else:
                 done = self.after_item(self.item(lambda: dev.run(self, issue)))

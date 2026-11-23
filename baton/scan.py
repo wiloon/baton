@@ -94,8 +94,10 @@ def file_scan(env, draft):
     text = strip_markers(Path(f"{draft}.md").read_text()).rstrip("\n")
     Path(f"{draft}.body").write_text(f'<!-- baton-scan area="{area}" -->\n{text}\n')
     title = title_file.read_text().split("\n", 1)[0]
-    created = pr_helpers.gh("issue", "create", "-R", env.repo.gh_repo, "--title", title, "--body-file", f"{draft}.body",
-                            "--label", "claude-found", "--label", "needs-triage")
+    created, _applied = pr_helpers.create_issue(
+        env.repo.gh_repo, title=title, body_file=f"{draft}.body",
+        labels=("claude-found", "needs-triage"), allow_unlabelled=False,
+        context=f"scan of {area}")
     if created.returncode != 0:
         notify.log(f"scan of {area}: gh issue create failed (draft {draft}){pr_helpers.why(created)}")
         notify.notify("Scan: filing the issue failed", f"{draft}.md")

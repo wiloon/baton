@@ -122,7 +122,10 @@ class Telemetry:
         return self._call("task", "merged", "--repo", self.repo, "--pr", self.pr, "--key", "merged",
                           "--merged-by", "owner") is not None
 
-    def verdict(self, kind, vendor, head, round, outcome, reply, review_file=""):
+    def last_run_id(self):
+        return self._item().get("last_run_id", "")
+
+    def verdict(self, kind, vendor, head, round, outcome, reply, review_file="", *, run_id=None):
         verdict = next((v for prefix, v in (("REVIEW: pass", "pass"), ("REVIEW: changes", "changes"),
                                             ("SPEC: accept", "accept"), ("SPEC: changes", "changes"),
                                             ("SPEC: reject", "reject")) if outcome.startswith(prefix)), "")
@@ -130,7 +133,7 @@ class Telemetry:
             return
         round = number(round)
         options = ["--verdict", verdict, "--agent", vendor, "--round", round, "--head-sha", head]
-        if last := self._item().get("last_run_id"):
+        if last := (self.last_run_id() if run_id is None else run_id):
             options += ["--run-id", last]
         if kind in ("review", "screenshot_review"):   # a count only (#227): the review text never leaves this function
             text = Path(review_file).read_text() if review_file and Path(review_file).is_file() \

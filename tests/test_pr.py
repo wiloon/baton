@@ -377,6 +377,12 @@ def test_a_pr_create_that_landed_returns_the_existing_pr(scripted):
     assert [c[:2] for c in fake.calls] == [("pr", "create"), ("pr", "list")]
 
 
+def test_a_landed_merge_is_recognized_after_a_transient_state_read(scripted):
+    fake = scripted((1, "", "HTTP 503: Service Unavailable"), (1, "", "HTTP 502: Bad Gateway"), (0, "MERGED\n", ""))
+    assert pr.gh("pr", "merge", "5", "-R", "o/r", "--squash").returncode == 0
+    assert [c[:2] for c in fake.calls] == [("pr", "merge"), ("pr", "view"), ("pr", "view")]
+
+
 def test_a_comment_that_did_not_land_is_posted_again(scripted):
     fake = scripted((1, "", "TLS handshake timeout"), (0, json.dumps({"comments": [{"body": "older"}]}), ""), (0, "", ""))
     assert pr.gh("pr", "comment", "5", "-R", "o/r", "--body", "<!-- baton-x -->\nhi").returncode == 0
@@ -387,4 +393,33 @@ def test_why_is_the_last_stderr_lines():
     import subprocess
     result = subprocess.CompletedProcess([], 1, "", "a\n\nb\nc\nHTTP 502: Bad Gateway\n")
     assert pr.why(result) == " (gh: b | c | HTTP 502: Bad Gateway)"
+    assert pr.why(subprocess.CompletedProcess([], 1, "", "")) == ""
+
+
+def test_why_redacts_github_tokens_from_stderr(gh, child_token):
+    import subprocess
+    ghp = "ghp_" + ("a" * 40)
+    stderr = f"auth failed token={ghp} also {child_token}\nmore\ntrail\n"
+    got = pr.why(subprocess.CompletedProcess([], 1, "", stderr))
+    assert got == " (gh: auth failed token=[redacted] also [redacted] | more | trail)"
+
+
+def test_why_redacts_before_truncating_to_the_tail(gh, monkeypatch):
+    import subprocess
+    pem = "-----BEGIN KEY-----\nabcdefgh\nijklmnop\n-----END KEY-----"
+    monkeypatch.setenv("SOME_API_SECRET", pem)
+    got = pr.why(subprocess.CompletedProcess([], 1, "", f"x\n{pem}\ntail\n"))
+    assert "BEGIN KEY" not in got and "abcdefgh" not in got and "ijklmnop" not in got
+    assert "tail" in got
+
+
+def test_why_withholds_stderr_when_secret_lookup_raises(gh, child_token, monkeypatch):
+    import subprocess
+    from baton import advisor
+
+    def boom(env):
+        raise IsADirectoryError("secret env file")
+    monkeypatch.setattr(advisor, "secret_values", boom)
+    got = pr.why(subprocess.CompletedProcess([], 1, "", f"denied {child_token}\n"))
+    assert got == " (gh: [stderr withheld: redaction failed])"
     assert pr.why(subprocess.CompletedProcess([], 1, "", "")) == ""
