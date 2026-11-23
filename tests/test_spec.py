@@ -2151,6 +2151,30 @@ def test_a_persistent_read_failure_after_a_confirmed_post_hands_off_once(loop, m
     for now in (1_420, 1_421, 1_700, 1_721):
         clock["now"] = now
         tick.Tick(loop.env).run()
-    assert reads == [1_361, 1_421, 1_721]
+    assert reads == [1_361, 1_421]
     assert loop.log().count("handoff spec_review_comment_post_failed ") == 1
     assert len(loop.gh.posted("<!-- baton-spec-review round=3")) == 1
+
+
+def test_a_restart_after_the_last_failed_read_hands_off_without_another_read(loop, monkeypatch):
+    clock, reads = _stopped_after_a_landed_post(loop, monkeypatch, healthy_at=10_000)
+    clock["now"] = 1_361
+    with pytest.raises(Deferred, match="spec_review_comment_post_failed"):
+        loop.run()
+    handoff = spec.Spec.handoff
+
+    def crashing(self, text, reason, **kwargs):
+        if reason == "spec_review_comment_post_failed":
+            monkeypatch.setattr(spec.Spec, "handoff", handoff)
+            raise InterruptedError("runner stopped before the handoff")
+        return handoff(self, text, reason, **kwargs)
+
+    monkeypatch.setattr(spec.Spec, "handoff", crashing)
+    clock["now"] = 1_421
+    tick.Tick(loop.env).run()   # the tick contains the crash; the handoff never happened
+    assert "handoff spec_review_comment_post_failed " not in loop.log()
+    for now in (1_722, 1_800):
+        clock["now"] = now
+        tick.Tick(loop.env).run()
+    assert reads == [1_361, 1_421]
+    assert loop.log().count("handoff spec_review_comment_post_failed ") == 1

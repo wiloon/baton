@@ -492,6 +492,18 @@ class Spec:
         elif pending is not None:
             binding = pending["continuation"]
         confirmed = pending is not None and pending.get("confirmed", False)
+        consumed = False
+        if confirmed and not initial and pending.get("reads"):
+            # Consume the due read first, so a restart never allows another (#151).
+            reads = pending["reads"]
+            if reads >= owner_handoff.MAX_ATTEMPTS:
+                return stop("The comment landed, but its continuation could not be read.")
+            reads += 1
+            now = int(owner_handoff.clock())
+            pending = {**pending, "reads": reads, "scheduled": now,
+                       "due": now + owner_handoff.DELAYS[reads - 1]}
+            owner_handoff.restore_retry(self.env, n, reason, n, pending)
+            consumed = True
         if not initial and not confirmed:
             result = self.handoff(text(), reason, resume=True)
             if result.action == owner_handoff.DEFER:
@@ -575,12 +587,14 @@ class Spec:
                 raise Deferred("handoff-retry", reason, lends_slot=False)
         if confirmed and status == "retry":
             # The post already landed: a transient read only delays the continuation (#151).
-            reads = pending.get("reads", 0) + 1
-            if reads <= owner_handoff.MAX_ATTEMPTS:
+            if consumed:
+                if pending["reads"] < owner_handoff.MAX_ATTEMPTS:
+                    raise Deferred("handoff-retry", reason, lends_slot=False)
+            else:
                 now = int(owner_handoff.clock())
                 owner_handoff.restore_retry(self.env, n, reason, n,
-                                            {**pending, "reads": reads, "scheduled": now,
-                                             "due": now + owner_handoff.DELAYS[reads - 1]})
+                                            {**pending, "reads": 1, "scheduled": now,
+                                             "due": now + owner_handoff.DELAYS[0]})
                 raise Deferred("handoff-retry", reason, lends_slot=False)
         return stop(f"Reconciliation: {status}." + (pr_helpers.why(posted) if posted is not None else ""))
 
