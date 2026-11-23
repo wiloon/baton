@@ -410,6 +410,16 @@ def adr_open_binding(item="1"):
             "base": "main", "wt": "/tmp/wt", "applied": "Goal\nNew step\n"}
 
 
+def checks_binding(item="1"):
+    return {"pr": item, "issue": "7", "starting": "old body\n", "intended": "new body\n",
+            "head": "a" * 40, "feedback": "f" * 64, "fixer": "claude", "who": "",
+            "consume": False, "description_rc": 0, "description_reason": "", "clear_cursor": False}
+
+
+def task_binding(item="1"):
+    return {**checks_binding(item), "want": "partial", "consume": False}
+
+
 def test_every_category_1_reason_is_rule_mode_with_retry_budget():
     assert handoff.RETRY_REASONS == {
         "review_comment_missing", "spec_comments_read_failed", "spec_pending_adr_read_failed",
@@ -418,6 +428,7 @@ def test_every_category_1_reason_is_rule_mode_with_retry_budget():
         "spec_pending_accept_post_failed", "spec_accept_post_failed",
         "spec_body_edit_failed", "spec_adr_open_failed",
         "fix_push_failed", "dev_push_failed", "spec_adr_push_failed",
+        "fix_checks_refresh_failed", "fix_task_write_failed",
     }
     for reason in handoff.RETRY_REASONS:
         entry = handoff.REASONS[reason]
@@ -440,6 +451,8 @@ def test_every_category_1_reason_is_rule_mode_with_retry_budget():
     ("fix_push_failed", push_binding("1")),
     ("dev_push_failed", issue_push_binding("1")),
     ("spec_adr_push_failed", issue_push_binding("1", reason="spec_adr_push_failed")),
+    ("fix_checks_refresh_failed", checks_binding("1")),
+    ("fix_task_write_failed", task_binding("1")),
 ])
 def test_each_category_1_reason_defers_then_hands_off_through_perform(env, monkeypatch, reason, binding):
     """Every replayed read, comment post or push shares the same budget: no advisor, two later attempts, then handoff."""

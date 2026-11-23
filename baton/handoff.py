@@ -43,6 +43,8 @@ SPEC_ADR_OPEN = "spec_adr_open_failed"
 FIX_PUSH = "fix_push_failed"
 DEV_PUSH = "dev_push_failed"
 SPEC_ADR_PUSH = "spec_adr_push_failed"
+FIX_CHECKS = "fix_checks_refresh_failed"
+FIX_TASK = "fix_task_write_failed"
 COMMENT_POSTS = (REVIEW_POST, SCREENSHOT_POST)
 SPEC_POSTS = (SPEC_REVIEW_POST, SPEC_REPLY_POST)
 SPEC_ACCEPT_POSTS = (SPEC_PENDING_ACCEPT_POST, SPEC_ACCEPT_POST)
@@ -53,9 +55,11 @@ SPEC_WRITE_POSTS = (*SPEC_POSTS, *SPEC_ACCEPT_POSTS, *SPEC_BODY_WRITES)
 # Dev and ADR pushes are issue-scoped; fix pushes are PR-scoped.
 ISSUE_PUSHES = (DEV_PUSH, SPEC_ADR_PUSH)
 PUSH_REASONS = frozenset({FIX_PUSH, *ISSUE_PUSHES})
+# PR description metadata writes after a fix (checks refresh and TASK: edits).
+FIX_META_WRITES = (FIX_CHECKS, FIX_TASK)
 RETRY_REASONS = frozenset({
     "review_comment_missing", "spec_comments_read_failed", "spec_pending_adr_read_failed",
-    *COMMENT_POSTS, *SPEC_WRITE_POSTS, *PUSH_REASONS,
+    *COMMENT_POSTS, *SPEC_WRITE_POSTS, *PUSH_REASONS, *FIX_META_WRITES,
 })
 
 # Categories: 1 rule-decided, 2 judgement, 3 needs investigation, 4 owner-only.
@@ -419,6 +423,33 @@ def _spec_body_edit_binding_valid(item, binding):
             and isinstance(binding.get("wt"), str) and bool(binding["wt"]))
 
 
+def _fix_meta_write_binding_valid(item, binding, *, reason):
+    """A checks refresh or TASK: body edit with its starting and intended bodies (#151)."""
+    starting, intended = binding.get("starting"), binding.get("intended")
+    head, feedback = binding.get("head"), binding.get("feedback")
+    description_rc = binding.get("description_rc")
+    if (binding.get("pr") != item or not isinstance(binding.get("issue"), str)
+            or (binding["issue"] and not binding["issue"].isdecimal())
+            or not isinstance(starting, str) or not isinstance(intended, str)
+            or starting == intended
+            or not isinstance(binding.get("fixer"), str) or not binding["fixer"]
+            or not isinstance(binding.get("who"), str)
+            or not isinstance(head, str)
+            or (head != "" and not re.fullmatch(r"[0-9a-f]{40}", head))
+            or not isinstance(feedback, str)
+            or (feedback != "" and not re.fullmatch(r"[0-9a-f]{64}", feedback))
+            or type(description_rc) is not int or description_rc not in (0, 1, 2)
+            or not isinstance(binding.get("description_reason"), str)
+            or type(binding.get("clear_cursor")) is not bool
+            or bool(description_rc) != bool(binding["description_reason"])):
+        return False
+    if reason == FIX_CHECKS:
+        return type(binding.get("consume")) is bool
+    if reason == FIX_TASK:
+        return binding.get("want") in ("partial", "complete")
+    return False
+
+
 def _spec_adr_open_binding_valid(item, binding):
     """An ADR docs PR create for a known head branch and commit (#151)."""
     commit, branch = binding.get("commit"), binding.get("branch")
@@ -486,6 +517,8 @@ def _binding_valid(reason, item, binding):
         return _spec_adr_open_binding_valid(item, binding)
     if reason in PUSH_REASONS:
         return _push_binding_valid(item, binding, reason=reason)
+    if reason in FIX_META_WRITES:
+        return _fix_meta_write_binding_valid(item, binding, reason=reason)
     return (binding.get("pr") == item and type(binding.get("round")) is int and binding["round"] > 0
             and all(isinstance(binding.get(key), str) for key in
                     ("head", "base", "digest", "issue", "screenshot_digest"))
@@ -526,10 +559,11 @@ def load_retry(env, episode, reason, item=""):
     if "phase" in data:
         finished_ok = reason == FIX_PUSH and binding.get("next") == "done"
         body_or_open = reason in SPEC_BODY_WRITES and data["phase"] == "landed"
+        meta_phase = reason in FIX_META_WRITES and data["phase"] == "landed"
         push_phase = (reason in PUSH_REASONS and data["phase"] in ("landed", "finished")
                       and binding["remote"] is not None
                       and (data["phase"] != "finished" or finished_ok))
-        if not body_or_open and not push_phase:
+        if not body_or_open and not meta_phase and not push_phase:
             raise RetryUnreadable(f"invalid write phase in {path.name}")
     attempts, due, scheduled = data.get("attempts"), data.get("due"), data.get("scheduled")
     if type(attempts) is not int or not (0 <= attempts <= MAX_ATTEMPTS):
