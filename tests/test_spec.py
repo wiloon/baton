@@ -3616,6 +3616,18 @@ def test_a_genuine_owner_reply_supersedes_saved_advisor_answers(advised, monkeyp
     assert "ready-for-human" in advised.gh.labels
 
 
+def test_a_conflicting_owner_instruction_hands_off_without_an_answer(advised):
+    """Issue-body grounding that disagrees with the latest owner comment hands off (#125)."""
+    advised.gh.body = f"Goal\n{EXCERPT}\n"
+    advised.gh._comment("Manual checks defer until the owner clears them.")
+    advised.script = [CHANGES, reviser(QUESTIONS, outcome="SPEC: human")]
+    advised.advice = advice(grounded())
+    assert advised.run() is False
+    assert not advised.gh.posted("<!-- baton-advisor-answer")
+    assert "ready-for-human" in advised.gh.labels
+    assert advised.advice_calls  # the advisor was consulted; validation refused the set
+
+
 @pytest.mark.parametrize("change", ["owner reply", "issue closed", "ADR head", "new ADR"])
 def test_changed_inputs_during_advisor_publication_prevent_revision(advised, monkeypatch, change):
     advised.gh.body = f"Goal\n{EXCERPT}\n"

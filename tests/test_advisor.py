@@ -571,6 +571,54 @@ def test_an_answer_over_the_length_limit_is_rejected_not_trimmed(adv):
     assert d.action == "handoff" and "length limit" in d.failure
 
 
+def test_a_grounded_answer_that_conflicts_with_the_latest_owner_instruction_hands_off(adv):
+    """Issue-body grounding is rejected when the latest owner comment settles differently (#125)."""
+    body = "Manual checks use the existing gate path."
+    owner = "Manual checks defer until the owner clears them."
+    snapshot = questions_snapshot([
+        f"[c1] (issue body): {body}",
+        f"[c2] (owner comment): {owner}",
+    ])
+    adv.replies = answer_reply(body, cites=("c1",))
+    d = advisor.advise(adv.env, "spec_questions", 17, snapshot, ("answer_spec_questions",),
+                       category=2, revalidate=lambda: True)
+    assert d.action == "handoff" and "owner instruction" in d.failure
+    assert not advisor.granted(adv.env, "spec_questions", 17)
+
+
+def test_a_grounded_answer_that_agrees_with_the_latest_owner_instruction_executes(adv):
+    body = "Manual checks use the existing gate path."
+    owner = f"Confirmed: {body}"
+    snapshot = questions_snapshot([
+        f"[c1] (issue body): {body}",
+        f"[c2] (owner comment): {owner}",
+    ])
+    adv.replies = answer_reply(body, cites=("c1", "c2"))
+    d = advisor.advise(adv.env, "spec_questions", 18, snapshot, ("answer_spec_questions",),
+                       category=2, revalidate=lambda: True)
+    assert d.action == "answer_spec_questions" and d.answers[0]["text"] == body
+    assert advisor.granted(adv.env, "spec_questions", 18)
+
+
+def test_evidence_from_optional_excerpts_is_omitted_from_the_decision_record(adv):
+    """Provider quotes that only appear in opted-in raw excerpts stay out of the record (#125)."""
+    from dataclasses import replace
+    baseline = "Decision point: review_limit.\nDiff size: 1 file.\nbaseline quote about the tests."
+    enabled = replace(adv.env, repo=replace(adv.env.repo, advisor_diff_excerpts=True))
+    snapshot = advisor.augment_snapshot(
+        enabled, baseline, diff_excerpt="@@ -1 +1 @@\n-old assertion\n+new assertion\n")
+    assert "new assertion" in snapshot
+    adv.replies = [{"action": "extra_round", "reason": "only a test is missing",
+                    "evidence": ["baseline quote about the tests.", "new assertion"]}]
+    d = advisor.advise(enabled, "review_limit", 19, snapshot, ("extra_round",),
+                      revalidate=lambda: True)
+    assert d.action == "extra_round"
+    [record] = adv.records()
+    assert record["evidence"] == ["baseline quote about the tests."]
+    assert "new assertion" not in record["evidence"]
+    assert "@@" not in str(record)
+
+
 def replace_cap(cfg, chars):
     from dataclasses import replace
     return replace(cfg, snapshot_chars=chars)

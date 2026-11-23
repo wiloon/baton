@@ -122,6 +122,26 @@ def parse_citations(snapshot):
     return found
 
 
+def latest_owner_instruction(snapshot):
+    """Text of the latest (owner comment) citation row, or '' when none exist."""
+    latest = ""
+    for match in CITATION_LINE.finditer(snapshot or ""):
+        if match["source"] == "owner comment":
+            latest = match["text"]
+    return latest
+
+
+def baseline_snapshot(snapshot):
+    """Drop repository-opted-in raw excerpt sections; decision records keep only the baseline."""
+    text = snapshot or ""
+    cut = len(text)
+    for marker in ("\n\nDiff excerpt:\n", "\n\nCI log excerpt:\n", "\n\nLocal documents:\n"):
+        at = text.find(marker)
+        if 0 <= at < cut:
+            cut = at
+    return text[:cut]
+
+
 def question_ids(snapshot):
     """qN ids listed under Questions: in the snapshot, in order."""
     block = re.search(r"(?ms)^Questions:\n(.*?)(?=^Citation evidence:|\Z)", snapshot or "")
@@ -141,6 +161,7 @@ def normalize_answers(raw, snapshot, unusable=frozenset()):
     if not expected:
         raise ValueError("snapshot has no questions")
     citations = parse_citations(snapshot)
+    instruction = latest_owner_instruction(snapshot)
     seen, answers = set(), []
     for row in raw:
         if not isinstance(row, dict):
@@ -164,6 +185,8 @@ def normalize_answers(raw, snapshot, unusable=frozenset()):
         combined = "\n".join(citations[c] for c in cites)
         if not text or text not in combined:
             raise ValueError("answer text is not taken from its citations")
+        if instruction and text not in instruction:
+            raise ValueError("answer conflicts with the latest owner instruction")
         answers.append({"id": qid, "case": case, "text": text, "citations": tuple(cites)})
     if sorted(seen) != sorted(expected) or [a["id"] for a in answers] != expected:
         raise ValueError("answers must cover each question id exactly once in order")
@@ -440,7 +463,10 @@ def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=No
                 advised = redact(advised, values)
                 failure = f"action outside the allowed set: {advised[:60]!r}"
             reason = redact(raw_reason, values)[:600]
-            evidence = [redact(quote, values)[:300] for quote in raw_evidence[:5]]
+            # Keep opted-in raw excerpts out of the decision record (#125).
+            recordable = baseline_snapshot(text)
+            evidence = [redact(quote, values)[:300] for quote in raw_evidence[:5]
+                        if quote in recordable]
             if not failure and advised == "answer_spec_questions":
                 answers = normalize_answers(reply.get("answers"), text, cut_rows)
                 observed_only = any(row["case"] != "grounded" for row in answers)
