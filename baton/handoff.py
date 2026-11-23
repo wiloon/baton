@@ -38,14 +38,18 @@ SPEC_REVIEW_POST = "spec_review_comment_post_failed"
 SPEC_REPLY_POST = "spec_reply_post_failed"
 SPEC_PENDING_ACCEPT_POST = "spec_pending_accept_post_failed"
 SPEC_ACCEPT_POST = "spec_accept_post_failed"
+SPEC_BODY_EDIT = "spec_body_edit_failed"
+SPEC_ADR_OPEN = "spec_adr_open_failed"
 FIX_PUSH = "fix_push_failed"
 DEV_PUSH = "dev_push_failed"
 SPEC_ADR_PUSH = "spec_adr_push_failed"
 COMMENT_POSTS = (REVIEW_POST, SCREENSHOT_POST)
 SPEC_POSTS = (SPEC_REVIEW_POST, SPEC_REPLY_POST)
 SPEC_ACCEPT_POSTS = (SPEC_PENDING_ACCEPT_POST, SPEC_ACCEPT_POST)
+# Spec body edits and ADR PR creation share tick discovery with other issue writes.
+SPEC_BODY_WRITES = (SPEC_BODY_EDIT, SPEC_ADR_OPEN)
 # Spec comment posts and accept/pending-accept posts share tick discovery.
-SPEC_WRITE_POSTS = (*SPEC_POSTS, *SPEC_ACCEPT_POSTS)
+SPEC_WRITE_POSTS = (*SPEC_POSTS, *SPEC_ACCEPT_POSTS, *SPEC_BODY_WRITES)
 # Dev and ADR pushes are issue-scoped; fix pushes are PR-scoped.
 ISSUE_PUSHES = (DEV_PUSH, SPEC_ADR_PUSH)
 PUSH_REASONS = frozenset({FIX_PUSH, *ISSUE_PUSHES})
@@ -384,6 +388,50 @@ def _spec_adr_push_binding_valid(item, binding):
             and isinstance(binding.get("author"), str) and bool(binding["author"]))
 
 
+def _spec_revision_continuation_valid(item, binding):
+    """Shared fields for a body edit or ADR open that finishes the reviser's round (#151)."""
+    boundary = binding.get("comment_ids")
+    return (binding.get("issue") == item
+            and binding.get("reviser") in ("claude", "codex", "cursor")
+            and type(binding.get("round")) is int and binding["round"] > 0
+            and isinstance(binding.get("reply"), str)
+            and isinstance(binding.get("mode_note"), str)
+            and isinstance(binding.get("model"), str)
+            and binding.get("human") in ("", " human")
+            and binding.get("next") in ("review", "human")
+            and type(binding.get("max_rounds")) is int and binding["max_rounds"] > 0
+            and isinstance(binding.get("limit_why"), str) and bool(binding["limit_why"])
+            and isinstance(binding.get("feedback"), str)
+            and bool(re.fullmatch(r"[0-9a-f]{64}", binding["feedback"]))
+            and isinstance(boundary, list)
+            and all(type(value) is int and value > 0 for value in boundary)
+            and len(set(boundary)) == len(boundary)
+            and isinstance(binding.get("author"), str) and bool(binding["author"]))
+
+
+def _spec_body_edit_binding_valid(item, binding):
+    """A revised issue body and the inputs it was produced from (#151)."""
+    intended, original = binding.get("intended"), binding.get("original")
+    return (_spec_revision_continuation_valid(item, binding)
+            and isinstance(intended, str) and bool(intended)
+            and isinstance(original, str) and bool(re.fullmatch(r"[0-9a-f]{64}", original))
+            and type(binding.get("has_commits")) is bool
+            and isinstance(binding.get("wt"), str) and bool(binding["wt"]))
+
+
+def _spec_adr_open_binding_valid(item, binding):
+    """An ADR docs PR create for a known head branch and commit (#151)."""
+    commit, branch = binding.get("commit"), binding.get("branch")
+    return (_spec_revision_continuation_valid(item, binding)
+            and isinstance(commit, str) and bool(re.fullmatch(r"[0-9a-f]{40}", commit))
+            and isinstance(branch, str) and bool(branch)
+            and binding.get("base") == "main"
+            and isinstance(binding.get("issue_body"), str)
+            and bool(re.fullmatch(r"[0-9a-f]{64}", binding["issue_body"]))
+            and isinstance(binding.get("wt"), str) and bool(binding["wt"])
+            and isinstance(binding.get("applied"), str))
+
+
 def _push_binding_valid(item, binding, *, reason):
     """A push of a known post-sign-off commit to a destination ref (#151)."""
     if not _push_core_valid(binding):
@@ -432,6 +480,10 @@ def _binding_valid(reason, item, binding):
         return _spec_comment_post_valid(item, binding, reason=reason)
     if reason in SPEC_ACCEPT_POSTS:
         return _spec_accept_post_valid(item, binding, reason=reason)
+    if reason == SPEC_BODY_EDIT:
+        return _spec_body_edit_binding_valid(item, binding)
+    if reason == SPEC_ADR_OPEN:
+        return _spec_adr_open_binding_valid(item, binding)
     if reason in PUSH_REASONS:
         return _push_binding_valid(item, binding, reason=reason)
     return (binding.get("pr") == item and type(binding.get("round")) is int and binding["round"] > 0
@@ -473,10 +525,12 @@ def load_retry(env, episode, reason, item=""):
         raise RetryUnreadable(f"invalid confirmed-post phase in {path.name}")
     if "phase" in data:
         finished_ok = reason == FIX_PUSH and binding.get("next") == "done"
-        if (reason not in PUSH_REASONS or data["phase"] not in ("landed", "finished")
-                or binding["remote"] is None
-                or (data["phase"] == "finished" and not finished_ok)):
-            raise RetryUnreadable(f"invalid push phase in {path.name}")
+        body_or_open = reason in SPEC_BODY_WRITES and data["phase"] == "landed"
+        push_phase = (reason in PUSH_REASONS and data["phase"] in ("landed", "finished")
+                      and binding["remote"] is not None
+                      and (data["phase"] != "finished" or finished_ok))
+        if not body_or_open and not push_phase:
+            raise RetryUnreadable(f"invalid write phase in {path.name}")
     attempts, due, scheduled = data.get("attempts"), data.get("due"), data.get("scheduled")
     if type(attempts) is not int or not (0 <= attempts <= MAX_ATTEMPTS):
         raise RetryUnreadable(f"out-of-range attempts in {path.name}")

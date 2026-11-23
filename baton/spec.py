@@ -1255,6 +1255,333 @@ class Spec:
             for leftover in Path("/tmp").glob(f"baton-spec-{n}-{round}.*"):
                 leftover.unlink()
 
+    def body_edit_binding(self, intended, original, round, reviser, model, human, reply, mode_note,
+                          max_rounds, inputs):
+        """Inputs known before applying a revised issue body (#151)."""
+        return {
+            "issue": self.issue, "reviser": reviser, "model": model or "", "round": round,
+            "human": human, "reply": reply, "mode_note": mode_note,
+            "max_rounds": max_rounds, "limit_why": "n/a",
+            "intended": intended, "original": self.body_key(original),
+            "feedback": self.owner_feedback_digest(inputs["comments"]),
+            "comment_ids": [row["id"] for row in inputs["comments"]],
+            "author": self.env.owner, "next": "human" if human else "review",
+            "has_commits": bool(git(self.wt, "rev-list", f"{self.base}..HEAD")),
+            "wt": str(self.wt),
+        }
+
+    def check_body_edit(self, binding):
+        """Revalidate a saved body edit before rewriting or running its continuation."""
+        data, transient = read_issue(self.env, self.issue, once=True)
+        if data is None:
+            return "retry" if transient else "failed"
+        self.adr_read = data
+        if data["state"] == "CLOSED":
+            return "superseded"
+        labels = {label["name"] for label in data["labels"]}
+        if "ready-for-human" in labels:
+            return "paused"
+        if "ready-for-agent" in labels and "needs-triage" not in labels and any(
+            (row["author"] or {}).get("login") == binding["author"]
+            and (verdict := VERDICT.match(row["body"])) and verdict[1] == "accept"
+            for row in data["comments"] if row["id"] not in set(binding["comment_ids"])
+        ):
+            return "superseded"
+        if self.owner_feedback_digest(data["comments"]) != binding["feedback"]:
+            return "changed"
+        kind, round = state_from(data["comments"], self.env.owner)
+        if kind in ("review", "reply", "reply-human") and round > binding["round"]:
+            return "changed"
+        if data["body"] == binding["intended"]:
+            return "landed"
+        if self.body_key(data["body"]) == binding["original"]:
+            return "absent"
+        return "changed"
+
+    def finish_body_edit(self, binding):
+        """Continuation after a landed body edit: push ADR commits or post the reply (#151)."""
+        n = self.issue
+        owner_handoff.clear_retry(self.env, n, owner_handoff.SPEC_BODY_EDIT)
+        data = self.adr_read
+        if data is None:
+            data, _ = read_issue(self.env, n, once=True)
+            if data is None:
+                self.handoff("Could not read the issue after the body edit landed.",
+                             "spec_comments_read_failed")
+                return "stop"
+        known = set(binding["comment_ids"])
+        inputs = {"body": binding["intended"],
+                  "comments": [row for row in data["comments"] if row["id"] in known]}
+        applied = binding["intended"]
+        if binding["has_commits"]:
+            try:
+                self.record(binding["reviser"], binding["model"])
+            except OSError:
+                return "stop"
+            push_binding = self.adr_push_binding(
+                binding["reviser"], binding["model"], binding["round"], binding["human"],
+                binding["reply"], binding["mode_note"], binding["max_rounds"], inputs, applied)
+            self.adr_round = (inputs, applied)
+            return self.push_adr(push_binding, initial=True)
+        try:
+            self.record(binding["reviser"], binding["model"])
+        except OSError:
+            return "stop"
+        return self.finish_revision_reply(
+            binding["reviser"], binding["model"], binding["round"], binding["human"],
+            binding["reply"], binding["mode_note"], binding["max_rounds"], inputs, applied)
+
+    def edit_body(self, binding, *, initial, pending=None):
+        """Save before applying a revised issue body, or consume a due attempt (#151)."""
+        n, reason = self.issue, owner_handoff.SPEC_BODY_EDIT
+        text = f"Applying the revised issue body failed. {self.url}"
+
+        def stop(message):
+            self.handoff(f"{text} {message}", reason)
+            return "stop"
+
+        try:
+            found = owner_handoff.load_retry(self.env, n, reason)
+        except owner_handoff.RetryUnreadable as exc:
+            return stop(str(exc))
+        if initial:
+            if found is not None:
+                raise Deferred("handoff-retry", reason, lends_slot=False)
+            pending = owner_handoff.prepare_retry(self.env, n, reason, n, binding)
+            if pending is None:
+                return stop("The worker inputs could not be saved.")
+        else:
+            pending = found if pending is None else pending
+            if pending is None:
+                return stop("The saved body edit is missing.")
+            binding = pending["continuation"]
+            if pending.get("phase") == "landed":
+                if not self.worktree():
+                    return stop("spec worktree missing.")
+                self.gh("issue", "edit", n, "--add-label", "agent-wip")
+                return self.finish_body_edit(binding)
+            result = self.handoff(text, reason, resume=True)
+            if result.action == owner_handoff.DEFER:
+                raise Deferred("handoff-retry", reason, lends_slot=False)
+            if result.action != owner_handoff.RETRY:
+                return "stop"
+            binding = result.continuation
+            # Keep the pre-resume attempts: resume already consumed one on disk (#151).
+            if not self.worktree():
+                return stop("spec worktree missing.")
+            self.gh("issue", "edit", n, "--add-label", "agent-wip")
+
+        def reconcile(*, sending=False):
+            return self.check_body_edit(binding)
+
+        status = reconcile(sending=initial)
+        edited = None
+        if status == "absent":
+            body_file = Path(self.ctx, f"issue-{n}-body-edit.md")
+            body_file.write_text(binding["intended"])
+            edited = pr_helpers.gh("issue", "edit", n, "-R", self.repo, "--body-file", str(body_file),
+                                   reconcile=reconcile)
+            if edited.returncode == 0:
+                status = "landed"
+            elif pr_helpers.transient(edited):
+                status = "retry"
+            else:
+                return stop(f"permanent failure.{pr_helpers.why(edited)}")
+        if status == "landed":
+            landed = {**owner_handoff.load_retry(self.env, n, reason), "phase": "landed"}
+            owner_handoff.restore_retry(self.env, n, reason, n, landed)
+            return self.finish_body_edit(binding)
+        if status == "superseded":
+            owner_handoff.clear_retry(self.env, n, reason)
+            advisor.finish_episode(self.env, "issue", n, "superseded")
+            self.gh("issue", "edit", n, "--remove-label", "agent-wip")
+            self.finish()
+            return "stop"
+        if status == "paused":
+            owner_handoff.restore_retry(self.env, n, reason, n, pending)
+            raise Deferred("handoff-retry", reason, lends_slot=False)
+        if status == "retry":
+            attempts = pending["attempts"] + (0 if initial else 1)
+            if attempts < owner_handoff.MAX_ATTEMPTS:
+                now = int(owner_handoff.clock())
+                owner_handoff.restore_retry(
+                    self.env, n, reason, n,
+                    {**pending, "attempts": attempts, "scheduled": now,
+                     "due": now + owner_handoff.DELAYS[attempts]})
+                raise Deferred("handoff-retry", reason, lends_slot=False)
+        return stop(f"Reconciliation: {status}." + (pr_helpers.why(edited) if edited is not None else ""))
+
+    def adr_open_binding(self, push_binding, applied):
+        """Inputs known before opening the ADR docs PR (#151)."""
+        return {
+            "issue": push_binding["issue"], "reviser": push_binding["reviser"],
+            "model": push_binding["model"], "round": push_binding["round"],
+            "human": push_binding["human"], "reply": push_binding["reply"],
+            "mode_note": push_binding["mode_note"], "max_rounds": push_binding["max_rounds"],
+            "limit_why": push_binding["limit_why"], "author": push_binding["author"],
+            "next": push_binding["next"], "feedback": push_binding["feedback"],
+            "comment_ids": list(push_binding["comment_ids"]),
+            "issue_body": push_binding["issue_body"],
+            "commit": push_binding["commit"], "branch": push_binding["branch"],
+            "base": "main", "wt": push_binding["wt"],
+            "applied": applied if applied is not None else "",
+        }
+
+    def check_adr_open(self, binding):
+        """Revalidate a saved ADR open before creating the PR or running its continuation."""
+        data, transient = read_issue(self.env, self.issue, once=True)
+        if data is None:
+            return "retry" if transient else "failed"
+        self.adr_read = data
+        if data["state"] == "CLOSED":
+            return "superseded"
+        labels = {label["name"] for label in data["labels"]}
+        if "ready-for-human" in labels:
+            return "paused"
+        if "ready-for-agent" in labels and "needs-triage" not in labels and any(
+            (row["author"] or {}).get("login") == binding["author"]
+            and (verdict := VERDICT.match(row["body"])) and verdict[1] == "accept"
+            for row in data["comments"] if row["id"] not in set(binding["comment_ids"])
+        ):
+            return "superseded"
+        if (self.body_key(data["body"]) != binding["issue_body"]
+                or self.owner_feedback_digest(data["comments"]) != binding["feedback"]):
+            return "changed"
+        kind, round = state_from(data["comments"], self.env.owner)
+        if kind in ("review", "reply", "reply-human") and round > binding["round"]:
+            return "changed"
+        found, read_transient = self.discover_adr(request=pr_helpers.call)
+        if found is None:
+            return "retry" if read_transient else "invalid"
+        if not found:
+            return "absent"
+        if found.get("headRefOid") != binding["commit"]:
+            return "changed"
+        self.pr = str(found["number"])
+        return "landed"
+
+    def finish_adr_open(self, binding):
+        """Continuation after a landed ADR PR create: post the saved reply (#151)."""
+        n = self.issue
+        try:
+            self.record(binding["reviser"], binding["model"])
+        except OSError:
+            return "stop"
+        data = self.adr_read
+        if data is None:
+            data, _ = read_issue(self.env, n, once=True)
+            if data is None:
+                self.handoff("Could not read the issue after the ADR PR opened.",
+                             "spec_comments_read_failed")
+                return "stop"
+        known = set(binding["comment_ids"])
+        applied = binding["applied"] or None
+        inputs = {"body": applied if applied is not None else data["body"],
+                  "comments": [row for row in data["comments"] if row["id"] in known]}
+
+        def after_save():
+            # Only once the reply operation is saved: a crash before this still resumes from the landed open.
+            owner_handoff.clear_retry(self.env, n, owner_handoff.SPEC_ADR_OPEN)
+
+        return self.finish_revision_reply(
+            binding["reviser"], binding["model"], binding["round"], binding["human"],
+            binding["reply"], binding["mode_note"], binding["max_rounds"], inputs, applied,
+            after_save=after_save)
+
+    def open_adr(self, binding, *, initial, pending=None):
+        """Save before opening the ADR docs PR, or consume a due attempt (#151)."""
+        n, reason = self.issue, owner_handoff.SPEC_ADR_OPEN
+        text = f"Opening the ADR PR for {binding['branch'] if binding else '?'} failed. {self.url}"
+
+        def stop(message):
+            self.handoff(f"{text} {message}", reason)
+            return "stop"
+
+        try:
+            found = owner_handoff.load_retry(self.env, n, reason)
+        except owner_handoff.RetryUnreadable as exc:
+            return stop(str(exc))
+        if initial:
+            if found is not None:
+                raise Deferred("handoff-retry", reason, lends_slot=False)
+            pending = owner_handoff.prepare_retry(self.env, n, reason, n, binding)
+            if pending is None:
+                return stop("The worker inputs could not be saved.")
+            # The open operation owns the continuation; a crash before create still resumes here.
+            owner_handoff.clear_retry(self.env, n, owner_handoff.SPEC_ADR_PUSH)
+            self.push_flag().unlink(missing_ok=True)
+        else:
+            pending = found if pending is None else pending
+            if pending is None:
+                return stop("The saved ADR open is missing.")
+            binding = pending["continuation"]
+            if pending.get("phase") == "landed":
+                if not self.worktree():
+                    return stop("spec worktree missing.")
+                self.gh("issue", "edit", n, "--add-label", "agent-wip")
+                self.base = f"origin/{binding['branch']}"
+                return self.finish_adr_open(binding)
+            result = self.handoff(text, reason, resume=True)
+            if result.action == owner_handoff.DEFER:
+                raise Deferred("handoff-retry", reason, lends_slot=False)
+            if result.action != owner_handoff.RETRY:
+                return "stop"
+            binding = result.continuation
+            # Keep the pre-resume attempts: resume already consumed one on disk (#151).
+            if not self.worktree():
+                return stop("spec worktree missing.")
+            self.gh("issue", "edit", n, "--add-label", "agent-wip")
+            self.base = f"origin/{binding['branch']}"
+
+        def reconcile(*, sending=False):
+            return self.check_adr_open(binding)
+
+        status = reconcile(sending=initial)
+        created = None
+        if status == "absent":
+            created = pr_helpers.gh(
+                "pr", "create", "--head", binding["branch"], "--base", binding["base"],
+                "-R", self.repo, "--title", f"docs(adr): spec revisions for #{n}", "--body",
+                f"ADR revisions from the spec review of #{n} ({binding['reviser']} revises). The runner merges this "
+                "once a spec reviewer accepts the spec; the issue stays open for implementation.\n\n"
+                f"## {check_section.HEADING}\nnone",
+                reconcile=reconcile)
+            if created.returncode == 0:
+                self.pr = created.stdout.strip().rsplit("/", 1)[-1]
+                status = "landed"
+            elif pr_helpers.transient(created):
+                status = "retry"
+            else:
+                return stop(f"permanent failure.{pr_helpers.why(created)}")
+        if status == "landed":
+            landed = {**owner_handoff.load_retry(self.env, n, reason), "phase": "landed"}
+            owner_handoff.restore_retry(self.env, n, reason, n, landed)
+            return self.finish_adr_open(binding)
+        if status == "superseded":
+            owner_handoff.clear_retry(self.env, n, reason)
+            advisor.finish_episode(self.env, "issue", n, "superseded")
+            self.gh("issue", "edit", n, "--remove-label", "agent-wip")
+            self.finish()
+            return "stop"
+        if status == "paused":
+            owner_handoff.restore_retry(self.env, n, reason, n, pending)
+            raise Deferred("handoff-retry", reason, lends_slot=False)
+        if status == "invalid":
+            self.handoff(f"Could not identify the ADR pull request for {binding['branch']}.",
+                         "spec_adr_state_invalid")
+            owner_handoff.clear_retry(self.env, n, reason)
+            return "stop"
+        if status == "retry":
+            attempts = pending["attempts"] + (0 if initial else 1)
+            if attempts < owner_handoff.MAX_ATTEMPTS:
+                now = int(owner_handoff.clock())
+                owner_handoff.restore_retry(
+                    self.env, n, reason, n,
+                    {**pending, "attempts": attempts, "scheduled": now,
+                     "due": now + owner_handoff.DELAYS[attempts]})
+                raise Deferred("handoff-retry", reason, lends_slot=False)
+        return stop(f"Reconciliation: {status}." + (pr_helpers.why(created) if created is not None else ""))
+
     def finish_adr_push(self, binding):
         """Continuation after a landed ADR push: open the docs PR when needed, then the reply (#151)."""
         n, wt = self.issue, binding["wt"]
@@ -1264,36 +1591,29 @@ class Spec:
             capture_output=True, text=True)
         self.base = f"origin/{binding['branch']}"
         self.pr = binding["pr"] or self.pr
-        if not self.pr:
-            created = self.gh("pr", "create", "--head", binding["branch"], "--base", "main",
-                              "--title", f"docs(adr): spec revisions for #{n}", "--body",
-                              f"ADR revisions from the spec review of #{n} ({binding['reviser']} revises). The runner merges this "
-                              "once a spec reviewer accepts the spec; the issue stays open for implementation.\n\n"
-                              f"## {check_section.HEADING}\nnone")
-            if created.returncode != 0:
-                self.handoff(f"Opening the ADR PR for {binding['branch']} failed.{pr_helpers.why(created)}",
-                             "spec_adr_open_failed")
-                owner_handoff.clear_retry(self.env, n, owner_handoff.SPEC_ADR_PUSH)
-                self.push_flag().unlink(missing_ok=True)
+        if self.adr_round is not None:
+            inputs, applied = self.adr_round   # first path: the round's own inputs, no new read
+        else:
+            data = getattr(self, "adr_read", None)
+            if data is None:
+                data, _ = read_issue(self.env, n, once=True)
+            if data is None:
+                self.handoff("Could not read the issue after the ADR push landed.",
+                             "spec_comments_read_failed")
                 return "stop"
-            self.pr = created.stdout.strip().rsplit("/", 1)[-1]
+            self.adr_read = data
+            known = set(binding["comment_ids"])
+            inputs = {"body": data["body"], "comments": [r for r in data["comments"] if r["id"] in known]}
+            applied = None
+        if not self.pr:
+            open_binding = self.adr_open_binding(binding, applied)
+            return self.open_adr(open_binding, initial=True)
         try:
             self.record(binding["reviser"], binding["model"])
         except OSError:
             owner_handoff.clear_retry(self.env, n, owner_handoff.SPEC_ADR_PUSH)
             self.push_flag().unlink(missing_ok=True)
             return "stop"
-        if self.adr_round is not None:
-            inputs, applied = self.adr_round   # first path: the round's own inputs, no new read
-        else:
-            data = self.adr_read
-            if data is None:
-                self.handoff("Could not read the issue after the ADR push landed.",
-                             "spec_comments_read_failed")
-                return "stop"
-            known = set(binding["comment_ids"])
-            inputs = {"body": data["body"], "comments": [r for r in data["comments"] if r["id"] in known]}
-            applied = None
 
         def after_save():
             # Only once the reply operation is saved: a crash before this still resumes from the landed record.
@@ -1505,16 +1825,18 @@ class Spec:
                 return "stop"
             _, reviser = retry
             attempt += 1
+        text = strip_markers(comment.read_text()).encode()[:REPLY_CAP].decode(errors="ignore").rstrip("\n")
         applied = None
         if body.is_file() and body.stat().st_size:
             body.write_text(check_section.canonicalize(strip_markers(body.read_text())).rstrip("\n") + "\n")
             applied = body.read_text()
-            edited = self.gh("issue", "edit", n, "--body-file", str(body))
-            if edited.returncode != 0:
-                self.handoff(f"Applying {reviser} revised issue body failed ({body}).{pr_helpers.why(edited)}",
-                             "spec_body_edit_failed")
-                return "stop"
-        text = strip_markers(comment.read_text()).encode()[:REPLY_CAP].decode(errors="ignore").rstrip("\n")
+            binding = self.body_edit_binding(
+                applied, inputs["body"], round, reviser, model, human, text, mode_note, max_rounds, inputs)
+            try:
+                return self.edit_body(binding, initial=True)
+            finally:
+                for leftover in Path("/tmp").glob(f"baton-spec-{n}-{round}.*"):
+                    leftover.unlink()
         if git(wt, "rev-list", f"{self.base}..HEAD"):
             try:
                 self.record(reviser, model)
@@ -1561,6 +1883,18 @@ class Spec:
                 return reason, pending
         return None
 
+    def waiting_body_write(self):
+        """The first saved body edit or ADR open for this issue, or None."""
+        for reason in owner_handoff.SPEC_BODY_WRITES:
+            try:
+                pending = owner_handoff.load_retry(self.env, self.issue, reason)
+            except owner_handoff.RetryUnreadable as exc:
+                self.handoff(f"Could not read the saved {reason} operation: {exc}", reason)
+                return "unreadable"
+            if pending is not None:
+                return reason, pending
+        return None
+
     def loop(self, issue_payload=None):
         """True once the spec reviewer accepted (verdict comment posted, any ADR PR merged),
         False when the owner or a failure took over. Deferred when a vendor cannot run now.
@@ -1571,17 +1905,26 @@ class Spec:
         resume_post = self.waiting_comment_post()
         if resume_post == "unreadable":
             return False
+        resume_write = None if resume_post else self.waiting_body_write()
+        if resume_write == "unreadable":
+            return False
         resume_push = None
         if resume_post and resume_post[0] == owner_handoff.SPEC_REPLY_POST:
             # The saved reply owns the continuation even if the process stopped during push cleanup.
             owner_handoff.clear_retry(env, n, owner_handoff.SPEC_ADR_PUSH)
-        else:
+            owner_handoff.clear_retry(env, n, owner_handoff.SPEC_ADR_OPEN)
+            owner_handoff.clear_retry(env, n, owner_handoff.SPEC_BODY_EDIT)
+            self.push_flag().unlink(missing_ok=True)
+        elif resume_write and resume_write[0] == owner_handoff.SPEC_ADR_OPEN:
+            owner_handoff.clear_retry(env, n, owner_handoff.SPEC_ADR_PUSH)
+            self.push_flag().unlink(missing_ok=True)
+        elif not resume_post and not resume_write:
             resume_push = self.waiting_adr_push()
             if resume_push == "unreadable":
                 return False
         reason = "spec_pending_adr_read_failed"
         try:
-            waiting = None if (resume_post or resume_push is not None) else owner_handoff.load_retry(env, n, reason)
+            waiting = None if (resume_post or resume_write or resume_push is not None) else owner_handoff.load_retry(env, n, reason)
         except owner_handoff.RetryUnreadable:
             self.handoff("Could not read the saved ADR operation.", reason)
             return False
@@ -1593,11 +1936,30 @@ class Spec:
             adr = self.adr_discovery()
             if adr is None:
                 return False
-        if issue_payload is None and not resume_post and resume_push is None:
+        if issue_payload is None and not resume_post and not resume_write and resume_push is None:
             issue_payload = self.issue_payload()
             if issue_payload is None:
                 return False
-        if resume_push is not None:
+        if resume_write:
+            write_reason, pending = resume_write
+            if write_reason == owner_handoff.SPEC_BODY_EDIT:
+                outcome = self.edit_body(None, initial=False, pending=pending)
+            else:
+                outcome = self.open_adr(None, initial=False, pending=pending)
+            if outcome == "revised":
+                step, round = "review", pending["continuation"]["round"] + 1
+            else:
+                return outcome == "accept"
+            max_rounds = pending["continuation"]["max_rounds"]
+            issue_payload, self.fresh_payload = self.fresh_payload or self.issue_payload(), None
+            if issue_payload is None:
+                return False
+            if git(self.repo_dir, "rev-parse", "-q", "--verify", f"origin/{self.branch}") is not None:
+                self.base = f"origin/{self.branch}"
+            if not self.worktree():
+                notify.log(f"spec worktree for #{n} failed")
+                return False
+        elif resume_push is not None:
             outcome = self.push_adr(None, initial=False, pending=resume_push)
             if outcome == "revised":
                 step, round = "review", resume_push["continuation"]["round"] + 1

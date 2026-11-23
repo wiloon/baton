@@ -325,13 +325,194 @@ def test_a_comment_that_timed_out_but_landed_is_not_posted_twice(loop):
     assert sum(1 for c in loop.gh.calls if c[:2] == ["issue", "comment"]) == 3   # review, reply, verdict
 
 
-def test_a_gh_failure_that_outlasts_the_retries_is_in_runner_log(loop):
+def test_a_gh_failure_that_outlasts_the_retries_is_in_runner_log(loop, monkeypatch):
+    """After pr.gh's backoff a transient body edit uses the category-1 budget (#151)."""
+    clock = _spec_clock(monkeypatch)
     loop.gh.comments = []
     loop.gh.flaky["issue edit --body-file"] = [("HTTP 502: Bad Gateway", False)] * 4
+    loop.script = [CHANGES, reviser(body="Goal\nNew step\n"), ACCEPT]
+    with pytest.raises(Deferred, match="spec_body_edit_failed"):
+        loop.run()
+    assert "gh issue edit failed after 4 tries (gh: HTTP 502: Bad Gateway)" in loop.log()
+    clock["now"] = 1_060
+    assert loop.run() is True
+    assert loop.gh.body == "Goal\nNew step\n"
+    assert [run["role"] for run in loop.runs] == ["spec_review", "spec", "spec_review"]
+
+
+def test_a_transient_body_edit_defers_then_recovers_without_a_second_worker(loop, monkeypatch):
+    """spec_body_edit_failed: no early replay, one reviser, body applied after 60s (#151)."""
+    clock = _spec_clock(monkeypatch)
+    call, edits = spec.pr_helpers.call, []
+    loop.gh.comments = []
+    loop.script = [CHANGES, reviser(body="Goal\nNew step\n"), ACCEPT]
+
+    def flaky(*args, input=None, limit=None):
+        if args[:2] == ("issue", "edit") and "--body-file" in args:
+            edits.append(clock["now"])
+            if clock["now"] < 1_060:
+                return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return call(*args, input=input, limit=limit)
+
+    monkeypatch.setattr(spec.pr_helpers, "call", flaky)
+    with pytest.raises(Deferred, match="spec_body_edit_failed"):
+        loop.run()
+    assert [run["role"] for run in loop.runs] == ["spec_review", "spec"]
+    assert loop.gh.body == "Goal\nOld step\n"
+    saved = handoff.load_retry(session.resolve(loop.env), N, "spec_body_edit_failed")
+    assert saved["attempts"] == 0 and saved["continuation"]["intended"] == "Goal\nNew step\n"
+    clock["now"] = 1_059
+    before = len(edits)
+    with pytest.raises(Deferred, match="spec_body_edit_failed"):
+        loop.run()
+    assert len(edits) == before and [run["role"] for run in loop.runs] == ["spec_review", "spec"]
+    clock["now"] = 1_060
+    assert loop.run() is True
+    assert [run["role"] for run in loop.runs] == ["spec_review", "spec", "spec_review"]
+    assert set(edits) == {1_000, 1_060}
+    assert loop.gh.body == "Goal\nNew step\n"
+    assert len(loop.gh.posted("<!-- baton-spec-reply round=1 by=")) == 1
+    assert not list(Path(loop.env["STATE"]).glob("handoff-*-*spec_body_edit_failed.json"))
+
+
+def test_a_lost_body_edit_response_is_recognized_without_a_second_write(loop, monkeypatch):
+    """A body edit that landed before its answer was lost counts as success (#151)."""
+    clock = _spec_clock(monkeypatch)
+    call, edits = spec.pr_helpers.call, []
+    loop.gh.comments = []
+    loop.script = [CHANGES, reviser(body="Goal\nNew step\n"), ACCEPT]
+
+    def write_then_fail(*args, input=None, limit=None):
+        if args[:2] == ("issue", "edit") and "--body-file" in args:
+            edits.append(clock["now"])
+            path = Path(args[args.index("--body-file") + 1])
+            loop.gh.body = path.read_text()
+            return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return call(*args, input=input, limit=limit)
+
+    monkeypatch.setattr(spec.pr_helpers, "call", write_then_fail)
+    assert loop.run() is True
+    assert len(edits) == 1
+    assert loop.gh.body == "Goal\nNew step\n"
+    assert [run["role"] for run in loop.runs] == ["spec_review", "spec", "spec_review"]
+    assert not list(Path(loop.env["STATE"]).glob("handoff-*-*spec_body_edit_failed.json"))
+
+
+def test_an_exhausted_body_edit_hands_off_exactly_once(loop, monkeypatch):
+    clock = _spec_clock(monkeypatch)
+    call = spec.pr_helpers.call
+    notes = []
+    monkeypatch.setattr(spec.notify, "notify", lambda title, text="": notes.append(text))
+    loop.gh.comments = []
     loop.script = [CHANGES, reviser(body="Goal\nNew step\n")]
+
+    def unavailable(*args, input=None, limit=None):
+        if args[:2] == ("issue", "edit") and "--body-file" in args:
+            return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return call(*args, input=input, limit=limit)
+
+    monkeypatch.setattr(spec.pr_helpers, "call", unavailable)
+    with pytest.raises(Deferred, match="spec_body_edit_failed"):
+        loop.run()
+    clock["now"] = 1_060
+    with pytest.raises(Deferred, match="spec_body_edit_failed"):
+        loop.run()
+    clock["now"] = 1_360
     assert loop.run() is False
-    log = loop.log()
-    assert "gh issue edit failed after 4 tries (gh: HTTP 502: Bad Gateway)" in log
+    assert "ready-for-human" in loop.gh.labels
+    assert sum("revised issue body failed" in note or "Applying the revised issue body failed" in note
+               for note in notes) == 1
+    assert [run["role"] for run in loop.runs] == ["spec_review", "spec"]
+    assert not list(Path(loop.env["STATE"]).glob("handoff-*-*spec_body_edit_failed.json"))
+
+
+def test_a_changed_body_during_body_edit_deferral_hands_off(loop, monkeypatch):
+    clock = _spec_clock(monkeypatch)
+    call = spec.pr_helpers.call
+    loop.gh.comments = []
+    loop.script = [CHANGES, reviser(body="Goal\nNew step\n")]
+
+    def unavailable(*args, input=None, limit=None):
+        if args[:2] == ("issue", "edit") and "--body-file" in args and clock["now"] < 1_060:
+            return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return call(*args, input=input, limit=limit)
+
+    monkeypatch.setattr(spec.pr_helpers, "call", unavailable)
+    with pytest.raises(Deferred, match="spec_body_edit_failed"):
+        loop.run()
+    loop.gh.body = "Owner changed the issue\n"
+    clock["now"] = 1_060
+    assert loop.run() is False
+    assert "ready-for-human" in loop.gh.labels
+    assert loop.gh.body == "Owner changed the issue\n"
+    assert not list(Path(loop.env["STATE"]).glob("handoff-*-*spec_body_edit_failed.json"))
+
+
+def test_a_transient_adr_open_defers_then_recovers_without_a_second_worker(loop, monkeypatch):
+    """spec_adr_open_failed: no early create, one reviser, PR opened after 60s (#151)."""
+    clock = _spec_clock(monkeypatch)
+    call, creates = spec.pr_helpers.call, []
+    loop.script = [CHANGES, reviser(commit=True), ACCEPT]
+
+    def flaky(*args, input=None, limit=None):
+        if args[:2] == ("pr", "create"):
+            creates.append(clock["now"])
+            if clock["now"] < 1_060:
+                return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return call(*args, input=input, limit=limit)
+
+    monkeypatch.setattr(spec.pr_helpers, "call", flaky)
+    with pytest.raises(Deferred, match="spec_adr_open_failed"):
+        loop.run()
+    assert [run["role"] for run in loop.runs] == ["spec_review", "spec"]
+    assert handoff.load_retry(session.resolve(loop.env), N, handoff.SPEC_ADR_PUSH) is None
+    saved = handoff.load_retry(session.resolve(loop.env), N, handoff.SPEC_ADR_OPEN)
+    assert saved["attempts"] == 0 and saved["continuation"]["branch"].startswith("docs/spec-issue-")
+    clock["now"] = 1_059
+    before = len(creates)
+    with pytest.raises(Deferred, match="spec_adr_open_failed"):
+        loop.run()
+    assert len(creates) == before
+    clock["now"] = 1_060
+    assert loop.run() is True
+    assert [run["role"] for run in loop.runs] == ["spec_review", "spec", "spec_review"]
+    assert set(creates) == {1_000, 1_060}
+    assert loop.gh.adr_pr == "77"
+    assert len(loop.gh.posted("<!-- baton-spec-reply round=1 by=")) == 1
+    assert not list(Path(loop.env["STATE"]).glob("handoff-*-*spec_adr_open_failed.json"))
+
+
+def test_a_fork_same_named_branch_does_not_count_as_a_landed_adr_open(loop, monkeypatch):
+    """A fork's same-named branch is absence for ADR open reconciliation (#151)."""
+    clock = _spec_clock(monkeypatch)
+    call = spec.pr_helpers.call
+    loop.script = [CHANGES, reviser(commit=True), ACCEPT]
+    fork = [{
+        "number": 99, "headRefName": f"docs/spec-issue-{N}", "baseRefName": "main",
+        "headRefOid": "b" * 40, "isCrossRepository": True,
+        "headRepository": {"name": "app"}, "headRepositoryOwner": {"login": "fork"},
+    }]
+
+    def flaky(*args, input=None, limit=None):
+        if args[:2] == ("pr", "create") and clock["now"] < 1_060:
+            return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        if args[:2] == ("pr", "list"):
+            return subprocess.CompletedProcess(args, 0, json.dumps(fork if not loop.gh.adr_pr else [{
+                "number": int(loop.gh.adr_pr), "headRefName": f"docs/spec-issue-{N}",
+                "baseRefName": "main", "headRefOid": loop.gh.head_oid,
+                "isCrossRepository": False, "headRepository": {"name": "app"},
+                "headRepositoryOwner": {"login": "owner"},
+            }]), "")
+        return call(*args, input=input, limit=limit)
+
+    monkeypatch.setattr(spec.pr_helpers, "call", flaky)
+    with pytest.raises(Deferred, match="spec_adr_open_failed"):
+        loop.run()
+    clock["now"] = 1_060
+    assert loop.run() is True
+    assert loop.gh.adr_pr == "77"
+    assert sum(c[:2] == ["pr", "create"] for c in loop.gh.calls) >= 1
+    assert len(loop.gh.posted("<!-- baton-spec-reply round=1 by=")) == 1
 
 
 def test_a_handoff_whose_label_swap_fails_says_so(loop, monkeypatch):
@@ -396,8 +577,8 @@ def test_a_transient_adr_push_defers_then_recovers_without_a_second_worker(loop,
     assert not list(Path(loop.env["STATE"]).glob("handoff-*-*spec_adr_push_failed.json"))
 
 
-def test_a_landed_adr_push_makes_no_extra_issue_read_and_clears_after_the_reply_is_saved(loop, monkeypatch):
-    """The continuation reuses the round's inputs (first path) or the check's read (resume) (#151)."""
+def test_a_landed_adr_push_revalidates_once_for_open_and_clears_open_after_the_reply_is_saved(loop, monkeypatch):
+    """Push hands off to ADR open; open revalidates once, then reply clears the open record (#151)."""
     from baton import common
 
     clock = _spec_clock(monkeypatch)
@@ -421,8 +602,8 @@ def test_a_landed_adr_push_makes_no_extra_issue_read_and_clears_after_the_reply_
         return prepare(env, episode, reason, item, binding)
 
     def clearing(env, episode, reason, *a, **k):
-        if reason == "spec_adr_push_failed":
-            order.append(("clear", bool(loop.gh.posted("<!-- baton-spec-reply")),
+        if reason in (handoff.SPEC_ADR_PUSH, handoff.SPEC_ADR_OPEN):
+            order.append((reason, bool(loop.gh.posted("<!-- baton-spec-reply")),
                           handoff.load_retry(env, episode, handoff.SPEC_REPLY_POST) is not None))
         return clear(env, episode, reason, *a, **k)
 
@@ -437,40 +618,45 @@ def test_a_landed_adr_push_makes_no_extra_issue_read_and_clears_after_the_reply_
     assert loop.run() is True
     assert [run["role"] for run in loop.runs] == ["spec_review", "spec", "spec_review"]
     assert len(loop.gh.posted("<!-- baton-spec-reply round=1 by=")) == 1
-    assert reads_before_reply_save == [[True]]
-    # the push record went only after the reply operation was saved, and before the reply was posted
-    assert order == [("clear", False, True)]
+    # push-check read, then ADR-open revalidation, before the reply is saved
+    assert reads_before_reply_save == [[True, True]]
+    # push clears when open is saved; open clears once the reply operation is saved
+    assert order == [
+        (handoff.SPEC_ADR_PUSH, False, False),
+        (handoff.SPEC_ADR_OPEN, False, True),
+    ]
 
 
-@pytest.mark.parametrize("keep_push_record", [True, False], ids=["both-records", "stale-push-flag"])
-def test_a_saved_adr_reply_takes_over_on_restart(loop, monkeypatch, keep_push_record):
+@pytest.mark.parametrize("keep_open_record", [True, False], ids=["both-records", "open-already-cleared"])
+def test_a_saved_adr_reply_takes_over_on_restart(loop, monkeypatch, keep_open_record):
     clock = _spec_clock(monkeypatch)
     env = session.resolve(loop.env)
-    push_reason = handoff.SPEC_ADR_PUSH
-    flag = loop.path("spec-adr-push-waiting")
+    open_reason = handoff.SPEC_ADR_OPEN
     clear = handoff.clear_retry
-    unlink = Path.unlink
+    call = spec.pr_helpers.call
 
-    def interrupt(env, episode, reason, *args, **kwargs):
-        if reason == push_reason:
+    def interrupt_clear(env, episode, reason, *args, **kwargs):
+        if reason == open_reason:
             raise InterruptedError
         return clear(env, episode, reason, *args, **kwargs)
 
-    def interrupt_unlink(path, *args, **kwargs):
-        if path == flag:
-            raise InterruptedError
-        return unlink(path, *args, **kwargs)
+    def interrupt_after_open_cleared(*args, input=None, limit=None):
+        if args[:2] == ("issue", "comment"):
+            body = args[args.index("--body") + 1] if "--body" in args else ""
+            if "<!-- baton-spec-reply" in body:
+                raise InterruptedError
+        return call(*args, input=input, limit=limit)
 
     loop.script = [CHANGES, reviser(commit=True), ACCEPT]
     with monkeypatch.context() as crash:
-        if keep_push_record:
-            crash.setattr(handoff, "clear_retry", interrupt)
+        if keep_open_record:
+            crash.setattr(handoff, "clear_retry", interrupt_clear)
         else:
-            crash.setattr(Path, "unlink", interrupt_unlink)
+            crash.setattr(spec.pr_helpers, "call", interrupt_after_open_cleared)
         with pytest.raises(InterruptedError):
             loop.run()
-    assert (handoff.load_retry(env, N, push_reason) is not None) is keep_push_record
-    assert flag.exists()
+    assert handoff.load_retry(env, N, handoff.SPEC_ADR_PUSH) is None
+    assert (handoff.load_retry(env, N, open_reason) is not None) is keep_open_record
     assert handoff.load_retry(env, N, handoff.SPEC_REPLY_POST) is not None
     assert not loop.gh.posted("<!-- baton-spec-reply")
 
@@ -483,7 +669,7 @@ def test_a_saved_adr_reply_takes_over_on_restart(loop, monkeypatch, keep_push_re
     assert [run["role"] for run in loop.runs] == ["spec_review", "spec", "spec_review"]
     assert sum(call[:2] == ["pr", "create"] for call in loop.gh.calls) == 1
     assert len(loop.gh.posted("<!-- baton-spec-reply round=1 by=")) == 1
-    assert handoff.load_retry(env, N, push_reason) is None and not flag.exists()
+    assert handoff.load_retry(env, N, open_reason) is None
     assert handoff.load_retry(env, N, handoff.SPEC_REPLY_POST) is None
 
 
@@ -548,7 +734,8 @@ def test_adr_push_resume_checks_the_saved_operation_and_issue(loop, waiting_adr_
     assert handoff.load_retry(env, N, reason) is None
 
 
-def test_a_saved_landed_adr_push_resumes_without_a_second_push(loop, monkeypatch):
+def test_a_saved_adr_open_resumes_without_a_second_push(loop, monkeypatch):
+    """After a push lands, a crash during pr create leaves the open operation to resume (#151)."""
     clock = _spec_clock(monkeypatch)
     call = spec.pr_helpers.call
 
@@ -563,18 +750,24 @@ def test_a_saved_landed_adr_push_resumes_without_a_second_push(loop, monkeypatch
         with pytest.raises(InterruptedError):
             loop.run()
     env = session.resolve(loop.env)
-    assert handoff.load_retry(env, N, handoff.SPEC_ADR_PUSH)["phase"] == "landed"
+    assert handoff.load_retry(env, N, handoff.SPEC_ADR_PUSH) is None
+    saved = handoff.load_retry(env, N, handoff.SPEC_ADR_OPEN)
+    assert saved is not None and saved.get("phase") is None and saved["attempts"] == 0
     assert not loop.gh.posted("<!-- baton-spec-reply")
 
     def unexpected_push(*args, **kwargs):
-        pytest.fail("A landed ADR retry should only run its continuation")
+        pytest.fail("A saved ADR open should only create the PR and continue")
 
     monkeypatch.setattr(spec, "push", unexpected_push)
-    assert clock["now"] == 1_000
+    clock["now"] = 1_059
+    with pytest.raises(Deferred, match="spec_adr_open_failed"):
+        loop.run()
+    clock["now"] = 1_060
     assert loop.run() is True
     assert [run["role"] for run in loop.runs] == ["spec_review", "spec", "spec_review"]
     assert len(loop.gh.posted("<!-- baton-spec-reply round=1 by=")) == 1
-    assert handoff.load_retry(env, N, handoff.SPEC_ADR_PUSH) is None
+    assert handoff.load_retry(env, N, handoff.SPEC_ADR_OPEN) is None
+    assert sum(c[:2] == ["pr", "create"] for c in loop.gh.calls) == 1
 
 
 def test_a_lost_adr_push_response_is_recognized_without_a_second_write(loop, monkeypatch):
