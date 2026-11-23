@@ -1568,12 +1568,17 @@ class Spec:
         ISSUE_PAYLOAD is an already-fetched {title, body, comments} from a recovered read (#151).
         """
         n, env = self.issue, self.env
-        resume_push = self.waiting_adr_push()
-        if resume_push == "unreadable":
-            return False
-        resume_post = None if resume_push is not None else self.waiting_comment_post()
+        resume_post = self.waiting_comment_post()
         if resume_post == "unreadable":
             return False
+        resume_push = None
+        if resume_post and resume_post[0] == owner_handoff.SPEC_REPLY_POST:
+            # The saved reply owns the continuation even if the process stopped during push cleanup.
+            owner_handoff.clear_retry(env, n, owner_handoff.SPEC_ADR_PUSH)
+        else:
+            resume_push = self.waiting_adr_push()
+            if resume_push == "unreadable":
+                return False
         reason = "spec_pending_adr_read_failed"
         try:
             waiting = None if (resume_post or resume_push is not None) else owner_handoff.load_retry(env, n, reason)

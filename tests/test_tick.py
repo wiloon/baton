@@ -2406,6 +2406,7 @@ def _waiting_dev_push(devrun, monkeypatch, open_prs):
     assert devrun.go()[1] == 75
     devrun.gh.answers["pr list"] = open_prs
     clock["now"] = 1_060
+    return clock
 
 
 def test_a_fork_pr_from_the_same_branch_name_does_not_supersede_a_dev_push(devrun, monkeypatch):
@@ -2423,3 +2424,112 @@ def test_a_same_repo_pr_from_the_branch_supersedes_a_dev_push(devrun, monkeypatc
     t, rc = devrun.go()
     assert rc == 80 and not devrun.gh.ran("pr", "create")
     assert handoff.load_retry(session.resolve(devrun.env), "300", "dev_push_failed") is None
+
+
+def test_tick_resumes_a_waiting_dev_push_only_when_due_and_unpaused(devrun, monkeypatch, capsys):
+    from baton import common
+
+    clock = _waiting_dev_push(devrun, monkeypatch, [])
+    payload = {"title": "A title", "body": "A body", "comments": [], "state": "OPEN", "labels": []}
+    devrun.gh.answers["issue view"] = lambda args: "OPEN" if "--jq" in args else payload
+    pushes = []
+
+    def push(wt, ref, **kwargs):
+        pushes.append(clock["now"])
+        return common.push(wt, ref, **kwargs)
+
+    monkeypatch.setattr(dev, "push", push)
+    clock["now"] = 1_059
+    assert devrun.make("300").run() == 75
+    assert "DEFERRED: handoff-retry dev_push_failed" in capsys.readouterr().err
+    assert not pushes
+
+    clock["now"] = 1_060
+    payload["labels"] = [{"name": "ready-for-human"}]
+    assert devrun.make().run() == 0
+    saved = handoff.load_retry(devrun.make().env, "300", handoff.DEV_PUSH)
+    assert saved["attempts"] == 0 and not pushes
+    assert not devrun.gh.ran("pr", "create")
+
+    payload["labels"] = []
+    assert devrun.make().run() == 0
+    assert pushes == [1_060] and len(devrun.runs) == 1
+    assert len(devrun.gh.ran("pr", "create")) == 1
+    assert handoff.load_retry(devrun.make().env, "300", handoff.DEV_PUSH) is None
+
+
+def test_tick_cleanup_keeps_the_worktree_of_a_waiting_push(devrun, monkeypatch):
+    clock = _waiting_dev_push(devrun, monkeypatch, [])
+    wt = Path(devrun.runs[0]["cwd"])
+    closed_worktree = wt.with_name("agent-301")
+    closed_worktree.mkdir()
+    devrun.gh.answers["issue view"] = lambda args: "CLOSED" if args[2] in {"300", "301"} else "OPEN"
+    clock["now"] = 1_059
+
+    assert devrun.make().run() == 0
+    assert devrun.gh.ran("remove-worktree") == [["remove-worktree", str(closed_worktree)]]
+    assert (wt / "new.txt").read_text() == "new\n"
+    assert not devrun.gh.ran("pr", "create") and len(devrun.runs) == 1
+    assert handoff.load_retry(devrun.make().env, "300", handoff.DEV_PUSH) is not None
+
+
+@pytest.mark.parametrize("change", ["damaged", "missing", "feedback", "closed"])
+def test_dev_push_resume_checks_the_saved_operation_and_issue(devrun, monkeypatch, change):
+    _waiting_dev_push(devrun, monkeypatch, [])
+    seen = _watch_handoffs(monkeypatch)
+    env, reason = devrun.make().env, handoff.DEV_PUSH
+    record = handoff.retry_path(env, "300", reason)
+    if change == "damaged":
+        record.write_text("{")
+    elif change == "missing":
+        record.unlink()
+        handoff.waiting_path(env, "300", reason).unlink()
+    elif change == "feedback":
+        devrun.gh.answers["issue view"]["comments"] = [
+            {"id": 1, "author": {"login": "owner"}, "body": "Please change the implementation"},
+        ]
+    else:
+        devrun.gh.answers["issue view"]["state"] = "CLOSED"
+
+    def unexpected_push(*args, **kwargs):
+        pytest.fail("The original push is no longer safe to resume")
+
+    monkeypatch.setattr(dev, "push", unexpected_push)
+    assert devrun.go()[1] == 80
+    assert len(devrun.runs) == 1 and not devrun.gh.ran("pr", "create")
+    assert _reasons(seen) == ([] if change == "closed" else [reason])
+    if change == "closed":
+        assert not seen["notices"]
+    assert handoff.load_retry(env, "300", reason) is None
+
+
+def test_a_saved_landed_dev_push_resumes_without_a_second_push(devrun, monkeypatch):
+    from baton import common
+
+    monkeypatch.setattr(handoff, "clock", lambda: 1_000)
+    restore = handoff.restore_retry
+    pushes = []
+
+    def push(wt, ref, **kwargs):
+        pushes.append(ref)
+        return common.push(wt, ref, **kwargs)
+
+    def interrupt(env, episode, reason, item, pending):
+        restore(env, episode, reason, item, pending)
+        if reason == handoff.DEV_PUSH and pending.get("phase") == "landed":
+            raise InterruptedError
+
+    monkeypatch.setattr(dev, "push", push)
+    devrun.script = [implements()]
+    with monkeypatch.context() as crash:
+        crash.setattr(handoff, "restore_retry", interrupt)
+        with pytest.raises(InterruptedError):
+            dev.run(devrun.make(), "300")
+    env = devrun.make().env
+    assert handoff.load_retry(env, "300", handoff.DEV_PUSH)["phase"] == "landed"
+    assert not devrun.gh.ran("pr", "create")
+
+    assert devrun.go()[1] == 80
+    assert len(pushes) == len(devrun.runs) == 1
+    assert len(devrun.gh.ran("pr", "create")) == 1
+    assert handoff.load_retry(env, "300", handoff.DEV_PUSH) is None
