@@ -1390,9 +1390,9 @@ class Spec:
         edited = None
         if resumed_landed and status not in ("landed", "superseded", "paused"):
             return stop(f"Reconciliation: {status}.")
+        if status in ("absent", "landed") and not claim():
+            return "stop"
         if status == "absent":
-            if not claim():
-                return "stop"
             body_file = Path(self.ctx, f"issue-{n}-body-edit.md")
             body_file.write_text(binding["intended"])
             edited = pr_helpers.gh("issue", "edit", n, "-R", self.repo, "--body-file", str(body_file),
@@ -1404,8 +1404,6 @@ class Spec:
             else:
                 return stop(f"permanent failure.{pr_helpers.why(edited)}")
         if status == "landed":
-            if not claim():
-                return "stop"
             if not resumed_landed:
                 landed = {**owner_handoff.load_retry(self.env, n, reason), "phase": "landed"}
                 owner_handoff.restore_retry(self.env, n, reason, n, landed)
@@ -1562,14 +1560,20 @@ class Spec:
             return True
 
         status = reconcile(sending=initial)
-        if resumed_landed and status == "landed":
-            self.pr = saved_pr or self.pr
+        if status == "invalid":
+            self.handoff(f"Could not identify the ADR pull request for {binding['branch']}.",
+                         "spec_adr_state_invalid")
+            owner_handoff.clear_retry(self.env, n, reason)
+            return "stop"
+        # Discovery supplies the canonical positive PR number. An exact match also rejects missing or malformed state.
+        if resumed_landed and status == "landed" and saved_pr != self.pr:
+            return stop("The saved ADR PR number does not match the open ADR PR.")
         created = None
         if resumed_landed and status not in ("landed", "superseded", "paused"):
             return stop(f"Reconciliation: {status}.")
+        if status in ("absent", "landed") and not claim():
+            return "stop"
         if status == "absent":
-            if not claim():
-                return "stop"
             created = pr_helpers.gh(
                 "pr", "create", "--head", binding["branch"], "--base", binding["base"],
                 "-R", self.repo, "--title", f"docs(adr): spec revisions for #{n}", "--body",
@@ -1585,8 +1589,6 @@ class Spec:
             else:
                 return stop(f"permanent failure.{pr_helpers.why(created)}")
         if status == "landed":
-            if not claim():
-                return "stop"
             if not resumed_landed:
                 landed = {**owner_handoff.load_retry(self.env, n, reason), "phase": "landed", "pr": self.pr}
                 owner_handoff.restore_retry(self.env, n, reason, n, landed)
@@ -1600,11 +1602,6 @@ class Spec:
         if status == "paused":
             owner_handoff.restore_retry(self.env, n, reason, n, pending)
             raise Deferred("handoff-retry", reason, lends_slot=False)
-        if status == "invalid":
-            self.handoff(f"Could not identify the ADR pull request for {binding['branch']}.",
-                         "spec_adr_state_invalid")
-            owner_handoff.clear_retry(self.env, n, reason)
-            return "stop"
         if status == "retry":
             attempts = pending["attempts"] + (0 if initial else 1)
             if attempts < owner_handoff.MAX_ATTEMPTS:

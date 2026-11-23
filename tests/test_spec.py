@@ -5,6 +5,7 @@ import json
 import os
 import re
 from contextvars import ContextVar
+from itertools import pairwise
 from pathlib import Path
 import subprocess
 import time
@@ -367,7 +368,10 @@ def test_a_transient_body_edit_defers_then_recovers_without_a_second_worker(loop
         loop.run()
     assert len(edits) == before and [run["role"] for run in loop.runs] == ["spec_review", "spec"]
     clock["now"] = 1_060
+    loop.gh.calls.clear()
     assert loop.run() is True
+    assert sum(c[:3] == ["issue", "edit", N] and ("--add-label", "agent-wip") in pairwise(c)
+               for c in loop.gh.calls) == 1
     assert [run["role"] for run in loop.runs] == ["spec_review", "spec", "spec_review"]
     assert set(edits) == {1_000, 1_060}
     assert loop.gh.body == "Goal\nNew step\n"
@@ -474,7 +478,10 @@ def test_a_transient_adr_open_defers_then_recovers_without_a_second_worker(loop,
         loop.run()
     assert len(creates) == before
     clock["now"] = 1_060
+    loop.gh.calls.clear()
     assert loop.run() is True
+    assert sum(c[:3] == ["issue", "edit", N] and ("--add-label", "agent-wip") in pairwise(c)
+               for c in loop.gh.calls) == 1
     assert [run["role"] for run in loop.runs] == ["spec_review", "spec", "spec_review"]
     assert set(creates) == {1_000, 1_060}
     assert loop.gh.adr_pr == "77"
@@ -596,18 +603,63 @@ def test_a_permanent_adr_open_failure_hands_off_without_a_deferral(loop, monkeyp
     assert not list(Path(loop.env["STATE"]).glob("handoff-*-*spec_adr_open_failed.json"))
 
 
-def test_an_ambiguous_adr_lookup_hands_off_as_invalid_state(loop, monkeypatch):
-    call = spec.pr_helpers.call
+def _stop_after_adr_open_lands(loop, monkeypatch):
+    _spec_clock(monkeypatch)
     loop.script = [CHANGES, reviser(commit=True)]
 
-    def broken(*args, input=None, limit=None):
-        if args[:2] == ("pr", "list") and "--head" in args:
-            return subprocess.CompletedProcess(args, 0, "not json", "")
+    def interrupt(self, *args, **kwargs):
+        raise InterruptedError
+
+    with monkeypatch.context() as crash:
+        crash.setattr(spec.Spec, "finish_revision_reply", interrupt)
+        with pytest.raises(InterruptedError):
+            loop.run()
+    assert loop.gh.adr_pr == "77"
+    assert not loop.gh.posted("<!-- baton-spec-reply")
+
+
+@pytest.mark.parametrize("replacement", [False, True], ids=["same-pr", "replacement-pr"])
+def test_a_landed_adr_open_resumes_only_for_the_same_pr(loop, monkeypatch, spec_handoffs, replacement):
+    _stop_after_adr_open_lands(loop, monkeypatch)
+    if replacement:
+        loop.gh.adr_pr = "78"
+    else:
+        loop.script = [ACCEPT]
+
+    assert loop.run() is not replacement
+    assert sum(c[:2] == ["pr", "create"] for c in loop.gh.calls) == 1
+    replies = loop.gh.posted("<!-- baton-spec-reply round=1 by=")
+    if replacement:
+        assert not replies
+        spec_handoffs("spec_adr_open_failed")
+    else:
+        reply, = replies
+        assert "ADR revisions: #77" in reply
+
+
+@pytest.mark.parametrize("resumed", [False, True], ids=["initial-open", "landed-resume"])
+def test_an_ambiguous_adr_lookup_hands_off_as_invalid_state(loop, monkeypatch, spec_handoffs, resumed):
+    if resumed:
+        _stop_after_adr_open_lands(loop, monkeypatch)
+    else:
+        loop.script = [CHANGES, reviser(commit=True)]
+    call = spec.pr_helpers.call
+
+    def ambiguous(*args, input=None, limit=None):
+        if args[:2] == ("pr", "list") and "--head" in args and len(loop.runs) == 2:
+            matching = {
+                "number": 77, "headRefName": f"docs/spec-issue-{N}", "baseRefName": "main",
+                "headRefOid": loop.gh.wt_head(), "isCrossRepository": False,
+                "headRepository": {"name": "app"}, "headRepositoryOwner": {"login": "owner"},
+            }
+            return subprocess.CompletedProcess(args, 0, json.dumps([matching, {**matching, "number": 78}]), "")
         return call(*args, input=input, limit=limit)
 
-    monkeypatch.setattr(spec.pr_helpers, "call", broken)
+    monkeypatch.setattr(spec.pr_helpers, "call", ambiguous)
     assert loop.run() is False
-    assert not loop.gh.ran("pr", "create") and "ready-for-human" in loop.gh.labels
+    assert sum(c[:2] == ["pr", "create"] for c in loop.gh.calls) == int(resumed)
+    assert not loop.gh.posted("<!-- baton-spec-reply")
+    spec_handoffs("spec_adr_state_invalid")
 
 
 def test_a_stop_after_the_body_edit_landed_resumes_without_a_second_reviser(loop, monkeypatch):
