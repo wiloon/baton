@@ -1680,15 +1680,45 @@ def test_a_blocked_review_alternate_resumes_before_dispatch(advised, monkeypatch
 def test_author_state_retry_reseeds_then_picks_reviewer(advised, monkeypatch):
     advised.advice = [{"action": "retry_step", "reason": "transient seed failure",
                        "evidence": ["Decision point: review_author_state_failed"]}]
+    order = []
     attempts = iter([False, True, True])
 
     def seed(self):
-        return next(attempts, True)
+        ok = next(attempts, True)
+        order.append("seed-ok" if ok else "seed-fail")
+        return ok
 
     monkeypatch.setattr(review.Review, "seed", seed)
     advised.reviews[:] = ["pass"]
     assert advised.run(fixer="cursor", reviewer="claude") == 0
     assert len(advised.advice_calls) == 1 and advised.merged == [PR]
+    assert order[:2] == ["seed-fail", "seed-ok"]          # re-seeded before any reviewer was picked
+    assert [a["vendor"] for a in advised.agents if a["role"] == "review"] == ["claude"]
+    from baton import session
+    assert recovery_load(advised) is None                 # the executed grant is cleared
+
+
+def recovery_load(loop):
+    from baton import recovery, session
+    return recovery.load(session.resolve(loop.env), "297", PR)
+
+
+def test_author_state_handoff_advice_ends_in_one_handoff(advised, monkeypatch):
+    handoffs = []
+    real = review.Review.handoff
+    monkeypatch.setattr(review.Review, "handoff",
+                        lambda self, reason, title, text, **kw: (
+                            None if kw.get("fallback") else handoffs.append(reason),   # fallback: no handoff
+                            real(self, reason, title, text, **kw))[1])
+    seeds = []
+    monkeypatch.setattr(review.Review, "seed", lambda self: seeds.append(1) and False)
+    advised.advice = [{"action": "handoff", "reason": "recording authors keeps failing",
+                       "evidence": ["Decision point: review_author_state_failed"]}]
+    advised.reviews[:] = ["pass"]
+    assert advised.run(fixer="cursor", reviewer="claude") == 0
+    assert handoffs == ["review_author_state_failed"]
+    assert len(seeds) == 1 and not [a for a in advised.agents if a["role"] == "review"]
+    assert advised.merged == []
 
 
 def test_fingerprint_mismatch_on_pending_review_recovery_hands_off(loop, monkeypatch):

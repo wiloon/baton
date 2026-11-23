@@ -360,6 +360,19 @@ def test_a_reject_is_a_note_and_a_handoff(loop, spec_handoffs):
     assert note.endswith("round 1: reject\n\nno") and "ready-for-human" in loop.gh.labels
 
 
+def test_a_live_spec_reject_makes_no_provider_call_and_one_handoff(loop, spec_handoffs, monkeypatch):
+    from baton import advisor
+    from baton.config import Advisor
+    calls = []
+    monkeypatch.setenv(advisor.KEY, "sk-" + "s" * 24)
+    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="live"))
+    monkeypatch.setattr(advisor, "call_deepseek", lambda *a, **k: calls.append(1) or ({}, {}))
+    loop.script = [{"rc": 0, "status": "success", "outcome": "SPEC: reject", "reply": "no\nSPEC: reject", "model": "", "defer": ""}]
+    assert loop.run() is False
+    assert calls == []
+    spec_handoffs("spec_rejected")                            # exactly one handoff, with its reason
+
+
 def test_a_failed_review_run_is_a_handoff(loop):
     loop.script = [{"rc": 1, "status": "failure", "outcome": "RESULT: failed claude failure rc=1", "reply": "", "model": "", "defer": ""}]
     assert loop.run() is False

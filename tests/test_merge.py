@@ -644,6 +644,29 @@ def test_a_merged_partial_pr_releases_its_task_once(run):
     assert Path(run.env["STATE"], "last-slice-297").read_text() == f"{PR}\n"
 
 
+def test_a_merged_slice_closes_its_dev_grants_but_not_the_next_slices_on_reentry(run):
+    from baton import session
+    env = session.resolve(run.env)
+    stale = advisor.grant_path(env, "dev_verify_failed", "297")
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text("slice-one")
+
+    def decide(decision_id):
+        advisor.append(env, {"kind": "decision", "ts": 100, "point": "dev_verify_failed", "repo": "owner/app",
+                             "task_kind": "issue", "item": "297", "episode": "297", "decision_id": decision_id,
+                             "advised": "retry_step", "executed": "retry_step", "rule": "handoff"})
+    decide("one")
+    run.gh.set(open_prs=[], body=PARTIAL)
+    sh(run.wt, "git", "push", "-q", "origin", "HEAD:main")
+    sh(run.repo, "git", "fetch", "-q", "origin")
+    assert run.merger().finish_merged_task()
+    assert not stale.exists()                      # slice one's grant is closed with the merge
+    stale.write_text("slice-two")                  # the next slice's grant
+    decide("two")
+    assert run.merger().finish_merged_task()       # re-entry for slice one: the marker returns early
+    assert stale.read_text() == "slice-two"
+
+
 def test_a_later_slice_owning_the_task_leaves_it_alone(run):
     run.gh.set(open_prs=[{"number": 400}], body=PARTIAL)
     assert run.merger().finish_merged_task()
@@ -939,6 +962,19 @@ def test_a_pr_touching_an_owner_review_path_goes_to_the_owner_after_ci(run):
     assert run.events[-1] == "notify PR #335 review and CI passed" and "ci" in run.events
     assert "bin/guard.sh" in run.texts["PR #335 review and CI passed"]
     assert "README.md" not in run.texts["PR #335 review and CI passed"]
+
+
+def test_a_live_owner_path_handoff_makes_no_provider_call(run, monkeypatch):
+    observing = []
+    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="live", snapshot_chars=1000))
+    monkeypatch.setenv(advisor.KEY, "fake-advisor-key")
+    monkeypatch.setattr(advisor, "call_deepseek", lambda *a, **k: observing.append(1) or ({}, {}))
+    run.gh.set(files_api=[{"filename": "bin/guard.sh"}])
+    run.go(OWNER_REVIEW_PATHS="bin/guard.sh")
+    assert observing == []                                    # zero provider requests, live mode
+    assert not run.merged() and "bin/guard.sh" in run.texts["PR #335 review and CI passed"]
+    assert run.events.count("notify PR #335 review and CI passed") == 1   # one handoff
+    assert "owner_review_path" in run.texts["PR #335 review and CI passed"] or run.labelled("ready-for-human")
 
 
 def test_a_pr_touching_no_owner_review_path_merges(run):
