@@ -32,7 +32,7 @@ import sys
 import time
 
 from . import advisor, agents, checks as check_section, claude_cli, dispatch, e2e_gate, fix, handoff as owner_handoff, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, recovery, review, vendors
-from .common import Deferred, changed, git, permission_denials, push, restore, strip_markers
+from .common import Deferred, changed, child_env, git, permission_denials, push, restore, strip_markers
 from .quota import atomic_json
 
 REPLY_CAP = 60000
@@ -286,8 +286,10 @@ class Spec:
         self.wt = Path(str(env.dirs.worktrees), f"spec-{issue}")
         self.branch = f"docs/spec-issue-{issue}"
         self.pr, self.base, self.adr_head = "", "origin/main", ""
-        self.extra = 1 if advisor.granted(self.env, "spec_limit", self.issue) else 0
+        self.extra = int(advisor.granted(self.env, "spec_limit", self.issue)
+                         and not advisor.granted(self.env, "spec_questions", self.issue))
         self.fresh_payload = None
+        self.answer_intent: dict | None = None
 
     def path(self, name):
         return Path(self.state, f"{name}-{self.issue}")
@@ -750,43 +752,56 @@ class Spec:
             data = json.loads(path.read_text())
         except FileNotFoundError:
             return None
-        except (OSError, ValueError):
-            return "unreadable"
-        if not isinstance(data, dict) or not isinstance(data.get("body"), str):
-            return "unreadable"
+        strings = ("body", "questions", "reviewer", "issue_body", "feedback", "pr", "adr_head", "document_head")
+        if (not isinstance(data, dict) or any(not isinstance(data.get(key), str) for key in strings)
+                or any(type(data.get(key)) is not int for key in ("round", "max_rounds", "question_id"))
+                or not (0 < data["round"] < data["max_rounds"] and data["question_id"] > 0)):
+            raise ValueError("Invalid saved advisor answer intent")
         return data
 
-    def referenced_documents(self, texts, limit, chars):
-        """(relative path, text) of the ADR files TEXTS reference, read from the spec worktree."""
-        root = Path(self.wt, "docs", "adr")
-        if not root.is_dir():
+    def referenced_documents(self, texts, revision, limit, chars):
+        """Read referenced ADR blobs from a commit, retaining whether the raw excerpt was cut."""
+        if not revision:
             return []
+        tree = git(self.wt, "ls-tree", "--format=%(objectmode) %(objectname) %(path)", revision, "--", "docs/adr/")
+        documents = {}
+        for row in (tree or "").splitlines():
+            mode, oid, name = row.split(" ", 2)
+            if mode in ("100644", "100755") and re.fullmatch(r"docs/adr/[A-Za-z0-9][A-Za-z0-9._-]*\.md", name):
+                documents[name.removeprefix("docs/adr/")] = oid
         names = []
         for text in texts:
             for match in re.finditer(r"docs/adr/([A-Za-z0-9][A-Za-z0-9._-]*\.md)|\bADR[ -]?0*(\d{1,4})\b",
-                                     text or "", re.I):
+                                     text or "", re.IGNORECASE):
                 if match.group(1):
                     names.append(match.group(1))
                 else:
-                    names.extend(p.name for p in sorted(root.glob(f"{int(match.group(2)):04d}-*.md")))
+                    prefix = f"{int(match.group(2)):04d}-"
+                    names.extend(name for name in documents if name.startswith(prefix))
         found = []
         for name in dict.fromkeys(names):
-            path = root / name
-            if not path.is_file() or path.is_symlink() or len(found) >= limit:
+            if len(found) >= limit:
+                break
+            if name not in documents:
                 continue
             try:
-                found.append((f"docs/adr/{name}", path.read_text()[:chars]))
-            except OSError:
+                blob = subprocess.run(["git", "-C", str(self.wt), "cat-file", "blob", documents[name]],
+                                      capture_output=True, env=child_env(), check=True)
+                text = blob.stdout.decode("utf-8")
+            except (subprocess.CalledProcessError, UnicodeError, OSError):
                 continue
+            found.append((f"docs/adr/{name}", text[:chars], len(text) > chars))
         return found
 
-    def questions_citation_entries(self, issue_body, comments, reply=""):
+    def questions_citation_entries(self, issue_body, comments, reply, document_head):
         """Baseline citation rows from the issue body and genuine owner comments."""
         entries, owner = [], self.env.owner
 
-        def one_line(text):
+        def one_line(text, truncated=False):
             line = re.sub(r"\s+", " ", (text or "").strip())
-            return line[:1500] + advisor.TRUNCATED if len(line) > 1500 else line
+            if line and (truncated or len(line) > 1500):
+                return line[:1500] + advisor.TRUNCATED
+            return line
 
         body = one_line(issue_body)
         if body:
@@ -799,33 +814,42 @@ class Spec:
                 continue
             owner_texts.append(comment.get("body") or "")
             entries.append((f"c{len(entries) + 1}", "owner comment", text))
-        if self.env.repo.advisor_local_documents:
-            for rel, text in self.referenced_documents(owner_texts, 5, 2000):
-                text = one_line(text)
-                if text:
-                    entries.append((f"c{len(entries) + 1}", f"document {rel}", text))
+        for rel, text, truncated in self.referenced_documents(owner_texts, document_head, 5, 2000):
+            text = one_line(text, truncated)
+            if text:
+                entries.append((f"c{len(entries) + 1}", f"document {rel}", text))
         return entries
 
+    def document_revision(self):
+        return git(self.wt, "rev-parse", "--verify", "origin/main^{commit}") or ""
+
+    def latest_spec_comment(self, data):
+        return next((row for row in reversed(data["comments"])
+                     if (row["author"] or {}).get("login") == self.env.owner
+                     and STATE_RE.match(row["body"])), None)
+
     def answer_inputs_current(self, data, saved):
-        """True while the issue, owner replies, question comment and ADR head match SAVED (#125)."""
-        if self.body_key(data["body"]) != saved["issue_body"]:
+        """True while the open issue, owner replies, latest trusted question and ADR match."""
+        if data["state"] != "OPEN" or self.body_key(data["body"]) != saved["issue_body"]:
+            return False
+        if any(label["name"] == "ready-for-human" for label in data["labels"]):
             return False
         if self.owner_feedback_digest(data["comments"]) != saved["feedback"]:
             return False
-        found = any((c.get("body") or "").startswith(f"<!-- baton-spec-reply round={saved['round']} human ")
-                    and owner_handoff.body_digest(c["body"]) == saved["questions"]
-                    for c in data["comments"])
-        if not found:
+        question = self.latest_spec_comment(data)
+        if (question is None or question["id"] != saved["question_id"]
+                or owner_handoff.body_digest(question["body"]) != saved["questions"]):
             return False
-        if saved.get("pr"):
-            revision, _ = self.read_pr_revision(saved["pr"])
-            if not revision or revision["state"] != "OPEN" or revision["headRefOid"] != saved.get("adr_head"):
-                return False
-        return True
+        if not saved["pr"] and saved["document_head"] and self.document_revision() != saved["document_head"]:
+            return False
+        adr, _ = self.discover_adr(pr_helpers.call, ("-R", self.repo))
+        return (adr is not None and str(adr.get("number", "")) == saved["pr"]
+                and adr.get("headRefOid", "") == saved["adr_head"])
 
     def questions_snapshot(self, binding, questions, payload):
         """(snapshot, revalidate) for the spec_questions decision point."""
-        entries = self.questions_citation_entries(payload["body"], payload["comments"], binding.get("reply") or "")
+        entries = self.questions_citation_entries(
+            payload["body"], payload["comments"], binding.get("reply") or "", binding["document_head"])
         question_lines = "\n".join(f"- {q['id']}: {q['text']}" for q in questions)
         citation_block = advisor.format_citations(entries) if entries else "Citation evidence:\n"
         baseline = (
@@ -838,9 +862,9 @@ class Spec:
         )
         snapshot = advisor.augment_snapshot(self.env, baseline)
         saved = {
-            "questions": binding["digest"], "round": binding["round"], "issue_body": binding["issue_body"],
+            "questions": binding["digest"], "question_id": binding["question_id"], "issue_body": binding["issue_body"],
             "feedback": binding["feedback"], "adr_head": binding.get("adr_head") or "",
-            "pr": binding.get("pr") or "",
+            "pr": binding.get("pr") or "", "document_head": binding["document_head"],
         }
 
         def still_current():
@@ -868,20 +892,56 @@ class Spec:
         """Persist intent, post one attributed answer comment, reconcile a lost response (#125)."""
         body = self.format_answer_body(binding, answers, binding["digest"])
         intent = {
-            "body": body, "digest": owner_handoff.body_digest(body),
-            "questions": binding["digest"], "round": binding["round"],
-            "max_rounds": binding["max_rounds"], "reviewer": binding["reviewer"],
+            "body": body,
+            "questions": binding["digest"], "question_id": binding["question_id"], "round": binding["round"],
+            "max_rounds": binding["max_rounds"] + self.extra, "reviewer": binding["reviewer"],
             "issue_body": binding["issue_body"], "feedback": binding["feedback"],
             "adr_head": binding.get("adr_head") or "", "pr": binding.get("pr") or "",
+            "document_head": binding["document_head"],
         }
         try:
             atomic_json(self.answer_intent_path(), intent)
         except OSError:
             self.handoff("Could not save the advisor answer before posting.", "spec_questions")
             return "stop"
-        return self.complete_answer_post(intent, binding)
+        outcome = self.complete_answer_post(intent)
+        if outcome == "answered":
+            self.answer_intent = intent
+        return outcome
 
-    def complete_answer_post(self, intent, binding=None):
+    def stop_advisor_answer(self, intent, *, closed=False):
+        self.clear_answer_intent()
+        owner_handoff.clear_retry(self.env, self.issue, owner_handoff.SPEC_REPLY_POST)
+        if closed:
+            advisor.finish_episode(self.env, "issue", self.issue, "closed")
+        else:
+            self.handoff(f"{intent['reviewer']} has questions only you can answer. "
+                         "Reply on the issue, then remove ready-for-human.", "spec_questions")
+
+    def posted_answer_bodies(self, data, intent):
+        """Trusted answers for this digest published after its bound question."""
+        for row in reversed(data["comments"]):
+            if row["id"] == intent["question_id"]:
+                break
+            if (row["author"] or {}).get("login") == self.env.owner:
+                marker = ADVISOR_ANSWER.match(row["body"])
+                if marker and marker["q"] == intent["questions"]:
+                    yield row["body"]
+
+    def answer_revision_payload(self, intent):
+        """Re-read the publication and its inputs at the revision boundary."""
+        data, transient = read_issue(self.env, self.issue, once=True)
+        if data is None and transient:
+            raise Deferred("advisor-answer", "spec_questions", lends_slot=False)
+        if (data is None or not self.answer_inputs_current(data, intent)
+                or intent["body"] not in self.posted_answer_bodies(data, intent)):
+            self.stop_advisor_answer(intent, closed=bool(data and data["state"] == "CLOSED"))
+            return None
+        self.clear_answer_intent()
+        owner_handoff.clear_retry(self.env, self.issue, owner_handoff.SPEC_REPLY_POST)
+        return data
+
+    def complete_answer_post(self, intent):
         """Post or reconcile the saved advisor answer; 'answered' resumes revision."""
         n = self.issue
         data, transient = read_issue(self.env, n, once=True)
@@ -893,25 +953,13 @@ class Spec:
             return "stop"
         # A genuine owner reply, an edited issue or a moved ADR supersedes the saved answer, also on restart.
         if not self.answer_inputs_current(data, intent):
-            self.clear_answer_intent()
-            self.handoff(f"{intent['reviewer']} has questions only you can answer. "
-                         "Reply on the issue, then remove ready-for-human.", "spec_questions")
+            self.stop_advisor_answer(intent, closed=data["state"] == "CLOSED")
             return "stop"
-        matches = [c for c in data["comments"]
-                   if (c.get("author") or {}).get("login") == self.env.owner
-                   and (c.get("body") or "") == intent["body"]]
-        def done():
-            # The human reply continuation is finished once answers are posted (or reconciled).
-            owner_handoff.clear_retry(self.env, n, owner_handoff.SPEC_REPLY_POST)
-            self.clear_answer_intent()
-            return "answered"
 
-        if matches:
-            return done()
-        if any(ADVISOR_ANSWER.match(c.get("body") or "") and
-               ADVISOR_ANSWER.match(c["body"])["q"] == intent["questions"]
-               for c in data["comments"]
-               if (c.get("author") or {}).get("login") == self.env.owner):
+        posted_answers = list(self.posted_answer_bodies(data, intent))
+        if intent["body"] in posted_answers:
+            return "answered"
+        if posted_answers:
             # A different body for the same question version: do not double-post.
             self.clear_answer_intent()
             self.handoff("An advisor answer for these questions is already present but does not match "
@@ -922,14 +970,23 @@ class Spec:
             data, transient = read_issue(self.env, n, once=True)
             if data is None:
                 return "retry" if transient else "failed"
-            if any((c.get("body") or "") == intent["body"] for c in data["comments"]):
+            if data["state"] == "CLOSED":
+                return "closed"
+            if not self.answer_inputs_current(data, intent):
+                return "superseded"
+            posted_answers = list(self.posted_answer_bodies(data, intent))
+            if intent["body"] in posted_answers:
                 return "landed"
-            return "absent"
+            return "superseded" if posted_answers else "absent"
 
         posted = pr_helpers.gh("issue", "comment", n, "-R", self.repo, "--body", intent["body"],
                                reconcile=reconcile)
-        if posted.returncode == 0 or reconcile() == "landed":
-            return done()
+        status = "landed" if posted.returncode == 0 else reconcile()
+        if status == "landed":
+            return "answered"
+        if status in ("closed", "superseded"):
+            self.stop_advisor_answer(intent, closed=status == "closed")
+            return "stop"
         if pr_helpers.transient(posted):
             raise Deferred("advisor-answer", "spec_questions", lends_slot=False)
         self.clear_answer_intent()
@@ -951,6 +1008,14 @@ class Spec:
         payload = self.issue_payload()
         if payload is None:
             return "stop"
+        question = self.latest_spec_comment(payload)
+        if (question is None or question["body"] != binding["body"] or question["id"] in binding["comment_ids"]):
+            self.handoff(why, "spec_questions")
+            return "stop"
+        document_head = ""
+        if self.env.repo and self.env.repo.advisor_local_documents:
+            document_head = binding["adr_head"] or self.document_revision()
+        binding = {**binding, "question_id": question["id"], "document_head": document_head}
         snap, check = self.questions_snapshot(binding, questions, payload)
         result = self.handoff(why, "spec_questions", snapshot=snap, revalidate=check,
                               observed_actions=("answer_spec_questions",))
@@ -962,7 +1027,7 @@ class Spec:
             return "stop"
         # Re-check citations against the current sources before posting.
         entries = {i: text for i, _, text in self.questions_citation_entries(
-            payload["body"], payload["comments"], binding.get("reply") or "")}
+            payload["body"], payload["comments"], binding.get("reply") or "", document_head)}
         for row in answers:
             combined = "\n".join(entries[c] for c in row["citations"] if c in entries)
             if row["text"] not in combined:
@@ -1043,11 +1108,11 @@ class Spec:
                 owner_handoff.clear_retry(self.env, n, reason)
                 return "changes"
             if binding["next"] == "human":
-                # Clear only after the handoff or answer attempt returns: an interrupt during
-                # handoff must leave the confirmed reply so the next tick retries the handoff.
+                # Leave the confirmed reply discoverable by tick until the answer's revision starts.
                 outcome = self.answer_or_handoff(binding)
-                owner_handoff.clear_retry(self.env, n, reason)
-                return "answered" if outcome == "answered" else "stop"
+                if outcome != "answered":
+                    owner_handoff.clear_retry(self.env, n, reason)
+                return outcome
             owner_handoff.clear_retry(self.env, n, reason)
             return "revised"
 
@@ -1189,7 +1254,9 @@ class Spec:
             diff_excerpt = (git(self.wt, "diff", "origin/main...HEAD") or "")[:4000]
         docs = []
         if env.repo.advisor_local_documents:
-            docs = self.referenced_documents([issue_text, reply], 3, 1500)
+            revision = self.adr_head or self.document_revision()
+            docs = [(path, text + advisor.TRUNCATED if truncated else text)
+                    for path, text, truncated in self.referenced_documents([issue_text, reply], revision, 3, 1500)]
         snapshot = advisor.augment_snapshot(env, baseline, diff_excerpt=diff_excerpt,
                                             document_excerpts=tuple(docs))
         return snapshot, (lambda: spec_state(env, n) == state)
@@ -1198,6 +1265,9 @@ class Spec:
         """True when the spec goes on for one advisor-granted round; otherwise hands off."""
         if round < max_rounds + self.extra:
             return True
+        if advisor.granted(self.env, "spec_questions", self.issue):
+            self.handoff(why, "spec_limit", observed_actions=())
+            return False
         snap, check = self.limit_snapshot(round, reviewer, reply, context)
         result = self.handoff(why, "spec_limit", snapshot=snap, revalidate=check)
         if result.action == "extra_round":
@@ -1583,25 +1653,23 @@ class Spec:
         ISSUE_PAYLOAD is an already-fetched {title, body, comments} from a recovered read (#151).
         """
         n, env = self.issue, self.env
-        answer_intent = self.load_answer_intent()
-        if answer_intent == "unreadable":
-            self.clear_answer_intent()
+        try:
+            answer_intent = self.load_answer_intent()
+        except (OSError, ValueError):
             self.handoff("Could not read the saved advisor answer intent.", "spec_questions")
+            self.clear_answer_intent()
+            owner_handoff.clear_retry(self.env, n, owner_handoff.SPEC_REPLY_POST)
             return False
         if answer_intent is not None:
             outcome = self.complete_answer_post(answer_intent)
             if outcome != "answered":
                 return False
-            # Fall through into the normal reply-human → revise path with the posted answers.
-            issue_payload = self.issue_payload()
-            if issue_payload is None:
-                return False
-        resume_post = self.waiting_comment_post()
+        resume_post = self.waiting_comment_post() if answer_intent is None else None
         if resume_post == "unreadable":
             return False
         reason = "spec_pending_adr_read_failed"
         try:
-            waiting = None if resume_post else owner_handoff.load_retry(env, n, reason)
+            waiting = None if resume_post or answer_intent else owner_handoff.load_retry(env, n, reason)
         except owner_handoff.RetryUnreadable:
             self.handoff("Could not read the saved ADR operation.", reason)
             return False
@@ -1613,7 +1681,7 @@ class Spec:
             adr = self.adr_discovery()
             if adr is None:
                 return False
-        if issue_payload is None and not resume_post:
+        if issue_payload is None and not resume_post and answer_intent is None:
             issue_payload = self.issue_payload()
             if issue_payload is None:
                 return False
@@ -1633,6 +1701,8 @@ class Spec:
             if post_reason in owner_handoff.SPEC_ACCEPT_POSTS:
                 return self.post_accept(post_reason, None, initial=False) == "accept"
             outcome = self.post_comment(post_reason, None, initial=False, claim=claim)
+            if outcome == "answered":
+                answer_intent = self.answer_intent
             if outcome in ("changes", "answered"):
                 step, round = "revise", binding["round"]
             elif outcome == "revised":
@@ -1641,28 +1711,33 @@ class Spec:
                 return outcome == "accept"
             # The loop's own limit, restored unchanged: a deferral must not raise it (#151).
             max_rounds = binding["max_rounds"]
-            issue_payload, self.fresh_payload = self.fresh_payload or self.issue_payload(), None
-            if issue_payload is None:
-                return False
+            if answer_intent is None:
+                issue_payload, self.fresh_payload = self.fresh_payload or self.issue_payload(), None
+                if issue_payload is None:
+                    return False
         else:
-            if issue_payload["state"] == "CLOSED":
-                return False
-            listed = issue_payload["comments"]
-            pending = accept_pending(env, n, listed=listed)
-            if pending:
-                self.gh("issue", "edit", n, "--remove-label", "ready-for-human", "--add-label", "agent-wip")
-                binding = {"step": "acceptance", "pr": pending["pr"], "verdict": pending["verdict"],
-                           "issue_body": issue_payload["body"], "adr_head": pending["head"]}
-                return self.resume_pending_accept(binding, issue_payload)
-            kind, round = state_from(listed, env.owner)
-            if pending_role(kind) == "reviser":
-                step = "revise"   # the reviewer asked for changes, or the owner answered
-            elif kind == "reply":
-                step, round = "review", round + 1   # a reviser revised; the spec is reviewed again
+            if answer_intent is not None:
+                step, round, max_rounds = "revise", answer_intent["round"], answer_intent["max_rounds"]
             else:
-                step, round = "review", 1
-                self.keep_owner_body(issue_payload["body"])
-            max_rounds = max(int(env.config.scheduling.max_spec_rounds or 3), round + 1)   # an owner answer earns another round
+                if issue_payload is None or issue_payload["state"] == "CLOSED":
+                    return False
+                listed = issue_payload["comments"]
+                pending = accept_pending(env, n, listed=listed)
+                if pending:
+                    self.gh("issue", "edit", n, "--remove-label", "ready-for-human", "--add-label", "agent-wip")
+                    binding = {"step": "acceptance", "pr": pending["pr"], "verdict": pending["verdict"],
+                               "issue_body": issue_payload["body"], "adr_head": pending["head"]}
+                    return self.resume_pending_accept(binding, issue_payload)
+                kind, round = state_from(listed, env.owner)
+                if pending_role(kind) == "reviser":
+                    step = "revise"   # the reviewer asked for changes, or the owner answered
+                elif kind == "reply":
+                    step, round = "review", round + 1   # a reviser revised; the spec is reviewed again
+                else:
+                    step, round = "review", 1
+                    self.keep_owner_body(issue_payload["body"])
+                # An owner answer earns another round.
+                max_rounds = max(int(env.config.scheduling.max_spec_rounds or 3), round + 1)
             if git(self.repo_dir, "rev-parse", "-q", "--verify", f"origin/{self.branch}") is not None:
                 self.base = f"origin/{self.branch}"
             recovering_worker = recovery.path(env, n, n).exists()
@@ -1672,20 +1747,30 @@ class Spec:
             if not self.worktree():
                 notify.log(f"spec worktree for #{n} failed")
                 return False
-            if not recovering_worker:
+            if not recovering_worker and answer_intent is None:
                 self.gh("issue", "edit", n, "--remove-label", "ready-for-human", "--add-label", "agent-wip")
         # Sent by started() once a vendor is picked: a deferred tick (no vendor can run now) repeats every
         # timer interval, and announcing each one floods the owner with notices of work that never ran.
         self.announce = f"#{n}: spec review (round {round}, {'revision' if step == 'revise' else step})"
-        while issue_payload["state"] == "OPEN":
+        while answer_intent is not None or (issue_payload is not None and issue_payload["state"] == "OPEN"):
             self.hooks.round = round
             self.path("spec-paused").write_text(f"{n}\n")
-            if adr is None:
-                adr = self.adr_discovery()
-                if adr is None:
+            if answer_intent is not None:
+                issue_payload = self.answer_revision_payload(answer_intent)
+                if issue_payload is None:
                     return False
-            self.pr = str(adr["number"]) if adr else ""
-            self.adr_head = adr["headRefOid"] if adr else ""
+                self.pr, self.adr_head = answer_intent["pr"], answer_intent["adr_head"]
+                max_rounds, self.extra = answer_intent["max_rounds"], 0
+                answer_intent = None
+            else:
+                if issue_payload is None:
+                    return False
+                if adr is None:
+                    adr = self.adr_discovery()
+                    if adr is None:
+                        return False
+                self.pr = str(adr["number"]) if adr else ""
+                self.adr_head = adr["headRefOid"] if adr else ""
             adr = None
             context = Path(self.ctx, f"issue-{n}-spec-{round}-{step}-{time.strftime('%Y%m%d-%H%M%S')}.md")
             context.write_text(review.issue_context(env, n, data=issue_payload))
@@ -1698,13 +1783,8 @@ class Spec:
             else:
                 revised = self.revise_round(round, context, issue_payload, max_rounds)
                 if revised == "answered":
-                    # Grounded answers resume one revision with the remaining budget (no round bump).
-                    issue_payload = self.issue_payload()
-                    if issue_payload is None:
-                        return False
-                    context = Path(self.ctx, f"issue-{n}-spec-{round}-revise-{time.strftime('%Y%m%d-%H%M%S')}.md")
-                    context.write_text(review.issue_context(env, n, data=issue_payload))
-                    revised = self.revise_round(round, context, issue_payload, max_rounds)
+                    answer_intent = self.answer_intent
+                    continue
                 if revised != "revised":
                     return False
                 step, round = "review", round + 1
