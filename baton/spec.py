@@ -395,14 +395,6 @@ class Spec:
         return self.retry_read(lambda: read_issue(self.env, self.issue),
                                "Could not read the issue and its comments.", "spec_comments_read_failed")
 
-    def post(self, body, failed):
-        """Best-effort post for accept paths still outside the category-1 write budget."""
-        posted = self.gh("issue", "comment", self.issue, "--body", body)
-        if posted.returncode == 0:
-            return True
-        notify.log(f"#{self.issue}: {failed}{pr_helpers.why(posted)}")
-        return False
-
     def owner_feedback_digest(self, comments):
         rows = [
             (row["id"], row["body"])
@@ -463,6 +455,220 @@ class Spec:
         if sending and matches == [True]:
             return "changed"
         return "landed" if matches == [True] else "ambiguous"
+
+    def accept_post_binding(self, body, verdict, round, reviewer, inputs, *, next_step):
+        return {
+            "issue": self.issue, "pr": self.pr or "", "round": round, "reviewer": reviewer,
+            "author": self.env.owner, "body": body, "verdict": verdict,
+            "digest": owner_handoff.body_digest(body),
+            "issue_body": self.body_key(inputs["body"]),
+            "adr_head": self.adr_head or "",
+            "feedback": self.owner_feedback_digest(inputs["comments"]),
+            "comment_ids": [row["id"] for row in inputs["comments"]],
+            "next": next_step,
+        }
+
+    def check_accept_post(self, binding, *, pending):
+        if binding["author"] != self.env.owner:
+            return "changed"
+        data, transient = read_issue(self.env, self.issue, once=True)
+        if data is None:
+            return "retry" if transient else "failed"
+        if data["state"] == "CLOSED":
+            return "superseded"
+        labels = {label["name"] for label in data["labels"]}
+        if "ready-for-human" in labels:
+            return "paused"
+
+        boundary = set(binding["comment_ids"])
+        login_re = self.env.config.scheduling.cursor_login_re or r"^(app/cursor|cursor(\[bot\])?)$"
+        matches, verdict_matches = [], []
+        conflict, latest_accept = False, ""
+        for row in data["comments"]:
+            if row["id"] in boundary:
+                continue
+            body = row["body"]
+            login = (row["author"] or {}).get("login") or ""
+            owner = login == binding["author"]
+            if body == binding["body"]:
+                matches.append(owner)
+            if body == binding["verdict"]:
+                verdict_matches.append(owner)
+            if (owner or re.search(login_re, login)) and (verdict := VERDICT.match(body)):
+                latest_accept = body if verdict[1] == "accept" else ""
+                conflict |= not (owner and body == binding["verdict"])
+            elif owner and STATE_RE.match(body):
+                latest_accept = ""
+                conflict = True
+            elif owner and (marker := PENDING_ACCEPT.match(body)):
+                if body == binding["body"] or (not pending and marker["pr"] == binding["pr"]
+                                                and marker["verdict"] == binding["verdict"]):
+                    continue
+                latest_accept = ""
+                conflict = True
+
+        if latest_accept and "ready-for-agent" in labels and "needs-triage" not in labels:
+            if latest_accept != binding["verdict"]:
+                return "accepted"
+            if verdict_matches == [True]:
+                return "completed"
+        if (conflict or self.body_key(data["body"]) != binding["issue_body"]
+                or self.owner_feedback_digest(data["comments"]) != binding["feedback"]):
+            return "changed"
+        if pending and not matches:
+            matches = verdict_matches  # The exact verdict also proves the pending write landed.
+        if not matches:
+            return "absent"
+        return "landed" if matches == [True] else "ambiguous"
+
+    def check_accept_revision(self, binding, *, pending):
+        if binding["pr"]:
+            revision, transient = self.read_pr_revision(binding["pr"])
+            if revision is None:
+                return "", "retry" if transient else "failed"
+            state = revision["state"]
+            if (revision["headRefOid"] != binding["adr_head"]
+                    or state != "MERGED" and not (pending and state == "OPEN")):
+                return "", "changed"
+            return state, ""
+        adr, transient = self.discover_adr(pr_helpers.call, ("-R", self.repo))
+        if adr is None:
+            return "", "retry" if transient else "failed"
+        return "", "changed" if adr or binding["adr_head"] else ""
+
+    def finish_accept(self, verdict):
+        """Label transition done: tear down the worktree and announce acceptance."""
+        n = self.issue
+        merge.remove_worktree(self.repo_dir, self.wt)
+        round_m = re.search(r"round (\d+): accept", verdict)
+        notify.notify(f"#{n}: spec accepted (round {round_m.group(1) if round_m else '?'})", self.url)
+        advisor.finish_episode(self.env, "issue", n, "accept")
+        self.finish()
+        return "accept"
+
+    def post_accept(self, reason, binding, *, initial):
+        """Save before posting an accept or pending-accept comment; confirm the label transition (#151)."""
+        n = self.issue
+        pending_kind = reason == owner_handoff.SPEC_PENDING_ACCEPT_POST
+        label = "pending acceptance" if pending_kind else "accept verdict"
+
+        def text():
+            return f"Posting the {label} of round {binding['round'] if binding else '?'} failed. {self.url}"
+
+        def stop(message):
+            self.handoff(f"{text()} {message}", reason)
+            return "stop"
+
+        try:
+            pending = owner_handoff.load_retry(self.env, n, reason)
+        except owner_handoff.RetryUnreadable as exc:
+            return stop(str(exc))
+        if initial:
+            if pending is not None:
+                raise Deferred("handoff-retry", reason, lends_slot=False)
+            pending = owner_handoff.prepare_retry(self.env, n, reason, n, binding)
+            if pending is None:
+                return stop("The worker inputs could not be saved.")
+        elif pending is not None:
+            binding = pending["continuation"]
+        confirmed = pending is not None and pending.get("confirmed", False)
+        if not initial:
+            result = self.handoff(text(), reason, resume=True)
+            if result.action == owner_handoff.DEFER:
+                raise Deferred("handoff-retry", reason, lends_slot=False)
+            if result.action != owner_handoff.RETRY:
+                return "stop"
+            binding = result.continuation
+
+        if not pending_kind:
+            # The saved verdict operation now owns the continuation, even if a crash left both records.
+            owner_handoff.clear_retry(self.env, n, owner_handoff.SPEC_PENDING_ACCEPT_POST)
+
+        def confirm_verdict():
+            nonlocal confirmed
+            if not confirmed:
+                saved = owner_handoff.load_retry(self.env, n, reason)
+                owner_handoff.restore_retry(self.env, n, reason, n, {**saved, "confirmed": True})
+                confirmed = True
+
+        def continue_after_post():
+            nonlocal edited
+            if pending_kind:
+                if adr_state == "MERGED":
+                    return self.publish_accept(binding)
+                return self.merge_adr_and_publish(binding)
+
+            confirm_verdict()
+
+            def reconcile_labels():
+                state = reconcile()
+                if state in ("accepted", "completed"):
+                    return "landed"
+                if state == "landed":
+                    return "absent"
+                return "changed" if state == "absent" else state
+
+            if status == "landed":
+                edited = pr_helpers.gh("issue", "edit", n, "-R", self.repo, "--remove-label", "needs-triage",
+                                       "--add-label", "ready-for-agent", reconcile=reconcile_labels)
+                if edited.returncode != 0 or status == "accepted":
+                    return None
+            elif status != "completed":
+                return None
+            outcome = self.finish_accept(binding["verdict"])
+            owner_handoff.clear_retry(self.env, n, reason)
+            return outcome
+
+        def reconcile():
+            nonlocal status, adr_state
+            status = self.check_accept_post(binding, pending=pending_kind)
+            if status == "landed" or (status == "absent" and not confirmed):
+                adr_state, failure = self.check_accept_revision(binding, pending=pending_kind)
+                status = failure or status
+            return status
+
+        status, adr_state = "", ""
+        reconcile()
+        posted = edited = None
+        if not confirmed and status == "absent":
+            posted = pr_helpers.gh("issue", "comment", n, "-R", self.repo, "--body", binding["body"],
+                                   reconcile=reconcile)
+            if posted.returncode == 0:
+                if not pending_kind:
+                    confirm_verdict()
+                if status == "absent":
+                    reconcile()
+        if status == "landed" or (status == "completed" and not pending_kind):
+            outcome = continue_after_post()
+            if outcome is not None:
+                return outcome
+        if status in ("accepted", "completed"):
+            # A completed acceptance (verdict + labels) supersedes any saved accept write.
+            owner_handoff.clear_retry(self.env, n, reason)
+            self.finish()
+            return "accept"
+        if status == "superseded":
+            owner_handoff.clear_retry(self.env, n, reason)
+            advisor.finish_episode(self.env, "issue", n, "superseded")
+            self.gh("issue", "edit", n, "--remove-label", "agent-wip")
+            self.finish()
+            return "stop"
+        if status == "paused":
+            if confirmed:
+                pending = {**pending, "confirmed": True}
+            owner_handoff.restore_retry(self.env, n, reason, n, pending)
+            raise Deferred("handoff-retry", reason, lends_slot=False)
+        failure = edited if edited is not None else posted
+        if status == "retry" or (failure is not None and pr_helpers.transient(failure)
+                                  and status == ("landed" if edited is not None else "absent")):
+            saved = owner_handoff.load_retry(self.env, n, reason)
+            attempts = saved["attempts"]
+            if attempts < owner_handoff.MAX_ATTEMPTS:
+                now = int(owner_handoff.clock())
+                owner_handoff.restore_retry(self.env, n, reason, n,
+                                            {**saved, "scheduled": now, "due": now + owner_handoff.DELAYS[attempts]})
+                raise Deferred("handoff-retry", reason, lends_slot=False)
+        return stop(f"Reconciliation: {status}." + (pr_helpers.why(failure) if failure is not None else ""))
 
     def post_comment(self, reason, binding, *, initial, claim=None, context=None):
         """Save before sending a spec comment, or consume a due attempt before reconciling (#151).
@@ -722,7 +928,7 @@ class Spec:
         if outcome.startswith("SPEC: accept"):
             problems = self.accept_problems()
             if not problems:
-                return self.accept(reviewer, round, mode_note, reply)
+                return self.accept(reviewer, round, mode_note, reply, inputs)
             points = "\n".join(f"{i}. [decidable] {p}" for i, p in enumerate(problems, 1))
             body = (f"<!-- baton-spec-review round={round} by={reviewer} -->\n"
                     f"## Spec review ({reviewer}), round {round}: accept refused by the runner\n\n"
@@ -752,10 +958,6 @@ class Spec:
     def accept_verdict(self, reviewer, round, mode_note, reply):
         return (f"<!-- baton-verdict: accept by={reviewer} -->\n"
                 f"## Spec review ({reviewer}), round {round}: accept\n\n{mode_note}{reply[:REPLY_CAP]}")
-
-    def pr_state(self, pr):
-        revision, _ = self.read_pr_revision(pr)
-        return revision["state"] if revision else None
 
     def read_pr_revision(self, pr):
         result = self.gh("pr", "view", str(pr), "--json", "state,headRefOid")
@@ -803,23 +1005,17 @@ class Spec:
         return self.retry_read(self.discover_adr, "Could not identify the ADR pull request.",
                                "spec_pending_adr_read_failed", continuation={"step": "discovery"})
 
-    def publish_accept(self, verdict):
-        """Post the saved verdict and make the issue runnable. Keeps pending acceptance if the
-        verdict write fails so a later tick can finish after the ADR PR is merged."""
-        n = self.issue
-        if not self.post(verdict, "posting the accept verdict failed"):
-            return "stop"
-        self.gh("issue", "edit", n, "--remove-label", "needs-triage", "--add-label", "ready-for-agent")
-        merge.remove_worktree(self.repo_dir, self.wt)
-        round_m = re.search(r"round (\d+): accept", verdict)
-        notify.notify(f"#{n}: spec accepted (round {round_m.group(1) if round_m else '?'})", self.url)
-        advisor.finish_episode(self.env, "issue", n, "accept")
-        self.finish()
-        return "accept"
+    def publish_accept(self, binding):
+        """Carry the reviewed inputs into the durable verdict and label operation."""
+        verdict = binding["verdict"]
+        publication = {**binding, "body": verdict, "digest": owner_handoff.body_digest(verdict),
+                       "next": "transition"}
+        return self.post_accept(owner_handoff.SPEC_ACCEPT_POST, publication, initial=True)
 
-    def merge_adr_and_publish(self, pr, verdict, *, reviewer=""):
+    def merge_adr_and_publish(self, binding):
         """CI + shared merge helper for an open ADR PR, then publish the verdict once MERGED."""
-        n, who = self.issue, reviewer or "the reviewer"
+        pr, verdict = binding["pr"], binding["verdict"]
+        n, who = self.issue, binding["reviewer"]
         merger = merge.Merger(self.env, self.hooks, pr, n)
         ci_message = f"{who} accepted, but CI on the ADR PR #{pr} is not green."
 
@@ -835,11 +1031,12 @@ class Spec:
                 return stop(ci_message, "spec_adr_ci_after_update_not_green", ci_failed=True)
             return stop(f"{who} accepted, but merging the ADR PR #{pr} failed.{result.get('detail') or ''}",
                         "spec_adr_merge_failed", failure=result.get("reason") or "")
-        if self.pr_state(pr) != "MERGED":
+        revision, _ = self.read_pr_revision(pr)
+        if not revision or revision["state"] != "MERGED":
             return stop(f"{who} accepted, but ADR PR #{pr} is still open after the merge attempt.",
                         "spec_adr_merge_unconfirmed")
         notify.notify(f"#{n}: ADR PR #{pr} merged", f"https://github.com/{self.repo}/pull/{pr}")
-        return self.publish_accept(verdict)
+        return self.publish_accept({**binding, "adr_head": merger.merge_head})
 
     def resume_pending_accept(self, binding, payload=None, *, recovering=False):
         """Resume acceptance against the original inputs and one authoritative PR revision."""
@@ -848,7 +1045,10 @@ class Spec:
         reason = "spec_pending_adr_read_failed"
         why = f"Could not read inputs to resume acceptance of ADR PR #{pr}."
 
+        inputs = None
+
         def read():
+            nonlocal inputs
             data = payload
             if data is None:
                 data, transient = read_issue(self.env, self.issue)
@@ -869,6 +1069,8 @@ class Spec:
             if (binding["adr_head"] and head != binding["adr_head"]
                     or recovering and not binding["adr_head"]):
                 return "CHANGED", False
+            self.adr_head = head
+            inputs = data
             return state, False
 
         state = self.retry_read(read, why, reason, continuation=binding)
@@ -879,31 +1081,38 @@ class Spec:
         if state == "CHANGED":
             self.handoff(f"Issue body, verdict, or ADR head changed or could not be verified for PR #{pr}.", reason)
             return False
-        if state == "MERGED":
-            return self.publish_accept(verdict) == "accept"
         if state == "CLOSED":
             self.handoff(f"ADR PR #{pr} was closed without merging; acceptance stays pending.", "spec_adr_closed")
             return False
-        if state != "OPEN":
+        if state not in ("OPEN", "MERGED"):
             reason = "spec_adr_state_invalid"
             merger = merge.Merger(self.env, self.hooks, pr, self.issue)
             self.handoff(f"ADR PR #{pr} state is unreadable ({state}); acceptance stays pending.",
                          reason, **merger.observation(reason, acceptance=verdict))
             return False
-        return self.merge_adr_and_publish(pr, verdict) == "accept"
+        match = VERDICT.match(verdict)
+        reviewer = (match[3] if match else None) or "claude"
+        round_m = re.search(r"round (\d+): accept", verdict)
+        if not round_m:
+            self.handoff("Could not bind the accept verdict for a retry.", owner_handoff.SPEC_ACCEPT_POST)
+            return False
+        publication = self.accept_post_binding(verdict, verdict, int(round_m.group(1)), reviewer,
+                                               inputs, next_step="transition")
+        if state == "MERGED":
+            return self.publish_accept(publication) == "accept"
+        return self.merge_adr_and_publish(publication) == "accept"
 
-    def accept(self, reviewer, round, mode_note, reply):
+    def accept(self, reviewer, round, mode_note, reply, inputs):
         """Merge the ADR PR when there is one, post the verdict, and make the issue runnable."""
-        n, pr = self.issue, self.pr
+        pr = self.pr
         verdict = self.accept_verdict(reviewer, round, mode_note, reply[:REPLY_CAP])
         if pr:
             pending = f"<!-- baton-spec-accept-pending pr={pr} head={self.adr_head} -->\n{verdict}"
-            if not self.post(pending, f"posting pending acceptance for ADR PR #{pr} failed"):
-                self.handoff(f"{reviewer} accepted, but posting pending acceptance failed.",
-                             "spec_pending_accept_post_failed")
-                return "stop"
-            return self.merge_adr_and_publish(pr, verdict, reviewer=reviewer)
-        return self.publish_accept(verdict)
+            binding = self.accept_post_binding(
+                pending, verdict, round, reviewer, inputs, next_step="merge")
+            return self.post_accept(owner_handoff.SPEC_PENDING_ACCEPT_POST, binding, initial=True)
+        binding = self.accept_post_binding(verdict, verdict, round, reviewer, inputs, next_step="transition")
+        return self.publish_accept(binding)
 
     # --- the reviser's round ---
     def revise_round(self, round, context, inputs, max_rounds=None):
@@ -1008,8 +1217,9 @@ class Spec:
 
     # --- the loop ---
     def waiting_comment_post(self):
-        """The first saved spec review/reply post for this issue, or None."""
-        for reason in owner_handoff.SPEC_POSTS:
+        """The first saved spec review/reply or accept post for this issue, or None."""
+        for reason in (*owner_handoff.SPEC_POSTS, owner_handoff.SPEC_ACCEPT_POST,
+                       owner_handoff.SPEC_PENDING_ACCEPT_POST):
             try:
                 pending = owner_handoff.load_retry(self.env, self.issue, reason)
             except owner_handoff.RetryUnreadable as exc:
@@ -1060,6 +1270,8 @@ class Spec:
                 self.gh("issue", "edit", n, "--add-label", "agent-wip")
                 return True
 
+            if post_reason in owner_handoff.SPEC_ACCEPT_POSTS:
+                return self.post_accept(post_reason, None, initial=False) == "accept"
             outcome = self.post_comment(post_reason, None, initial=False, claim=claim)
             if outcome == "changes":
                 step, round = "revise", binding["round"]

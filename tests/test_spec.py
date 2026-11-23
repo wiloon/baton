@@ -385,14 +385,14 @@ def spec_handoffs(loop, monkeypatch):
                         lambda self, kind, *args: events.append(args) if kind == "handoff" else None)
     monkeypatch.setattr(spec.notify, "notify", lambda title, text="": notices.append(title))
 
-    def assert_handoffs(reason=None):
+    def assert_handoffs(reason=None, *, prior_notices=()):
         edits = [c for c in loop.gh.calls if c[:3] == ["issue", "edit", N]
                  and ("--add-label", "ready-for-human") in zip(c, c[1:])]
         assert edits == ([["issue", "edit", N, "-R", "owner/app", "--remove-label", "agent-wip",
                            "--add-label", "ready-for-human"]] if reason else [])
         assert events == ([(reason, "--reason", reason)] if reason else [])
         owner_notices = [title for title in notices if not title.startswith(f"#{N}: spec review (round ")]
-        assert owner_notices == ([f"#{N}: spec needs you"] if reason else [])
+        assert owner_notices == [*prior_notices, *([f"#{N}: spec needs you"] if reason else [])]
 
     return assert_handoffs
 
@@ -1156,7 +1156,8 @@ def test_acceptance_waits_through_issue_transport_failure_and_checks_the_saved_h
     loop.gh.pr_state = "MERGED"
     now["now"] = 1_360
     assert loop.run() == (not changed)
-    assert reads == {"pr": 2, "issue": 3}
+    # The verdict and transition each verify the PR through gh and read the issue through call.
+    assert reads == ({"pr": 4, "issue": 3} if not changed else {"pr": 2, "issue": 3})
     assert bool(loop.gh.posted(ACCEPTED)) == (not changed)
 
 
@@ -2180,3 +2181,553 @@ def test_a_restart_after_the_last_failed_read_hands_off_without_another_read(loo
         tick.Tick(loop.env).run()
     assert reads == [1_361, 1_421, 1_721]
     assert loop.log().count("handoff spec_review_comment_post_failed ") == 1
+
+
+# --- accept and pending-accept posts: category-1 retries (#151) --------------------------------
+
+def test_a_transient_accept_post_defers_then_recovers_without_a_second_worker(loop, monkeypatch):
+    """spec_accept_post_failed: no early replay, one worker, landed after 60s (#151)."""
+    clock = _spec_clock(monkeypatch)
+    call, posts = spec.pr_helpers.call, []
+    loop.script = [ACCEPT]
+
+    def flaky(*args, input=None, limit=None):
+        if args[:2] == ("issue", "comment"):
+            body = args[args.index("--body") + 1] if "--body" in args else ""
+            if body.startswith("<!-- baton-verdict: accept"):
+                posts.append(clock["now"])
+                if clock["now"] < 1_060:
+                    return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return call(*args, input=input, limit=limit)
+
+    monkeypatch.setattr(spec.pr_helpers, "call", flaky)
+    with pytest.raises(Deferred, match="spec_accept_post_failed"):
+        loop.run()
+    assert [run["role"] for run in loop.runs] == ["spec_review"]
+    assert not loop.gh.posted("<!-- baton-verdict: accept")
+    saved = handoff.load_retry(session.resolve(loop.env), N, "spec_accept_post_failed")
+    assert saved["attempts"] == 0 and saved["continuation"]["body"].startswith("<!-- baton-verdict: accept")
+    clock["now"] = 1_059
+    before = len(posts)
+    with pytest.raises(Deferred, match="spec_accept_post_failed"):
+        loop.run()
+    assert len(posts) == before and [run["role"] for run in loop.runs] == ["spec_review"]
+    clock["now"] = 1_060
+    assert loop.run() is True
+    assert [run["role"] for run in loop.runs] == ["spec_review"]
+    assert set(posts) == {1_000, 1_060}
+    assert len(loop.gh.posted("<!-- baton-verdict: accept by=")) == 1
+    assert "ready-for-agent" in loop.gh.labels and "needs-triage" not in loop.gh.labels
+    assert not list(Path(loop.env["STATE"]).glob("handoff-*-*spec_accept_post_failed.json"))
+
+
+def test_a_transient_pending_accept_post_defers_then_recovers_without_a_second_worker(loop, monkeypatch):
+    """spec_pending_accept_post_failed: no early replay, one worker, merge after 60s (#151)."""
+    clock = _spec_clock(monkeypatch)
+    call, posts = spec.pr_helpers.call, []
+    loop.script = [CHANGES, reviser(commit=True), ACCEPT]
+    monkeypatch.setattr(merge.time, "sleep", lambda s: None)
+
+    def flaky(*args, input=None, limit=None):
+        if args[:2] == ("issue", "comment"):
+            body = args[args.index("--body") + 1] if "--body" in args else ""
+            if "baton-spec-accept-pending" in body:
+                posts.append(clock["now"])
+                if clock["now"] < 1_060:
+                    return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return call(*args, input=input, limit=limit)
+
+    monkeypatch.setattr(spec.pr_helpers, "call", flaky)
+    with pytest.raises(Deferred, match="spec_pending_accept_post_failed"):
+        loop.run()
+    assert [run["role"] for run in loop.runs] == ["spec_review", "spec", "spec_review"]
+    assert not loop.gh.posted("<!-- baton-spec-accept-pending")
+    assert not any(c[:2] == ["pr", "merge"] for c in loop.gh.calls)
+    clock["now"] = 1_059
+    before = len(posts)
+    with pytest.raises(Deferred, match="spec_pending_accept_post_failed"):
+        loop.run()
+    assert len(posts) == before
+    clock["now"] = 1_060
+    assert loop.run() is True
+    assert set(posts) == {1_000, 1_060}
+    assert len(loop.gh.posted("<!-- baton-spec-accept-pending")) == 1
+    assert len(loop.gh.posted("<!-- baton-verdict: accept")) == 1
+    assert any(c[:2] == ["pr", "merge"] for c in loop.gh.calls)
+    assert "ready-for-agent" in loop.gh.labels
+    assert not list(Path(loop.env["STATE"]).glob("handoff-*-*spec_pending_accept_post_failed.json"))
+
+def test_tick_exhausts_a_waiting_accept_post_across_both_delays(loop, monkeypatch, spec_handoffs):
+    clock = _spec_clock(monkeypatch)
+    loop.gh.labels = {"claude-found", "needs-triage"}
+    loop.script = [ACCEPT]
+    call, writes = spec.pr_helpers.call, []
+
+    def unavailable(*args, input=None, limit=None):
+        if args[:2] == ("issue", "comment") and "<!-- baton-verdict: accept" in (
+                args[args.index("--body") + 1] if "--body" in args else ""):
+            writes.append(clock["now"])
+            return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return call(*args, input=input, limit=limit)
+
+    monkeypatch.setattr(spec.pr_helpers, "call", unavailable)
+    expected = []
+    for now in (1_000, 1_059, 1_060, 1_359, 1_360, 1_660):
+        clock["now"] = now
+        tick.Tick(loop.env, argv=(N,) if now == 1_000 else ()).run()
+        if now in (1_000, 1_060, 1_360):
+            expected.extend([now] * 4)
+        assert writes == expected
+    spec_handoffs("spec_accept_post_failed")
+    assert "ready-for-human" in loop.gh.labels
+    assert not list(Path(loop.env["STATE"]).glob("handoff-*-*spec_accept_post_failed.json"))
+
+
+def test_a_pending_accept_post_exhausts_across_both_delays(loop, monkeypatch, spec_handoffs):
+    clock = _spec_clock(monkeypatch)
+    loop.script = [CHANGES, reviser(commit=True), ACCEPT]
+    call, writes = spec.pr_helpers.call, []
+    monkeypatch.setattr(merge.time, "sleep", lambda s: None)
+
+    def unavailable(*args, input=None, limit=None):
+        if args[:2] == ("issue", "comment") and "baton-spec-accept-pending" in (
+                args[args.index("--body") + 1] if "--body" in args else ""):
+            writes.append(clock["now"])
+            return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return call(*args, input=input, limit=limit)
+
+    monkeypatch.setattr(spec.pr_helpers, "call", unavailable)
+    for now, action in ((1_000, "defer"), (1_059, "defer"), (1_060, "defer"),
+                        (1_359, "defer"), (1_360, "handoff")):
+        clock["now"] = now
+        if action == "defer":
+            with pytest.raises(Deferred, match="spec_pending_accept_post_failed"):
+                loop.run()
+        else:
+            assert loop.run() is False
+    assert writes == [1_000] * 4 + [1_060] * 4 + [1_360] * 4
+    spec_handoffs("spec_pending_accept_post_failed")
+    assert [run["role"] for run in loop.runs] == ["spec_review", "spec", "spec_review"]
+
+
+def test_a_lost_accept_response_is_recognized_without_a_second_write(loop, monkeypatch):
+    call, writes = spec.pr_helpers.call, []
+    loop.script = [ACCEPT]
+
+    def write_then_fail(*args, input=None, limit=None):
+        result = call(*args, input=input, limit=limit)
+        if args[:2] == ("issue", "comment") and "<!-- baton-verdict: accept" in (
+                args[args.index("--body") + 1] if "--body" in args else ""):
+            writes.append(args[args.index("--body") + 1])
+            return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return result
+
+    monkeypatch.setattr(spec.pr_helpers, "call", write_then_fail)
+    assert loop.run() is True
+    assert len(writes) == 1 and loop.gh.posted("<!-- baton-verdict: accept") == writes
+    assert "ready-for-agent" in loop.gh.labels and "needs-triage" not in loop.gh.labels
+    assert not list(Path(loop.env["STATE"]).glob("handoff-retry-*"))
+
+
+def test_a_landed_verdict_retries_the_label_transition_under_the_same_budget(loop, monkeypatch):
+    clock = _spec_clock(monkeypatch)
+    call, edits = spec.pr_helpers.call, []
+    loop.script = [ACCEPT]
+
+    def flaky_labels(*args, input=None, limit=None):
+        if args[:2] == ("issue", "edit") and "--add-label" in args and "ready-for-agent" in args:
+            edits.append(clock["now"])
+            if clock["now"] < 1_060:
+                return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return call(*args, input=input, limit=limit)
+
+    monkeypatch.setattr(spec.pr_helpers, "call", flaky_labels)
+    with pytest.raises(Deferred, match="spec_accept_post_failed"):
+        loop.run()
+    assert len(loop.gh.posted("<!-- baton-verdict: accept")) == 1
+    assert "ready-for-agent" not in loop.gh.labels
+    saved = handoff.load_retry(session.resolve(loop.env), N, "spec_accept_post_failed")
+    assert saved["confirmed"] is True and saved["attempts"] == 0
+    clock["now"] = 1_060
+    assert loop.run() is True
+    assert 1_000 in edits and 1_060 in edits
+    assert "ready-for-agent" in loop.gh.labels and "needs-triage" not in loop.gh.labels
+    assert not list(Path(loop.env["STATE"]).glob("handoff-*-*spec_accept_post_failed.json"))
+
+
+def test_a_restart_after_the_verdict_lands_completes_the_label_transition(loop, monkeypatch):
+    clock = _spec_clock(monkeypatch)
+    call = spec.pr_helpers.call
+    loop.script = [ACCEPT]
+    interrupted = True
+
+    def interrupt_transition(*args, input=None, limit=None):
+        if interrupted and args[:2] == ("issue", "edit") and "ready-for-agent" in args:
+            raise InterruptedError("runner stopped before applying acceptance labels")
+        return call(*args, input=input, limit=limit)
+
+    monkeypatch.setattr(spec.pr_helpers, "call", interrupt_transition)
+    with pytest.raises(InterruptedError):
+        loop.run()
+    [verdict] = loop.gh.posted("<!-- baton-verdict: accept")
+    assert "ready-for-agent" not in loop.gh.labels and "needs-triage" in loop.gh.labels
+
+    interrupted = False
+    clock["now"] = 1_060
+    monkeypatch.setattr(dev, "setup_worktree", lambda *args: ("", False))
+    tick.Tick(loop.env).run()
+    assert sum(run["role"] == "spec_review" for run in loop.runs) == 1
+    assert loop.gh.posted("<!-- baton-verdict: accept") == [verdict]
+    assert "ready-for-agent" in loop.gh.labels and "needs-triage" not in loop.gh.labels
+    assert not list(Path(loop.env["STATE"]).glob("handoff-*-*spec_accept_post_failed.json"))
+
+
+@pytest.mark.parametrize("failure", ["edited", "closed", "permanent"])
+def test_an_accept_post_stops_on_changed_input_closure_or_permanent_failure(loop, monkeypatch, spec_handoffs,
+                                                                           failure):
+    clock = _spec_clock(monkeypatch)
+    call, writes = spec.pr_helpers.call, []
+    loop.script = [ACCEPT]
+
+    def unavailable(*args, input=None, limit=None):
+        if args[:2] == ("issue", "comment") and "<!-- baton-verdict: accept" in (
+                args[args.index("--body") + 1] if "--body" in args else ""):
+            writes.append(clock["now"])
+            stderr = "HTTP 401: Bad credentials" if failure == "permanent" else "HTTP 503 unavailable"
+            return subprocess.CompletedProcess(args, 1, "", stderr)
+        return call(*args, input=input, limit=limit)
+
+    monkeypatch.setattr(spec.pr_helpers, "call", unavailable)
+    if failure == "permanent":
+        assert loop.run() is False
+        assert writes == [1_000]
+    else:
+        with pytest.raises(Deferred, match="spec_accept_post_failed"):
+            loop.run()
+        if failure == "closed":
+            loop.gh.issue_state = "CLOSED"
+        else:
+            loop.gh.body = "Owner changed the body while the accept waited."
+        clock["now"] = 1_060
+        assert loop.run() is False
+        assert writes == [1_000] * 4
+    spec_handoffs(None if failure == "closed" else "spec_accept_post_failed")
+    assert not loop.gh.posted("<!-- baton-verdict: accept")
+    assert not list(Path(loop.env["STATE"]).glob("handoff-*-*spec_accept_post_failed.json"))
+
+
+@pytest.mark.parametrize("damage", ["malformed JSON", "invalid binding", "missing retry", "missing waiting"])
+def test_a_damaged_accept_post_fails_closed_through_tick(loop, monkeypatch, spec_handoffs, damage):
+    clock = _spec_clock(monkeypatch)
+    call = spec.pr_helpers.call
+    loop.script = [ACCEPT]
+
+    def unavailable(*args, input=None, limit=None):
+        if args[:2] == ("issue", "comment") and clock["now"] < 1_060:
+            return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return call(*args, input=input, limit=limit)
+
+    monkeypatch.setattr(spec.pr_helpers, "call", unavailable)
+    with pytest.raises(Deferred, match="spec_accept_post_failed"):
+        loop.run()
+    reason = "spec_accept_post_failed"
+    for path in Path(loop.env["STATE"]).glob(f"handoff-*-*{reason}.json"):
+        if damage == "malformed JSON":
+            path.write_text("{not-json")
+        elif damage == "invalid binding":
+            record = json.loads(path.read_text())
+            record["continuation"]["comment_ids"] = ["invalid"]
+            path.write_text(json.dumps(record))
+        elif path.name.startswith("handoff-" + damage.removeprefix("missing ")):
+            path.unlink()
+    clock["now"] = 1_060
+    tick.Tick(loop.env).run()
+    spec_handoffs(reason)
+    assert [run["role"] for run in loop.runs] == ["spec_review"]
+    assert not loop.gh.posted("<!-- baton-verdict: accept")
+    assert handoff.load_retry(session.resolve(loop.env), N, reason) is None
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_a_pending_accept_post_that_finds_its_verdict_continues_without_reposting(loop, monkeypatch, restart):
+    clock = _spec_clock(monkeypatch)
+    call, posts = spec.pr_helpers.call, []
+    loop.script = [CHANGES, reviser(commit=True), ACCEPT]
+    monkeypatch.setattr(merge.time, "sleep", lambda s: None)
+
+    def flaky(*args, input=None, limit=None):
+        if args[:2] == ("issue", "comment"):
+            body = args[args.index("--body") + 1] if "--body" in args else ""
+            if "baton-spec-accept-pending" in body:
+                posts.append(body)
+                return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        if (restart and args[:2] == ("pr", "view") and "state,headRefOid" in args
+                and loop.gh.pr_state == "MERGED"):
+            raise InterruptedError("runner stopped before saving the verdict transition")
+        return call(*args, input=input, limit=limit)
+
+    monkeypatch.setattr(spec.pr_helpers, "call", flaky)
+    with pytest.raises(Deferred, match="spec_pending_accept_post_failed"):
+        loop.run()
+    saved = handoff.load_retry(session.resolve(loop.env), N, "spec_pending_accept_post_failed")
+    loop.gh._comment(saved["continuation"]["verdict"])
+    clock["now"] = 1_060
+    if restart:
+        with pytest.raises(InterruptedError):
+            loop.run()
+        assert "needs-triage" in loop.gh.labels
+        assert handoff.load_retry(session.resolve(loop.env), N, "spec_pending_accept_post_failed") is not None
+        restart = False
+        clock["now"] = 1_360
+    assert loop.run() is True
+    assert len(posts) == 4
+    assert not loop.gh.posted("<!-- baton-spec-accept-pending")
+    assert loop.gh.posted("<!-- baton-verdict: accept") == [saved["continuation"]["verdict"]]
+    assert sum(c[:2] == ["pr", "merge"] for c in loop.gh.calls) == 1
+
+
+def test_a_lost_pending_accept_response_merges_and_publishes_once(loop, monkeypatch):
+    call = spec.pr_helpers.call
+    loop.script = [CHANGES, reviser(commit=True), ACCEPT]
+    monkeypatch.setattr(merge.time, "sleep", lambda s: None)
+
+    def write_then_fail(*args, input=None, limit=None):
+        result = call(*args, input=input, limit=limit)
+        if (args[:2] == ("issue", "comment") and "--body" in args
+                and args[args.index("--body") + 1].startswith("<!-- baton-spec-accept-pending")):
+            return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return result
+
+    monkeypatch.setattr(spec.pr_helpers, "call", write_then_fail)
+    assert loop.run() is True
+    assert len(loop.gh.posted("<!-- baton-spec-accept-pending")) == 1
+    assert sum(c[:2] == ["pr", "merge"] for c in loop.gh.calls) == 1
+    assert len(loop.gh.posted("<!-- baton-verdict: accept")) == 1
+
+
+@pytest.mark.parametrize("change", ["labels landed", "owner feedback", "verdict deleted"])
+def test_accept_label_replay_reconciles_lost_response_or_owner_edit(loop, monkeypatch, spec_handoffs, change):
+    call, edits = spec.pr_helpers.call, []
+    loop.script = [ACCEPT]
+    landed = change == "labels landed"
+
+    def interrupted_edit(*args, input=None, limit=None):
+        if args[:2] == ("issue", "edit") and "ready-for-agent" in args:
+            edits.append(args)
+            if landed:
+                call(*args, input=input, limit=limit)
+            elif change == "verdict deleted":
+                loop.gh.comments.clear()
+            else:
+                loop.gh._comment("Owner changed the acceptance requirements")
+            return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return call(*args, input=input, limit=limit)
+
+    monkeypatch.setattr(spec.pr_helpers, "call", interrupted_edit)
+    assert loop.run() is landed
+    assert len(edits) == 1
+    assert len(loop.gh.posted("<!-- baton-verdict: accept")) == int(change != "verdict deleted")
+    if landed:
+        assert "ready-for-agent" in loop.gh.labels
+    else:
+        spec_handoffs("spec_accept_post_failed")
+
+
+def test_accept_checks_for_an_owner_edit_before_applying_labels(loop, monkeypatch, spec_handoffs):
+    call = spec.pr_helpers.call
+    loop.script = [ACCEPT]
+
+    def edit_after_verdict(*args, input=None, limit=None):
+        result = call(*args, input=input, limit=limit)
+        if (args[:2] == ("issue", "comment") and "--body" in args
+                and args[args.index("--body") + 1].startswith("<!-- baton-verdict: accept")):
+            loop.gh._comment("Owner changed the acceptance requirements")
+        return result
+
+    monkeypatch.setattr(spec.pr_helpers, "call", edit_after_verdict)
+    assert loop.run() is False
+    assert "ready-for-agent" not in loop.gh.labels
+    spec_handoffs("spec_accept_post_failed")
+
+
+@pytest.mark.parametrize("confirmed", [False, True])
+def test_accept_ticks_gate_and_budget_the_first_remote_read(loop, monkeypatch, spec_handoffs, confirmed):
+    clock = _spec_clock(monkeypatch)
+    call, reads, writes = spec.pr_helpers.call, [], []
+    loop.gh.labels = {"claude-found", "needs-triage"}
+    loop.script = [ACCEPT]
+
+    def unavailable(*args, input=None, limit=None):
+        if (clock["now"] > 1_000 and (args[:2] == ("api", "graphql")
+                                     or args[:2] == ("issue", "view") and "state,labels" in args)):
+            reads.append(clock["now"])
+            saved = handoff.load_retry(session.resolve(loop.env), N, "spec_accept_post_failed")
+            assert saved["attempts"] == {1_060: 1, 1_360: 2}[clock["now"]]
+            return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        if (args[:2] == ("issue", "comment") and "--body" in args
+                and args[args.index("--body") + 1].startswith("<!-- baton-verdict: accept")):
+            writes.append(clock["now"])
+            if not confirmed:
+                return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        if args[:2] == ("issue", "edit") and "ready-for-agent" in args:
+            writes.append(clock["now"])
+            return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return call(*args, input=input, limit=limit)
+
+    monkeypatch.setattr(spec.pr_helpers, "call", unavailable)
+    with pytest.raises(Deferred, match="spec_accept_post_failed"):
+        loop.run()
+    initial_writes = writes.copy()
+    for now, argv, expected in [
+        (1_059, (), []), (1_059, (N,), []), (1_060, (), [1_060]),
+        (1_359, (N,), [1_060]), (1_360, (N,), [1_060, 1_360]),
+    ]:
+        clock["now"] = now
+        tick.Tick(loop.env, argv=argv).run()
+        assert reads == expected
+        assert writes == initial_writes
+    spec_handoffs("spec_accept_post_failed")
+
+
+@pytest.mark.parametrize("change", ["new ADR", "different merged head", "expected merged head", "verdict head changed"])
+def test_resumed_accept_checks_saved_adr_identity_and_head(loop, monkeypatch, spec_handoffs, change):
+    clock = _spec_clock(monkeypatch)
+    call = spec.pr_helpers.call
+    loop.script = [ACCEPT] if change == "new ADR" else [CHANGES, reviser(commit=True), ACCEPT]
+    monkeypatch.setattr(merge.time, "sleep", lambda s: None)
+
+    pending = change in ("different merged head", "expected merged head")
+    marker = "<!-- baton-spec-accept-pending" if pending else "<!-- baton-verdict: accept"
+
+    def unavailable(*args, input=None, limit=None):
+        if args[:2] == ("issue", "comment") and "--body" in args and clock["now"] < 1_060:
+            body = args[args.index("--body") + 1]
+            if body.startswith(marker):
+                return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return call(*args, input=input, limit=limit)
+
+    monkeypatch.setattr(spec.pr_helpers, "call", unavailable)
+    reason = "spec_pending_accept_post_failed" if pending else "spec_accept_post_failed"
+    with pytest.raises(Deferred, match=reason):
+        loop.run()
+    if change == "new ADR":
+        loop.gh.adr_pr = "77"
+    elif pending:
+        saved = handoff.load_retry(session.resolve(loop.env), N, reason)["continuation"]
+        loop.gh._comment(saved["body"])
+        loop.gh.pr_state = "MERGED"
+        if change == "different merged head":
+            loop.gh.head_oid = "b" * 40
+        else:
+            loop.ci = False  # An already merged revision needs no CI wait.
+    else:
+        assert loop.gh.pr_state == "MERGED"
+        loop.gh.head_oid = "b" * 40
+    clock["now"] = 1_060
+    accepted = change == "expected merged head"
+    assert loop.run() is accepted
+    had_merge = change == "verdict head changed"
+    assert sum(c[:2] == ["pr", "merge"] for c in loop.gh.calls) == int(had_merge)
+    assert len(loop.gh.posted("<!-- baton-verdict: accept")) == int(accepted)
+    if not accepted:
+        spec_handoffs(reason, prior_notices=(f"#{N}: ADR PR #77 merged",) if had_merge else ())
+
+
+@pytest.mark.parametrize("comment", [
+    "<!-- baton-spec-review round=2 by=codex -->\nChanges requested",
+    "<!-- baton-spec-reply round=1 by=codex -->\nRevised spec",
+    "<!-- baton-verdict: revise -->\nNeeds a new round",
+])
+def test_a_new_trusted_round_blocks_a_saved_accept(loop, monkeypatch, spec_handoffs, comment):
+    clock = _defer_accept_verdict(loop, monkeypatch)
+    loop.gh._comment(comment)
+    clock["now"] = 1_060
+    assert loop.run() is False
+    assert not loop.gh.posted("<!-- baton-verdict: accept")
+    spec_handoffs("spec_accept_post_failed")
+
+
+def test_an_independently_completed_acceptance_clears_a_saved_accept(loop, monkeypatch, spec_handoffs):
+    clock = _defer_accept_verdict(loop, monkeypatch)
+    verdict = "<!-- baton-verdict: accept -->\nA separate acceptance"
+    loop.gh._comment(verdict, author="cursor")
+    loop.gh.labels.discard("needs-triage")
+    loop.gh.labels.add("ready-for-agent")
+    clock["now"] = 1_060
+    assert loop.run() is True
+    assert loop.gh.posted("<!-- baton-verdict: accept") == [verdict]
+    assert not list(Path(loop.env["STATE"]).glob("handoff-*-*spec_accept_post_failed.json"))
+    spec_handoffs()
+
+
+def _defer_accept_verdict(loop, monkeypatch):
+    clock = _spec_clock(monkeypatch)
+    call = spec.pr_helpers.call
+    loop.script = [ACCEPT]
+
+    def unavailable(*args, input=None, limit=None):
+        if args[:2] == ("issue", "comment") and clock["now"] < 1_060:
+            return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return call(*args, input=input, limit=limit)
+
+    monkeypatch.setattr(spec.pr_helpers, "call", unavailable)
+    with pytest.raises(Deferred, match="spec_accept_post_failed"):
+        loop.run()
+    return clock
+
+
+@pytest.mark.parametrize("edit", ["body", "feedback"])
+def test_edit_during_adr_merge_blocks_verdict_publication(loop, monkeypatch, spec_handoffs, edit):
+    call = spec.pr_helpers.call
+    loop.script = [CHANGES, reviser(commit=True), ACCEPT]
+    monkeypatch.setattr(merge.time, "sleep", lambda s: None)
+
+    def change_during_merge(*args, input=None, limit=None):
+        result = call(*args, input=input, limit=limit)
+        if args[:2] == ("pr", "merge"):
+            if edit == "body":
+                loop.gh.body += "\nAn owner edit during merge"
+            else:
+                loop.gh._comment("An owner edit during merge")
+        return result
+
+    monkeypatch.setattr(spec.pr_helpers, "call", change_during_merge)
+    assert loop.run() is False
+    assert loop.gh.pr_state == "MERGED"
+    assert not loop.gh.posted("<!-- baton-verdict: accept")
+    assert "ready-for-agent" not in loop.gh.labels
+    spec_handoffs("spec_accept_post_failed", prior_notices=(f"#{N}: ADR PR #77 merged",))
+
+
+def test_tick_rejects_a_confirmed_phase_on_a_pending_accept(loop, monkeypatch, spec_handoffs):
+    clock = _spec_clock(monkeypatch)
+    call = spec.pr_helpers.call
+    loop.script = [CHANGES, reviser(commit=True), ACCEPT]
+    reason = "spec_pending_accept_post_failed"
+    notify, messages = spec.notify.notify, []
+
+    def capture(title, body=""):
+        messages.append(body)
+        notify(title, body)
+
+    monkeypatch.setattr(spec.notify, "notify", capture)
+
+    def unavailable(*args, input=None, limit=None):
+        if (args[:2] == ("issue", "comment") and "--body" in args
+                and args[args.index("--body") + 1].startswith("<!-- baton-spec-accept-pending")):
+            return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return call(*args, input=input, limit=limit)
+
+    monkeypatch.setattr(spec.pr_helpers, "call", unavailable)
+    with pytest.raises(Deferred, match=reason):
+        loop.run()
+    path = Path(loop.env["STATE"]) / f"handoff-retry-{N}-{reason}.json"
+    record = json.loads(path.read_text())
+    path.write_text(json.dumps({**record, "confirmed": True}))
+    clock["now"] = 1_060
+    tick.Tick(loop.env, argv=(N,)).run()
+    spec_handoffs(reason)
+    assert any("invalid confirmed-post phase" in body for body in messages)
+    assert not loop.gh.posted("<!-- baton-spec-accept-pending")
+    assert not loop.gh.posted("<!-- baton-verdict: accept")
+    assert not any(c[:2] == ["pr", "merge"] for c in loop.gh.calls)

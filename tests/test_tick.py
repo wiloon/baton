@@ -29,7 +29,8 @@ class FakeGH:
     def __init__(self):
         self.calls, self.answers, self.fails = [], {}, set()
 
-    def __call__(self, *args, input=None):
+    def __call__(self, *args, input=None, **kwargs):
+        # Spec/review writes may call this as `gh(..., reconcile=...)`; ignore write helpers.
         self.calls.append(list(args))
         graphql = args[:2] == ("api", "graphql")
         head = "issue view" if graphql else " ".join(args[:2])
@@ -1880,7 +1881,8 @@ def test_tick_resumes_pending_adr_even_with_agent_wip_and_no_vendor(ctx, monkeyp
     ready = issue(12, labels=["ready-for-agent"])
     issues(ctx, ready=[ready])
     reads = []
-    verdict = "<!-- baton-verdict: accept by=claude -->\nAccepted plan"
+    verdict = ("<!-- baton-verdict: accept by=claude -->\n"
+               "## Spec review (claude), round 1: accept\n\nAccepted plan")
     pending = f"<!-- baton-spec-accept-pending pr=77 head={'a' * 40} -->\n{verdict}"
 
     def read_issue(args):
@@ -1897,6 +1899,8 @@ def test_tick_resumes_pending_adr_even_with_agent_wip_and_no_vendor(ctx, monkeyp
         return {"state": "MERGED", "headRefOid": "a" * 40}
 
     ctx.gh.answers.update({"issue view": read_issue, "pr view": read_pr})
+    # Accept write reconciliation reads through call (once=True); keep it on the same fake.
+    monkeypatch.setattr(tick.pr_helpers, "call", ctx.gh)
     monkeypatch.setattr(tick.Tick, "pick_vendor", lambda *a, **k: pytest.fail("acceptance needs no worker"))
     started = []
     monkeypatch.setattr(dev, "setup_worktree", lambda *a: started.append(a) or ("", False))
@@ -1910,6 +1914,7 @@ def test_tick_resumes_pending_adr_even_with_agent_wip_and_no_vendor(ctx, monkeyp
     assert reads == [1_000]
     ready["labels"].pop()
     ctx.make().run()
-    assert reads == [1_000, 1_060]
+    # Resume reads the PR once for acceptance, then again to revalidate the accept write (#151).
+    assert reads == [1_000, 1_060, 1_060]
     assert [body_of(call) for call in ctx.gh.ran("issue", "comment")] == [verdict]
     assert len(started) == 1   # the accept went straight on to dev, not back to the queue
