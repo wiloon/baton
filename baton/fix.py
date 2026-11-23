@@ -50,7 +50,6 @@ class Runner:
         self.gate_applies = True   # dev.run clears it for a partial slice
         self.handed_off = False    # set once handoff() labels the PR; callers tell it apart from rc 1
         self.push_feedback = None
-        self.inline_push = False   # a "continue" push hands control back instead of finishing the run
         self.ci_failed_head = ""
         self.push_caller = "ci" if round == "ci" else "review" if round else "standalone"
         self.last_fixer = ""
@@ -225,8 +224,6 @@ class Runner:
 
     def finish_push(self, pr, binding, url):
         """Continuation after a landed or freshly successful fix push (#151)."""
-        if binding["next"] == "handoff" and self.inline_push:
-            return 0   # the worker's own run goes on to its recovery step
         if binding["next"] == "handoff":
             reason = binding["handoff_reason"]
             title = (f"PR #{pr} has questions" if reason == "fix_needs_info"
@@ -241,6 +238,7 @@ class Runner:
                                        binding.get("description_reason") or "")
         if binding.get("clear_cursor"):
             self.clear_cursor_request(pr)
+        recovery.clear(self.env, self.push_episode(pr), pr)
         return 0
 
     def acknowledge_push(self, pr):
@@ -262,9 +260,9 @@ class Runner:
             ["git", "-C", binding["wt"], "fetch", "-q", "origin",
              f"+refs/heads/{branch}:refs/remotes/origin/{branch}"],
             capture_output=True, text=True)
+        if binding["next"] == "recover":
+            return self.recover_pushed_fix(pr, binding, url)
         rc = self.finish_push(pr, binding, url)
-        if rc == 0 and self.inline_push:
-            return 0
         if rc == 0:
             owner_handoff.restore_retry(self.env, self.push_episode(pr), owner_handoff.FIX_PUSH, str(pr),
                                         {**pending, "phase": "finished"})
@@ -272,9 +270,55 @@ class Runner:
             self.acknowledge_push(pr)
         return rc
 
+    def push_partial_fix(self, pr, wt, ref, url, outcome, fixer, source, feedback, head):
+        if outcome.startswith("RESULT: needs-info"):
+            return self.push_with_retry(pr, wt, ref, next_step="handoff", url=url, outcome=outcome,
+                                        handoff_reason="fix_needs_info", fixer=fixer)
+        start = self.retry_start
+        context = {
+            "source": source, "feedback": feedback, "head": head, "owner_triggered": self.owner_triggered,
+            "authors": self.attempt_authors,
+            "start": {key: start[key] for key in ("base", "head_ref", "feedback", "remote_head")} if start else None,
+        }
+        return self.push_with_retry(pr, wt, ref, next_step="recover", url=url, outcome=outcome,
+                                    handoff_reason="fix_run_failed", fixer=fixer, recovery_context=context)
+
+    def recover_pushed_fix(self, pr, binding, url):
+        wt, fixer = binding["wt"], binding["fixer"]
+        context = binding["recovery"]
+        source, feedback, head = context["source"], context["feedback"], context["head"]
+        self.last_fixer = fixer
+        self.attempt_authors = list(context["authors"])
+        self.retry_start = context["start"]
+        self.owner_triggered = context["owner_triggered"]
+        self.retry_context = {"fix_feedback": recovery.feedback_digest(feedback), "fix_source": source}
+        episode = self.push_episode(pr)
+        try:
+            saved = recovery.load(self.env, episode, pr)
+        except recovery.RecoveryUnreadable as error:
+            rc = self.handoff(pr, "fix_run_failed", f"PR #{pr} fix failed ({fixer})", str(error))
+        else:
+            # Selection may have deferred after recovery saved its grant for this push.
+            if (saved and saved["role"] == "fixer" and saved["reason"] == "fix_run_failed"
+                    and saved["failed_vendor"] == fixer
+                    and saved["fingerprint"].get("local_head") == binding["commit"]):
+                selected = self.resume(pr, wt)
+                rc = 1 if not selected else 0
+                if selected:
+                    _, fixer = selected
+            else:
+                action, fixer, _ = self.recover(
+                    pr, "fix_run_failed", f"PR #{pr} fix failed ({fixer})", f"{binding['outcome']} {url}",
+                    fixer, wt=wt, head=head, pushed=True)
+                rc = 1 if action == "handoff" else 0
+        self.acknowledge_push(pr)
+        if rc:
+            return rc
+        return self.dispatch_fixer(pr, wt, fixer, source, feedback, head)
+
     def push_with_retry(self, pr, wt, ref, *, next_step, url, upstream=False, outcome="",
                         handoff_reason="", description_rc=0, description_reason="", who="",
-                        fixer="", clear_cursor=False, pending=None):
+                        fixer="", clear_cursor=False, recovery_context=None, pending=None):
         """Save before pushing, or consume a due attempt before reconciling (#151)."""
         from . import handoff as owner_handoff
         episode = self.push_episode(pr)
@@ -285,7 +329,7 @@ class Runner:
         if not initial:
             binding = pending["continuation"]
             next_step, outcome = binding["next"], binding["outcome"]
-        note = f" (worker: {outcome})" if next_step == "handoff" and outcome else ""
+        note = f" (worker: {outcome})" if outcome else ""
         unreadable = f"{text}: could not observe the remote ref{note}. {url}"
         if not initial:
             if not pending.get("phase") and int(owner_handoff.clock()) < pending["due"]:
@@ -330,6 +374,8 @@ class Runner:
                 "clear_cursor": clear_cursor, "feedback": self.push_feedback,
                 "caller": self.push_caller, "ci_head": self.ci_failed_head,
             }
+            if recovery_context is not None:
+                binding["recovery"] = recovery_context
             self.push_flag(pr).write_text(str(self.env.runtime.issue or ""))
             pending = owner_handoff.prepare_retry(self.env, episode, reason, str(pr), binding)
             if pending is None:
@@ -587,12 +633,6 @@ class Runner:
     def fix_pr(self, pr, wt, fixer, source, feedback, head="", *, owner_triggered=False):
         self.last_fixer = fixer
         url = f"https://github.com/{self.repo}/pull/{pr}"
-        waiting = self.waiting_push(pr)
-        if waiting == "unreadable":
-            return 1
-        if waiting is not None:
-            return self.push_with_retry(pr, wt, waiting["continuation"]["ref"], next_step=waiting["continuation"]["next"],
-                                       url=url, pending=waiting)
         self.push_feedback = self.capture_push_feedback(pr)
         fix_file = Path(f"/tmp/baton-fix-{pr}.md")
         base_file = Path(self.state, f"cursor-fix-base-{pr}")
@@ -664,35 +704,16 @@ class Runner:
                     if action == "handoff":
                         return 1
                     return self.dispatch_fixer(pr, wt, fixer, source, correction(feedback, log), head)
-        pushed = not outcome.startswith("RESULT: fixed") and self.head(wt) != head
-        if pushed:
-            # Anything but a fix goes to the owner, who must see the partial work ("commit
-            # what is done" in the fix prompts): push it unverified. Only a fix is gated below.
+        if not outcome.startswith("RESULT: fixed") and self.head(wt) != head:
+            # Publish partial work before handing off or asking recovery to run another fixer.
             if not self.record(pr, fixer, wt, agent_head, model, cursor_base):
                 return 1
-            needs_info = outcome.startswith("RESULT: needs-info")
-            handoff_reason = "fix_needs_info" if needs_info else "fix_run_failed"
-            if needs_info:
-                return self.push_with_retry(
-                    pr, wt, "HEAD", next_step="handoff", url=url, outcome=outcome,
-                    handoff_reason=handoff_reason, fixer=fixer)
-            # A failed run may still be retried by recovery: push its commits, then go on to it.
-            self.inline_push = True
-            try:
-                rc = self.push_with_retry(
-                    pr, wt, "HEAD", next_step="handoff", url=url, outcome=outcome,
-                    handoff_reason=handoff_reason, fixer=fixer)
-            finally:
-                self.inline_push = False
-            if rc != 0:
-                return rc
+            return self.push_partial_fix(pr, wt, "HEAD", url, outcome, fixer, source, feedback, head)
         if not outcome.startswith("RESULT: fixed"):
             if outcome.startswith("RESULT: needs-info"):
                 return self.handoff(pr, "fix_needs_info", f"PR #{pr} has questions", url)
             action, fixer, _ = self.recover(pr, "fix_run_failed", f"PR #{pr} fix failed ({fixer})",
-                                            f"{outcome} {url}", fixer, wt=wt, head=head, pushed=pushed)
-            if pushed:
-                self.acknowledge_push(pr)   # the saved push record stays until recovery has decided
+                                            f"{outcome} {url}", fixer, wt=wt, head=head)
             if action == "handoff":
                 return 1
             return self.dispatch_fixer(pr, wt, fixer, source, feedback, head)
@@ -748,12 +769,6 @@ class Runner:
     def cursor_fix(self, pr, wt, source, feedback, head="", *, owner_triggered=False):
         agent_head = self.head(wt)
         url = f"https://github.com/{self.repo}/pull/{pr}"
-        waiting = self.waiting_push(pr)
-        if waiting == "unreadable":
-            return 1
-        if waiting is not None:
-            return self.push_with_retry(pr, wt, waiting["continuation"]["ref"], next_step=waiting["continuation"]["next"],
-                                       url=url, pending=waiting)
         branch = git(wt, "branch", "--show-current") or ""
         base_file = Path(self.state, f"cursor-fix-base-{pr}")
         baseline_file = Path(self.state, f"pr-body-base-{pr}")
@@ -801,11 +816,7 @@ class Runner:
                 if self.head(wt) != head:
                     if not self.record(pr, "cursor", wt, head, out["model"] or "unknown", ""):
                         return 1
-                    reason = ("fix_needs_info" if outcome.startswith("RESULT: needs-info")
-                              else "fix_run_failed")
-                    return self.push_with_retry(
-                        pr, wt, branch, next_step="handoff", url=url, outcome=outcome,
-                        handoff_reason=reason, fixer="cursor", clear_cursor=True)
+                    return self.push_partial_fix(pr, wt, branch, url, outcome, "cursor", source, feedback, head)
                 if outcome.startswith("RESULT: needs-info"):
                     return self.handoff(pr, "fix_needs_info", f"Cursor PR #{pr} has questions", url)
                 if not self.record(pr, "cursor", wt, agent_head, "", ""):
@@ -959,6 +970,15 @@ def fix_pr(runner, pr, wt, fixer, source, feedback, head="", *, owner_triggered=
 
     runner.owner_triggered = owner_triggered
     runner.retry_context = {"fix_feedback": recovery.feedback_digest(feedback), "fix_source": source}
+    # Reconcile a saved push before a worker grant can dispatch or resume verification.
+    waiting = runner.waiting_push(pr)
+    if waiting == "unreadable":
+        return 1
+    if waiting is not None:
+        binding = waiting["continuation"]
+        runner.last_fixer = binding["fixer"]
+        return runner.push_with_retry(pr, wt, binding["ref"], next_step=binding["next"],
+                                      url=f"https://github.com/{runner.repo}/pull/{pr}", pending=waiting)
     pending = runner.resume(pr, wt)
     if pending is False:
         return 1

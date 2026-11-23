@@ -298,7 +298,7 @@ def _push_binding_valid(item, binding, *, reason):
             or (remote and not re.fullmatch(r"[0-9a-f]{40}", remote))
             or type(binding.get("upstream")) is not bool
             or not isinstance(binding.get("wt"), str) or not binding["wt"]
-            or next_step not in ("done", "handoff")):
+            or next_step not in ("done", "handoff", "recover")):
         return False
     if (binding.get("pr") != item or not isinstance(binding.get("issue"), str)
             or (binding["issue"] and not binding["issue"].isdecimal())):
@@ -317,7 +317,7 @@ def _push_binding_valid(item, binding, *, reason):
             or not isinstance(binding.get("fixer"), str) or not binding["fixer"]
             or (binding["fixer"] == "cursor" and description_rc == 1)):
         return False
-    if next_step == "handoff":
+    if next_step in ("handoff", "recover"):
         if binding.get("handoff_reason") not in ("fix_run_failed", "fix_needs_info"):
             return False
         if not isinstance(binding.get("outcome"), str) or not binding["outcome"]:
@@ -330,8 +330,26 @@ def _push_binding_valid(item, binding, *, reason):
     elif (binding.get("handoff_reason") != "" or binding.get("outcome") != ""
           or bool(description_rc) != bool(binding["description_reason"])):
         return False
+    if next_step == "recover":
+        if binding["handoff_reason"] != "fix_run_failed" or not _push_recovery_valid(binding.get("recovery")):
+            return False
+    elif "recovery" in binding:
+        return False
     return (isinstance(binding.get("who"), str)
             and type(binding.get("clear_cursor")) is bool)
+
+
+def _push_recovery_valid(context):
+    if (not isinstance(context, dict)
+            or not all(isinstance(context.get(key), str) for key in ("source", "feedback", "head"))
+            or type(context.get("owner_triggered")) is not bool
+            or not isinstance(context.get("authors"), list)
+            or not all(isinstance(author, str) for author in context["authors"])
+            or "start" not in context):
+        return False
+    start = context["start"]
+    return start is None or (isinstance(start, dict) and all(
+        isinstance(start.get(key), str) for key in ("base", "head_ref", "feedback", "remote_head")))
 
 
 def _binding_valid(reason, item, binding):

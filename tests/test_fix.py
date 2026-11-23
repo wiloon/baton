@@ -1493,6 +1493,80 @@ def test_a_live_alternate_does_not_rerun_the_failed_fixer(advised_fix):
     assert set((advised_fix.root / "state" / f"pr-{PR}-authors").read_text().split()) == {"claude", "codex"}
 
 
+@pytest.mark.parametrize(("fixer", "action", "next_fixer"), [
+    ("claude", "retry_step", "claude"),
+    ("codex", "retry_step_other_vendor", "claude"),
+])
+def test_a_due_partial_push_resumes_live_recovery(advised_fix, monkeypatch, fixer, action, next_fixer):
+    from baton import common, handoff
+
+    now, pushes = [1_000], []
+    monkeypatch.setattr(handoff, "clock", lambda: now[0])
+
+    def flaky_push(wt, ref, **kwargs):
+        pushes.append(now[0])
+        if now[0] < 1_060:
+            return common.PushResult(False, transient=True, detail="connection refused")
+        result = common.push(wt, ref, **kwargs)
+        advised_fix.fake_gh.set(headRefOid=advised_fix.remote_head())
+        return result
+
+    monkeypatch.setattr(fix, "push", flaky_push)
+    advised_fix.advice = [{"action": action, "reason": "transient worker failure",
+                           "evidence": ["Decision point: fix_run_failed"]}]
+    advised_fix.agent({"outcome": "RESULT: failed boom"}, {})
+    assert advised_fix.fix(fixer, feedback="Keep the original findings")["rc"] == 75
+    assert pushes == [1_000] and not advised_fix.advice_calls
+
+    now[0] = 1_060
+    result = advised_fix.fix(fixer, feedback="")
+    assert result["rc"] == 0 and advised_fix.pushed() and not advised_fix.labelled()
+    assert result["authors"] == list(dict.fromkeys([fixer, next_fixer]))
+    assert pushes == [1_000, 1_060, 1_060]
+    assert [call[0] for call in advised_fix.agent_calls] == [fixer, next_fixer]
+    assert len(advised_fix.advice_calls) == 1
+    assert "Keep the original findings" in advised_fix.prompts[1]
+
+
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_a_landed_cursor_partial_push_runs_live_recovery(advised_fix, monkeypatch, interrupted):
+    from baton import common, handoff
+
+    pushes = []
+
+    def push(wt, ref, **kwargs):
+        pushes.append(ref)
+        result = common.push(wt, ref, **kwargs)
+        advised_fix.fake_gh.set(headRefOid=advised_fix.remote_head())
+        return result
+
+    monkeypatch.setattr(fix, "push", push)
+    advised_fix.advice = [{"action": "retry_step", "reason": "transient worker failure",
+                           "evidence": ["Decision point: fix_run_failed"]}]
+    advised_fix.agent(cursor_plan("RESULT: failed boom", outcome="RESULT: failed boom"),
+                      cursor_plan("RESULT: fixed"))
+    if interrupted:
+        restore = handoff.restore_retry
+
+        def stop_after_landing(env, episode, reason, item, pending):
+            restore(env, episode, reason, item, pending)
+            if pending.get("phase") == "landed":
+                raise InterruptedError("stopped after landing")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(handoff, "restore_retry", stop_after_landing)
+            with pytest.raises(InterruptedError, match="stopped after landing"):
+                advised_fix.fix("cursor")
+        assert advised_fix.pushed() and len(pushes) == 1 and not advised_fix.advice_calls
+
+    assert advised_fix.fix("cursor")["rc"] == 0 and advised_fix.pushed() and not advised_fix.labelled()
+    assert [call[0] for call in advised_fix.agent_calls] == ["cursor", "cursor"]
+    assert len(pushes) == 2 and len(advised_fix.advice_calls) == 1
+    advised_fix.agent(cursor_plan("RESULT: fixed"))
+    assert advised_fix.fix("cursor", feedback="Next review round")["rc"] == 0
+    assert len(advised_fix.agent_calls) == 3 and not advised_fix.labelled()
+
+
 def test_alternate_fixer_uses_the_cursor_adapter(advised_fix, monkeypatch):
     monkeypatch.setenv("VENDOR_POOL", "claude")
     advised_fix.advice = [{"action": "retry_step_other_vendor", "reason": "try Cursor",
