@@ -11,7 +11,7 @@ from pathlib import Path
 import re
 
 FIELDS = ("pr", "wt", "note", "fixer", "reviewer", "round", "step", "fix_head", "fixed_by", "ISSUE")
-OPTIONAL = ("code_verdict", "screenshot", "screenshot_checks",
+OPTIONAL = ("code_verdict", "screenshot", "screenshot_checks", "screenshot_comment",
             "reviewed_head", "base_branch", "reviewed_issue", "verdict_digest", "verdict_round",
             "screenshot_digest", "feedback_waiting", "post_waiting", "post_outcome", "extra")
 SAFE = re.compile(r"[A-Za-z0-9_@%+=:,./-]*")   # bash leaves these unquoted

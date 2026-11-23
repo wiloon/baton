@@ -399,12 +399,82 @@ def test_an_unreadable_remote_ref_that_looks_transient_is_retried_not_handed_off
     assert len(run.agent_calls) == 1
 
 
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_a_recovered_remote_read_allows_the_second_due_push_to_succeed(run, monkeypatch, interrupted):
+    from baton import common, handoff, session
+
+    clock = {"now": 1_000}
+    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
+    observe_remote = handoff.observe_remote
+    monkeypatch.setattr(handoff, "observe_remote", lambda wt, branch: (
+        (None, True) if clock["now"] == 1_000 else observe_remote(wt, branch)))
+    pushes = []
+
+    def flaky(*args, **kwargs):
+        pushes.append(clock["now"])
+        saved = handoff.load_retry(session.resolve(), "419", "fix_push_failed", str(PR))
+        assert saved["continuation"]["remote"] == run.remote_head()
+        if clock["now"] == 1_060:
+            return common.PushResult(False, transient=True, detail="connection refused")
+        return common.push(*args, **kwargs)
+
+    monkeypatch.setattr(fix, "push", flaky)
+    run.agent({})
+    assert run.fix()["rc"] == 75 and not pushes
+    clock["now"] = 1_060
+    if interrupted:
+        retry_path = handoff.retry_path(session.resolve(), "419", "fix_push_failed", str(PR))
+        atomic_json = handoff.atomic_json
+
+        def interrupt(path, data):
+            if path == retry_path and data["continuation"]["remote"] is not None:
+                raise InterruptedError("stopped while recording the remote baseline")
+            atomic_json(path, data)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(handoff, "atomic_json", interrupt)
+            with pytest.raises(InterruptedError):
+                run.fix()
+    else:
+        assert run.fix()["rc"] == 75
+    assert not run.labelled()
+    clock["now"] = 1_359
+    first_push = [] if interrupted else [1_060]
+    assert run.fix()["rc"] == 75 and pushes == first_push
+    clock["now"] = 1_360
+    assert run.fix()["rc"] == 0 and run.pushed() and not run.labelled()
+    assert pushes == [*first_push, 1_360] and len(run.agent_calls) == 1
+
+
 def test_an_unreadable_remote_ref_that_is_permanent_hands_off(run, monkeypatch):
     from baton import handoff
 
     monkeypatch.setattr(handoff, "observe_remote", lambda wt, branch: (None, False))
     run.agent({})
     assert run.fix()["rc"] == 1 and run.labelled() and not run.pushed()
+
+
+@pytest.mark.parametrize("initially_transient", [False, True])
+def test_a_permanently_unreadable_partial_push_ref_hands_off_with_the_worker_outcome(
+        run, monkeypatch, initially_transient):
+    from baton import handoff
+
+    sent = []
+    clock = {"now": 1_000}
+    monkeypatch.setattr(handoff.notify, "notify", lambda title, text="": sent.append((title, text)))
+    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
+    monkeypatch.setattr(handoff, "observe_remote", lambda wt, branch: (
+        None, initially_transient and clock["now"] == 1_000))
+    monkeypatch.setattr(fix, "push", lambda *a, **k: pytest.fail("pushed without a remote baseline"))
+    run.agent({"outcome": "RESULT: failed ran out of time"})
+    if initially_transient:
+        assert run.fix()["rc"] == 75 and not sent
+        clock["now"] = 1_060
+    assert run.fix()["rc"] == 1 and run.labelled()
+    [(title, message)] = sent
+    assert "pushing fix failed" in title
+    assert "could not observe the remote ref" in message and "RESULT: failed ran out of time" in message
+    assert len(run.agent_calls) == 1 and not run.pushed()
 
 
 def test_a_missing_fix_push_record_hands_off_instead_of_running_the_worker_again(run, monkeypatch):
@@ -546,19 +616,33 @@ def test_an_exhausted_partial_push_hands_off_once_with_the_workers_outcome(run, 
     assert len(sent) == 1 and "ran out of time" in sent[0][1]
 
 
-def test_a_damaged_fix_push_record_hands_off_without_replay(run, monkeypatch):
+@pytest.mark.parametrize("damage", ["invalid JSON", "missing remote"])
+def test_a_damaged_fix_push_record_hands_off_without_replay(run, monkeypatch, damage):
     from baton import common, handoff, session
 
     clock = {"now": 1_000}
     monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
-    monkeypatch.setattr(fix, "push",
-                        lambda *a, **k: common.PushResult(False, transient=True, detail="connection refused"))
+    pushes = []
+
+    def refused(*args, **kwargs):
+        pushes.append(clock["now"])
+        return common.PushResult(False, transient=True, detail="connection refused")
+
+    monkeypatch.setattr(fix, "push", refused)
     run.agent({})
     assert run.fix()["rc"] == 75
-    path = handoff.retry_path(session.resolve(), "419", "fix_push_failed", str(PR))
-    path.write_text("{not-json")
+    env = session.resolve()
+    path = handoff.retry_path(env, "419", "fix_push_failed", str(PR))
+    if damage == "invalid JSON":
+        path.write_text("{not-json")
+    else:
+        for record in (path, handoff.waiting_path(env, "419", "fix_push_failed", str(PR))):
+            data = json.loads(record.read_text())
+            del data["continuation"]["remote"]
+            record.write_text(json.dumps(data))
     clock["now"] = 1_060
     assert run.fix()["rc"] == 1 and run.labelled() and len(run.agent_calls) == 1
+    assert pushes == [1_000]
 
 
 def test_a_remote_change_during_fix_push_wait_hands_off(run, monkeypatch):

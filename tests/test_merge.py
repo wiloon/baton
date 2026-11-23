@@ -791,6 +791,50 @@ def test_a_waiting_repair_push_whose_record_is_gone_hands_off_without_a_second_r
     assert repair.fixes == [] and repair.labelled("ready-for-human") and not repair.merged()
 
 
+def test_a_ci_repair_push_that_exhausts_retries_hands_off_once_at_the_merge_gate(run, monkeypatch):
+    from baton import common, handoff
+
+    monkeypatch.setattr(merge.Merger, "ci_fix_round", REAL_CI_FIX_ROUND)
+    monkeypatch.setattr(merge.pick, "choose", lambda *a, **k: "codex")
+    run.env["VERIFY_HOOK"] = ""
+    run.env["CI_COMMAND"] = "git diff --check {base}"
+    run.greens[:] = [False]
+    run.gh.set(headRefOid=sh(run.wt, "git", "rev-parse", "HEAD"),
+               checks=[{"name": "golangci-lint", "bucket": "fail", "link": "https://github.com/owner/app/actions/runs/123"}],
+               logs={"123": "golangci-lint: unused helper"})
+    clock = {"now": 1_000}
+    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
+    workers, pushes, reasons = [], [], []
+
+    def repair(vendor, role, prompt, tag, cwd, *args):
+        workers.append((vendor, role))
+        (Path(cwd) / "repair.txt").write_text("CI repair\n")
+        sh(cwd, "git", "add", "repair.txt")
+        sh(cwd, "git", "commit", "-qm", "Repair CI")
+        return {"rc": 0, "outcome": "RESULT: fixed", "reply": "RESULT: fixed", "model": "test"}
+
+    def refuse(*args, **kwargs):
+        pushes.append(clock["now"])
+        return common.PushResult(False, transient=True, detail="connection refused")
+
+    monkeypatch.setattr(merge.fix.dispatch, "dispatch", repair)
+    monkeypatch.setattr(merge.fix, "push", refuse)
+    monkeypatch.setattr(merge.telemetry.Telemetry, "task",
+                        lambda self, kind, *args: reasons.append(args[0]) if kind == "handoff" else None)
+    for now in (1_000, 1_059, 1_060, 1_359):
+        clock["now"] = now
+        with pytest.raises(merge.Deferred, match="fix_push_failed"):
+            run.go()
+        assert not reasons and not run.labelled("ready-for-human")
+
+    clock["now"] = 1_360
+    run.go()
+    assert workers == [("codex", "fix")] and pushes == [1_000, 1_060, 1_360]
+    assert reasons == ["fix_push_failed"]
+    assert sum(c[:2] == ["pr", "edit"] and "ready-for-human" in c for c in run.gh.calls()) == 1
+    assert not run.merged()
+
+
 # --- behind branches (#122) -----------------------------------------------------------------
 
 OLD = "a" * 40

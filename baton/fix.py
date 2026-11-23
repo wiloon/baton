@@ -123,6 +123,11 @@ class Runner:
         title = f"PR #{pr}: pushing fix failed"
         text = f"PR #{pr}: pushing fix failed"
         initial = pending is None
+        if not initial:
+            next_step = pending["continuation"]["next"]
+            outcome = pending["continuation"].get("outcome", "")
+        note = f" (worker: {outcome})" if next_step == "handoff" and outcome else ""
+        unreadable = f"{text}: could not observe the remote ref{note}. {url}"
         if initial:
             if signoff := self.env.repo.signoff:
                 from .common import sign_off
@@ -134,7 +139,7 @@ class Runner:
                 return self.handoff(pr, reason, title, f"{text}: local commit or branch missing. {url}")
             remote, unreadable_transient = owner_handoff.observe_remote(wt, branch)
             if remote is None and not unreadable_transient:
-                return self.handoff(pr, reason, title, f"{text}: could not observe the remote ref. {url}")
+                return self.handoff(pr, reason, title, unreadable)
             binding = {
                 "pr": str(pr), "issue": str(self.env.runtime.issue or ""), "commit": commit,
                 "branch": branch, "ref": ref, "remote": remote, "upstream": upstream,
@@ -149,8 +154,6 @@ class Runner:
                 return self.handoff(pr, reason, title, f"{text}: the push inputs could not be saved. {url}")
         else:
             # Keep the pre-resume attempts: resume already consumed one on disk (#151).
-            saved = pending["continuation"]
-            note = f" (worker: {saved['outcome']})" if saved.get("next") == "handoff" and saved.get("outcome") else ""
             result = self.handoff(pr, reason, title, f"{text}{note}. {url}", resume=True)
             if result == 1:
                 return 1
@@ -159,10 +162,11 @@ class Runner:
                 # Nothing was pushed yet, so what origin holds now is the pre-push state.
                 remote, unreadable_transient = owner_handoff.observe_remote(wt, binding["branch"])
                 if remote is not None:
-                    binding = {**binding, "remote": remote}
+                    consumed = owner_handoff.load_retry(self.env, episode, reason, str(pr))
+                    binding = owner_handoff.save_push_baseline(self.env, episode, str(pr), consumed, remote)
                     pending = {**pending, "continuation": binding}
                 elif not unreadable_transient:
-                    return self.handoff(pr, reason, title, f"{text}: could not observe the remote ref. {url}")
+                    return self.handoff(pr, reason, title, unreadable)
 
         binding = pending["continuation"] if initial else binding
         pushed = None
@@ -181,9 +185,7 @@ class Runner:
                 status = owner_handoff.check_push_landed(binding)
                 if status == "absent" and pushed is not None and not pushed.transient:
                     detail = pushed.detail or "permanent push failure"
-                    if binding.get("next") == "handoff" and binding.get("outcome"):
-                        detail = f"{detail} (worker: {binding['outcome']})"
-                    return self.handoff(pr, reason, title, f"{text}: {detail}. {url}")
+                    return self.handoff(pr, reason, title, f"{text}: {detail}{note}. {url}")
                 if status == "absent" and pushed is not None and pushed.transient:
                     status = "retry"
         if status == "landed":
@@ -194,9 +196,7 @@ class Runner:
             return self.finish_push(pr, binding, url)
         if status in ("changed", "failed"):
             detail = "inputs changed or the remote is unreadable"
-            if binding.get("next") == "handoff" and binding.get("outcome"):
-                detail = f"{detail} (worker: {binding['outcome']})"
-            return self.handoff(pr, reason, title, f"{text}: {detail}. {url}")
+            return self.handoff(pr, reason, title, f"{text}: {detail}{note}. {url}")
         if status == "retry":
             attempts = pending["attempts"] + (0 if initial else 1)
             if attempts < owner_handoff.MAX_ATTEMPTS:
@@ -207,9 +207,7 @@ class Runner:
                      "due": now + owner_handoff.DELAYS[attempts]})
                 raise Deferred("handoff-retry", reason, lends_slot=False)
         detail = getattr(pushed, "detail", "") or status
-        if binding.get("next") == "handoff" and binding.get("outcome"):
-            detail = f"{detail} (worker: {binding['outcome']})"
-        return self.handoff(pr, reason, title, f"{text}: {detail}. {url}")
+        return self.handoff(pr, reason, title, f"{text}: {detail}{note}. {url}")
 
     def comment(self, pr, body, failed=""):
         posted = pr_helpers.gh("pr", "comment", str(pr), "-R", self.repo, "--body", body)

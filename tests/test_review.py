@@ -345,21 +345,36 @@ def test_a_waiting_fix_push_whose_record_is_gone_hands_off_without_a_second_fix(
     assert len(loop.fixes) == 1 and loop.labelled("ready-for-human") and loop.merged == []
 
 
-def test_a_deferred_merge_step_keeps_the_checkpoint_and_resumes_at_the_merge(loop, monkeypatch):
+@pytest.mark.parametrize("screenshots", [False, True])
+def test_a_deferred_merge_step_keeps_the_checkpoint_and_resumes_at_the_merge(loop, monkeypatch, screenshots):
+    from baton import handoff
+
     attempts = []
+    clock = {"now": 1_000}
+    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
 
     def merge_step(self, wt, screenshot=None):
-        attempts.append(1)
-        if len(attempts) == 1:
+        attempts.append(screenshot)
+        if handoff.clock() < 1_060:
             raise Deferred("handoff-retry", "fix_push_failed", lends_slot=False)
         loop.merged.append(self.pr)
 
     monkeypatch.setattr(merge.Merger, "merge_or_handoff", merge_step)
     loop.reviews[:] = ["pass"]
-    assert loop.run(fixer="cursor", reviewer="codex") == 75
-    assert loop.checkpoint()["step"] == "merge" and len(loop.agents) == 1
-    assert loop.run(fixer="cursor", reviewer="codex") == 0
-    assert len(attempts) == 2 and loop.merged == [PR] and len(loop.agents) == 1
+    loop.screens[:] = ["pass"] if screenshots else []
+    run = screen_run if screenshots else lambda loop: loop.run(fixer="cursor", reviewer="codex")
+    assert run(loop) == 75
+    expected = {"checks": "- The library at 390 px and 1280 px.",
+                "comment": screenshot_comments(loop)[0]} if screenshots else None
+    assert loop.checkpoint()["step"] == "merge" and attempts == [expected]
+    clock["now"] = 1_059
+    with monkeypatch.context() as early:
+        early.setattr(review.pr_helpers, "gh", lambda *a, **k: pytest.fail("read GitHub before the push was due"))
+        assert run(loop) == 75
+    clock["now"] = 1_060
+    assert run(loop) == 0
+    assert attempts == [expected] * 3 and loop.merged == [PR]
+    assert roles(loop) == (["review", "screenshot_review"] if screenshots else ["review"])
     assert not Path(loop.env["STATE"], f"review-pending-{PR}").exists()
 
 

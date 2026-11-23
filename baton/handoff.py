@@ -293,6 +293,7 @@ def _push_binding_valid(item, binding, *, reason):
     if (not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit)
             or not isinstance(branch, str) or not branch
             or not isinstance(ref, str) or not ref
+            or "remote" not in binding
             or (remote is not None and not isinstance(remote, str))
             or (remote and not re.fullmatch(r"[0-9a-f]{40}", remote))
             or type(binding.get("upstream")) is not bool
@@ -358,8 +359,18 @@ def load_retry(env, episode, reason, item=""):
         raise RetryUnreadable(f"incomplete retry operation {path.name}")
     binding = data.get("continuation")
     expected = {"episode": episode, "item": item, "reason": reason, "continuation": binding}
-    if waiting != expected or any(data.get(key) != value for key, value in expected.items()):
+    if any(data.get(key) != value for key, value in expected.items()):
         raise RetryUnreadable(f"mismatched retry operation {path.name}")
+    if waiting != expected:
+        # A due fix push can learn its baseline before the retry copy is replaced.
+        observed = waiting.get("continuation")
+        if (reason != FIX_PUSH or not isinstance(binding, dict) or not isinstance(observed, dict)
+                or "remote" not in binding or binding["remote"] is not None or observed.get("remote") is None
+                or type(data.get("attempts")) is not int or data["attempts"] < 1
+                or waiting != {**expected, "continuation": {**binding, "remote": observed["remote"]}}):
+            raise RetryUnreadable(f"mismatched retry operation {path.name}")
+        binding = observed
+        data = {**data, "continuation": binding}
     if not _binding_valid(reason, item, binding):
         raise RetryUnreadable(f"invalid continuation in {path.name}")
     if "confirmed" in data and (reason not in (*SPEC_POSTS, SPEC_ACCEPT_POST) or data["confirmed"] is not True):
@@ -381,6 +392,15 @@ def load_retry(env, episode, reason, item=""):
 def restore_retry(env, episode, reason, item, pending):
     """Update the budget while keeping the saved operation unchanged."""
     atomic_json(retry_path(env, episode, reason, item), pending)
+
+
+def save_push_baseline(env, episode, item, pending, remote):
+    """Record the first observed remote in both copies before issuing any push."""
+    binding = {**pending["continuation"], "remote": remote}
+    waiting = {"episode": episode, "item": item, "reason": FIX_PUSH, "continuation": binding}
+    atomic_json(waiting_path(env, episode, FIX_PUSH, item), waiting)
+    restore_retry(env, episode, FIX_PUSH, item, {**pending, "continuation": binding})
+    return binding
 
 
 def prepare_retry(env, episode, reason, item, binding):
