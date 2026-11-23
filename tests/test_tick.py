@@ -1697,6 +1697,90 @@ def test_dev_attempt_without_a_commit_is_not_an_author(advised_dev):
     assert advised_dev.path("pr-301-authors").read_text().split() == ["claude"]
 
 
+def _commit(cwd, name):
+    Path(cwd, name).write_text(f"{name}\n")
+    sh(cwd, "git", "add", "-A")
+    sh(cwd, "git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "-m", name)
+
+
+def _defers(cwd, output):
+    return {**DONE, "rc": 75, "defer": "short block"}
+
+
+def test_dev_keeps_the_contribution_of_a_run_that_committed_and_deferred(devrun, monkeypatch):
+    """Advisor off: the commit of a deferred run still counts for its author when another vendor finishes."""
+    vendors_ = iter(["codex", "claude"])
+    monkeypatch.setattr(tick.Tick, "pick_vendor", lambda self, role, mode, cands, **k: next(vendors_))
+
+    def commits_and_defers(cwd, output):
+        _commit(cwd, "first.txt")
+        return _defers(cwd, output)
+
+    def finishes(cwd, output):
+        _commit(cwd, "second.txt")
+        return implements(commit=False)(cwd, output)
+
+    devrun.script = [commits_and_defers, finishes]
+    assert devrun.go()[1] == 75
+    assert devrun.go()[1] == 80 and devrun.gh.ran("pr", "create")
+    assert set(devrun.path("pr-301-authors").read_text().split()) == {"codex", "claude"}
+    owners = {row.split()[0] for row in devrun.path("pr-301-contrib").read_text().splitlines()}
+    assert owners == {"codex", "claude"}   # the retained commit has its own row
+
+
+def test_dev_deferral_after_a_granted_retry_committed_continues(advised_dev, monkeypatch):
+    advised_dev.action = "retry_step"
+    seen = _watch_handoffs(monkeypatch)
+
+    def failed(cwd, output):
+        _commit(cwd, "first.txt")
+        return {**DONE, "outcome": "RESULT: failed after committing"}
+
+    def retry(cwd, output):
+        _commit(cwd, "second.txt")
+        return implements(commit=False)(cwd, output)
+
+    advised_dev.script = [failed, retry]
+    calls = []
+
+    def verify(self, *args, **kwargs):
+        calls.append(args)
+        if len(calls) == 1:
+            raise Deferred("codex", "short block")
+        return 0, "", 0
+
+    monkeypatch.setattr(fix.Runner, "verify", verify)
+    assert advised_dev.go()[1] == 75
+    assert advised_dev.go()[1] == 80 and advised_dev.gh.ran("pr", "create")
+    assert len(advised_dev.runs) == 2 and len(advised_dev.advice_calls) == 1   # the worker did not run again
+    assert _reasons(seen) == []
+
+
+def test_dev_worker_retry_survives_main_advancing_during_the_block(advised_dev, monkeypatch):
+    from baton import names
+    advised_dev.action = "retry_step"
+    seen = _watch_handoffs(monkeypatch)
+    advised_dev.script = [lambda cwd, output: {**DONE, "outcome": "RESULT: failed boom"}, _defers, implements()]
+    assert advised_dev.go()[1] == 75
+    _, wt = names.for_issue(Path(advised_dev.env["WT_ROOT"]), "300")
+    tree = sh(wt, "git", "rev-parse", "origin/main^{tree}")
+    tip = sh(wt, "git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit-tree", tree,
+             "-p", "origin/main", "-m", "main moved")
+    sh(wt, "git", "update-ref", "refs/remotes/origin/main", tip)
+    assert advised_dev.go()[1] == 80 and advised_dev.gh.ran("pr", "create")
+    assert _reasons(seen) == [] and len(advised_dev.runs) == 3
+
+
+def test_dev_blocked_after_a_granted_retry_hands_off_once(advised_dev, monkeypatch):
+    advised_dev.action = "retry_step"
+    seen = _watch_handoffs(monkeypatch)
+    advised_dev.script = [lambda cwd, output: {**DONE, "outcome": "RESULT: failed boom"},
+                          lambda cwd, output: {**DONE, "outcome": "RESULT: blocked no plan", "reply": "stuck"}]
+    assert advised_dev.go()[1] == 80
+    assert _reasons(seen) == ["dev_blocked"] and len(advised_dev.advice_calls) == 1
+    assert len(advised_dev.runs) == 2
+
+
 def test_dev_verification_retry_resumes_after_deferral(advised_dev, monkeypatch):
     monkeypatch.setattr(spec, "cursor_plan", lambda *a, **k: "<!-- baton-verdict: accept by=claude -->\nPlan")
     advised_dev.action = "retry_step"

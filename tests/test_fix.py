@@ -1078,6 +1078,74 @@ def test_a_verification_retry_after_deferral_uses_the_saved_budget(advised_fix, 
     assert len(advised_fix.advice_calls) == 1
 
 
+def _retry_then_block_in_verify(advised_fix, monkeypatch):
+    """A granted retry commits; the verification after it is cut short by a short block."""
+    from baton.common import Deferred
+
+    advised_fix.advice = [{"action": "retry_step", "reason": "transient worker failure",
+                           "evidence": ["Decision point: fix_run_failed"]}]
+    advised_fix.agent({"outcome": "RESULT: failed boom", "commit": False},
+                      {"outcome": "RESULT: fixed", "commit": True, "reply": "RESULT: fixed"})
+    verify = fix.Runner.verify
+    calls = []
+
+    def verify_once_blocked(self, *args, **kwargs):
+        calls.append(args)
+        if len(calls) == 1:
+            raise Deferred("claude", "short block")
+        return verify(self, *args, **kwargs)
+
+    monkeypatch.setattr(fix.Runner, "verify", verify_once_blocked)
+    return calls
+
+
+def test_a_deferral_after_the_retry_committed_continues_without_a_replay(advised_fix, monkeypatch):
+    _retry_then_block_in_verify(advised_fix, monkeypatch)
+    assert advised_fix.fix()["rc"] == 75
+    assert advised_fix.fix()["rc"] == 0 and not advised_fix.labelled()
+    assert len(advised_fix.agent_calls) == 2 and len(advised_fix.advice_calls) == 1
+
+
+def test_a_restart_after_the_retry_was_dispatched_hands_off_instead_of_dispatching_again(advised_fix, monkeypatch):
+    calls = _retry_then_block_in_verify(advised_fix, monkeypatch)
+    monkeypatch.setattr(fix.Runner, "verify", lambda self, *a, **k: calls.append(a) or (_ for _ in ()).throw(
+        RuntimeError("killed")))
+    with pytest.raises(RuntimeError):
+        advised_fix.fix()
+    assert advised_fix.fix()["rc"] == 1 and advised_fix.labelled()
+    assert len(advised_fix.agent_calls) == 2 and len(advised_fix.advice_calls) == 1
+
+
+def test_a_verification_retry_checks_the_base_it_failed_on(advised_fix, monkeypatch):
+    from baton.common import git
+    from baton.common import Deferred
+
+    advised_fix.verify_script("lint broke", "lint broke", "lint broke", "pass")
+    advised_fix.advice = [{"action": "retry_step", "reason": "flaky local check",
+                           "evidence": ["Decision point: fix_verify_failed"]}]
+    advised_fix.agent({"commit": True}, {"commit": True}, {"commit": True})
+    verify, bases = fix.Runner.verify, []
+
+    def spy(self, wt, base, *args, **kwargs):
+        bases.append(base)
+        if kwargs.get("repairs") == 0 and not spy.used:
+            spy.used = True
+            raise Deferred("claude", "short block")
+        return verify(self, wt, base, *args, **kwargs)
+
+    spy.used = False
+    monkeypatch.setattr(fix.Runner, "verify", spy)
+    git(advised_fix.worktree, "update-ref", "refs/remotes/origin/main", "HEAD")
+    original = git(advised_fix.worktree, "rev-parse", "origin/main")
+    assert advised_fix.fix()["rc"] == 75
+    tree = git(advised_fix.worktree, "rev-parse", "origin/main^{tree}")
+    tip = git(advised_fix.worktree, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit-tree", tree,
+              "-p", "origin/main", "-m", "main moved")
+    git(advised_fix.worktree, "update-ref", "refs/remotes/origin/main", tip)
+    assert advised_fix.fix()["rc"] == 0
+    assert bases[1:] == [original, original]   # both the deferred and the resumed retry
+
+
 @pytest.mark.parametrize("reason", ["fix_no_commit", "fix_task_invalid"])
 def test_cursor_retry_replaces_the_saved_request(advised_fix, monkeypatch, reason):
     advised_fix.advice = [{"action": "retry_step", "reason": "correct the request",

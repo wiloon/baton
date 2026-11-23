@@ -394,10 +394,10 @@ def dispatching(env, episode, item, binding, *, role=None):
     deferral without progress gives the grant back; one after progress (a commit, our own reply)
     checkpoints the new inputs so the normal resume continues instead of handing off."""
     record = _readable(env, episode, item)
-    if not record or role and record["role"] != role or record["state"] == "dispatched":
+    if not record or role and record["role"] != role:
         yield
         return
-    if record["state"] == "granted":
+    if record["state"] == "granted":   # dispatched: an enclosing step already consumed it
         persist(env, {**record, "state": "dispatched"})
     try:
         yield
