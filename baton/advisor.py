@@ -62,6 +62,7 @@ For answer_spec_questions return the same JSON fields plus
 Use grounded only when the citation excerpts already settle the question; copy the answer text
 character for character from those excerpts (no new decision wording). Use reversible_default for a
 technical default the owner could reverse, and owner_decision when only the owner can decide.
+If an owner comment addresses the question, cite the newest such comment and take the answer from it.
 Any non-grounded case, missing question, duplicate id, or citation outside the snapshot means the
 runner will hand the whole set off. Prefer handoff when evidence is incomplete or conflicting."""
 
@@ -122,18 +123,22 @@ def parse_citations(snapshot):
     return found
 
 
-def latest_owner_instruction(snapshot):
-    """Text of the latest (owner comment) citation row, or '' when none exist."""
-    latest = ""
-    for match in CITATION_LINE.finditer(snapshot or ""):
-        if match["source"] == "owner comment":
-            latest = match["text"]
-    return latest
+def owner_conflict(rows, cites, text):
+    """True when the newest owner comment among CITES does not contain the answer TEXT.
+
+    ROWS maps citation id → (source, text). An answer that cites no owner comment is not checked."""
+    owner = [c for c in cites if c in rows and rows[c][0] == "owner comment"]
+    if not owner:
+        return False
+    newest = max(owner, key=lambda c: int(c[1:]))
+    return text not in rows[newest][1]
 
 
 def baseline_snapshot(snapshot):
     """Drop repository-opted-in raw excerpt sections; decision records keep only the baseline."""
     text = snapshot or ""
+    text = "\n".join(line for line in text.split("\n") if not (
+        (m := CITATION_LINE.match(line)) and m["source"].startswith("document ")))
     cut = len(text)
     for marker in ("\n\nDiff excerpt:\n", "\n\nCI log excerpt:\n", "\n\nLocal documents:\n"):
         at = text.find(marker)
@@ -161,7 +166,7 @@ def normalize_answers(raw, snapshot, unusable=frozenset()):
     if not expected:
         raise ValueError("snapshot has no questions")
     citations = parse_citations(snapshot)
-    instruction = latest_owner_instruction(snapshot)
+    sources = {m["id"]: (m["source"], m["text"]) for m in CITATION_LINE.finditer(snapshot or "")}
     seen, answers = set(), []
     for row in raw:
         if not isinstance(row, dict):
@@ -185,8 +190,8 @@ def normalize_answers(raw, snapshot, unusable=frozenset()):
         combined = "\n".join(citations[c] for c in cites)
         if not text or text not in combined:
             raise ValueError("answer text is not taken from its citations")
-        if instruction and text not in instruction:
-            raise ValueError("answer conflicts with the latest owner instruction")
+        if owner_conflict(sources, cites, text):
+            raise ValueError("answer conflicts with the owner instruction it cites")
         answers.append({"id": qid, "case": case, "text": text, "citations": tuple(cites)})
     if sorted(seen) != sorted(expected) or [a["id"] for a in answers] != expected:
         raise ValueError("answers must cover each question id exactly once in order")

@@ -579,7 +579,7 @@ def test_a_grounded_answer_that_conflicts_with_the_latest_owner_instruction_hand
         f"[c1] (issue body): {body}",
         f"[c2] (owner comment): {owner}",
     ])
-    adv.replies = answer_reply(body, cites=("c1",))
+    adv.replies = answer_reply(body, cites=("c1", "c2"))
     d = advisor.advise(adv.env, "spec_questions", 17, snapshot, ("answer_spec_questions",),
                        category=2, revalidate=lambda: True)
     assert d.action == "handoff" and "owner instruction" in d.failure
@@ -598,6 +598,40 @@ def test_a_grounded_answer_that_agrees_with_the_latest_owner_instruction_execute
                        category=2, revalidate=lambda: True)
     assert d.action == "answer_spec_questions" and d.answers[0]["text"] == body
     assert advisor.granted(adv.env, "spec_questions", 18)
+
+
+def test_an_unrelated_later_owner_comment_does_not_block_a_body_grounded_answer(adv):
+    snapshot = questions_snapshot([
+        f"[c1] (issue body): {EXCERPT}", "[c2] (owner comment): Unrelated: no longer deferred."])
+    adv.replies = answer_reply(EXCERPT, cites=("c1",))
+    d = advisor.advise(adv.env, "spec_questions", 20, snapshot, ("answer_spec_questions",),
+                       category=2, revalidate=lambda: True)
+    assert d.action == "answer_spec_questions"
+
+
+def test_answers_grounded_in_different_owner_comments_both_pass(adv):
+    snapshot = ("Decision point: spec_questions.\nQuestions:\n- q1: A?\n- q2: B?\nCitation evidence:\n"
+                "[c1] (owner comment): Use the gate path.\n[c2] (owner comment): Keep the old flag.\n")
+    adv.replies = [{"action": "answer_spec_questions", "reason": "r", "evidence": [], "answers": [
+        {"id": "q1", "case": "grounded", "text": "Use the gate path.", "citations": ["c1"]},
+        {"id": "q2", "case": "grounded", "text": "Keep the old flag.", "citations": ["c2"]}]}]
+    d = advisor.advise(adv.env, "spec_questions", 21, snapshot, ("answer_spec_questions",),
+                       category=2, revalidate=lambda: True)
+    assert d.action == "answer_spec_questions"
+
+
+def test_document_excerpt_rows_stay_out_of_the_decision_record(adv):
+    from dataclasses import replace
+    enabled = replace(adv.env, repo=replace(adv.env.repo, advisor_local_documents=True))
+    doc = "ADR eight keeps raw documents private."
+    snapshot = questions_snapshot([f"[c1] (issue body): {EXCERPT}",
+                                   f"[c2] (document docs/adr/0008.md): {doc}"])
+    adv.replies = [{"action": "answer_spec_questions", "reason": "r", "evidence": [EXCERPT, doc],
+                    "answers": [{"id": "q1", "case": "grounded", "text": EXCERPT, "citations": ["c1"]}]}]
+    advisor.advise(enabled, "spec_questions", 22, snapshot, ("answer_spec_questions",),
+                   category=2, revalidate=lambda: True)
+    [record] = adv.records()
+    assert record["evidence"] == [EXCERPT]
 
 
 def test_evidence_from_optional_excerpts_is_omitted_from_the_decision_record(adv):

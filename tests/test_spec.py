@@ -3621,11 +3621,21 @@ def test_a_conflicting_owner_instruction_hands_off_without_an_answer(advised):
     advised.gh.body = f"Goal\n{EXCERPT}\n"
     advised.gh._comment("Manual checks defer until the owner clears them.")
     advised.script = [CHANGES, reviser(QUESTIONS, outcome="SPEC: human")]
-    advised.advice = advice(grounded())
+    advised.advice = advice(grounded(cite=("c1", "c2")))
     assert advised.run() is False
     assert not advised.gh.posted("<!-- baton-advisor-answer")
     assert "ready-for-human" in advised.gh.labels
     assert advised.advice_calls  # the advisor was consulted; validation refused the set
+
+
+def test_an_unrelated_later_owner_comment_still_lets_a_body_answer_post(advised, monkeypatch):
+    advised.gh.body = f"Goal\n{EXCERPT}\n"
+    advised.gh._comment("Unrelated: no longer deferred.")
+    advised.script = [CHANGES, reviser(QUESTIONS, outcome="SPEC: human"), reviser("adopted"), ACCEPT]
+    advised.advice = advice(grounded())
+    monkeypatch.setattr(dev, "setup_worktree", lambda *a, **k: ("", False))
+    advised.run()
+    assert len(advised.gh.posted("<!-- baton-advisor-answer")) == 1
 
 
 @pytest.mark.parametrize("change", ["owner reply", "issue closed", "ADR head", "new ADR"])
@@ -3897,7 +3907,8 @@ EXCERPT = "Manual checks use the existing gate path."
 
 
 def grounded(text=EXCERPT, cite="c1", qid="q1"):
-    return {"id": qid, "case": "grounded", "text": text, "citations": [cite]}
+    return {"id": qid, "case": "grounded", "text": text,
+            "citations": [cite] if isinstance(cite, str) else list(cite)}
 
 
 def advice(*answers):

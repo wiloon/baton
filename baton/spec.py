@@ -1047,15 +1047,14 @@ class Spec:
         rows = self.questions_citation_entries(
             payload["body"], payload["comments"], binding.get("reply") or "", document_head)
         entries = {i: text for i, _, text in rows}
-        owner_texts = [text for _, source, text in rows if source == "owner comment"]
-        instruction = owner_texts[-1] if owner_texts else ""
+        sources = {i: (source, text) for i, source, text in rows}
         for row in answers:
             combined = "\n".join(entries[c] for c in row["citations"] if c in entries)
             if row["text"] not in combined:
                 self.handoff(why + " Advisor citations no longer match the issue.", "spec_questions")
                 return "stop"
-            if instruction and row["text"] not in instruction:
-                self.handoff(why + " Advisor answer conflicts with the latest owner instruction.",
+            if advisor.owner_conflict(sources, row["citations"], row["text"]):
+                self.handoff(why + " Advisor answer conflicts with the owner instruction it cites.",
                              "spec_questions")
                 return "stop"
         return self.publish_advisor_answers(binding, answers)
