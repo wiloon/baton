@@ -19,8 +19,11 @@ SCAN = True
 SKIP_SCREENSHOT_AFTER_REVIEW = False
 ROUTE_FIELDS = frozenset({"model", "effort", "subagent_model"})
 EMPTY_MODEL_OK = False
-RECORDS_AUTHOR_MODEL = False
-SAME_VENDOR_REVIEW = False
+RECORDS_AUTHOR_MODEL = True
+# Owner, 2026-11-24 (temporary while Codex and Cursor are out of weekly quota): Claude may review
+# Claude-written code, but only on a distinct model (e.g. Opus after Sonnet); never the same model.
+SAME_VENDOR_REVIEW = True
+SAME_VENDOR_SAME_MODEL = False
 DEFAULT_MAX_MINUTES = 150
 PREFLIGHT_CHECKS = (("claude", "--version"),)
 VERSION_EXECUTABLE = "claude"

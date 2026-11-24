@@ -297,7 +297,7 @@ class VendorTests(unittest.TestCase):
         codex_cooldown.write_text(str(NOW + LONG_REST))
         cursor_cooldown = Path(self.state, "cursor-cooldown-until")
         cursor_cooldown.write_text(str(NOW + LONG_REST))
-        with patch.object(vendors.agents.ADAPTERS["claude"], "SAME_VENDOR_REVIEW", True):
+        with patch.object(vendors.agents.ADAPTERS["claude"], "SAME_VENDOR_SAME_MODEL", True):
             result, rc = vendors.pick(self.state, POOL, "review", ["codex", "claude", "cursor"],
                                       pr="9", by="contrib", now=NOW, review=True)
             self.assertEqual((result["vendor"], rc), ("claude", 0))
@@ -328,6 +328,26 @@ class VendorTests(unittest.TestCase):
         vendors.record_author_model(self.state, "16", "codex", "gpt-6.1-terra")
         self.assertEqual(vendors.same_vendor_review_mode(self.state, "16", "codex", "gpt-6.1-terra"), "same-model-fresh-context")
         self.assertEqual(vendors.same_vendor_review_mode(self.state, "16", "codex", "gpt-6.2"), "same-vendor-different-model")
+
+    def test_claude_reviews_claude_code_only_on_a_distinct_model(self):
+        vendors.record_author(self.state, "17", "claude")
+        vendors.record_author_model(self.state, "17", "claude", "claude-sonnet-5-5")
+        self.assertEqual(vendors.same_vendor_review_mode(self.state, "17", "claude", "opus"),
+                         "same-vendor-different-model")
+        self.assertTrue(vendors.review_allowed(self.state, "17", "claude", "claude-opus-5-5"))
+        self.assertTrue(vendors.screenshot_allowed(self.state, "17", "claude", "opus"))
+        for same in ("sonnet", "claude-sonnet-5-5", "unknown", ""):
+            self.assertFalse(vendors.review_allowed(self.state, "17", "claude", same), same)
+        for vendor in ("codex", "cursor"):
+            Path(self.state, f"{vendor}-cooldown-until").write_text(str(NOW + LONG_REST))
+        result, rc = vendors.pick(self.state, POOL, "review", [*POOL, "cursor"],
+                                  pr="17", by="contrib", now=NOW, review=True)
+        self.assertEqual((result["vendor"], rc), ("claude", 0))
+        self.assertEqual(result["review_mode"], "same-vendor-different-model")
+
+    def test_claude_without_a_recorded_model_never_reviews_its_own_code(self):
+        vendors.record_author(self.state, "18", "claude")
+        self.assertFalse(vendors.review_allowed(self.state, "18", "claude", "opus"))
 
     def test_review_does_not_accept_an_unknown_codex_model(self):
         for vendor in ("claude", "cursor"):

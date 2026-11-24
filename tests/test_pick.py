@@ -80,6 +80,7 @@ def test_same_vendor_review_follows_the_adapter_capability(env, monkeypatch):
     Path(state, "pr-16-author-models").write_text("stub model-a\n")
     assert not vendors.review_allowed(state, 16, "stub", "model-b")
     monkeypatch.setattr(agents.ADAPTERS["stub"], "SAME_VENDOR_REVIEW", True, raising=False)
+    monkeypatch.setattr(agents.ADAPTERS["stub"], "SAME_VENDOR_SAME_MODEL", True, raising=False)
     assert vendors.review_allowed(state, 16, "stub", "model-b")
     assert vendors.review_allowed(state, 16, "stub", "model-a")
     assert vendors.screenshot_allowed(state, 16, "stub", "model-b")

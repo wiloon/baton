@@ -29,6 +29,7 @@ ROUTE_FIELDS = frozenset({"model", "effort"})
 EMPTY_MODEL_OK = True
 RECORDS_AUTHOR_MODEL = True
 SAME_VENDOR_REVIEW = True
+SAME_VENDOR_SAME_MODEL = True
 DEFAULT_MAX_MINUTES = 60
 PREFLIGHT_CHECKS = (("codex", "--version"), ("codex", "login", "status"))
 VERSION_EXECUTABLE = "codex"
