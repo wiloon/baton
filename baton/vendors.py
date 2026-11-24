@@ -287,14 +287,24 @@ def same_vendor_review(vendor):
 def same_vendor_review_mode(state, pr, vendor, model):
     """How a same-vendor reviewer may audit its own code: with a different model, or, as the last
     resort, with the same model in a fresh session (every review run starts one). "" when the
-    adapter does not allow it or a model is not proven: unknown authors are never review eligible."""
+    adapter does not allow it or a model is not proven: unknown authors are never review eligible.
+    An adapter's distinct_models(a, b) compares aliases and IDs (Claude's "sonnet" is
+    claude-sonnet-*); SAME_VENDOR_SAME_MODEL says whether the fresh-session last resort is allowed."""
     if not same_vendor_review(vendor):
         return ""
     written = [row.split(maxsplit=1)[1] for row in _lines(state_path(state, pr, "author-models"))
                if row.startswith(f"{vendor} ")]
     if not (model and model != "unknown" and written and "unknown" not in written):
         return ""
-    return "same-model-fresh-context" if model in written else "same-vendor-different-model"
+    adapter = agents.ADAPTERS[vendor]
+    distinct = getattr(adapter, "distinct_models", None)
+    if distinct is None:
+        different = model not in written
+    else:
+        different = all(distinct(model, author_model) for author_model in written)
+    if different:
+        return "same-vendor-different-model"
+    return "same-model-fresh-context" if getattr(adapter, "SAME_VENDOR_SAME_MODEL", False) else ""
 
 
 def review_allowed(state, pr, vendor, model="", fixed_by=""):

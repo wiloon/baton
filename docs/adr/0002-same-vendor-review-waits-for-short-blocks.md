@@ -53,3 +53,7 @@ eligibility policy (ADRs 0004 and 0005).
   outside the registry or allowlist cannot run or hold up the step.
 - Issue #148: use each vendor's effective 5-hour cap for short quota blocks so one vendor
   can use its full 5-hour window while others keep their reserve.
+- 2026-11-24 (owner, temporary while Codex and Cursor were out of weekly quota): Claude may
+  review Claude-written code too, on a distinct model only (Opus after Sonnet). Claude records
+  the writer's model; `SAME_VENDOR_SAME_MODEL` keeps the same-model fresh-session fallback to
+  Codex. Revert by setting Claude's `SAME_VENDOR_REVIEW` back to `False`.
