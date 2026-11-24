@@ -288,6 +288,29 @@ class VendorTests(unittest.TestCase):
             self.assertEqual((result["vendor"], rc), ("codex", 0))
             self.assertEqual(result["review_mode"], "same-vendor-different-model")
 
+    def test_review_considers_all_same_vendor_candidates_and_waits_for_short_cross_vendor_blocks(self):
+        self.codex_pr("9")
+        vendors.record_author(self.state, "9", "claude")
+        vendors.record_author_model(self.state, "9", "claude", "opus")
+        self.snap("claude", 0.20)
+        codex_cooldown = Path(self.state, "codex-cooldown-until")
+        codex_cooldown.write_text(str(NOW + LONG_REST))
+        cursor_cooldown = Path(self.state, "cursor-cooldown-until")
+        cursor_cooldown.write_text(str(NOW + LONG_REST))
+        with patch.object(vendors.agents.ADAPTERS["claude"], "SAME_VENDOR_REVIEW", True):
+            result, rc = vendors.pick(self.state, POOL, "review", ["codex", "claude", "cursor"],
+                                      pr="9", by="contrib", now=NOW, review=True)
+            self.assertEqual((result["vendor"], rc), ("claude", 0))
+            self.assertEqual(result["review_mode"], "same-model-fresh-context")
+            self.assertIn("codex", result["blocked"])
+            codex_cooldown.unlink()
+            self.snap("codex", 0.20)
+            cursor_cooldown.write_text(str(NOW + 60))
+            result, rc = vendors.pick(self.state, POOL, "review", ["codex", "claude", "cursor"],
+                                      pr="9", by="contrib", now=NOW, review=True)
+            self.assertEqual((result["vendor"], rc), ("", 75))
+            self.assertIn("waiting for cursor", result["reason"])
+
     def test_review_falls_back_to_the_same_codex_model_in_a_fresh_session(self):
         vendors.record_author(self.state, "16", "codex")
         vendors.record_author_model(self.state, "16", "codex", "gpt-6.2-astra")
@@ -331,6 +354,19 @@ class VendorTests(unittest.TestCase):
         Path(self.state, "pr-14-contrib").write_text("codex 17\n")
         vendors.record_author_model(self.state, "14", "codex", "gpt-6.1-terra")
         self.assertFalse(vendors.review_allowed(self.state, "14", "codex", "gpt-6.1-sol"))
+
+    def test_legacy_writer_stays_unknown_with_another_adapters_model_evidence(self):
+        pr = "14"
+        vendors.record_author(self.state, pr, "claude")
+        vendors.record_author_model(self.state, pr, "claude", "opus")
+        vendors.record_author(self.state, pr, "codex")
+        Path(self.state, f"pr-{pr}-contrib").write_text("claude 5\ncodex 17\n")
+        vendors.record_author_model(self.state, pr, "codex", "gpt-6.1-terra")
+        vendors.record_author_model(self.state, pr, "codex", "gpt-6.1-terra")
+
+        self.assertFalse(vendors.review_allowed(self.state, pr, "codex", "gpt-6.1-sol"))
+        self.assertEqual(Path(self.state, f"pr-{pr}-author-models").read_text().splitlines(),
+                         ["claude opus", "codex unknown", "codex gpt-6.1-terra"])
 
     def test_first_codex_fix_of_cursor_pr_has_known_model(self):
         vendors.record_author(self.state, "15", "cursor")
