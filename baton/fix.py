@@ -119,7 +119,7 @@ class Runner:
             exclusions=getattr(self, "retry_exclusions", ()), **self.retry_picker(pr))
         return (result[0]["action"], result[1], budget["verify_repairs"]) if result else ("handoff", vendor, 0)
 
-    def resume(self, pr, wt):
+    def resume(self, pr, wt, *, verify_only=False):
         episode = self.env.runtime.issue or pr
         try:
             saved = recovery.load(self.env, episode, pr)
@@ -127,7 +127,8 @@ class Runner:
             saved = None
         saved_reason = saved["reason"] if saved and saved["reason"].startswith("fix_") else "fix_run_failed"
         selected = recovery.resume(
-            self.env, episode, pr, lambda reason: reason.startswith("fix_"),
+            self.env, episode, pr,
+            lambda reason: reason == "fix_verify_failed" if verify_only else reason.startswith("fix_"),
             lambda: self.retry_binding(wt, pr),
             lambda text: self.handoff(pr, saved_reason, f"PR #{pr} needs you", text),
             role="fixer", local=lambda record: record["reason"] == "fix_verify_failed", **self.retry_picker(pr))
@@ -150,10 +151,11 @@ class Runner:
         finally:
             self.verification_progress = None
 
-    def finish_verified(self, pr, wt, fixer, *, prefix=""):
+    def finish_verified(self, pr, wt, fixer, *, prefix="", description_rc=0, description_reason=""):
         url = f"https://github.com/{self.repo}/pull/{pr}"
         ref = (git(wt, "branch", "--show-current") or "HEAD") if fixer == "cursor" else "HEAD"
         return self.push_with_retry(pr, wt, ref, next_step="done", url=url, who=prefix, fixer=fixer,
+                                    description_rc=description_rc, description_reason=description_reason,
                                     clear_cursor=fixer == "cursor")
 
     def add_author(self, vendor):
@@ -379,6 +381,7 @@ class Runner:
             pending = owner_handoff.prepare_retry(self.env, episode, reason, str(pr), binding)
             if pending is None:
                 return self.handoff(pr, reason, title, f"{text}: the push inputs could not be saved{note}. {url}")
+            self.clear_task_write(pr)
             Path(self.state, f"slot-deferred-{pr}").unlink(missing_ok=True)
         elif pending["attempts"] < owner_handoff.MAX_ATTEMPTS:
             # Keep the pre-resume attempts: resume already consumed one on disk (#151).
@@ -652,7 +655,10 @@ class Runner:
 
     def capture_head(self, pr):
         """The PR head SHA to bind a metadata write to; None when it can't be read."""
-        viewed = pr_helpers.view(pr, "headRefOid")
+        try:
+            viewed = pr_helpers.view(pr, "headRefOid")
+        except ValueError:
+            return None
         head = viewed.get("headRefOid") if isinstance(viewed, dict) else None
         return head if isinstance(head, str) and re.fullmatch(r"[0-9a-f]{40}", head) else None
 
@@ -750,11 +756,12 @@ class Runner:
             pending = owner_handoff.prepare_retry(self.env, episode, reason, str(pr), binding)
             if pending is None:
                 return self.handoff(pr, reason, title, f"{text} The checks inputs could not be saved.")
+            self.clear_task_write(pr)
         else:
             binding = pending["continuation"]
             if pending.get("phase") == "landed":
                 self.checks_written = True
-                return self.finish_checks(pr, binding, url)
+                return self.finish_checks(pr, binding, resumed=True)
             result = self.handoff(pr, reason, title, text, resume=True)
             if result == 1:
                 return 1
@@ -770,31 +777,31 @@ class Runner:
         self.checks_written = True
         landed = {**owner_handoff.load_retry(self.env, episode, reason, str(pr)), "phase": "landed"}
         owner_handoff.restore_retry(self.env, episode, reason, str(pr), landed)
-        return self.finish_checks(pr, binding, url, description_rc=description_rc,
-                                  description_reason=description_reason, clear_cursor=clear_cursor)
+        return self.finish_checks(pr, binding, resumed=not initial)
 
-    def finish_checks(self, pr, binding, url, *, description_rc=0, description_reason="", clear_cursor=False):
+    def finish_checks(self, pr, binding, *, resumed):
         """Continuation after a landed checks refresh (#151)."""
         from . import handoff as owner_handoff
-        discarded = description_rc or binding.get("description_rc") or 0
-        if discarded:
-            self.description_discarded(
-                pr, binding.get("fixer") or "fixer",
-                description_reason or binding.get("description_reason") or "")
-        if clear_cursor or binding.get("clear_cursor"):
+        if binding["description_rc"]:
+            self.description_discarded(pr, binding["fixer"], binding["description_reason"])
+        if binding["clear_cursor"] or (resumed and binding["consume"] and binding["fixer"] == "cursor"):
             self.clear_cursor_request(pr)
         owner_handoff.clear_retry(self.env, self.push_episode(pr), owner_handoff.FIX_CHECKS, str(pr))
         recovery.clear(self.env, self.push_episode(pr), pr)
         return 0
 
-    def recheck_without_commit(self, pr, who, url, description_changed=False):
+    def recheck_without_commit(self, pr, who, url, description_changed=False, *, fixer,
+                               description_rc=0, description_reason=""):
         """(rc, changed) for a fix with no commit: a re-check the fixer gave still reaches the
         description, and the next review checks it. No re-check leaves the description alone,
         unless the fixer rewrote it: its own checks section must not reach the merge gate."""
         if not description_changed and not pr_helpers.fixer_gave_checks(self.ctx, pr):
+            if description_rc:
+                self.description_discarded(pr, fixer, description_reason)
             return 0, False
         self.checks_written = False
-        rc = self.refresh_checks(pr, who, url, consume=True, fixer=self.last_fixer or "")
+        rc = self.refresh_checks(pr, who, url, consume=True, fixer=fixer,
+                                 description_rc=description_rc, description_reason=description_reason)
         if rc != 0:
             return rc, False
         return 0, self.checks_written
@@ -816,6 +823,10 @@ class Runner:
             f"<!-- baton-description-discarded by={fixer} -->\n"
             f"Discarded the PR description request from {fixer}.\n\n{detail}",
         )
+
+    def clear_task_write(self, pr):
+        from . import handoff as owner_handoff
+        owner_handoff.clear_retry(self.env, self.push_episode(pr), owner_handoff.FIX_TASK, str(pr))
 
     def write_task(self, pr, url, *, want="", pending=None, fixer="", who="", baseline=None,
                    description_rc=0, description_reason="", resume=None):
@@ -872,24 +883,27 @@ class Runner:
                 "who": who, "description_rc": description_rc, "description_reason": description_reason or "",
                 "clear_cursor": False, "resume": resume,
             }
+            if self.retry_context:
+                binding["retry_context"] = self.retry_context
             pending = owner_handoff.prepare_retry(self.env, episode, reason, str(pr), binding)
             if pending is None:
                 return self.handoff(pr, reason, title, f"{text} The task inputs could not be saved."), False, ""
         else:
             binding = pending["continuation"]
-            want = binding["want"]
+            if pending.get("phase") == "landed":
+                return 0, True, ""
             result = self.handoff(pr, reason, title, text, resume=True)
             if result == 1:
                 return 1, False, ""
             binding = result.continuation
 
-        self.task_binding = binding
         outcome = self.run_meta_write(pr, reason, title, text, binding, pending, initial)
         if outcome != "landed":
             return outcome, False, ""
+        landed = {**owner_handoff.load_retry(self.env, episode, reason, str(pr)), "phase": "landed"}
+        owner_handoff.restore_retry(self.env, episode, reason, str(pr), landed)
         log = f"PR #{pr}: task completion change at the fixer's request; the next review checks it"
         notify.log(log)
-        owner_handoff.clear_retry(self.env, episode, reason, str(pr))
         return 0, True, log
 
     # --- a Claude or Codex fixer ---
@@ -995,11 +1009,11 @@ class Runner:
         url = f"https://github.com/{self.repo}/pull/{pr}"
         base_file = Path(self.state, f"cursor-fix-base-{pr}")
         if self.head(wt) == head:
-            rc, checks_changed = self.recheck_without_commit(pr, "", url, description_changed)
+            rc, checks_changed = self.recheck_without_commit(
+                pr, "", url, description_changed, fixer=fixer,
+                description_rc=description_rc, description_reason=description_reason)
             if rc != 0:
                 return rc
-            if description_rc != 0:
-                self.description_discarded(pr, fixer, description_reason)
             if not task_changed and not checks_changed and not description_changed:
                 action, fixer, _ = self.recover(pr, "fix_no_commit", f"PR #{pr} needs you",
                                                 f"The fix run made no commit; stopping the loop. {url}", fixer, wt=wt, head=head)
@@ -1033,6 +1047,7 @@ class Runner:
         base_file.unlink(missing_ok=True)
         episode = self.env.runtime.issue or str(pr)
         recovery.clear(self.env, str(episode), str(pr))
+        self.clear_task_write(pr)
         return 0
 
     # --- a Cursor fixer ---
@@ -1119,19 +1134,17 @@ class Runner:
             pr_helpers.remove_body_request(request)
             has_request = False
         if not has_request or description_rc:
-            self.task_binding = None
+            resume = {"head": head, "agent_head": agent_head, "description_changed": bool(body_changed),
+                      "model": "", "cursor_base": ""}
             rc, task_changed, log = self.write_task(
                 pr, url, want=want, fixer="cursor", baseline=baseline_file,
-                description_rc=2 if discarded else 0, description_reason=description_reason)
+                description_rc=2 if discarded else 0, description_reason=description_reason, resume=resume)
             if rc == PUSH_SUPERSEDED:
                 return rc
             if rc == 1:
                 if discarded:
                     self.description_discarded(pr, "cursor", description_reason)
                 return 1
-            saved = self.task_binding   # a resumed write remembers a discarded description
-            if rc == 0 and saved and saved["description_rc"] and not discarded:
-                discarded, description_reason = True, saved["description_reason"]
             if rc != 0 and (rc != 2 or description_rc != 2):
                 reason = "fix_task_invalid"
                 start = agent_head if self.attempt_authors else head
@@ -1144,14 +1157,51 @@ class Runner:
                     return 1
                 self.clear_cursor_request(pr, keep_base=True)
                 return self.dispatch_fixer(pr, wt, alt, source, correction(feedback, log), head)
+        return self.finish_cursor_fix(
+            pr, wt, branch, url, source, feedback, head, agent_head=agent_head,
+            body_changed=body_changed, task_changed=task_changed, discarded=discarded,
+            description_reason=description_reason)
+
+    def resume_task_write(self, pr, wt, url, source, feedback, pending):
+        from . import handoff as owner_handoff
+        binding = pending["continuation"]
+        fixer = binding["fixer"]
+        saved = binding.get("resume")
+        if saved is None:
+            # Older Cursor TASK records stored the base only in the sidecar.
+            try:
+                head = Path(self.state, f"cursor-fix-base-{pr}").read_text().strip()
+            except (OSError, ValueError):
+                head = ""
+            if not re.fullmatch(r"[0-9a-f]{40}", head):
+                return self.handoff(pr, owner_handoff.FIX_TASK, f"Cursor PR #{pr}: task completion change failed",
+                                    "The saved Cursor fix base is missing or damaged.")
+            saved = {"head": head, "agent_head": self.head(wt), "description_changed": False}
+        rc, task_changed, _ = self.write_task(pr, url, pending=pending, fixer=fixer)
+        if rc != 0:
+            return rc
+        if fixer != "cursor":
+            return self.finish_fix(
+                pr, wt, fixer, source, feedback, saved["head"], agent_head=saved["agent_head"],
+                model=saved["model"], cursor_base=saved["cursor_base"], task_changed=task_changed,
+                description_rc=binding["description_rc"], description_changed=saved["description_changed"],
+                description_reason=binding["description_reason"])
+        branch = git(wt, "branch", "--show-current") or ""
+        return self.finish_cursor_fix(
+            pr, wt, branch, url, source, feedback, saved["head"], agent_head=saved["agent_head"],
+            body_changed=saved["description_changed"], task_changed=task_changed, discarded=binding["description_rc"] == 2,
+            description_reason=binding["description_reason"])
+
+    def finish_cursor_fix(self, pr, wt, branch, url, source, feedback, head, *, agent_head,
+                          body_changed, task_changed, discarded, description_reason):
         moved = self.head(wt) != head
         recorded_before_retry = False
         if not moved:
-            rc, checks_changed = self.recheck_without_commit(pr, "Cursor ", url, body_changed)
+            rc, checks_changed = self.recheck_without_commit(
+                pr, "Cursor ", url, body_changed, fixer="cursor",
+                description_rc=2 if discarded else 0, description_reason=description_reason)
             if rc != 0:
                 return rc
-            if discarded:
-                self.description_discarded(pr, "cursor", description_reason)
             if not (body_changed or task_changed or checks_changed):
                 action, alt, _ = self.recover(pr, "fix_no_commit", f"Cursor PR #{pr} needs you",
                                                 f"Cursor's fix run made no commit. {url}", "cursor", wt=wt, head=head)
@@ -1198,6 +1248,7 @@ class Runner:
         self.clear_cursor_request(pr)
         episode = self.env.runtime.issue or str(pr)
         recovery.clear(self.env, str(episode), str(pr))
+        self.clear_task_write(pr)
         return 0
 
 
@@ -1256,6 +1307,7 @@ def fix_pr(runner, pr, wt, fixer, source, feedback, head="", *, owner_triggered=
     if waiting == "unreadable":
         return 1
     if waiting is not None:
+        runner.clear_task_write(pr)
         binding = waiting["continuation"]
         runner.last_fixer = binding["fixer"]
         return runner.push_with_retry(pr, wt, binding["ref"], next_step=binding["next"],
@@ -1265,6 +1317,7 @@ def fix_pr(runner, pr, wt, fixer, source, feedback, head="", *, owner_triggered=
     if waiting_checks == "unreadable":
         return 1
     if waiting_checks is not None:
+        runner.clear_task_write(pr)
         binding = waiting_checks["continuation"]
         runner.last_fixer = binding.get("fixer") or runner.last_fixer
         return runner.refresh_checks(
@@ -1273,27 +1326,22 @@ def fix_pr(runner, pr, wt, fixer, source, feedback, head="", *, owner_triggered=
     waiting_task = runner.waiting_meta(pr, owner_handoff.FIX_TASK)
     if waiting_task == "unreadable":
         return 1
+    task = {}
     if waiting_task is not None:
-        binding = waiting_task["continuation"]
-        runner.last_fixer = binding.get("fixer") or runner.last_fixer
-        if binding["fixer"] == "cursor":
-            # cursor_fix reconciles from its saved request and reaches write_task itself.
-            return runner.dispatch_fixer(pr, wt, "cursor", source, feedback, head)
-        runner.push_feedback = binding["feedback"] or None
-        rc, _, _ = runner.write_task(pr, url, pending=waiting_task)
-        if rc != 0 or not binding.get("resume"):
-            return rc
-        saved = binding["resume"]
-        try:
-            return runner.finish_fix(
-                pr, wt, binding["fixer"], source, feedback, saved["head"], agent_head=saved["agent_head"],
-                model=saved["model"], cursor_base=saved["cursor_base"], task_changed=True,
-                description_rc=binding["description_rc"], description_changed=saved["description_changed"],
-                description_reason=binding["description_reason"])
-        except KeyError:
-            return runner.handoff(pr, owner_handoff.FIX_TASK, f"PR #{pr}: task completion change failed",
-                                  "The saved fix continuation is damaged.")
-    pending = runner.resume(pr, wt)
+        task = waiting_task["continuation"]
+        runner.last_fixer = task["fixer"]
+        runner.push_feedback = task["feedback"] or None
+        # The review loop can resume metadata writes without reloading the worker prompt.
+        runner.retry_context = task.get("retry_context", runner.retry_context)
+        pending = runner.resume(pr, wt, verify_only=True) if waiting_task.get("phase") == "landed" else None
+        if pending is False:
+            return 1
+        if not pending:
+            if advisor.enabled(runner.env):
+                runner.retry_start = runner.retry_binding(wt, pr)
+            return runner.resume_task_write(pr, wt, url, source, feedback, waiting_task)
+    else:
+        pending = runner.resume(pr, wt)
     if pending is False:
         return 1
     if advisor.enabled(runner.env):
@@ -1304,14 +1352,16 @@ def fix_pr(runner, pr, wt, fixer, source, feedback, head="", *, owner_triggered=
     budget = record["remaining_budget"]
     head = budget.get("head") or head
     if record["reason"] == "fix_verify_failed":
-        runner.last_fixer = fixer
+        runner.last_fixer = task.get("fixer", fixer)
         rc, failure, rounds = runner.verify_retry(wt, budget.get("base_sha") or "origin/main", fixer, "pr", pr,
                                                   repairs=budget["verify_repairs"],
                                             repairs_before=budget["repairs_used"])
         if rc:
             runner.verify_failed(pr, failure, rounds)
             return runner.handoff(pr, "fix_verify_failed", f"PR #{pr}: local CI verification failed", failure)
-        rc = runner.finish_verified(pr, wt, fixer, prefix="Cursor " if fixer == "cursor" else "")
+        rc = runner.finish_verified(
+            pr, wt, runner.last_fixer, prefix="Cursor " if runner.last_fixer == "cursor" else "",
+            description_rc=task.get("description_rc", 0), description_reason=task.get("description_reason", ""))
         runner.clear_cursor_request(pr)
         recovery.clear(runner.env, runner.env.runtime.issue or pr, pr)
         return rc

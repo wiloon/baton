@@ -417,7 +417,9 @@ def checks_binding(item="1"):
 
 
 def task_binding(item="1"):
-    return {**checks_binding(item), "want": "partial", "consume": False}
+    return {**checks_binding(item), "want": "partial",
+            "resume": {"head": "b" * 40, "agent_head": "b" * 40, "model": "unknown",
+                       "cursor_base": "", "description_changed": False}}
 
 
 def test_every_category_1_reason_is_rule_mode_with_retry_budget():

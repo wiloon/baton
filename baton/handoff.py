@@ -440,13 +440,30 @@ def _fix_meta_write_binding_valid(item, binding, *, reason):
             or (feedback != "" and not re.fullmatch(r"[0-9a-f]{64}", feedback))
             or type(description_rc) is not int or description_rc not in (0, 1, 2)
             or not isinstance(binding.get("description_reason"), str)
-            or type(binding.get("clear_cursor")) is not bool
-            or not (binding.get("resume") is None or isinstance(binding["resume"], dict))):
+            or type(binding.get("clear_cursor")) is not bool):
         return False
     if reason == FIX_CHECKS:
         return type(binding.get("consume")) is bool
     if reason == FIX_TASK:
-        return binding.get("want") in ("partial", "complete")
+        if binding.get("want") not in ("partial", "complete"):
+            return False
+        if "retry_context" in binding:
+            context = binding["retry_context"]
+            if (not isinstance(context, dict)
+                    or context.keys() != {"fix_feedback", "fix_source"}
+                    or not isinstance(context["fix_feedback"], str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", context["fix_feedback"])
+                    or not isinstance(context["fix_source"], str)):
+                return False
+        resume = binding.get("resume")
+        if binding["fixer"] == "cursor" and resume is None:
+            return True    # Older Cursor records have a separate saved base.
+        return (isinstance(resume, dict)
+                and all(isinstance(resume.get(key), str) and re.fullmatch(r"[0-9a-f]{40}", resume[key])
+                        for key in ("head", "agent_head"))
+                and isinstance(resume.get("model"), str)
+                and isinstance(resume.get("cursor_base"), str)
+                and type(resume.get("description_changed")) is bool)
     return False
 
 
