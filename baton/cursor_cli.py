@@ -20,6 +20,7 @@ SKIP_SCREENSHOT_AFTER_REVIEW = True
 ROUTE_FIELDS = frozenset({"model"})
 EMPTY_MODEL_OK = False
 RECORDS_AUTHOR_MODEL = False
+SAME_VENDOR_REVIEW = False
 DEFAULT_MAX_MINUTES = 60
 PREFLIGHT_CHECKS = (("cursor-agent", "--version"),)
 VERSION_EXECUTABLE = "cursor-agent"

@@ -2841,6 +2841,8 @@ def admit_stub(loop, monkeypatch):
     repo = replace(cfg.repos[0], gh_repo=loop.env["GH_REPO"], owner=loop.env["OWNER"])
     cfg = replace(cfg, repos=(repo,))
     sess = session.create(cfg, repo=repo)
+    # The fake GitHub CLI uses OWNER to attribute posted comments.
+    sess = replace(sess, tools={**sess.tools, "OWNER": repo.owner})
     sess = replace(sess, dirs=replace(
         sess.dirs, state=Path(loop.env["STATE"]), logs=Path(loop.env["LOGS"]),
         ctx=Path(loop.env["CTX"]), clone=Path(loop.env["REPO_DIR"]),
@@ -2888,6 +2890,30 @@ def test_stub_reply_review_posts_baton_review_by_stub(loop, monkeypatch):
     assert loop.run(fixer="pool", reviewer="stub") == 0
     assert loop.comments()[0].startswith("<!-- baton-review round=1 by=stub -->\nstub review findings")
     assert any(a["tag"] == f"pr-{PR}-stub-review-1" for a in loop.agents)
+
+
+@pytest.mark.parametrize("actual_model", ["unknown", "stub-1"])
+def test_same_vendor_reply_review_checks_and_reports_actual_model(loop, monkeypatch, actual_model):
+    env = admit_stub(loop, monkeypatch)
+    loop.gh.set(headRefName="owner/issue-1", author={"login": "owner"})
+    monkeypatch.setattr(agents.ADAPTERS["stub"], "SAME_VENDOR_REVIEW", True)
+    vendors.record_author(loop.env["STATE"], PR, "stub")
+    vendors.record_author_model(loop.env["STATE"], PR, "stub", "stub-1")
+
+    def agent(vendor, role, prompt, tag, cwd, settings="", output="", env=None, hooks=None):
+        return {"rc": 0, "status": "success", "outcome": "REVIEW: pass",
+                "reply": "stub review findings\nREVIEW: pass", "model": actual_model, "defer": ""}
+
+    monkeypatch.setattr(review.dispatch, "dispatch", agent)
+    rv = review.Review(env, review.telemetry.from_env(env, issue="297", pr=PR), PR, loop.wt, "297", "")
+    outcome = rv.run_review(1, "", "stub")
+    if actual_model == "unknown":
+        assert outcome == "RESULT: failed actual reviewer model may be a PR author"
+        assert not any(body.startswith("<!-- baton-review") for body in loop.comments())
+    else:
+        assert outcome == "REVIEW: pass"
+        assert loop.comments()[0].startswith("<!-- baton-review round=1 by=stub -->\n"
+                                             "Review mode: same-model-fresh-context (stub/stub-1).\n\n")
 
 
 def test_stub_dirty_reply_review_restores_and_posts_no_verdict(loop, monkeypatch):

@@ -28,6 +28,7 @@ SKIP_SCREENSHOT_AFTER_REVIEW = False
 ROUTE_FIELDS = frozenset({"model", "effort"})
 EMPTY_MODEL_OK = True
 RECORDS_AUTHOR_MODEL = True
+SAME_VENDOR_REVIEW = True
 DEFAULT_MAX_MINUTES = 60
 PREFLIGHT_CHECKS = (("codex", "--version"), ("codex", "login", "status"))
 VERSION_EXECUTABLE = "codex"
