@@ -15,6 +15,7 @@ CLI for the bash callers that stay (the tick's recovery, the spec round, the cle
 from . import session
 import argparse
 from fnmatch import fnmatchcase
+import json
 import os
 from pathlib import Path
 import re
