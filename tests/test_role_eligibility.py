@@ -269,3 +269,13 @@ def test_analyst_reserve_inherits_only_eligible_preferences(tmp_path, order, exp
     with analyst_pool.reserve(cfg, state, now) as (analyst, lease, selection):
         assert lease and analyst.vendor == expected
         assert selection["preference"] == filtered
+
+
+def test_scan_skips_a_scan_role_on_an_adapter_without_scan_capability(pool_env, monkeypatch, capsys):
+    sess = pool_env["sess"]
+    monkeypatch.setattr(type(sess.config), "for_role", lambda self, role, **k: ("codex",))
+    monkeypatch.setattr(scan.dispatch, "dispatch", lambda *a, **k: pytest.fail("dispatch"))
+    monkeypatch.setattr(scan, "refresh_worktree", lambda *a: pytest.fail("worktree refresh"))
+    outcome, draft = scan.scan_area(sess, "0", "api")
+    assert "no vendor with scan role" in capsys.readouterr().err
+    assert outcome is None and draft == ""

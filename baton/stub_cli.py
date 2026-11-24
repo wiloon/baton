@@ -42,6 +42,7 @@ REVIEW_TEMPLATE = "stub-review-prompt.md"
 REVIEW_DELIVERY = "reply"
 REVIEW_SKILL_POLICY = "none"
 SCREENSHOT_DELIVERY = ""
+SCREENSHOT_TOOL = ""
 CONTINUITY_PIN = True
 FIX_SCOPE_POLICY = "must_fix_nits_optional"
 FIVE_MINUTE_CACHE_ROLES = ()

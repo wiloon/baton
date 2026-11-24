@@ -904,19 +904,20 @@ class Review:
                 and "owner" not in vendors.review_excluded(self.state, self.pr))
 
     def screenshot_vendor(self):
-        """Claude or Codex, by the code review's exclusions; Cursor never looks at screenshots."""
+        """An image-capable adapter (IMAGES), by the code review's exclusions."""
         return pick.choose(self.env, "screenshot_reviewer", "", "review", self.vendors(), pr=str(self.pr),
                            issue=self.issue, fixed_by=self.fixed_by)
 
-    def shots_step(self, shots):
+    def shots_step(self, shots, vendor):
         """The screenshot reviewer's look at the manual-check screenshots (#50): every valid PNG,
         or one Must fix when there are none."""
         if not shots:
             return (f"This PR has `## {check_section.HEADING}` but there are no screenshots: report one Must fix asking the "
                     "author to shoot every manual-check item the way the repository's agent docs describe.")
         listed = "".join(f"\n   - `{path}`" for path in shots)
-        return ("Look at every one of the screenshots of this PR's manual checks (Claude: the Read tool; "
-                f"Codex: view_image):{listed}\n"
+        tool = agents.ADAPTERS[vendor].SCREENSHOT_TOOL
+        return ("Look at every one of the screenshots of this PR's manual checks "
+                f"({tool}):{listed}\n"
                 "   Compare each with the manual checks above and the issue.")
 
     def run_screenshot_review(self, round, data, checks, vendor=""):
@@ -947,7 +948,7 @@ class Review:
         out = self.agent(vendor, "screenshot_review", self.render(
             "screenshot-review-prompt.md", PR=str(pr), ISSUE=self.issue or "unknown", GH_REPO=self.repo,
             WORKTREE=str(wt), ROUND=str(round), MAX_ROUNDS=str(self.max_rounds), CONTEXT_FILE=str(context),
-            MANUAL_CHECKS=cut(check_verdicts.numbered(checks), limit), SHOTS_STEP=self.shots_step(notify.shots(pr, self.ctx)), DELIVERY=delivery),
+            MANUAL_CHECKS=cut(check_verdicts.numbered(checks), limit), SHOTS_STEP=self.shots_step(notify.shots(pr, self.ctx), vendor), DELIVERY=delivery),
             f"pr-{pr}-screenshot-review-{round}", str(self.self_dir / "review-settings.json"), str(review_file), self.env)
         outcome, model = out["outcome"], out["model"] or ""
         if not vendors.screenshot_allowed(self.state, pr, vendor, model, self.fixed_by):

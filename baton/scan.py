@@ -19,7 +19,7 @@ import subprocess
 import sys
 import time
 
-from . import dispatch, fix, notify, pr as pr_helpers, prompts, vendors
+from . import agents, dispatch, fix, notify, pr as pr_helpers, prompts, vendors
 from .common import Deferred, strip_markers
 
 
@@ -33,10 +33,10 @@ def refresh_worktree(repo_dir, wt):
 @session.scoped
 def scan_area(env, index, area):
     """One scan run on AREA. (outcome, draft) with draft "" unless it found a defect;
-    Deferred when Claude cannot run now; outcome None when the worktree failed."""
+    Deferred when no scan adapter can run now; outcome None when the worktree failed."""
     env = session.resolve(env)
     state, wt = str(env.dirs.state), Path(str(env.dirs.worktrees), "scan")
-    scanners = env.config.for_role("scan")
+    scanners = tuple(v for v in env.config.for_role("scan") if agents.ADAPTERS[v].SCAN)
     if not scanners:
         reason = "scan skipped: no vendor with scan role"
         notify.log(reason)
