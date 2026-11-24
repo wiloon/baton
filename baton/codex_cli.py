@@ -42,6 +42,7 @@ LEGACY_SEED_WITH_OWNER = False
 UNMARKED_AUTHOR_INFERENCE = True
 GITHUB_ACCESS = "denied"
 FIX_RESUMABLE_VIA_REPLY = False
+FIX_TEMPLATE = "codex-fix-prompt.md"
 READONLY_RESET = True
 REVIEW_TEMPLATE = "codex-review-prompt.md"
 REVIEW_DELIVERY = "artifact"

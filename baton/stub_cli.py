@@ -1,6 +1,6 @@
 """Test-double adapter (`stub-agent`): registered for capability-routing coverage (#112).
 
-Declares runner-mediated GitHub access, reply-based resumable fixes, after-run read-only
+Declares runner-mediated GitHub access, artifact-based fixes, after-run read-only
 reset and no image support. Production hosts leave it undeclared; tests admit it with
 `[vendors.stub]` and the four role grants.
 """
@@ -34,7 +34,8 @@ COMMIT_MARKERS = ()
 LEGACY_SEED_WITH_OWNER = False
 UNMARKED_AUTHOR_INFERENCE = True
 GITHUB_ACCESS = "runner"
-FIX_RESUMABLE_VIA_REPLY = True
+FIX_RESUMABLE_VIA_REPLY = False
+FIX_TEMPLATE = "stub-fix-prompt.md"
 READONLY_RESET = True
 REVIEW_TEMPLATE = "stub-review-prompt.md"
 REVIEW_DELIVERY = "reply"

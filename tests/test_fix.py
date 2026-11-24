@@ -2248,3 +2248,146 @@ def test_a_deferred_replacement_description_preserves_the_owners_issue_correctio
     gh.fail("edit-before-write", False)
     assert run.fix("cursor")["rc"] == 1 and run.labelled()
     assert run.body() == corrected and len(run.agent_calls) == 1
+
+# --- stage 2 fix capability routing (#113) -------------------------------------------------
+
+def test_adapters_declare_fix_capabilities():
+    from baton import agents
+    expected = {
+        "claude": ("fix-prompt.md", "settings", False),
+        "codex": ("codex-fix-prompt.md", "denied", False),
+        "cursor": ("cursor-fix-prompt.md", "runner", True),
+        "stub": ("stub-fix-prompt.md", "runner", False),
+    }
+    for vendor, (template, access, reply) in expected.items():
+        adapter = agents.ADAPTERS[vendor]
+        assert adapter.FIX_TEMPLATE == template
+        assert adapter.GITHUB_ACCESS == access
+        assert adapter.FIX_RESUMABLE_VIA_REPLY is reply
+
+
+def _admit_stub_fixer(run, monkeypatch):
+    from dataclasses import replace
+    from baton import config, session
+    from conftest import full_text
+    from test_adapter_capabilities import with_stub
+
+    path = Path(run.root, "stub-fix.toml")
+    path.write_text(with_stub(full_text()))
+    cfg = config.load(path, home=run.root / "home")
+    cfg = replace(cfg, paths=replace(cfg.paths, self_dir=run.bin,
+                                     state=Path(os.environ["STATE"]),
+                                     logs=Path(os.environ["LOGS"]),
+                                     ctx=Path(os.environ["CTX"])))
+    sess = session.create(cfg, repo=cfg.repos[0])
+    sess = replace(sess, dirs=replace(
+        sess.dirs, state=Path(os.environ["STATE"]), logs=Path(os.environ["LOGS"]),
+        ctx=Path(os.environ["CTX"])))
+
+    def resolve(value=None):
+        if isinstance(value, session.Session):
+            return value
+        return sess
+
+    monkeypatch.setattr(session, "resolve", resolve)
+    return sess
+
+
+@pytest.mark.parametrize("fixer,template_line", [
+    ("claude", f"4. Write one reply to `/tmp/baton-fix-{PR}.md` with the Write tool; do not post it."
+               " The runner posts it. Include no `<!-- baton-` markers."),
+    ("codex", f"4. Write one reply to `/tmp/baton-fix-{PR}.md`; do not post it."
+              " The runner posts it. Include no `<!-- baton-` markers."),
+    ("cursor", "5. The runner posts your final message on the PR."
+               " Put the checks section above the `TASK:`/`RESULT:` lines."),
+    ("stub", f"4. Write the Stub fix reply to `/tmp/baton-fix-{PR}.md`; do not post it."
+             " The runner posts it. Include no `<!-- baton-` markers."),
+])
+def test_fix_templates_come_from_the_adapter(run, monkeypatch, fixer, template_line):
+    _admit_stub_fixer(run, monkeypatch)
+    reply = "## Must fix\nnone\n\n## Checks to verify\nnone\n\nRESULT: fixed\n"
+    run.agent(cursor_plan(reply) if fixer == "cursor" else {"file": reply})
+    assert run.fix(fixer)["rc"] == 0
+    prompt = run.prompts[0]
+    assert template_line in prompt.splitlines()
+    if fixer == "cursor":
+        assert f"pr-{PR}-body.md" in prompt
+        assert not run.agent_calls[0][3]
+    else:
+        assert run.agent_calls[0][3] == f"/tmp/baton-fix-{PR}.md"
+        assert f"pr-{PR}-description.md" in prompt
+        assert f"/tmp/baton-fix-{PR}.md.body" in prompt
+    assert run.comments()[0].startswith(f"<!-- baton-fix by={fixer} -->")
+
+
+@pytest.mark.parametrize("fixer,ref,prefix", [("cursor", "cursor/issue-1", "Cursor "), ("claude", "HEAD", "")])
+def test_verification_resume_uses_the_fixer_protocol_and_clears_cursor_state(
+    advised_fix, monkeypatch, gh, fixer, ref, prefix,
+):
+    from baton import recovery, session
+    from baton.common import Deferred
+
+    run = advised_fix
+    state = Path(os.environ["STATE"])
+    cursor_base = state / f"cursor-fix-base-{PR}"
+    cursor_task = state / f"cursor-fix-task-{PR}"
+    reply = "## Checks to verify\nnone\n\nRESULT: fixed"
+    if fixer == "claude":
+        request = BODY.replace("## Checks to verify\nnone", "## Checks to verify\n- /billing: cursor badge")
+        run.agent(cursor_plan(reply, request=request))
+        gh.fail("edit")
+        assert run.fix("cursor")["rc"] == 75
+        assert cursor_base.exists() and cursor_task.exists()
+        gh.fail("edit", False)
+
+    run.verify_script("lint broke", "lint broke", "lint broke", "pass")
+    run.advice = [{"action": "retry_step", "reason": "transient verification",
+                   "evidence": ["Decision point: fix_verify_failed"]}]
+    run.agent(cursor_plan(reply) if fixer == "cursor" else {"file": reply},
+              {"commit": True}, {"commit": True})
+    verify = fix.Runner.verify
+
+    def defer_once(self, *args, **kwargs):
+        if kwargs.get("repairs") == 0 and not defer_once.used:
+            defer_once.used = True
+            raise Deferred(fixer, "short block")
+        return verify(self, *args, **kwargs)
+
+    defer_once.used = False
+    monkeypatch.setattr(fix.Runner, "verify", defer_once)
+    assert run.fix(fixer)["rc"] == 75
+    saved = recovery.load(session.resolve(os.environ), "419", PR)
+    assert saved["reason"] == "fix_verify_failed"
+    assert cursor_base.exists()
+
+    pushes = []
+    push = fix.Runner.push_with_retry
+
+    def capture_push(self, pr, wt, push_ref, **kwargs):
+        pushes.append((push_ref, kwargs["who"], kwargs["fixer"], kwargs["clear_cursor"]))
+        return push(self, pr, wt, push_ref, **kwargs)
+
+    monkeypatch.setattr(fix.Runner, "push_with_retry", capture_push)
+    calls = list(run.agent_calls)
+    assert run.fix(fixer)["rc"] == 0
+    assert pushes == [(ref, prefix, fixer, fixer == "cursor")] and run.pushed()
+    assert not cursor_base.exists() and not cursor_task.exists()
+    assert run.agent_calls == calls
+
+
+def test_stub_artifact_fix_discards_a_pending_cursor_request(run, monkeypatch, gh):
+    _admit_stub_fixer(run, monkeypatch)
+    request = BODY.replace("## Checks to verify\nnone", "## Checks to verify\n- /billing: cursor badge")
+    run.agent(cursor_plan("## Checks to verify\n- /billing: cursor badge\n\nRESULT: fixed", request=request))
+    gh.fail("edit")
+    assert run.fix("cursor")["rc"] == 75
+    gh.fail("edit", False)
+
+    run.agent({"file": "## Checks to verify\nnone\n\nRESULT: fixed\n"})
+    assert run.fix("stub")["rc"] == 0
+    assert [call[0] for call in run.agent_calls] == ["cursor", "stub"]
+    assert run.agent_calls[-1][3] == f"/tmp/baton-fix-{PR}.md"
+    assert section(run.body(), "Checks to verify") == "none"
+    state = Path(os.environ["STATE"])
+    assert not (state / f"cursor-fix-task-{PR}").exists()
+    assert not (Path(env_ctx()) / f"pr-{PR}-body.md").exists()
