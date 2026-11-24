@@ -156,8 +156,10 @@ class Tick:
                 (state / f"spec-paused-{a['spec']}").unlink(missing_ok=True)
             if a["cursor_fix"] and not push_pending:
                 n = a["cursor_fix"]
-                for path in (state / f"cursor-fix-base-{n}", state / f"pr-body-base-{n}",
-                             state / f"cursor-fix-task-{n}", state / f"owner-fix-feedback-{n}",
+                from . import agents
+                reply = [state / f"{rid}-fix-{kind}-{n}" for rid, ad in agents.ADAPTERS.items()
+                         if ad.FIX_RESUMABLE_VIA_REPLY for kind in ("base", "task")]
+                for path in (*reply, state / f"pr-body-base-{n}", state / f"owner-fix-feedback-{n}",
                              self.ctx / f"pr-{n}-fix-checks.json"):
                     path.unlink(missing_ok=True)
                 pr_helpers.remove_body_request(self.ctx / f"pr-{n}-body.md")
