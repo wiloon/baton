@@ -2257,7 +2257,7 @@ def test_adapters_declare_fix_capabilities():
         "claude": ("fix-prompt.md", "settings", False),
         "codex": ("codex-fix-prompt.md", "denied", False),
         "cursor": ("cursor-fix-prompt.md", "runner", True),
-        "stub": ("stub-fix-prompt.md", "runner", False),
+        "stub": ("stub-fix-prompt.md", "runner", True),
     }
     for vendor, (template, access, reply) in expected.items():
         adapter = agents.ADAPTERS[vendor]
@@ -2300,17 +2300,17 @@ def _admit_stub_fixer(run, monkeypatch):
               " The runner posts it. Include no `<!-- baton-` markers."),
     ("cursor", "5. The runner posts your final message on the PR."
                " Put the checks section above the `TASK:`/`RESULT:` lines."),
-    ("stub", f"4. Write the Stub fix reply to `/tmp/baton-fix-{PR}.md`; do not post it."
-             " The runner posts it. Include no `<!-- baton-` markers."),
+    ("stub", "5. The runner posts your final message on the PR."
+             " Put the checks section above the `TASK:`/`RESULT:` lines."),
 ])
 def test_fix_templates_come_from_the_adapter(run, monkeypatch, fixer, template_line):
     _admit_stub_fixer(run, monkeypatch)
     reply = "## Must fix\nnone\n\n## Checks to verify\nnone\n\nRESULT: fixed\n"
-    run.agent(cursor_plan(reply) if fixer == "cursor" else {"file": reply})
+    run.agent(cursor_plan(reply) if fixer in ("cursor", "stub") else {"file": reply})
     assert run.fix(fixer)["rc"] == 0
     prompt = run.prompts[0]
     assert template_line in prompt.splitlines()
-    if fixer == "cursor":
+    if fixer in ("cursor", "stub"):
         assert f"pr-{PR}-body.md" in prompt
         assert not run.agent_calls[0][3]
     else:
@@ -2375,7 +2375,7 @@ def test_verification_resume_uses_the_fixer_protocol_and_clears_cursor_state(
     assert run.agent_calls == calls
 
 
-def test_stub_artifact_fix_discards_a_pending_cursor_request(run, monkeypatch, gh):
+def test_stub_reply_fix_discards_a_pending_cursor_request(run, monkeypatch, gh):
     _admit_stub_fixer(run, monkeypatch)
     request = BODY.replace("## Checks to verify\nnone", "## Checks to verify\n- /billing: cursor badge")
     run.agent(cursor_plan("## Checks to verify\n- /billing: cursor badge\n\nRESULT: fixed", request=request))
@@ -2383,11 +2383,24 @@ def test_stub_artifact_fix_discards_a_pending_cursor_request(run, monkeypatch, g
     assert run.fix("cursor")["rc"] == 75
     gh.fail("edit", False)
 
-    run.agent({"file": "## Checks to verify\nnone\n\nRESULT: fixed\n"})
+    run.agent(cursor_plan("## Checks to verify\nnone\n\nRESULT: fixed"))
     assert run.fix("stub")["rc"] == 0
     assert [call[0] for call in run.agent_calls] == ["cursor", "stub"]
-    assert run.agent_calls[-1][3] == f"/tmp/baton-fix-{PR}.md"
     assert section(run.body(), "Checks to verify") == "none"
-    state = Path(os.environ["STATE"])
-    assert not (state / f"cursor-fix-task-{PR}").exists()
     assert not (Path(env_ctx()) / f"pr-{PR}-body.md").exists()
+
+
+def test_stub_fix_posts_its_marker_and_retries_a_description_update_without_a_cli_run(run, monkeypatch, gh):
+    _admit_stub_fixer(run, monkeypatch)
+    request = BODY.replace("## Checks to verify\nnone", "## Checks to verify\n- /billing: stub badge")
+    run.agent(cursor_plan("Badge added.\n\n## Checks to verify\n- /billing: stub badge\n\nRESULT: fixed", request=request))
+    gh.fail("edit")
+    assert run.fix("stub")["rc"] == 75
+    state = Path(os.environ["STATE"])
+    assert (state / f"stub-fix-base-{PR}").exists() and (state / f"stub-fix-task-{PR}").exists()
+    gh.fail("edit", False)
+    assert run.fix("stub")["rc"] == 0
+    assert [call[0] for call in run.agent_calls] == ["stub"]
+    assert section(run.body(), "Checks to verify") == "- /billing: stub badge"
+    assert run.comments()[0].startswith("<!-- baton-fix by=stub -->")
+    assert run.pushed() and not (state / f"stub-fix-base-{PR}").exists()
