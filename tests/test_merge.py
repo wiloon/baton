@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from baton import advisor, after_merge, ci, merge, notify, pick, pr as pr_helpers
+from baton import advisor, ci, merge, notify, pick, pr as pr_helpers
 from baton.config import Advisor
 from conftest import sh
 from test_notify import PNG, Telegram
@@ -409,27 +409,6 @@ def test_checks_the_owner_wrote_into_the_issue_merge_once_verified(run):
     assert run.merged() and not run.labelled("ready-for-human")
 
 
-def test_deferred_checks_keep_only_what_the_screenshot_review_left(run):
-    run.gh.set(body=CLEAN.replace("none", TWO))
-    run.go(MANUAL_CHECKS="defer", screenshot={"checks": TWO, "comment": verdicts("1. verified", "2. owner")})
-    assert run.merged()
-    saved = json.loads(Path(run.env["STATE"], f"deferred-checks-items-pr-{PR}").read_text())
-    assert saved == {"source": [ONE, SIGNUP], "left": [SIGNUP]}
-
-
-def test_deferred_manual_checks_do_not_stop_the_merge(run):
-    run.gh.set(body=CLEAN.replace("none", "- check the theme"))
-    run.go(MANUAL_CHECKS="defer")
-    assert run.merged() and not run.labelled("ready-for-human") and not run.captions()
-    assert "notify PR #335 merged" in run.events and "after_merge" in run.events
-
-
-def test_deferred_manual_checks_still_need_auto_merge(run):
-    run.gh.set(body=CLEAN.replace("none", "- check the theme"))
-    run.go(MANUAL_CHECKS="defer", AUTO_MERGE="0")
-    assert run.events == ["notify PR #335 review passed"] and not run.merged() and not run.captions()
-
-
 def test_a_repository_can_turn_auto_merge_off_for_itself(run):
     run.go(REPO_AUTO_MERGE="0")
     assert run.events == ["notify PR #335 review passed"] and not run.merged() and run.labelled("ready-for-human")
@@ -461,10 +440,6 @@ def two_checks(heading):
     return f"Closes #297\n\n## {heading}\n{TWO}\n"
 
 
-def remainder(run):
-    return Path(run.env["STATE"], f"deferred-checks-items-pr-{PR}")
-
-
 @BOTH_HEADINGS
 def test_verdicts_clear_or_partly_hand_off_under_either_name(run, heading):
     run.gh.set(body=two_checks(heading))
@@ -474,13 +449,6 @@ def test_verdicts_clear_or_partly_hand_off_under_either_name(run, heading):
     assert run.captions()[0].splitlines()[3:] == [f"- {SIGNUP}"]
     run.go(screenshot={"checks": TWO, "comment": verdicts("1. verified", "2. verified")})
     assert run.merged()
-
-
-@BOTH_HEADINGS
-def test_defer_writes_only_the_left_items_under_either_name(run, heading):
-    run.gh.set(body=two_checks(heading))
-    run.go(MANUAL_CHECKS="defer", screenshot={"checks": TWO, "comment": verdicts("1. verified", "2. owner")})
-    assert run.merged() and json.loads(remainder(run).read_text()) == {"source": [ONE, SIGNUP], "left": [SIGNUP]}
 
 
 @pytest.mark.parametrize("body", [
@@ -493,8 +461,6 @@ def test_a_section_that_lists_nothing_or_is_not_well_formed_is_never_cleared_by_
     run.gh.set(body=body)
     run.go(screenshot={"checks": "", "comment": verdicts("1. verified")})
     assert not run.merged() and run.labelled("ready-for-human")
-    run.go(MANUAL_CHECKS="defer", screenshot={"checks": "", "comment": verdicts("1. verified")})
-    assert run.merged() and not remainder(run).exists()
 
 
 @pytest.mark.parametrize("first, second, expected", [
@@ -521,34 +487,13 @@ def test_unreadable_verdicts_are_no_verdicts(run):
     text = run.texts["PR #335 needs a manual check"]
     assert not run.merged() and "Checks for you" in text and ONE in text and SIGNUP in text
     assert run.captions()[0].splitlines()[3:] == [f"- {ONE}", f"- {SIGNUP}"]
-    run.go(MANUAL_CHECKS="defer", screenshot={"checks": TWO, "comment": incomplete})
-    assert run.merged() and not remainder(run).exists()
 
 
-def test_a_failed_merge_leaves_no_remainder(run):
+def test_a_failed_merge_of_verified_checks_goes_to_the_owner(run):
     run.gh.set(body=two_checks("Checks to verify"))
     run.gh.fail("merge")
-    run.go(MANUAL_CHECKS="defer", screenshot={"checks": TWO, "comment": verdicts("1. verified", "2. verified")})
-    assert run.labelled("ready-for-human") and not remainder(run).exists()
-
-
-def tracked_check_lines(run, monkeypatch):
-    monkeypatch.setenv("MANUAL_CHECKS", "defer")
-    Path(run.env["STATE"], "deferred-checks-since").write_text("2026-11-14T09:00:00+00:00\n")
-    run.gh.set(mergedAt="2026-11-14T10:00:00Z")
-    after_merge.deferred_checks(PR, "297")
-    [tracker] = run.gh.created()
-    assert tracker["title"] == "Checks to try"
-    return tracker["body"].split("\n\n")[-1].splitlines()
-
-
-def test_a_retry_replaces_the_remainder_of_an_earlier_attempt(run, monkeypatch):
-    stale = {"source": [ONE, SIGNUP, "A new check."], "left": []}
-    remainder(run).write_text(json.dumps(stale))
-    run.gh.set(body=two_checks("Checks to verify") + "- A new check.\n")
-    run.go(MANUAL_CHECKS="defer", screenshot={"checks": TWO, "comment": verdicts("1. verified", "2. verified")})
-    assert run.merged() and not remainder(run).exists()
-    assert tracked_check_lines(run, monkeypatch) == [f"- [ ] {ONE}", f"- [ ] {SIGNUP}", "- [ ] A new check."]
+    run.go(screenshot={"checks": TWO, "comment": verdicts("1. verified", "2. verified")})
+    assert run.labelled("ready-for-human") and "notify PR #335 merge failed" in run.events
 
 
 def test_a_check_added_between_reads_is_in_both_gate_handoff_messages(run, monkeypatch):
@@ -564,28 +509,6 @@ def test_a_check_added_between_reads_is_in_both_gate_handoff_messages(run, monke
     [caption] = run.captions()
     assert caption.startswith("PR #335: Checks for you\n")
     assert caption.splitlines()[3:] == expected
-
-
-def test_the_tracker_gets_the_checks_added_between_merge_and_gate_reads(run, monkeypatch):
-    initial = two_checks("Checks to verify")
-    edited = initial + "- Added later.\n"
-    run.gh.set(body=initial)
-    real_body = pr_helpers.body
-    reads = []
-
-    def read_and_edit(pr):
-        body = real_body(pr)
-        reads.append(body)
-        if len(reads) == 1:
-            run.gh.set(body=edited)
-        return body
-
-    monkeypatch.setattr(pr_helpers, "body", read_and_edit)
-    run.go(MANUAL_CHECKS="defer", screenshot={"checks": TWO, "comment": verdicts("1. verified", "2. verified")})
-    assert reads == [initial.rstrip("\n"), edited.rstrip("\n")]
-    assert run.merged()
-    assert json.loads(remainder(run).read_text()) == {"source": [ONE, SIGNUP], "left": []}
-    assert tracked_check_lines(run, monkeypatch) == [f"- [ ] {ONE}", f"- [ ] {SIGNUP}", "- [ ] Added later."]
 
 
 @pytest.mark.parametrize("verdict, left, listed", [

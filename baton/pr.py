@@ -422,10 +422,9 @@ def checks_none(text):
     return checks.is_none(text)
 
 
-def gate(pr, defer=False, cleared=None):
+def gate(pr, cleared=None):
     """After green CI: merge, hand off for a manual check, or queue a metadata review
-    when the live description would close the wrong issue (preflight). DEFER: the
-    repository's manual checks wait for a later trial instead of the merge (#48).
+    when the live description would close the wrong issue (preflight).
     CLEARED: the manual checks the screenshot review verified, all of them (#92); they
     clear the gate only while the live description still lists exactly those checks.
     A checks handoff includes the body that caused it, when it could be read."""
@@ -434,7 +433,7 @@ def gate(pr, defer=False, cleared=None):
         return {"action": "manual_checks"}
     listed = checks.items(current)   # none unless the body has exactly one checks section
     verified = cleared is not None and bool(listed) and listed == check_verdicts.items(cleared)
-    if not (defer or verified or checks_none(current)):
+    if not (verified or checks_none(current)):
         return {"action": "manual_checks", "body": current}
     try:
         preflight(pr)
@@ -485,7 +484,7 @@ def main(argv=None):
         current = body(args.pr)
         return 0 if current is not None and checks_none(current) else 1
     elif args.command == "gate":
-        print(json.dumps(gate(args.pr, defer=env.repo.manual_checks == "defer")))
+        print(json.dumps(gate(args.pr)))
     return 0
 
 

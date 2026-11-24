@@ -111,19 +111,13 @@ gate_option = ""
 # true when the repository requires a Signed-off-by on every commit (a DCO check): before each
 # push the runner adds one for the author to the agent's unpushed commits that lack it.
 signoff = false
-# "gate": a PR whose `## Checks to verify` is not none waits for the owner (ready-for-human),
-# unless the screenshot review verified every check (below). "defer": it merges once review and
-# CI pass, and its checks are collected in one open "Checks to try" issue
-# (ready-for-human) for a later trial of the whole app. Only PRs merged after defer is first seen
-# on are collected; turning it off and on again restarts that.
-manual_checks = "gate"
 # true: after a successful pool code review of an agent PR with manual checks, a separate
 # screenshot review run (models.routes.screenshot_review, preferences.screenshot_reviewer) looks
 # at the manual-check screenshots: Must fix for anything a user would see as broken, or for
 # missing screenshots. Every fixer re-shoots them. Owner PRs and Cursor reviews skip it.
 # It also gives each manual check a verdict (ADR 0006): verified, broken or owner. When the last
 # round verified them all, the PR merges like one with no manual checks (the screenshots still
-# go to Telegram); otherwise only the checks left for the owner are handed over or deferred.
+# go to Telegram); otherwise only the checks left for the owner are handed over.
 # Checks the owner wrote into the issue are judged the same way.
 screenshot_review = false
 # false: every PR of this repository waits for the owner (ready-for-human), even when
