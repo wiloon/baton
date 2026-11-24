@@ -2692,6 +2692,27 @@ def test_a_switched_fixer_drops_the_former_producers_pending_checks_refresh(run,
     assert not (Path(env_ctx()) / f"pr-{PR}-fix-checks.json").exists()
 
 
+def test_a_switched_fixer_whose_verify_fails_then_retries_still_credits_the_earlier_producer(advised_fix, monkeypatch):
+    run = advised_fix
+    _admit_stub_fixer(run, monkeypatch)
+    state = Path(os.environ["STATE"])
+    request = BODY.replace("Disabled buttons.", "Cursor's superseded description.")
+    run.agent(cursor_plan("## Checks to verify\nnone\n\nRESULT: fixed", request=request))
+    clock, _ = _flaky_edits(monkeypatch, fail_until=1_001)
+    assert run.fix("cursor")["rc"] == 75
+    clock["now"] = 1_001
+    run.advice = [{"action": "retry_step", "reason": "flaky local check",
+                   "evidence": ["Decision point: fix_verify_failed"]}]
+    run.verify_script("lint broke", "lint broke", "lint broke", "pass")
+    run.agent(cursor_plan("## Checks to verify\nnone\n\nRESULT: fixed", commit=False),
+              {"outcome": "RESULT: fixed", "commit": True},
+              {"outcome": "RESULT: fixed", "commit": True})
+    assert run.fix("stub")["rc"] == 0
+    assert (state / f"pr-{PR}-authors").read_text().split() == ["cursor", "stub"]
+    contrib = (state / f"pr-{PR}-contrib").read_text().split("\n")
+    assert any(row.startswith("cursor ") for row in contrib)
+
+
 def test_a_stub_fix_that_fails_a_task_write_leaves_no_reply_files(run, monkeypatch, gh):
     _admit_stub_fixer(run, monkeypatch)
     state = Path(os.environ["STATE"])

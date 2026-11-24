@@ -1490,8 +1490,8 @@ class Runner:
                 return 1
             if rc != 0 and (rc != 2 or not discarded):
                 reason = "fix_task_invalid"
-                start = agent_head if self.attempt_authors else head
-                if not self.record(pr, fixer, wt, start, "", ""):
+                start = agent_head if (self.attempt_authors or self.prior_author) else head
+                if not self.record(pr, fixer, wt, start, "", head if self.prior_author else ""):
                     return 1
                 action, alt, _ = self.recover(pr, reason, f"PR #{pr}: task completion change failed ({fixer})",
                                               f"Invalid task relation from {fixer}. {url}", fixer, wt=wt, head=head,
@@ -1618,7 +1618,7 @@ class Runner:
         else:
             rc, failure, rounds = self.verify(wt, "origin/main", fixer, "pr", pr)
             if rc != 0:
-                start = agent_head if self.attempt_authors else head
+                start = agent_head if (self.attempt_authors or self.prior_author) else head
                 if not self.record(pr, fixer, wt, start, "", head if self.prior_author else ""):
                     return 1
                 recorded_before_retry = True
