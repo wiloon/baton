@@ -26,7 +26,6 @@ issue labelled ready-for-agent
   fix           answer the review or a failing CI check (up to max_review_rounds)
   merge         [scheduling].auto_merge and the repository's [[repos]] auto_merge both true,
                 CI green, "## Checks to verify" none, or every check verified by the screenshot review -> merge; else ready-for-human
-                (manual_checks = "defer": the checks go to a "Checks to try" issue instead)
                 (screenshot_review = true: a second, separate run checks the manual-check screenshots after the code review;
                  every check verified -> merge; otherwise only the unverified ones go to the owner, ADR 0006)
 ```
