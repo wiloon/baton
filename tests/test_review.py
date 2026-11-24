@@ -3009,3 +3009,19 @@ def test_review_loop_pins_when_adapter_declares_continuity(loop, monkeypatch):
     loop.gh.set(headRefName="cursor/issue-297", author={"login": "cursor"})
     assert loop.run(fixer="cursor", reviewer="claude") == 0
     assert pins and pins[0] is False
+
+
+
+@pytest.mark.parametrize("vendor,expected", [("stub", True), ("cursor", True), ("claude", False), ("codex", False)])
+def test_review_vendor_selection_pins_by_adapter_continuity(monkeypatch, vendor, expected):
+    seen = {}
+
+    def fake_choose(env, role, current, *args, pinned=False, **kwargs):
+        seen["pinned"] = pinned
+        return current
+
+    monkeypatch.setattr(review.pick, "choose", fake_choose)
+    monkeypatch.setattr(review.pick, "all_vendors", lambda env: [])
+    rv = review.Review({}, None, "1", "/tmp", "1", "")
+    assert rv.review_vendor(vendor) == vendor
+    assert seen["pinned"] is expected

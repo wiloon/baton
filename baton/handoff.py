@@ -457,9 +457,8 @@ def _fix_meta_write_binding_valid(item, binding, *, reason):
                     or not isinstance(context["fix_source"], str)):
                 return False
         resume = binding.get("resume")
-        if (binding["fixer"] in agents.ADAPTERS
-                and agents.ADAPTERS[binding["fixer"]].FIX_RESUMABLE_VIA_REPLY and resume is None):
-            return True    # Older reply-protocol records have a separate saved base.
+        if binding["fixer"] == "cursor" and resume is None:
+            return True    # Legacy Cursor records predate the stored resume base.
         return (isinstance(resume, dict)
                 and all(isinstance(resume.get(key), str) and re.fullmatch(r"[0-9a-f]{40}", resume[key])
                         for key in ("head", "agent_head"))

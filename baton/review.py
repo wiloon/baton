@@ -1,5 +1,5 @@
 """The review loop for the bash runner (migration slice 4c, #280): `run_review`,
-`cursor_review`, `review_loop` and the review context of run.sh.
+`review_loop` and the review context of run.sh.
 
 One reviewer run reads the PR's context file and returns REVIEW: pass or REVIEW: changes;
 on changes a fixer is picked by contribution and baton.fix runs, then the next round
@@ -778,7 +778,7 @@ class Review:
         """The reviewer with the fewest lines in the PR. When every vendor is excluded, Exhausted
         ends the step with a ready-for-human handoff."""
         return pick.choose(self.env, "reviewer", current, "review", self.vendors(), pr=str(self.pr),
-                           issue=self.issue, fixed_by=self.fixed_by, pinned=current == "cursor")
+                           issue=self.issue, fixed_by=self.fixed_by, pinned=continuity_pin(current))
 
     def review_allowed(self, vendor, model=""):
         """Persisted authors survive restarts and role changes: a vendor that wrote the PR does
@@ -845,10 +845,6 @@ class Review:
         body = f"<!-- baton-review round={round} by={reviewer} -->\n{posted[:REPLY_CAP]}"
         binding = self.comment_post_binding(body, round, outcome, reviewer, head, data)
         return self.post_review_comment(round, reviewer, binding), reply
-
-    def cursor_review(self, round, note, context, data, head):
-        """Compatibility wrapper: Cursor's reply-delivery review."""
-        return self.reply_review("cursor", round, note, context, data, head)
 
     def run_review(self, round, note, reviewer=None):
         """One reviewer run; returns OUTCOME. Use the loop's selected reviewer when supplied.

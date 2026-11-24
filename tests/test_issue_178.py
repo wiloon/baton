@@ -276,7 +276,7 @@ def test_feedback_cli_prints_only_owner_words(gh, capsys):
 
 # --- review round 1 ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("fixer", ["claude", "codex", "cursor"])
+@pytest.mark.parametrize("fixer", ["claude", "codex", "cursor", "stub"])
 @pytest.mark.parametrize("mode", ["ordinary", "owner_with_findings", "owner_without_findings"])
 def test_rendered_fix_prompts_apply_only_the_scope_for_the_current_run(run, fixer, mode):
     findings = "## Must fix\n1. a\n2. b\n\n## Nits\n- file.py:8 tidy a name"
@@ -298,7 +298,7 @@ def test_rendered_fix_prompts_apply_only_the_scope_for_the_current_run(run, fixe
         assert "Handle every" not in prompt
         assert "All review nits are in scope for the reply" not in prompt
     else:
-        assert ("Handle every Must fix point" if fixer == "cursor" else "Handle every point") in prompt
+        assert ("Handle every Must fix point" if fixer in ("cursor", "stub") else "Handle every point") in prompt
         assert "All review nits are in scope for the reply" in prompt
         assert "The owner's words set the scope" not in prompt
         assert "Any `<findings>` block is context only" not in prompt
