@@ -3508,8 +3508,8 @@ def test_live_grounded_spec_answers_post_once_and_resume_revision(advised, monke
     assert [r["role"] for r in advised.runs] == ["spec_review", "spec", "spec", "spec_review"]
     assert "ready-for-human" not in advised.gh.labels
     assert advised.gh.posted("<!-- baton-verdict: accept")
-    ctx = next(Path(advised.env["CTX"]).glob(f"issue-{N}-spec-*-revise-*.md")).read_text()
-    assert "<advisor-answer" in ctx and excerpt in ctx
+    ctxs = [p.read_text() for p in sorted(Path(advised.env["CTX"]).glob(f"issue-{N}-spec-*-revise-*.md"))]
+    assert any("<advisor-answer" in c and excerpt in c for c in ctxs)
 
 
 def test_a_deferred_adr_push_resumes_revision_after_grounded_answers(advised, monkeypatch):

@@ -3042,6 +3042,42 @@ def test_review_loop_pins_when_adapter_declares_continuity(loop, monkeypatch):
     assert pins and pins[0] is False
 
 
+def test_a_transient_stub_review_comment_post_writes_a_valid_record_and_replays(loop, monkeypatch):
+    """Stub's reply-protocol comment post retries through handoff like Cursor's (#113)."""
+    from subprocess import CompletedProcess
+
+    admit_stub(loop, monkeypatch)
+    loop.gh.set(headRefName="owner/issue-1", author={"login": "owner"})
+    loop.reviews[:] = ["pass"]
+    clock = {"now": 1_000}
+    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
+    monkeypatch.setattr(review.pr_helpers, "sleep", lambda *_: None)
+    runs, call = [], review.pr_helpers.call
+
+    def agent(vendor, role, prompt, tag, cwd, settings="", output="", env=None, hooks=None):
+        runs.append(tag)
+        return {"rc": 0, "status": "success", "outcome": "REVIEW: pass",
+                "reply": "stub review findings\nREVIEW: pass", "model": "stub-1", "defer": ""}
+
+    def flaky_comment(*args, **kwargs):
+        if args[:2] == ("pr", "comment") and clock["now"] < 1_060:
+            return CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return call(*args, **kwargs)
+
+    monkeypatch.setattr(review.dispatch, "dispatch", agent)
+    monkeypatch.setattr(review.pr_helpers, "call", flaky_comment)
+    assert loop.run(fixer="pool", reviewer="stub") == 75
+    saved = handoff.load_retry(session.resolve(loop.env), "297", "review_comment_post_failed", str(PR))
+    assert saved["continuation"]["reviewer"] == "stub"
+    assert saved["continuation"]["body"].startswith("<!-- baton-review round=1 by=stub -->\n")
+    assert handoff._binding_valid(handoff.REVIEW_POST, str(PR), saved["continuation"]) is True
+    clock["now"] = 1_060
+    assert loop.run(fixer="pool", reviewer="stub") == 0
+    assert len(runs) == 1
+    assert loop.comments()[0].startswith("<!-- baton-review round=1 by=stub -->\n")
+    assert not list(Path(loop.env["STATE"]).glob("handoff-retry-*"))
+
+
 
 @pytest.mark.parametrize("vendor,expected", [("stub", True), ("cursor", True), ("claude", False), ("codex", False)])
 def test_review_vendor_selection_pins_by_adapter_continuity(monkeypatch, vendor, expected):
