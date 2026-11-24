@@ -2723,3 +2723,23 @@ def test_a_stub_fix_that_fails_a_task_write_leaves_no_reply_files(run, monkeypat
     assert run.fix("stub")["rc"] == 1
     for name in (f"stub-fix-base-{PR}", f"stub-fix-task-{PR}", f"pr-{PR}-fix-owner", f"pr-body-base-{PR}"):
         assert not (state / name).exists(), name
+
+
+def test_a_recovery_grant_switches_to_the_next_fixer_without_applying_the_pending_cursor_request(advised_fix, monkeypatch):
+    run = advised_fix
+    _admit_stub_fixer(run, monkeypatch)
+    monkeypatch.setattr(fix.pick, "all_vendors", lambda env: ["cursor", "stub"])
+    state = Path(os.environ["STATE"])
+    base = run.remote_head()
+    request = BODY.replace("Disabled buttons.", "Cursor's superseded description.")
+    run.advice = [{"action": "retry_step_other_vendor", "reason": "try another fixer",
+                   "evidence": ["Decision point: fix_run_failed"]}]
+    run.agent(cursor_plan("RESULT: failed boom", outcome="RESULT: failed boom", request=request),
+              cursor_plan("## Checks to verify\nnone\n\nRESULT: fixed"))
+    result = run.fix("cursor")
+    assert result["rc"] == 0 and result["fixer"] == "stub"
+    assert [call[0] for call in run.agent_calls] == ["cursor", "stub"]
+    assert run.pushed() and run.remote_head() != base
+    assert "Cursor's superseded description." not in run.body()
+    assert _owner() is None
+    assert not (state / f"cursor-fix-base-{PR}").exists() and not (state / f"cursor-fix-task-{PR}").exists()

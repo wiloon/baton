@@ -706,6 +706,16 @@ def test_a_repair_failure_without_a_handoff_is_not_taken_for_one(repair):
     assert Path(repair.env["STATE"], f"ci-fix-{PR}-{HEAD}").exists()
 
 
+def test_a_reply_fixer_whose_description_update_defers_hands_the_head_off_without_marking_it(repair, monkeypatch):
+    """fix_pr returns 75 (a validated description GitHub refused): hand the head off, write no marker."""
+    monkeypatch.setattr(merge.pick, "choose", lambda *a, **k: "cursor")
+    repair.fix_rc = 75
+    assert repair.merger().ci_fix_round(str(repair.wt)) == 1
+    assert repair.fixes[0]["fixer"] == "cursor"
+    assert any("CI repair deferred; handing off this head" in line for line in repair.log())
+    assert not Path(repair.env["STATE"], f"ci-fix-{PR}-{HEAD}").exists()
+
+
 def save_waiting_push(repair, fixer="codex"):
     """A deferred CI-repair push as the fix run saves it, with the repaired head noted."""
     from baton import handoff, session
