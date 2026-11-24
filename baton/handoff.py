@@ -45,6 +45,7 @@ DEV_PUSH = "dev_push_failed"
 SPEC_ADR_PUSH = "spec_adr_push_failed"
 FIX_CHECKS = "fix_checks_refresh_failed"
 FIX_TASK = "fix_task_write_failed"
+FIX_DESCRIPTION = "fix_description_write_failed"
 COMMENT_POSTS = (REVIEW_POST, SCREENSHOT_POST)
 SPEC_POSTS = (SPEC_REVIEW_POST, SPEC_REPLY_POST)
 SPEC_ACCEPT_POSTS = (SPEC_PENDING_ACCEPT_POST, SPEC_ACCEPT_POST)
@@ -55,8 +56,8 @@ SPEC_WRITE_POSTS = (*SPEC_POSTS, *SPEC_ACCEPT_POSTS, *SPEC_BODY_WRITES)
 # Dev and ADR pushes are issue-scoped; fix pushes are PR-scoped.
 ISSUE_PUSHES = (DEV_PUSH, SPEC_ADR_PUSH)
 PUSH_REASONS = frozenset({FIX_PUSH, *ISSUE_PUSHES})
-# PR description metadata writes after a fix (checks refresh and TASK: edits).
-FIX_META_WRITES = (FIX_CHECKS, FIX_TASK)
+# PR description metadata writes after a fix (description, checks, TASK:).
+FIX_META_WRITES = (FIX_DESCRIPTION, FIX_CHECKS, FIX_TASK)
 RETRY_REASONS = frozenset({
     "review_comment_missing", "spec_comments_read_failed", "spec_pending_adr_read_failed",
     *COMMENT_POSTS, *SPEC_WRITE_POSTS, *PUSH_REASONS, *FIX_META_WRITES,
@@ -118,6 +119,7 @@ REASONS = {
     "spec_accept_post_failed": Reason(1, "rule"),
     "fix_checks_refresh_failed": Reason(1, "rule"),
     "fix_task_write_failed": Reason(1, "rule"),
+    "fix_description_write_failed": Reason(1, "rule"),
     "fix_run_unfinished": Reason(1, "rule"),
     "spec_body_edit_failed": Reason(1, "rule"),
     "spec_adr_open_failed": Reason(1, "rule"),
@@ -423,10 +425,31 @@ def _spec_body_edit_binding_valid(item, binding):
             and isinstance(binding.get("wt"), str) and bool(binding["wt"]))
 
 
+def _fix_description_resume_valid(resume):
+    return (isinstance(resume, dict)
+            and all(isinstance(resume.get(key), str) and re.fullmatch(r"[0-9a-f]{40}", resume[key])
+                    for key in ("head", "agent_head"))
+            and isinstance(resume.get("model"), str)
+            and isinstance(resume.get("cursor_base"), str)
+            and type(resume.get("description_changed")) is bool)
+
+
 def _fix_meta_write_binding_valid(item, binding, *, reason):
-    """A checks refresh or TASK: body edit with its starting and intended bodies (#151)."""
+    """A description, checks or TASK: body edit with its starting and intended bodies (#151)."""
     starting, intended = binding.get("starting"), binding.get("intended")
     head, feedback = binding.get("head"), binding.get("feedback")
+    if reason == FIX_DESCRIPTION:
+        want = binding.get("want")
+        return (binding.get("pr") == item and isinstance(binding.get("issue"), str)
+                and (binding["issue"] == "" or binding["issue"].isdecimal())
+                and isinstance(starting, str) and isinstance(intended, str)
+                and starting != intended
+                and isinstance(binding.get("fixer"), str) and binding["fixer"]
+                and isinstance(head, str) and bool(re.fullmatch(r"[0-9a-f]{40}", head))
+                and isinstance(feedback, str)
+                and (feedback == "" or bool(re.fullmatch(r"[0-9a-f]{64}", feedback)))
+                and (want == "" or want in ("partial", "complete"))
+                and _fix_description_resume_valid(binding.get("resume")))
     description_rc = binding.get("description_rc")
     if (binding.get("pr") != item or not isinstance(binding.get("issue"), str)
             or (binding["issue"] and not binding["issue"].isdecimal())
@@ -458,12 +481,10 @@ def _fix_meta_write_binding_valid(item, binding, *, reason):
         resume = binding.get("resume")
         if binding["fixer"] == "cursor" and resume is None:
             return True    # Older Cursor records have a separate saved base.
-        return (isinstance(resume, dict)
-                and all(isinstance(resume.get(key), str) and re.fullmatch(r"[0-9a-f]{40}", resume[key])
-                        for key in ("head", "agent_head"))
-                and isinstance(resume.get("model"), str)
-                and isinstance(resume.get("cursor_base"), str)
-                and type(resume.get("description_changed")) is bool)
+        if not _fix_description_resume_valid(resume):
+            return False
+        pending_description = binding.get("pending_description")
+        return pending_description is None or isinstance(pending_description, str)
     return False
 
 

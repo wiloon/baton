@@ -288,15 +288,14 @@ def test_cursor_recheck_comes_from_its_reply(run):
     assert "Checks to verify" not in run.comments()[0] and run.comments()[0].startswith("<!-- baton-fix by=cursor -->")
 
 
-def test_a_description_request_github_refuses_defers_and_resumes_without_an_agent(run, gh):
+def test_a_lost_cursor_description_response_is_recognized_without_a_second_write(run, gh):
+    """A description edit that landed before its answer was lost counts as success (#151)."""
     request = BODY.replace("## Checks to verify\nnone", "## Checks to verify\n- /billing: badge")
     run.agent(cursor_plan("## Checks to verify\n- /billing: badge\n\nRESULT: fixed", request=request))
     gh.fail("edit")
-    assert run.fix("cursor")["rc"] == 75
-    assert len(run.agent_calls) == 1 and not run.labelled()
-    gh.fail("edit", False)
-    assert run.fix("cursor")["rc"] == 0 and len(run.agent_calls) == 1   # resumed: no second run
+    assert run.fix("cursor")["rc"] == 0 and len(run.agent_calls) == 1 and not run.labelled()
     assert section(run.body(), "Checks to verify") == "- /billing: badge"
+    assert len([c for c in gh.calls() if c[:2] == ["pr", "edit"] and "--body-file" in c]) == 1
 
 
 def test_a_description_only_cursor_fix_pushes_nothing_and_keeps_the_evidence(run, gh):
@@ -328,10 +327,8 @@ def test_a_description_write_whose_response_was_lost_counts_as_a_change(run, gh)
     gh.set(headRefName="cursor/issue-297", body="Refs #297\n\nOld description")
     gh.fail("edit")
     state, ctx = str(run.root / "state"), str(run.root / "ctx")
-    assert pr_helpers.apply_body(PR, str(request), state, ctx) == (
-        1, False, "GitHub could not update the PR description", False)
-    gh.fail("edit", False)
     assert pr_helpers.apply_body(PR, str(request), state, ctx) == (0, True, "", False)
+    assert "Corrected description" in run.body()
 
 
 # --- task completion (tests/completion.sh) ---------------------------------------------------
@@ -577,8 +574,9 @@ def test_a_missing_fix_push_record_hands_off_instead_of_running_the_worker_again
 
 
 def test_a_cursor_run_with_no_commit_posts_one_discard_comment(run, monkeypatch):
-    monkeypatch.setattr(fix.pr_helpers, "apply_body", lambda *a, **k: (2, False, "something", False))
-    run.agent(cursor_plan("Adopted.\n\nRESULT: fixed", commit=False))
+    monkeypatch.setattr(fix.Runner, "write_description",
+                        lambda *a, **k: (2, False, "something", False))
+    run.agent(cursor_plan("Adopted.\n\nRESULT: fixed", request=BODY, commit=False))
     run.fix("cursor")
     assert sum("baton-description-discarded" in c for c in run.comments()) == 1
 
@@ -838,10 +836,13 @@ def test_a_description_failure_is_discarded_not_handed_off(run, monkeypatch, fix
     """#141: a rejected or failed description request never hands off by itself. The Claude/Codex
     path continues (its checks refresh counts as a change); Cursor's no-commit run stops as fix_no_commit."""
     if fixer == "cursor" and rc == 1:
-        pytest.skip("a GitHub failure defers the Cursor path before any handoff")
+        pytest.skip("a transient GitHub failure defers the Cursor path under the shared budget")
     seen = _codes(monkeypatch)
-    monkeypatch.setattr(fix.pr_helpers, "apply_body", lambda *a, **k: (rc, False, "something", False))
-    run.agent(cursor_plan("Adopted.\n\nRESULT: fixed", commit=False) if fixer == "cursor" else {**CHECKED, "commit": False})
+    monkeypatch.setattr(fix.Runner, "write_description",
+                        lambda *a, **k: (2, False, "something", False))
+    plan = cursor_plan("Adopted.\n\nRESULT: fixed", request=BODY, commit=False) if fixer == "cursor" else {
+        **CHECKED, "commit": False, "description": NEW_DESCRIPTION}
+    run.agent(plan)
     run.fix(fixer)
     assert seen == ([] if fixer == "claude" else ["fix_no_commit"])
 
@@ -1091,23 +1092,23 @@ def test_cursor_verify_failure_beats_a_description_handoff(run, gh):
     gh.set(body=COMPLETE, headRefName="cursor/issue-419")
     bad = "Task completion: partial\n\n## What changed\nNope.\n"   # no TASK: → rejected body
     run.verify_script("lint broke")
-    # Repair also fails so verification hands off before the description handoff.
+    # Invalid description is discarded at once; verification still hands the PR off.
     run.agent(cursor_plan("RESULT: fixed", request=bad),
               {"commit": False, "outcome": "RESULT: failed stuck"})
     assert run.fix("cursor")["rc"] == 1 and run.labelled() and not run.pushed()
     assert any("<!-- baton-verify-failed -->" in c for c in run.comments())
-    assert "description request not applied" not in "\n".join(run.runner_log())
+    assert any("description request not applied" in line for line in run.runner_log())
 
 
-def test_cursor_defers_body_and_task_then_resumes_without_an_agent(run, gh):
-    # Acceptance 4: matching partial body + TASK on live complete; GitHub edit fails, then resumes.
-    gh.set(body=COMPLETE, headRefName="cursor/issue-419")
+def test_cursor_defers_body_and_task_then_resumes_without_an_agent(run, monkeypatch):
+    # Acceptance 4: matching partial body + TASK on live complete; transient edit fails, then resumes.
+    clock, _ = _flaky_edits(monkeypatch)
+    run.fake_gh.set(body=COMPLETE, headRefName="cursor/issue-419")
     text = "Task completion: partial\n\n## What changed\nFixed all items.\n\n## Checks to verify\nnone\n"
     run.agent(cursor_plan("## Checks to verify\nnone\n\nTASK: partial\nRESULT: fixed", request=text))
-    gh.fail("edit-before-write")
     assert run.fix("cursor")["rc"] == 75 and len(run.agent_calls) == 1 and not run.labelled()
     assert run.body() == COMPLETE
-    gh.fail("edit-before-write", False)
+    clock["now"] = 1_060
     assert run.fix("cursor")["rc"] == 0 and len(run.agent_calls) == 1 and run.pushed()
     assert "completion=partial" in run.body() and "Refs #419" in run.body()
     assert "Fixed all items." in run.body()
@@ -1171,13 +1172,12 @@ def test_a_permanent_task_write_failure_hands_off_without_a_deferral(run, gh):
     assert any("task completion change failed" in line for line in run.runner_log())
 
 
-def test_cursor_retries_a_failed_read_then_hands_off_an_unchanged_request(run, gh):
+def test_cursor_discards_when_the_pr_description_cannot_be_read(run, gh):
+    """An unreadable PR before the description write discards; no commit still hands off (#151)."""
     run.agent(cursor_plan("RESULT: fixed", request=BODY, commit=False))
     gh.fail("view")
-    assert run.fix("cursor")["rc"] == 75 and not run.labelled()
-    gh.fail("view", False)
-    assert run.fix("cursor")["rc"] == 1 and len(run.agent_calls) == 1 and run.labelled()
-    assert run.body() == BODY
+    assert run.fix("cursor")["rc"] == 1 and run.labelled() and len(run.agent_calls) == 1
+    assert any("Discarded the PR description request" in c for c in run.comments())
     assert any("made no commit" in line for line in run.runner_log())
 
 
@@ -1243,16 +1243,14 @@ def test_cursor_applies_task_after_a_rejected_body_when_the_write_lands(run, gh)
 
 
 def test_cursor_lost_body_response_still_counts_on_resume(run, gh):
-    # Lost success response: fake gh writes then fails; retry sees the landed body vs baseline.
+    # Lost success response: fake gh writes then fails; look finds the landed body (#151).
     gh.set(body=COMPLETE, headRefName="cursor/issue-419")
     text = COMPLETE.replace("Disabled buttons.", "Fixed all items.")
     run.agent(cursor_plan("## Checks to verify\nnone\n\nTASK: partial\nRESULT: fixed",
                           request=text, commit=False))
     gh.fail("edit")
-    assert run.fix("cursor")["rc"] == 75
+    assert run.fix("cursor")["rc"] == 0 and len(run.agent_calls) == 1 and not run.labelled()
     assert "Fixed all items." in run.body() and "completion=partial" in run.body()
-    # Keep the edit failure active. The retry can finish using the already-landed body.
-    assert run.fix("cursor")["rc"] == 0 and len(run.agent_calls) == 1
     assert len([c for c in gh.calls() if c[:2] == ["pr", "edit"] and "--body-file" in c]) == 1
 
 
@@ -2087,6 +2085,7 @@ def test_a_deferred_task_write_still_refreshes_the_fixers_checks(run, monkeypatc
 
 @pytest.mark.parametrize("fixer", ["claude", "cursor"])
 def test_a_deferred_task_write_posts_the_discard_comment_once(run, monkeypatch, fixer):
+    """An invalid description is discarded at once; the TASK: write still defers (#151 section 5)."""
     clock, _ = _flaky_edits(monkeypatch)
     run.fake_gh.set(body=COMPLETE, headRefName="cursor/issue-419")
     bad = "Task completion: partial\nTask completion: complete\n\n## What changed\nNope.\n"
@@ -2095,7 +2094,7 @@ def test_a_deferred_task_write_posts_the_discard_comment_once(run, monkeypatch, 
     else:
         run.agent({**_TASK_REPLY, "description": bad, "commit": False})
     assert run.fix(fixer)["rc"] == 75
-    assert not [c for c in run.comments() if "Discarded the PR description request" in c]
+    assert len([c for c in run.comments() if "Discarded the PR description request" in c]) == 1
     clock["now"] = 1_060
     assert run.fix(fixer)["rc"] == 0 and len(run.agent_calls) == 1
     assert len([c for c in run.comments() if "Discarded the PR description request" in c]) == 1
@@ -2137,11 +2136,12 @@ def test_a_discard_survives_deferred_task_and_checks_writes(run, monkeypatch, fi
         run.agent({**_TASK_REPLY, "file": checks, "description": bad, "commit": False})
     assert run.fix(fixer)["rc"] == 75
     assert run.body() == COMPLETE
+    assert sum("baton-description-discarded" in c for c in run.comments()) == 1
     clock["now"] = 1_060
     assert run.fix(fixer)["rc"] == 75
     assert "completion=partial" in run.body()
     assert section(run.body(), "Checks to verify") == "none"
-    assert not any("baton-description-discarded" in c for c in run.comments())
+    assert sum("baton-description-discarded" in c for c in run.comments()) == 1
 
     clock["now"] = 1_120
     assert run.fix(fixer)["rc"] == 0
@@ -2237,14 +2237,100 @@ def test_an_unreadable_pr_head_hands_off_before_a_task_write_is_saved(run, gh):
     assert "completion=partial" not in run.body()
 
 
-def test_a_deferred_replacement_description_preserves_the_owners_issue_correction(run, gh):
-    gh.set(body=COMPLETE, headRefName="owner-branch")
+def test_a_deferred_replacement_description_preserves_the_owners_issue_correction(run, monkeypatch):
+    """A body change during a Cursor description wait discards instead of replaying (#151)."""
+    clock, _ = _flaky_edits(monkeypatch)
+    run.fake_gh.set(body=COMPLETE, headRefName="owner-branch")
     request = COMPLETE.replace("Disabled buttons.", "Revised description.")
     run.agent(cursor_plan("## Checks to verify\nnone\n\nTASK: partial\nRESULT: fixed", request=request, commit=False))
-    gh.fail("edit-before-write")
     assert run.fix("cursor")["rc"] == 75
     corrected = COMPLETE.replace("419", "420").replace("## Checks to verify\nnone", "## Checks to verify\n- Owner check")
-    gh.set(body=corrected)
-    gh.fail("edit-before-write", False)
-    assert run.fix("cursor")["rc"] == 1 and run.labelled()
-    assert run.body() == corrected and len(run.agent_calls) == 1
+    run.fake_gh.set(body=corrected)
+    clock["now"] = 1_060
+    assert run.fix("cursor")["rc"] == 0 and not run.labelled()
+    assert "issue=420" in run.body() and "Revised description." not in run.body()
+    assert len(run.agent_calls) == 1
+    assert any("Discarded the PR description request" in c for c in run.comments())
+
+
+# --- description requests under the shared budget (#151 section 5) ---
+def test_a_transient_cursor_description_defers_then_recovers_without_a_second_worker(run, monkeypatch):
+    """Cursor description writes wait 60s then 300s; recovery needs no second worker (#151)."""
+    clock, edits = _flaky_edits(monkeypatch)
+    request = COMPLETE.replace("Disabled buttons.", "Corrected description.")
+    run.fake_gh.set(body=COMPLETE, headRefName="cursor/issue-419")
+    run.agent(cursor_plan("## Checks to verify\nnone\n\nRESULT: fixed", request=request, commit=False))
+    assert run.fix("cursor")["rc"] == 75
+    assert run.body() == COMPLETE and len(run.agent_calls) == 1
+    assert list(Path(run.root / "state").glob("handoff-*-*fix_description_write_failed.json"))
+    assert 1_000 in edits
+    before = len(edits)
+    clock["now"] = 1_030
+    assert run.fix("cursor")["rc"] == 75 and len(run.agent_calls) == 1 and len(edits) == before
+    clock["now"] = 1_060
+    assert run.fix("cursor")["rc"] == 0 and len(run.agent_calls) == 1
+    assert "Corrected description." in run.body() and not run.labelled()
+    assert 1_060 in edits
+    assert not list(Path(run.root / "state").glob("handoff-*-*fix_description_write_failed.json"))
+
+
+def test_an_exhausted_cursor_description_discards_without_a_handoff(run, monkeypatch):
+    """Cursor description exhaustion discards and continues; it never hands off alone (#151)."""
+    clock, _ = _flaky_edits(monkeypatch, fail_until=1_420)
+    request = COMPLETE.replace("Disabled buttons.", "Corrected description.")
+    run.fake_gh.set(body=COMPLETE, headRefName="cursor/issue-419")
+    run.agent(cursor_plan("## Checks to verify\nnone\n\nTASK: partial\nRESULT: fixed",
+                          request=request, commit=False))
+    assert run.fix("cursor")["rc"] == 75
+    clock["now"] = 1_060
+    assert run.fix("cursor")["rc"] == 75
+    clock["now"] = 1_360
+    # Description budget exhausted → discard; TASK: then also fails transiently and defers.
+    assert run.fix("cursor")["rc"] == 75
+    assert any("Discarded the PR description request" in c for c in run.comments())
+    assert not run.labelled()
+    assert not list(Path(run.root / "state").glob("handoff-*-*fix_description_write_failed.json"))
+    from baton import handoff, session
+    task = handoff.load_retry(session.resolve(), "419", "fix_task_write_failed", str(PR))
+    assert task is not None and task["attempts"] < handoff.MAX_ATTEMPTS
+    clock["now"] = task["due"]
+    assert run.fix("cursor")["rc"] == 0 and "completion=partial" in run.body()
+    assert "Corrected description." not in run.body() and len(run.agent_calls) == 1
+
+
+@pytest.mark.parametrize("fixer", ["claude", "codex"])
+def test_a_lost_claude_description_response_counts_as_success(run, gh, fixer):
+    """Claude/Codex look after a failed edit; a landed body is success with no discard (#151)."""
+    request = COMPLETE.replace("Disabled buttons.", "Corrected description.")
+    gh.set(body=COMPLETE)
+    run.agent({**CHECKED, "description": request, "commit": False} if fixer == "claude" else {
+        "reply": "RESULT: fixed", "file": "## Checks to verify\nnone\n\nRESULT: fixed\n",
+        "description": request, "commit": False})
+    gh.fail("edit")
+    assert run.fix(fixer)["rc"] == 0 and not run.labelled()
+    assert "Corrected description." in run.body()
+    assert not any("Discarded the PR description request" in c for c in run.comments())
+
+
+def test_a_permanent_cursor_description_failure_discards_without_deferral(run, monkeypatch):
+    import subprocess
+
+    call = fix.pr_helpers.call
+
+    def permanent_description(*args, input=None, limit=None):
+        if args[:2] == ("pr", "edit") and "--body-file" in args:
+            source = args[args.index("--body-file") + 1]
+            text = input if source == "-" and input is not None else Path(source).read_text()
+            if "Corrected description" in text:
+                return subprocess.CompletedProcess(args, 1, "", "HTTP 401 unauthorized")
+        return call(*args, input=input, limit=limit)
+
+    monkeypatch.setattr(fix.pr_helpers, "call", permanent_description)
+    request = COMPLETE.replace("Disabled buttons.", "Corrected description.")
+    run.fake_gh.set(body=COMPLETE, headRefName="cursor/issue-419")
+    run.agent(cursor_plan("## Checks to verify\nnone\n\nTASK: partial\nRESULT: fixed",
+                          request=request, commit=False))
+    assert run.fix("cursor")["rc"] == 0 and not run.labelled()
+    assert "Corrected description." not in run.body() and "completion=partial" in run.body()
+    assert any("Discarded the PR description request" in c for c in run.comments())
+    assert not list(Path(run.root / "state").glob("handoff-*-*fix_description_write_failed.json"))

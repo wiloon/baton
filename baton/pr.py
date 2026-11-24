@@ -330,7 +330,12 @@ def apply_body(pr, request, state, ctx, completion=None):
     except ValueError as error:
         return 2, False, str(error), False
     if prepared.rstrip("\n") != before and not edit_body(pr, prepared, ctx, f"pr-{pr}-body-prepared."):
-        return 1, False, "GitHub could not update the PR description", False
+        # Section 5: a lost write response still counts when the intended body is present.
+        landed = body(pr)
+        if landed is not None and landed.rstrip("\n") == prepared.rstrip("\n"):
+            pass
+        else:
+            return 1, False, "GitHub could not update the PR description", False
     task_changed = bool(completion and completion != original_completion)
     if task_changed:
         try:
