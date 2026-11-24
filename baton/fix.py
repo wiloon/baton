@@ -1102,6 +1102,9 @@ class Runner:
             shots = Path(self.ctx, f"pr-{pr}-shots")
             session.run_process(["rm", "-rf", str(shots)])
             shots.mkdir(parents=True)
+            if fixer != "cursor":
+                # A later Cursor round must not resume the request this run supersedes.
+                Path(self.state, f"cursor-fix-task-{pr}").unlink(missing_ok=True)
             self.clear_reply_request(pr, fixer, keep_base=True)
             Path(self.ctx, f"pr-{pr}-fix-checks.json").unlink(missing_ok=True)
             out = self.agent(fixer, "fix", self.render(
