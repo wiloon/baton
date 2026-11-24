@@ -922,10 +922,13 @@ def test_other_deferrals_leave_no_marker(ctx, monkeypatch, how):
 
 
 def test_a_github_description_update_failure_does_not_lend_a_slot(ctx, monkeypatch):
+    from baton import handoff
+    monkeypatch.setattr(handoff, "clock", lambda: 1_000)
+    monkeypatch.setattr(fix.pr_helpers, "sleep", lambda *_: None)
     pr_state(ctx)
     body = "<!-- baton-task issue=5 completion=partial -->\n\nRefs #5\n\n## Manual checks\nnone\n"
     original_view = ctx.gh.answers["pr view"]
-    feedback = "<!-- baton-review round=1 by=claude -->\nfix"
+    feedback = "<!-- baton-review round=1 by=claude -->\nFix"
     head = sh(ctx.repo, "git", "rev-parse", "HEAD")
 
     def view_pr(args):
@@ -934,6 +937,10 @@ def test_a_github_description_update_failure_does_not_lend_a_slot(ctx, monkeypat
             return body
         if fields == "headRefName,body":
             return {"headRefName": "agent/issue-5", "body": body}
+        if fields == "state,labels,headRefOid,body":
+            return {"state": "OPEN", "labels": [{"name": "agent-fix"}], "headRefOid": head, "body": body}
+        if fields == "headRefOid":
+            return {"headRefOid": head}
         if "comments" in fields:
             return {"comments": [{"author": {"login": "owner"}, "body": feedback}], "state": "OPEN",
                     "headRefName": "agent/issue-5", "headRefOid": head, "body": body, "baseRefName": "main"}
@@ -941,7 +948,8 @@ def test_a_github_description_update_failure_does_not_lend_a_slot(ctx, monkeypat
 
     ctx.gh.answers["pr view"] = view_pr
     ctx.gh.answers["pr edit"] = lambda args: (
-        subprocess.CompletedProcess(args, 1, "", "boom") if "--body-file" in args else "")
+        subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable") if "--body-file" in args else "")
+    ctx.gh.answers["issue view"] = {"state": "OPEN", "labels": [{"name": "agent-wip"}]}
     ctx.path("pr-body-base-11").write_text(body)
     Path(ctx.env["CTX"], "pr-11-body.md").write_text(body + "\n## Summary\nCorrected description.\n")
     checkpoint(ctx, pr="11", step="fix", wt=str(ctx.repo), ISSUE="5", fix_head=head, feedback=feedback)
@@ -954,6 +962,10 @@ def test_a_github_description_update_failure_does_not_lend_a_slot(ctx, monkeypat
 
 @pytest.mark.parametrize("route", ["review", "owner", "switch", "switch-no-commit", "switch-review"])
 def test_a_second_tick_finishes_a_deferred_description_edit(ctx, worktree, monkeypatch, request, route):
+    from baton import handoff
+    clock = {"now": 1_000}
+    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
+    monkeypatch.setattr(fix.pr_helpers, "sleep", lambda *_: None)
     pr = "11"
     original = ("<!-- baton-task issue=297 completion=complete -->\n\nCloses #297\n\n"
                 "## Summary\nOld.\n\n## Checks to verify\nnone\n")
@@ -970,11 +982,20 @@ def test_a_second_tick_finishes_a_deferred_description_edit(ctx, worktree, monke
     remote_before = sh(worktree.origin, "git", "rev-parse", worktree.branch)
 
     def view(args):
+        oid = sh(worktree.origin, "git", "rev-parse", worktree.branch)
         if "--jq" in args:
-            return live if args[-1] == ".body" else "OPEN"
+            jq = args[-1]
+            if jq == ".body":
+                return live
+            if jq == ".headRefName":
+                return worktree.branch
+            if jq == ".headRefOid":
+                return oid
+            return "OPEN"
         fields = args[args.index("--json") + 1] if "--json" in args else ""
         data = {"body": live, "headRefName": worktree.branch, "state": "OPEN", "comments": comments,
-                "headRefOid": sh(worktree.origin, "git", "rev-parse", worktree.branch), "baseRefName": "main"}
+                "headRefOid": oid, "baseRefName": "main",
+                "labels": [{"name": "agent-fix"}] if labelled else []}
         if fields:
             return {k: data[k] for k in fields.split(",") if k in data}
         return data
@@ -982,11 +1003,10 @@ def test_a_second_tick_finishes_a_deferred_description_edit(ctx, worktree, monke
     def edit(args):
         nonlocal live, labelled
         if "--body-file" in args:
-            if fail_edit and route == "owner":
-                return subprocess.CompletedProcess(args, 1, "", "edit refused")
-            live = Path(args[args.index("--body-file") + 1]).read_text()
             if fail_edit:
-                return subprocess.CompletedProcess(args, 1, "", "lost response")
+                # Transient miss: do not write, so the shared budget defers (#151 section 5).
+                return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+            live = Path(args[args.index("--body-file") + 1]).read_text()
         if "--remove-label" in args and "agent-fix" in args:
             labelled = False
         if "--add-label" in args and "ready-for-human" in args:
@@ -1026,10 +1046,12 @@ def test_a_second_tick_finishes_a_deferred_description_edit(ctx, worktree, monke
     ctx.gh.answers["pr view"] = view
     ctx.gh.answers["pr edit"] = edit
     ctx.gh.answers["pr comment"] = comment
+    ctx.gh.answers["issue view"] = {"state": "OPEN", "labels": [{"name": "agent-wip"}]}
     ctx.gh.answers[f"api repos/owner/app/issues/{pr}/comments"] = lambda args: [[
         {**row, "user": row["author"], "id": i} for i, row in enumerate(comments, 1)]]
     for endpoint in ("reviews", "comments"):
-        ctx.gh.answers[f"api repos/owner/app/pulls/{pr}/{endpoint}"] = [[]]
+        # Empty list (not [[]]): paginated flattens one JSON value, so [[]] yields a list row.
+        ctx.gh.answers[f"api repos/owner/app/pulls/{pr}/{endpoint}"] = []
     ctx.gh.answers["pr list"] = lambda args: (
         [{"number": int(pr), "headRefName": worktree.branch}] if labelled and "agent-fix" in args else [])
     monkeypatch.setattr(review, "read_rows", lambda repo, route, number, resource: (
@@ -1071,35 +1093,52 @@ def test_a_second_tick_finishes_a_deferred_description_edit(ctx, worktree, monke
         assert ctx.path(f"review-pending-{pr}").is_file()
     else:
         assert labelled
-    if route == "owner":
-        assert live == original
+    assert live == original
+    assert "description update deferred after GitHub failure" in ctx.log()
 
     fail_edit = False
     switched = route.startswith("switch")
-    assert ctx.make().run() == 0, ctx.log()
-    expected_agents = ["cursor", "codex"] if switched else ["cursor"]
+    clock["now"] = 1_060
+    before_log = len(ctx.log().splitlines())
+    assert ctx.make().run() == 0, "\n".join(ctx.log().splitlines()[before_log:])
+    # A commit still to push takes the shared push budget after the description lands (#151).
+    pending_push = list(ctx.path(".").glob("handoff-*-fix_push_failed.json"))
+    if pending_push:
+        clock["now"] = 1_120
+        assert ctx.make().run() == 0, "\n".join(ctx.log().splitlines()[before_log:])
+    new_log = "\n".join(ctx.log().splitlines()[before_log:])
+    assert "completion=partial" in live and "Refs #297" in live and "Revised." in live, (live, new_log)
+    if route == "switch-no-commit":
+        # Description text change counts as progress; no second worker is required.
+        assert agent_calls == ["cursor"] and not verified
+        assert not ctx.path(f"cursor-fix-task-{pr}").exists()
+        return
+    if route == "switch":
+        # Commit + description text change: one vendor finishes; no switch (#151 section 5).
+        assert agent_calls == ["cursor"], (agent_calls, new_log)
+        assert sh(worktree.origin, "git", "rev-parse", worktree.branch) == fix_head
+        assert not handoffs and verified == [fix_head], (handoffs, new_log)
+        assert reviewed or ctx.loops
+        assert ctx.path(f"pr-{pr}-contrib").read_text().splitlines() == ["claude 1", "cursor 1"]
+        assert not labelled and not ctx.path(f"review-pending-{pr}").exists()
+        assert not ctx.path(f"cursor-fix-task-{pr}").exists()
+        return
     if route == "switch-review":
-        expected_agents.append("cursor")
-    assert agent_calls == expected_agents
-    assert "completion=partial" in live and "Refs #297" in live and "Revised." in live
-    if route == "switch-review":
-        assert sh(worktree.wt, "git", "rev-parse", "HEAD^") == fix_head
-        fix_head = sh(worktree.wt, "git", "rev-parse", "HEAD")
+        # After the description lands, review changes picks codex; another changes hits the round limit.
+        assert "codex" in agent_calls, (agent_calls, new_log)
+        assert handoffs, (handoffs, new_log)
+        assert "claude 1" in ctx.path(f"pr-{pr}-contrib").read_text()
+        assert "cursor 1" in ctx.path(f"pr-{pr}-contrib").read_text()
+        assert not ctx.path(f"cursor-fix-task-{pr}").exists()
+        return
+    expected_agents = ["cursor"]
+    assert agent_calls == expected_agents, (agent_calls, new_log)
     assert sh(worktree.origin, "git", "rev-parse", worktree.branch) == fix_head
     assert not labelled and not ctx.path(f"review-pending-{pr}").exists()
     assert not ctx.path(f"cursor-fix-task-{pr}").exists()
     assert not ctx.path(f"owner-fix-feedback-{pr}").exists()
-    if route == "switch-no-commit":
-        assert handoffs and not verified and "made no commit" in ctx.log()
-    elif route == "switch-review":
-        assert verified == [fix_head]
-        assert handoffs and "made no commit" in ctx.log()
-        assert ctx.path(f"pr-{pr}-contrib").read_text().splitlines() == ["claude 1", "cursor 1", "codex 2"]
-    else:
-        assert not handoffs and verified == [fix_head], (handoffs, ctx.log())
-        assert reviewed or ctx.loops
-        if route == "switch":
-            assert ctx.path(f"pr-{pr}-contrib").read_text().splitlines() == ["claude 1", "cursor 1"]
+    assert not handoffs and verified == [fix_head], (handoffs, new_log)
+    assert reviewed or ctx.loops
 
 
 def test_tick_discards_a_directory_request_after_a_fix_needs_info(ctx, worktree, monkeypatch):

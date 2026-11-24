@@ -422,6 +422,14 @@ def task_binding(item="1"):
                        "cursor_base": "", "description_changed": False}}
 
 
+def description_binding(item="1"):
+    return {**checks_binding(item), "fixer": "cursor", "want": "partial",
+            "original_completion": "complete", "text_changed": True, "last_reason": "",
+            "wt": "/tmp/wt",
+            "resume": {"head": "b" * 40, "agent_head": "b" * 40, "model": "unknown",
+                       "cursor_base": "", "description_changed": False}}
+
+
 @pytest.mark.parametrize("fixer", ["claude", "codex", "cursor"])
 def test_fix_push_binding_accepts_existing_fixers(fixer):
     assert handoff._binding_valid("fix_push_failed", "1", {**push_binding("1"), "fixer": fixer}) is True
@@ -440,6 +448,12 @@ def test_task_binding_legacy_resume_exception_is_cursor_only():
     assert handoff._binding_valid("fix_task_write_failed", "1", {**base, "fixer": "stub"}) is False
 
 
+def test_description_binding_is_cursor_only():
+    assert handoff._binding_valid("fix_description_write_failed", "1", description_binding("1")) is True
+    assert handoff._binding_valid(
+        "fix_description_write_failed", "1", {**description_binding("1"), "fixer": "claude"}) is False
+
+
 def test_every_category_1_reason_is_rule_mode_with_retry_budget():
     assert handoff.RETRY_REASONS == {
         "review_comment_missing", "spec_comments_read_failed", "spec_pending_adr_read_failed",
@@ -448,7 +462,7 @@ def test_every_category_1_reason_is_rule_mode_with_retry_budget():
         "spec_pending_accept_post_failed", "spec_accept_post_failed",
         "spec_body_edit_failed", "spec_adr_open_failed",
         "fix_push_failed", "dev_push_failed", "spec_adr_push_failed",
-        "fix_checks_refresh_failed", "fix_task_write_failed",
+        "fix_description_write_failed", "fix_checks_refresh_failed", "fix_task_write_failed",
     }
     for reason in handoff.RETRY_REASONS:
         entry = handoff.REASONS[reason]
@@ -471,6 +485,7 @@ def test_every_category_1_reason_is_rule_mode_with_retry_budget():
     ("fix_push_failed", push_binding("1")),
     ("dev_push_failed", issue_push_binding("1")),
     ("spec_adr_push_failed", issue_push_binding("1", reason="spec_adr_push_failed")),
+    ("fix_description_write_failed", description_binding("1")),
     ("fix_checks_refresh_failed", checks_binding("1")),
     ("fix_task_write_failed", task_binding("1")),
 ])

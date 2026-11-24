@@ -768,10 +768,12 @@ class Tick:
             binding = waiting_meta["continuation"]
             issue = binding.get("issue") or issue
             fixer = binding.get("fixer") or "fixer"
-            # Metadata writes keep no worktree path; reopen from the live head when needed.
-            head_ref = (self.gh("pr", "view", pr, "-R", self.gh_repo, "--json", "headRefName",
-                                "--jq", ".headRefName") or "").strip()
-            wt = str(names.worktree_for(self.wt_root, head_ref)) if head_ref else ""
+            # A description deferral may still hold local commits; prefer its saved worktree.
+            wt = binding.get("wt") or ""
+            if not wt or not Path(wt).is_dir():
+                head_ref = (self.gh("pr", "view", pr, "-R", self.gh_repo, "--json", "headRefName",
+                                    "--jq", ".headRefName") or "").strip()
+                wt = str(names.worktree_for(self.wt_root, head_ref)) if head_ref else ""
         feedback_file = self.state / f"owner-fix-feedback-{pr}"
         feedback = (review.format_fix_feedback(*self.cached_owner_feedback(feedback_file))
                     if feedback_file.is_file() else "")

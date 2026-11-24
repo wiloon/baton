@@ -1315,7 +1315,7 @@ class Review:
             waiting = runner.waiting_push(pr)
             waiting_meta = None
             if waiting is None:
-                for meta_reason in (owner_handoff.FIX_CHECKS, owner_handoff.FIX_TASK):
+                for meta_reason in owner_handoff.FIX_META_WRITES:
                     waiting_meta = runner.waiting_meta(pr, meta_reason)
                     if waiting_meta is not None:
                         break

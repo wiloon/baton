@@ -288,13 +288,13 @@ def test_cursor_recheck_comes_from_its_reply(run):
     assert "Checks to verify" not in run.comments()[0] and run.comments()[0].startswith("<!-- baton-fix by=cursor -->")
 
 
-def test_a_description_request_github_refuses_defers_and_resumes_without_an_agent(run, gh):
+def test_a_description_request_github_refuses_defers_and_resumes_without_an_agent(run, monkeypatch):
+    clock, _ = _flaky_edits(monkeypatch)
     request = BODY.replace("## Checks to verify\nnone", "## Checks to verify\n- /billing: badge")
     run.agent(cursor_plan("## Checks to verify\n- /billing: badge\n\nRESULT: fixed", request=request))
-    gh.fail("edit")
     assert run.fix("cursor")["rc"] == 75
     assert len(run.agent_calls) == 1 and not run.labelled()
-    gh.fail("edit", False)
+    clock["now"] = 1_060
     assert run.fix("cursor")["rc"] == 0 and len(run.agent_calls) == 1   # resumed: no second run
     assert section(run.body(), "Checks to verify") == "- /billing: badge"
 
@@ -318,7 +318,8 @@ def test_a_crash_before_the_fix_completes_resumes_from_the_saved_request(run, gh
         run.fix("cursor")
     assert "Corrected description" in run.body()
     monkeypatch.setattr(fix.vendors, "record_author", record_author)
-    assert run.fix("cursor")["rc"] == 0 and len(run.agent_calls) == 1   # replayed, not rerun
+    result = run.fix("cursor")
+    assert result["rc"] == 0 and len(run.agent_calls) == 1, run.runner_log()   # replayed, not rerun
 
 
 def test_a_description_write_whose_response_was_lost_counts_as_a_change(run, gh):
@@ -328,9 +329,7 @@ def test_a_description_write_whose_response_was_lost_counts_as_a_change(run, gh)
     gh.set(headRefName="cursor/issue-297", body="Refs #297\n\nOld description")
     gh.fail("edit")
     state, ctx = str(run.root / "state"), str(run.root / "ctx")
-    assert pr_helpers.apply_body(PR, str(request), state, ctx) == (
-        1, False, "GitHub could not update the PR description", False)
-    gh.fail("edit", False)
+    # The fake gh writes then fails: look-before-decide recognizes the landed body (#151).
     assert pr_helpers.apply_body(PR, str(request), state, ctx) == (0, True, "", False)
 
 
@@ -577,8 +576,8 @@ def test_a_missing_fix_push_record_hands_off_instead_of_running_the_worker_again
 
 
 def test_a_cursor_run_with_no_commit_posts_one_discard_comment(run, monkeypatch):
-    monkeypatch.setattr(fix.pr_helpers, "apply_body", lambda *a, **k: (2, False, "something", False))
-    run.agent(cursor_plan("Adopted.\n\nRESULT: fixed", commit=False))
+    run.fake_gh.set(body="Original description.", headRefName="feature/no-issue")
+    run.agent(cursor_plan("Adopted.\n\nRESULT: fixed", request=BODY, commit=False))
     run.fix("cursor")
     assert sum("baton-description-discarded" in c for c in run.comments()) == 1
 
@@ -1099,15 +1098,15 @@ def test_cursor_verify_failure_beats_a_description_handoff(run, gh):
     assert "description request not applied" not in "\n".join(run.runner_log())
 
 
-def test_cursor_defers_body_and_task_then_resumes_without_an_agent(run, gh):
+def test_cursor_defers_body_and_task_then_resumes_without_an_agent(run, monkeypatch):
     # Acceptance 4: matching partial body + TASK on live complete; GitHub edit fails, then resumes.
-    gh.set(body=COMPLETE, headRefName="cursor/issue-419")
+    clock, _ = _flaky_edits(monkeypatch)
+    run.fake_gh.set(body=COMPLETE, headRefName="cursor/issue-419")
     text = "Task completion: partial\n\n## What changed\nFixed all items.\n\n## Checks to verify\nnone\n"
     run.agent(cursor_plan("## Checks to verify\nnone\n\nTASK: partial\nRESULT: fixed", request=text))
-    gh.fail("edit-before-write")
     assert run.fix("cursor")["rc"] == 75 and len(run.agent_calls) == 1 and not run.labelled()
     assert run.body() == COMPLETE
-    gh.fail("edit-before-write", False)
+    clock["now"] = 1_060
     assert run.fix("cursor")["rc"] == 0 and len(run.agent_calls) == 1 and run.pushed()
     assert "completion=partial" in run.body() and "Refs #419" in run.body()
     assert "Fixed all items." in run.body()
@@ -1171,12 +1170,13 @@ def test_a_permanent_task_write_failure_hands_off_without_a_deferral(run, gh):
     assert any("task completion change failed" in line for line in run.runner_log())
 
 
-def test_cursor_retries_a_failed_read_then_hands_off_an_unchanged_request(run, gh):
+def test_cursor_discards_a_request_it_cannot_read_the_body_for_then_hands_off_no_commit(run, gh):
+    # Section 5: nothing was captured to replay, so the request is discarded and the
+    # no-commit fix hands off under its own reason, not a description reason.
     run.agent(cursor_plan("RESULT: fixed", request=BODY, commit=False))
     gh.fail("view")
-    assert run.fix("cursor")["rc"] == 75 and not run.labelled()
-    gh.fail("view", False)
     assert run.fix("cursor")["rc"] == 1 and len(run.agent_calls) == 1 and run.labelled()
+    gh.fail("view", False)
     assert run.body() == BODY
     assert any("made no commit" in line for line in run.runner_log())
 
@@ -1243,17 +1243,36 @@ def test_cursor_applies_task_after_a_rejected_body_when_the_write_lands(run, gh)
 
 
 def test_cursor_lost_body_response_still_counts_on_resume(run, gh):
-    # Lost success response: fake gh writes then fails; retry sees the landed body vs baseline.
+    # Lost success response: fake gh writes then fails; look-before-decide finishes without a wait.
     gh.set(body=COMPLETE, headRefName="cursor/issue-419")
     text = COMPLETE.replace("Disabled buttons.", "Fixed all items.")
     run.agent(cursor_plan("## Checks to verify\nnone\n\nTASK: partial\nRESULT: fixed",
                           request=text, commit=False))
     gh.fail("edit")
-    assert run.fix("cursor")["rc"] == 75
+    assert run.fix("cursor")["rc"] == 0 and len(run.agent_calls) == 1 and not run.labelled()
     assert "Fixed all items." in run.body() and "completion=partial" in run.body()
-    # Keep the edit failure active. The retry can finish using the already-landed body.
-    assert run.fix("cursor")["rc"] == 0 and len(run.agent_calls) == 1
     assert len([c for c in gh.calls() if c[:2] == ["pr", "edit"] and "--body-file" in c]) == 1
+
+
+def test_a_transient_description_edit_defers_then_recovers_without_a_second_worker(run, monkeypatch):
+    """Cursor description edits wait for the shared 60s budget, then recover without a second worker (#151)."""
+    from baton import handoff, session
+
+    clock, edits = _flaky_edits(monkeypatch)
+    request = BODY.replace("Disabled buttons.", "Corrected description")
+    run.agent(cursor_plan("## Checks to verify\nnone\n\nRESULT: fixed", request=request, commit=False))
+    assert run.fix("cursor")["rc"] == 75 and len(run.agent_calls) == 1 and not run.labelled()
+    saved = handoff.load_retry(session.resolve(), "419", "fix_description_write_failed", str(PR))
+    assert saved["attempts"] == 0 and saved["due"] == 1_060
+    clock["now"] = 1_059
+    before = len(edits)
+    assert run.fix("cursor")["rc"] == 75
+    assert len(edits) == before and len(run.agent_calls) == 1
+    clock["now"] = 1_060
+    assert run.fix("cursor")["rc"] == 0 and len(run.agent_calls) == 1
+    assert "Corrected description" in run.body() and "Disabled buttons." not in run.body()
+    assert not run.labelled()
+    assert not list((run.root / "state").glob("handoff-*-*fix_description_write_failed.json"))
 
 
 def test_a_description_request_from_an_earlier_run_is_not_applied(run):
@@ -2237,14 +2256,41 @@ def test_an_unreadable_pr_head_hands_off_before_a_task_write_is_saved(run, gh):
     assert "completion=partial" not in run.body()
 
 
-def test_a_deferred_replacement_description_preserves_the_owners_issue_correction(run, gh):
-    gh.set(body=COMPLETE, headRefName="owner-branch")
+def test_a_deferred_replacement_description_preserves_the_owners_issue_correction(run, monkeypatch):
+    clock, _ = _flaky_edits(monkeypatch)
+    run.fake_gh.set(body=COMPLETE, headRefName="owner-branch")
     request = COMPLETE.replace("Disabled buttons.", "Revised description.")
     run.agent(cursor_plan("## Checks to verify\nnone\n\nTASK: partial\nRESULT: fixed", request=request, commit=False))
-    gh.fail("edit-before-write")
     assert run.fix("cursor")["rc"] == 75
     corrected = COMPLETE.replace("419", "420").replace("## Checks to verify\nnone", "## Checks to verify\n- Owner check")
-    gh.set(body=corrected)
-    gh.fail("edit-before-write", False)
+    run.fake_gh.set(body=corrected)
+    clock["now"] = 1_060
+    # Section 5: a changed body during the wait discards the description; the TASK: write then
+    # sees the owner's issue correction and hands off.
     assert run.fix("cursor")["rc"] == 1 and run.labelled()
     assert run.body() == corrected and len(run.agent_calls) == 1
+
+
+def test_an_exhausted_cursor_description_edit_discards_once_without_a_description_handoff(run, monkeypatch):
+    clock, edits = _flaky_edits(monkeypatch, fail_until=10_000)
+    request = BODY.replace("Disabled buttons.", "Corrected description")
+    run.agent(cursor_plan("## Checks to verify\nnone\n\nRESULT: fixed", request=request))
+    assert run.fix("cursor")["rc"] == 75
+    clock["now"] = 1_060
+    assert run.fix("cursor")["rc"] == 75
+    clock["now"] = 1_360
+    assert run.fix("cursor")["rc"] == 0 and len(run.agent_calls) == 1
+    assert {1_000, 1_060, 1_360} == set(edits) and edits.count(1_360) == edits.count(1_000)
+    assert "Corrected description" not in run.body() and not run.labelled()
+    assert sum("baton-description-discarded" in c for c in run.comments()) == 1
+
+
+def test_claude_discards_a_description_at_once_when_the_edit_is_confirmed_absent(run, monkeypatch):
+    clock, edits = _flaky_edits(monkeypatch, fail_until=10_000)
+    run.agent({"commit": False, "file": "## Must fix\n1. adopted\n\n## Checks to verify\nnone\n\nRESULT: fixed\n",
+               "description": BODY.replace("Disabled buttons.", "Corrected description")})
+    # The discarded description made no progress, so the no-commit fix takes fix_no_commit.
+    assert run.fix("claude")["rc"] == 1 and len(run.agent_calls) == 1
+    assert any("made no commit" in line for line in run.runner_log())
+    assert set(edits) == {1_000} and "Corrected description" not in run.body()
+    assert sum("baton-description-discarded" in c for c in run.comments()) == 1
