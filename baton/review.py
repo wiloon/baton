@@ -76,8 +76,15 @@ def issue_context_from(issue, data, owner, login_re, limit):
     lines = [f'<issue number="{issue}">\n# {jq_str(data.get("title"))}\n\n{cut(data.get("body"), limit)}\n</issue>']
     for comment in data.get("comments") or ():
         login = (comment.get("author") or {}).get("login") or ""
+        body = comment.get("body") or ""
+        # Advisor answers are runner-wrapped owner posts: keep them out of owner context (#125).
+        if login == owner and re.match(
+                r"<!-- baton-advisor-answer round=\d+ questions=[0-9a-f]+ by=deepseek -->", body):
+            safe = cut(body, limit).replace("</advisor-answer>", "<\\/advisor-answer>")
+            lines.append(f'<advisor-answer author="DeepSeek">\n{safe}\n</advisor-answer>')
+            continue
         if login == owner or re.search(login_re, login):
-            lines.append(f'<issue-comment author="{login}">\n{cut(comment.get("body"), limit)}\n</issue-comment>')
+            lines.append(f'<issue-comment author="{login}">\n{cut(body, limit)}\n</issue-comment>')
     return "".join(f"{line}\n" for line in lines)
 
 
@@ -1017,13 +1024,17 @@ class Review:
         lines = sum(int(f) for row in numstat.splitlines() for f in row.split()[:2] if f.isdecimal())
         reviews = "\n\n".join(f'<review round="{r}">\n{agent_review(self.repo, self.owner, pr, r)}\n</review>'
                               for r in range(1, round + 1))
-        snapshot = (f"Decision point: review round limit. PR #{pr} of {self.repo} used all {round} review rounds "
+        baseline = (f"Decision point: review round limit. PR #{pr} of {self.repo} used all {round} review rounds "
                     f"(max_review_rounds = {self.max_rounds}) and the last review still has must-fix items.\n"
                     f"Last reviewer: {reviewer}; last fixer: {self.fixed_by or fixer or 'none'}. "
                     f"Diff: {files} files, {lines} lines changed.\n"
                     "Actions: extra_round = one more fix by a fixer the vendor rules pick, then one more review; "
                     "handoff = the owner takes the PR.\n\n"
                     f"{reviews}\n\n{review_context(self.env, pr, self.issue)}")
+        diff_excerpt = ""
+        if self.env.repo.advisor_diff_excerpts:
+            diff_excerpt = (git(wt, "diff", "origin/main...HEAD") or "")[:4000]
+        snapshot = advisor.augment_snapshot(self.env, baseline, diff_excerpt=diff_excerpt)
 
         def still_current():
             data = pr_helpers.view(pr, "headRefOid,state")
