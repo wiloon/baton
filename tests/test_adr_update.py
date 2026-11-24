@@ -279,7 +279,7 @@ def test_a_refused_update_cannot_use_verification_that_finishes_at_the_deadline(
 
 def test_a_stalled_bounded_gh_call_is_killed_at_the_deadline(tmp_path, monkeypatch):
     gh = tmp_path / "gh"
-    gh.write_text("#!/bin/sh\ntrap '' TERM\n: > \"$ADR_STARTED\"\nsleep 2\n")
+    gh.write_text("#!/bin/sh\ntrap '' TERM\n: > \"$ADR_STARTED\"\nexec sleep 2\n")
     gh.chmod(0o755)
     started = tmp_path / "started"
     monkeypatch.setenv("ADR_STARTED", str(started))
