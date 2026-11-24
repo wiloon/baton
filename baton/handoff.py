@@ -45,6 +45,7 @@ DEV_PUSH = "dev_push_failed"
 SPEC_ADR_PUSH = "spec_adr_push_failed"
 FIX_CHECKS = "fix_checks_refresh_failed"
 FIX_TASK = "fix_task_write_failed"
+FIX_DESCRIPTION = "fix_description_write_failed"
 COMMENT_POSTS = (REVIEW_POST, SCREENSHOT_POST)
 SPEC_POSTS = (SPEC_REVIEW_POST, SPEC_REPLY_POST)
 SPEC_ACCEPT_POSTS = (SPEC_PENDING_ACCEPT_POST, SPEC_ACCEPT_POST)
@@ -55,8 +56,9 @@ SPEC_WRITE_POSTS = (*SPEC_POSTS, *SPEC_ACCEPT_POSTS, *SPEC_BODY_WRITES)
 # Dev and ADR pushes are issue-scoped; fix pushes are PR-scoped.
 ISSUE_PUSHES = (DEV_PUSH, SPEC_ADR_PUSH)
 PUSH_REASONS = frozenset({FIX_PUSH, *ISSUE_PUSHES})
-# PR description metadata writes after a fix (checks refresh and TASK: edits).
-FIX_META_WRITES = (FIX_CHECKS, FIX_TASK)
+# PR description metadata writes after a fix (description, checks refresh and TASK: edits).
+# Description exhaustion discards rather than handing off (#151 section 5).
+FIX_META_WRITES = (FIX_DESCRIPTION, FIX_CHECKS, FIX_TASK)
 RETRY_REASONS = frozenset({
     "review_comment_missing", "spec_comments_read_failed", "spec_pending_adr_read_failed",
     *COMMENT_POSTS, *SPEC_WRITE_POSTS, *PUSH_REASONS, *FIX_META_WRITES,
@@ -116,6 +118,7 @@ REASONS = {
     "spec_pending_adr_read_failed": Reason(1, "rule"),
     "spec_pending_accept_post_failed": Reason(1, "rule"),
     "spec_accept_post_failed": Reason(1, "rule"),
+    "fix_description_write_failed": Reason(1, "rule"),
     "fix_checks_refresh_failed": Reason(1, "rule"),
     "fix_task_write_failed": Reason(1, "rule"),
     "fix_run_unfinished": Reason(1, "rule"),
@@ -424,8 +427,17 @@ def _spec_body_edit_binding_valid(item, binding):
             and isinstance(binding.get("wt"), str) and bool(binding["wt"]))
 
 
+def _description_resume_valid(resume):
+    return (isinstance(resume, dict)
+            and all(isinstance(resume.get(key), str) and re.fullmatch(r"[0-9a-f]{40}", resume[key])
+                    for key in ("head", "agent_head"))
+            and isinstance(resume.get("model"), str)
+            and isinstance(resume.get("cursor_base"), str)
+            and type(resume.get("description_changed")) is bool)
+
+
 def _fix_meta_write_binding_valid(item, binding, *, reason):
-    """A checks refresh or TASK: body edit with its starting and intended bodies (#151)."""
+    """A description, checks refresh or TASK: body edit with its starting and intended bodies (#151)."""
     starting, intended = binding.get("starting"), binding.get("intended")
     head, feedback = binding.get("head"), binding.get("feedback")
     description_rc = binding.get("description_rc")
@@ -443,6 +455,23 @@ def _fix_meta_write_binding_valid(item, binding, *, reason):
             or not isinstance(binding.get("description_reason"), str)
             or type(binding.get("clear_cursor")) is not bool):
         return False
+    if reason == FIX_DESCRIPTION:
+        want = binding.get("want")
+        if want not in ("", "partial", "complete"):
+            return False
+        if binding.get("fixer") not in agents.ADAPTERS:
+            return False
+        if not agents.ADAPTERS[binding["fixer"]].FIX_RESUMABLE_VIA_REPLY:
+            return False
+        if binding.get("original_completion") not in ("partial", "complete"):
+            return False
+        if type(binding.get("text_changed")) is not bool:
+            return False
+        if not isinstance(binding.get("last_reason"), str):
+            return False
+        if not isinstance(binding.get("wt"), str):
+            return False
+        return _description_resume_valid(binding.get("resume"))
     if reason == FIX_CHECKS:
         return type(binding.get("consume")) is bool
     if reason == FIX_TASK:
@@ -459,12 +488,7 @@ def _fix_meta_write_binding_valid(item, binding, *, reason):
         resume = binding.get("resume")
         if binding["fixer"] == "cursor" and resume is None:
             return True    # Legacy Cursor records predate the stored resume base.
-        return (isinstance(resume, dict)
-                and all(isinstance(resume.get(key), str) and re.fullmatch(r"[0-9a-f]{40}", resume[key])
-                        for key in ("head", "agent_head"))
-                and isinstance(resume.get("model"), str)
-                and isinstance(resume.get("cursor_base"), str)
-                and type(resume.get("description_changed")) is bool)
+        return _description_resume_valid(resume)
     return False
 
 

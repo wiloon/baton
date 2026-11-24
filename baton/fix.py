@@ -20,6 +20,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 import time
 
 from . import agents, dispatch, e2e_gate, hooks as telemetry, notify, pick, pr as pr_helpers, pr_contract, prompts, recovery, vendors
@@ -27,6 +28,7 @@ from .common import Deferred, Exhausted, child_env, git, push, strip_markers
 
 REPLY_CAP = 60000
 PUSH_SUPERSEDED = 80
+UNCONFIRMED_DESCRIPTION = "The runner could not confirm whether the description edit landed"
 # The verify output a repair run gets in its prompt: the tail, where the errors are. The whole
 # output stays in the failure file (#38: a Claude agent could not read the ctx dir with the shell).
 FAILURE_PROMPT_CAP = 20000
@@ -50,6 +52,7 @@ class Runner:
         self.gate_applies = True   # dev.run clears it for a partial slice
         self.handed_off = False    # set once handoff() labels the PR; callers tell it apart from rc 1
         self.push_feedback = None
+        self.changed_input = ""
         self.ci_failed_head = ""
         self.push_caller = "ci" if round == "ci" else "review" if round else "standalone"
         self.last_fixer = ""
@@ -638,11 +641,13 @@ class Runner:
             if feedback is None:
                 return "retry"
             if feedback != binding["feedback"]:
+                self.changed_input = "the owner feedback"
                 return "changed"
         head = data.get("headRefOid")
         if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
             return "retry"
         if head != binding["head"]:
+            self.changed_input = "the PR head"
             return "changed"
         body = (data.get("body") or "").rstrip("\n")
         if body == binding["intended"]:
@@ -652,6 +657,7 @@ class Runner:
         if pending_description and body == pending_description:
             # Section 5: a failed description edit that landed after all is the new starting body.
             return "absent" if binding["intended"] != pending_description else "landed"
+        self.changed_input = "the PR description"
         return "changed"
 
     def capture_head(self, pr):
@@ -828,9 +834,265 @@ class Runner:
             f"Discarded the PR description request from {fixer}.\n\n{detail}",
         )
 
+    def clear_description_write(self, pr):
+        from . import handoff as owner_handoff
+        owner_handoff.clear_retry(self.env, self.push_episode(pr), owner_handoff.FIX_DESCRIPTION, str(pr))
+
     def clear_task_write(self, pr):
         from . import handoff as owner_handoff
         owner_handoff.clear_retry(self.env, self.push_episode(pr), owner_handoff.FIX_TASK, str(pr))
+
+    def write_description(self, pr, request, *, want="", fixer, resume=None, pending=None, baseline=None,
+                          wt=""):
+        """Apply a description (+ optional TASK:) under section 5 (#151).
+
+        Cursor waits under the shared category-1 budget; Claude and Codex discard on a confirmed
+        miss. Exhaustion and permanent failures discard rather than hand off. Returns
+        (rc, changed, reason, task_changed, discarded). Raises Deferred while Cursor waits.
+        """
+        from . import handoff as owner_handoff
+        reason = owner_handoff.FIX_DESCRIPTION
+        episode = self.push_episode(pr)
+        budgeted = agents.ADAPTERS[fixer].FIX_RESUMABLE_VIA_REPLY
+        if pending is None:
+            pending = self.waiting_meta(pr, reason)
+            if pending == "unreadable":
+                return 1, False, "", False, False
+        initial = pending is None
+        if not initial:
+            binding = pending["continuation"]
+            if pending.get("phase") == "landed":
+                task_changed = bool(binding["want"] and binding["want"] != binding.get("original_completion"))
+                return 0, True, "", task_changed, False
+            now = int(owner_handoff.clock())
+            if pending["attempts"] >= owner_handoff.MAX_ATTEMPTS:
+                # A restart after attempt two: no third try (#151).
+                detail = binding.get("last_reason") or UNCONFIRMED_DESCRIPTION
+                if request:
+                    pr_helpers.remove_body_request(Path(request))
+                self.clear_description_write(pr)
+                return 0, False, detail, False, True
+            if now < pending["due"]:
+                raise Deferred("handoff-retry", reason, lends_slot=False)
+            notify.log(f"handoff-retry {reason} attempt={pending['attempts'] + 1}/{owner_handoff.MAX_ATTEMPTS} "
+                       f"episode={episode}")
+            resume = binding.get("resume") or resume
+            outcome = self._run_description_write(pr, binding, pending, initial=False)
+            return self._settle_description(pr, request, binding, outcome, resume=resume)
+        path = Path(request) if request else None
+        if path is None or (not path.exists() and not path.is_symlink()):
+            return 0, False, "", False, False
+        if path.is_symlink() or not path.is_file() or path.stat().st_size == 0:
+            detail = "description request must be a non-empty regular file and cannot be a symlink"
+            pr_helpers.remove_body_request(path)
+            return 0, False, detail, False, True
+        current = pr_helpers.view(pr, "headRefName,body")
+        if current is None:
+            detail = "GitHub could not confirm whether the description edit landed"
+            if budgeted:
+                # Unreadable before the first save: nothing to replay; discard.
+                pr_helpers.remove_body_request(path)
+                return 0, False, detail, False, True
+            pr_helpers.remove_body_request(path)
+            return 0, False, detail, False, True
+        before = (current.get("body") or "").rstrip("\n")
+        original = pr_helpers._original_body(baseline, before) if baseline is not None else before
+        try:
+            relation_source = {**current, "body": original} if want else current
+            issue, original_completion = pr_contract.relation(relation_source)
+            if not re.fullmatch(r"\d+", issue) or original_completion not in ("partial", "complete"):
+                detail = "cannot determine the PR's issue and task completion"
+                pr_helpers.remove_body_request(path)
+                return 0, False, detail, False, True
+            if want and pr_contract.relation(current)[0] != issue:
+                detail = "the PR's associated issue changed since the fix began"
+                pr_helpers.remove_body_request(path)
+                return 0, False, detail, False, True
+            prepared = pr_helpers._prepare_request(path.read_text(), issue, original_completion, want or None)
+        except ValueError as error:
+            pr_helpers.remove_body_request(path)
+            return 0, False, str(error), False, True
+        intended = prepared.rstrip("\n")
+        task_changed = bool(want and want != original_completion)
+        # Match apply_body: a relation-only edit is not a description text change.
+        measured_from = original
+        if task_changed:
+            try:
+                measured_from = pr_contract.retarget(original, issue, want).rstrip("\n")
+            except ValueError:
+                pass
+        text_changed = intended != measured_from
+        if intended == before:
+            pr_helpers.remove_body_request(path)
+            Path(self.state, f"pr-body-base-{pr}").unlink(missing_ok=True)
+            return 0, text_changed, "", task_changed, False
+        if self.push_feedback is None:
+            self.push_feedback = self.capture_push_feedback(pr)
+        head = self.capture_head(pr)
+        if head is None:
+            detail = "The PR head could not be read."
+            if budgeted:
+                pr_helpers.remove_body_request(path)
+                return 0, False, detail, False, True
+            pr_helpers.remove_body_request(path)
+            return 0, False, detail, False, True
+        binding = {
+            "pr": str(pr), "issue": str(self.env.runtime.issue or issue or ""),
+            "starting": original, "intended": intended, "head": head,
+            "feedback": self.push_feedback or "", "fixer": fixer, "who": "",
+            "want": want or "", "original_completion": original_completion,
+            "text_changed": text_changed,
+            "description_rc": 0, "description_reason": "", "clear_cursor": False,
+            "wt": str(wt or (resume or {}).get("wt") or ""),
+            "resume": resume or {"head": head, "agent_head": head, "model": "",
+                                 "cursor_base": "", "description_changed": False},
+            "last_reason": "",
+        }
+        if budgeted:
+            pending = owner_handoff.prepare_retry(self.env, episode, reason, str(pr), binding)
+            if pending is None:
+                pr_helpers.remove_body_request(path)
+                return 0, False, "The description inputs could not be saved.", False, True
+        outcome = self._run_description_write(pr, binding, pending, initial=True, prepared=prepared)
+        return self._settle_description(pr, request, binding, outcome, resume=binding["resume"],
+                                        task_changed=task_changed, text_changed=text_changed)
+
+    def _run_description_write(self, pr, binding, pending, *, initial, prepared=None):
+        """Reconcile and optionally rewrite a saved description; Cursor may defer (#151)."""
+        from . import handoff as owner_handoff
+        reason = owner_handoff.FIX_DESCRIPTION
+        episode = self.push_episode(pr)
+        budgeted = agents.ADAPTERS[binding["fixer"]].FIX_RESUMABLE_VIA_REPLY
+
+        def reconcile():
+            return self.check_meta_write(pr, binding)
+
+        original = pending
+        if pending is not None and not initial and budgeted:
+            # Consume first: a crash after this point must not repeat the attempt (#151).
+            now = int(owner_handoff.clock())
+            used = pending["attempts"] + 1
+            pending = {**pending, "attempts": used, "scheduled": now,
+                       "due": now + owner_handoff.DELAYS[min(used, owner_handoff.MAX_ATTEMPTS - 1)]}
+            owner_handoff.restore_retry(self.env, episode, reason, str(pr), pending)
+        self.changed_input = ""
+
+        # Initial attempt just read the body while building the binding; resume revalidates first.
+        status = "absent" if initial else reconcile()
+        edited = None
+        unconfirmed = status == "retry"
+        if status == "absent":
+            body_text = prepared if prepared is not None else binding["intended"] + "\n"
+            if not body_text.endswith("\n"):
+                body_text += "\n"
+            # A real file path (not stdin) keeps the tick and apply_body test doubles working.
+            with tempfile.NamedTemporaryFile(
+                    "w", dir=self.ctx, prefix=f"pr-{pr}-description.", delete=False) as file:
+                file.write(body_text)
+            try:
+                edited = pr_helpers.gh(
+                    "pr", "edit", str(pr), "-R", self.repo, "--body-file", file.name,
+                    reconcile=reconcile if pending is not None
+                    else (lambda: self._description_after_failure(pr, binding)))
+            finally:
+                Path(file.name).unlink(missing_ok=True)
+            if edited.returncode == 0:
+                status = "landed"
+            else:
+                status = reconcile() if pending is not None else self._description_after_failure(pr, binding)
+                unconfirmed = status == "retry"
+                if status in ("absent", "retry"):
+                    if not pr_helpers.transient(edited):
+                        if unconfirmed:
+                            return {"status": "discard", "detail": UNCONFIRMED_DESCRIPTION, "unconfirmed": True}
+                        return {"status": "discard",
+                                "detail": f"GitHub could not update the PR description{pr_helpers.why(edited)}"}
+                    status = "retry"
+        if status == "landed":
+            return {"status": "landed"}
+        if status == "superseded":
+            owner_handoff.clear_retry(self.env, episode, reason, str(pr))
+            from . import advisor
+            advisor.finish_episode(self.env, "pr", pr, "superseded")
+            return {"status": "superseded"}
+        if status == "paused":
+            if pending is not None:
+                owner_handoff.restore_retry(self.env, episode, reason, str(pr), original)
+            raise Deferred("handoff-retry", reason, lends_slot=False)
+        if status == "changed":
+            return {"status": "discard",
+                    "detail": f"{self.changed_input or 'the PR description'} changed during the edit"}
+        if status == "retry" and not budgeted:
+            if unconfirmed or edited is None:
+                return {"status": "discard", "detail": UNCONFIRMED_DESCRIPTION, "unconfirmed": True}
+            return {"status": "discard",
+                    "detail": f"GitHub could not update the PR description{pr_helpers.why(edited)}"}
+        attempts = (pending or {}).get("attempts", 0)
+        if status == "retry" and pending is not None and attempts < owner_handoff.MAX_ATTEMPTS:
+            notify.log(f"PR #{pr}: description update deferred after GitHub failure")
+            if initial:
+                now = int(owner_handoff.clock())
+                owner_handoff.restore_retry(
+                    self.env, episode, reason, str(pr),
+                    {**pending, "scheduled": now, "due": now + owner_handoff.DELAYS[0]})
+            raise Deferred("handoff-retry", reason, lends_slot=False)
+        if unconfirmed or edited is None:
+            return {"status": "discard", "detail": UNCONFIRMED_DESCRIPTION, "unconfirmed": True}
+        return {"status": "discard",
+                "detail": f"GitHub could not update the PR description{pr_helpers.why(edited)}"}
+
+    def _description_after_failure(self, pr, binding):
+        """Classify the body after a failed description edit with no saved retry yet."""
+        try:
+            viewed = pr_helpers.view(pr, "body")
+        except ValueError:
+            return "retry"
+        if viewed is None:
+            return "retry"
+        body = (viewed.get("body") or "").rstrip("\n")
+        if body == binding["intended"]:
+            return "landed"
+        if body == binding["starting"]:
+            return "absent"
+        return "changed"
+
+    def _settle_description(self, pr, request, binding, outcome, *, resume=None, task_changed=None,
+                            text_changed=None):
+        """Finish a description attempt: clear state, discard, or report progress."""
+        status = outcome["status"]
+        if status == "discard" and outcome.get("unconfirmed") and self._description_after_failure(
+                pr, binding) == "landed":
+            # The edit landed after all: count it and skip the discard (section 5).
+            outcome = {"status": "landed"}
+            status = "landed"
+        if status == "superseded":
+            if request:
+                pr_helpers.remove_body_request(Path(request))
+            Path(self.state, f"pr-body-base-{pr}").unlink(missing_ok=True)
+            return PUSH_SUPERSEDED, False, "", False, False
+        if status == "landed":
+            self.clear_description_write(pr)
+            if agents.ADAPTERS[binding["fixer"]].FIX_RESUMABLE_VIA_REPLY:
+                # A reply fixer keeps its request and baseline until the fix completes, so a crash
+                # replays the landed edit as progress (clear_cursor_request removes them).
+                pass
+            else:
+                if request:
+                    pr_helpers.remove_body_request(Path(request))
+                Path(self.state, f"pr-body-base-{pr}").unlink(missing_ok=True)
+            if task_changed is None:
+                task_changed = bool(binding.get("want") and binding["want"] != binding.get("original_completion"))
+            if text_changed is None:
+                text_changed = binding.get("text_changed")
+            if text_changed is None:
+                text_changed = True
+            return 0, bool(text_changed), "", task_changed, False
+        detail = outcome.get("detail") or "GitHub could not update the PR description"
+        self.clear_description_write(pr)
+        if request:
+            pr_helpers.remove_body_request(Path(request))
+        # Keep pr-body-base so a following TASK: write can detect an issue change (#151).
+        return 0, False, detail, False, True
 
     def write_task(self, pr, url, *, want="", pending=None, fixer="", who="", baseline=None,
                    description_rc=0, description_reason="", resume=None):
@@ -966,14 +1228,21 @@ class Runner:
         if outcome.startswith("RESULT: fixed"):
             want = pr_helpers.task_wanted(out["reply"])
             has_request = description_request.exists() or description_request.is_symlink()
-            description_rc, description_changed, description_reason, task_changed = pr_helpers.apply_body(
-                pr, str(description_request), self.state, self.ctx, completion=want or None)
+            resume = {"agent_head": agent_head, "head": head, "model": model, "cursor_base": cursor_base,
+                      "description_changed": False}
+            if has_request:
+                rc, description_changed, description_reason, task_changed, discarded = self.write_description(
+                    pr, str(description_request), want=want or "", fixer=fixer, resume=resume,
+                    baseline=Path(self.state, f"pr-body-base-{pr}"), wt=str(wt))
+                if rc == PUSH_SUPERSEDED:
+                    return rc
+                if rc == 1:
+                    return 1
+                description_rc = 2 if discarded else 0
+                resume = {**resume, "description_changed": bool(description_changed)}
             Path(self.state, f"pr-body-base-{pr}").unlink(missing_ok=True)
-            pr_helpers.remove_body_request(description_request)
             # A rejected body keeps the prior text; still apply a valid TASK: request.
             if not has_request or description_rc:
-                resume = {"agent_head": agent_head, "head": head, "model": model, "cursor_base": cursor_base,
-                          "description_changed": bool(description_changed)}
                 rc, task_changed, log = self.write_task(
                     pr, url, want=want, fixer=fixer, description_rc=description_rc,
                     description_reason=description_reason, resume=resume)
@@ -1143,28 +1412,29 @@ class Runner:
                 temp.write_text(f"{want}\n{self.push_feedback or ''}\n")
                 temp.replace(task_file)
         has_request = request.exists() or request.is_symlink()
-        description_rc, body_changed, description_reason, task_changed = pr_helpers.apply_body(
-            pr, str(request), self.state, self.ctx, completion=want or None)
-        if description_rc == 1:
-            notify.log(f"PR #{pr}: description update deferred after GitHub failure")
-            return 75
-        discarded = description_rc == 2
-        if discarded:
-            pr_helpers.remove_body_request(request)
-            has_request = False
-        if not has_request or description_rc:
-            resume = {"head": head, "agent_head": agent_head, "description_changed": bool(body_changed),
-                      "model": "", "cursor_base": ""}
+        resume = {"head": head, "agent_head": agent_head, "description_changed": False,
+                  "model": "", "cursor_base": ""}
+        body_changed, description_reason, task_changed, discarded = False, "", False, False
+        if has_request:
+            rc, body_changed, description_reason, task_changed, discarded = self.write_description(
+                pr, str(request), want=want or "", fixer=fixer, resume=resume,
+                baseline=baseline_file, wt=str(wt))
+            if rc == PUSH_SUPERSEDED:
+                return rc
+            if rc == 1:
+                return 1
+            resume = {**resume, "description_changed": bool(body_changed)}
+            if discarded:
+                has_request = False
+        if not has_request or discarded:
             rc, task_changed, log = self.write_task(
                 pr, url, want=want, fixer=fixer, baseline=baseline_file,
                 description_rc=2 if discarded else 0, description_reason=description_reason, resume=resume)
             if rc == PUSH_SUPERSEDED:
                 return rc
             if rc == 1:
-                if discarded:
-                    self.description_discarded(pr, fixer, description_reason)
                 return 1
-            if rc != 0 and (rc != 2 or description_rc != 2):
+            if rc != 0 and (rc != 2 or not discarded):
                 reason = "fix_task_invalid"
                 start = agent_head if self.attempt_authors else head
                 if not self.record(pr, fixer, wt, start, "", ""):
@@ -1179,6 +1449,59 @@ class Runner:
         return self.finish_reply_fix(
             pr, wt, fixer, branch, url, source, feedback, head, agent_head=agent_head,
             body_changed=body_changed, task_changed=task_changed, discarded=discarded,
+            description_reason=description_reason)
+
+    def resume_description_write(self, pr, wt, url, source, feedback, pending):
+        """Resume a Cursor description edit, then the rest of the fix (#151 section 5)."""
+        binding = pending["continuation"]
+        fixer = binding["fixer"]
+        saved = binding["resume"]
+        self.last_fixer = fixer
+        self.push_feedback = binding["feedback"] or None
+        request = Path(self.ctx, f"pr-{pr}-body.md")
+        rc, body_changed, description_reason, task_changed, discarded = self.write_description(
+            pr, str(request) if request.exists() or request.is_symlink() else "",
+            want=binding.get("want") or "", fixer=fixer, resume=saved, pending=pending)
+        if rc == PUSH_SUPERSEDED:
+            return rc
+        if rc == 1:
+            return 1
+        if discarded:
+            # After a discard, a valid TASK: change is its own write (#151 section 5).
+            # The discard comment waits for the checks/push continuation, as today.
+            resume = {**saved, "description_changed": False}
+            baseline = Path(self.state, f"pr-body-base-{pr}")
+            if not baseline.is_file():
+                # Retarget against the body captured with the description, so an owner
+                # issue correction during the wait is still detected.
+                temp = baseline.with_suffix(".tmp")
+                temp.write_text(binding["starting"] + "\n")
+                temp.replace(baseline)
+            task_rc, task_changed, log = self.write_task(
+                pr, url, want=binding.get("want") or "", fixer=fixer, baseline=baseline,
+                description_rc=2, description_reason=description_reason, resume=resume)
+            if task_rc == PUSH_SUPERSEDED:
+                return task_rc
+            if task_rc == 1:
+                return 1
+            if task_rc != 0:
+                start = saved["agent_head"] if self.attempt_authors else saved["head"]
+                if not self.record(pr, fixer, wt, start, saved.get("model") or "", saved.get("cursor_base") or ""):
+                    return 1
+                action, alt, _ = self.recover(
+                    pr, "fix_task_invalid", f"PR #{pr}: task completion change failed ({fixer})",
+                    f"Invalid task relation from {fixer}. {url}", fixer, wt=wt, head=saved["head"],
+                    validation_error=log)
+                if action == "handoff":
+                    return 1
+                self.clear_reply_request(pr, fixer, keep_base=True)
+                return self.dispatch_fixer(pr, wt, alt, source, correction(feedback, log), saved["head"])
+        else:
+            saved = {**saved, "description_changed": bool(body_changed)}
+        branch = git(wt, "branch", "--show-current") or ""
+        return self.finish_reply_fix(
+            pr, wt, fixer, branch, url, source, feedback, saved["head"], agent_head=saved["agent_head"],
+            body_changed=saved["description_changed"], task_changed=task_changed, discarded=discarded,
             description_reason=description_reason)
 
     def resume_task_write(self, pr, wt, url, source, feedback, pending):
@@ -1343,6 +1666,19 @@ def fix_pr(runner, pr, wt, fixer, source, feedback, head="", *, owner_triggered=
         return runner.push_with_retry(pr, wt, binding["ref"], next_step=binding["next"],
                                       url=f"https://github.com/{runner.repo}/pull/{pr}", pending=waiting)
     url = f"https://github.com/{runner.repo}/pull/{pr}"
+    waiting_description = runner.waiting_meta(pr, owner_handoff.FIX_DESCRIPTION)
+    if waiting_description == "unreadable":
+        return 1
+    if (isinstance(waiting_description, dict)
+            and waiting_description["continuation"]["fixer"] != fixer):
+        # Another fixer never applies a pending description it did not write: drop it.
+        runner.clear_description_write(pr)
+        for name, adapter in agents.ADAPTERS.items():
+            if adapter.FIX_RESUMABLE_VIA_REPLY and name != fixer:
+                runner.clear_reply_request(pr, name, keep_base=True)
+        waiting_description = None
+    if waiting_description is not None:
+        return runner.resume_description_write(pr, wt, url, source, feedback, waiting_description)
     waiting_checks = runner.waiting_meta(pr, owner_handoff.FIX_CHECKS)
     if waiting_checks == "unreadable":
         return 1

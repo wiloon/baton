@@ -353,8 +353,19 @@ def apply_body(pr, request, state, ctx, completion=None):
         prepared = _prepare_request(path.read_text(), issue, original_completion, completion)
     except ValueError as error:
         return 2, False, str(error), False
-    if prepared.rstrip("\n") != before and not edit_body(pr, prepared, ctx, f"pr-{pr}-body-prepared."):
-        return 1, False, "GitHub could not update the PR description", False
+    intended = prepared.rstrip("\n")
+    if intended != before and not edit_body(pr, prepared, ctx, f"pr-{pr}-body-prepared."):
+        # Look before deciding: a lost success response still counts (#151 section 5).
+        current = view(pr, "headRefName,body")
+        if current is None:
+            return 1, False, "GitHub could not confirm whether the description edit landed", False
+        after = (current.get("body") or "").rstrip("\n")
+        if after == intended:
+            before = after
+        elif after == original:
+            return 1, False, "GitHub could not update the PR description", False
+        else:
+            return 2, False, "the PR description changed during the edit", False
     task_changed = bool(completion and completion != original_completion)
     if task_changed:
         try:
@@ -362,7 +373,7 @@ def apply_body(pr, request, state, ctx, completion=None):
         except ValueError:
             # The replacement also corrected text that prevented a relation-only edit.
             pass
-    return 0, prepared.rstrip("\n") != original, "", task_changed
+    return 0, intended != original, "", task_changed
 
 
 def apply_task(pr, want, ctx, baseline=None):
