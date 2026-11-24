@@ -2471,10 +2471,10 @@ def test_verification_resume_uses_the_fixer_protocol_and_clears_cursor_state(
     if fixer == "claude":
         request = BODY.replace("## Checks to verify\nnone", "## Checks to verify\n- /billing: cursor badge")
         run.agent(cursor_plan(reply, request=request))
-        gh.fail("edit")
+        clock, _ = _flaky_edits(monkeypatch, fail_until=1_001)
         assert run.fix("cursor")["rc"] == 75
         assert cursor_base.exists() and cursor_task.exists()
-        gh.fail("edit", False)
+        clock["now"] = 1_001  # GitHub is back; Cursor's retry is still inside its budget
 
     run.verify_script("lint broke", "lint broke", "lint broke", "pass")
     run.advice = [{"action": "retry_step", "reason": "transient verification",
@@ -2515,12 +2515,13 @@ def test_stub_reply_fix_discards_a_pending_cursor_request(run, monkeypatch, gh):
     _admit_stub_fixer(run, monkeypatch)
     request = BODY.replace("Disabled buttons.", "Cursor's superseded description.")
     run.agent(cursor_plan("## Checks to verify\n- /billing: cursor badge\n\nRESULT: fixed", request=request))
-    gh.fail("edit-before-write")
+    clock, _ = _flaky_edits(monkeypatch, fail_until=1_001)
     assert run.fix("cursor")["rc"] == 75
-    gh.fail("edit-before-write", False)
+    clock["now"] = 1_001  # GitHub is back, but Cursor's retry (due +60s) is not yet due
 
     run.agent(cursor_plan("## Checks to verify\nnone\n\nRESULT: fixed"))
     assert run.fix("stub")["rc"] == 0
+    assert [call[0] for call in run.agent_calls] == ["cursor", "stub"]
     assert section(run.body(), "What changed") == "Disabled buttons."
     assert section(run.body(), "Checks to verify") == "none"
     assert not (Path(env_ctx()) / f"pr-{PR}-body.md").exists()
@@ -2557,13 +2558,13 @@ print(json.dumps({{"type": "result", "subtype": "success", "model": "stub-1", "r
     cli.chmod(0o755)
     (cli.parent / "timeout").unlink()
 
-    gh.fail("edit-before-write")
+    clock, _ = _flaky_edits(monkeypatch)
     assert run.fix("stub")["rc"] == 75
     assert replacement not in run.body()
     assert calls.read_text().splitlines() == ["stub-agent"]
     assert run.comments()[0].startswith("<!-- baton-fix by=stub -->")
 
-    gh.fail("edit-before-write", False)
+    clock["now"] = 1_060
     assert run.fix("stub")["rc"] == 0
     assert section(run.body(), "What changed") == replacement
     assert calls.read_text().splitlines() == ["stub-agent"]

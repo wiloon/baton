@@ -1669,6 +1669,14 @@ def fix_pr(runner, pr, wt, fixer, source, feedback, head="", *, owner_triggered=
     waiting_description = runner.waiting_meta(pr, owner_handoff.FIX_DESCRIPTION)
     if waiting_description == "unreadable":
         return 1
+    if (isinstance(waiting_description, dict)
+            and not Path(runner.state, f"{fixer}-fix-base-{pr}").is_file()):
+        # Another fixer never applies a pending description it did not write: drop it.
+        runner.clear_description_write(pr)
+        for name, adapter in agents.ADAPTERS.items():
+            if adapter.FIX_RESUMABLE_VIA_REPLY and name != fixer:
+                runner.clear_reply_request(pr, name, keep_base=True)
+        waiting_description = None
     if waiting_description is not None:
         return runner.resume_description_write(pr, wt, url, source, feedback, waiting_description)
     waiting_checks = runner.waiting_meta(pr, owner_handoff.FIX_CHECKS)
