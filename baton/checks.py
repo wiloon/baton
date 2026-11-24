@@ -11,7 +11,6 @@ from . import check_verdicts
 
 HEADING = "Checks to verify"
 LEGACY = "Manual checks"
-LEGACY_TRACKER = "Manual checks to try"   # the title of tracking issues opened before the rename
 # Footers a coding tool appends to whatever section ends the body.
 ATTRIBUTION = re.compile(r"(🤖 Generated with |co-authored-by:)", re.IGNORECASE)
 

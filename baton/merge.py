@@ -279,7 +279,6 @@ class Merger:
         try:
             after_merge.follow_ups(str(self.pr), self.issue)
             after_merge.owner_actions(str(self.pr), self.issue)
-            after_merge.deferred_checks(str(self.pr), self.issue)
         except Exception as exc:
             notify.log(f"PR #{self.pr}: after-merge failed: {exc}")
             notify.log(f"PR #{self.pr}: after-merge filing failed")
@@ -298,18 +297,6 @@ class Merger:
         if verdicts is None:
             return None
         return [item for item, verdict in zip(listed, verdicts) if verdict != "verified"]
-
-    def remainder(self):
-        return Path(self.state, f"deferred-checks-items-pr-{self.pr}")
-
-    def keep_deferred(self, source, left):
-        """With manual_checks = "defer", only the checks LEFT go to the tracking issue (#48). The
-        file records the SOURCE checks they were computed from too, so the tracker trusts it
-        only while the merged description still lists them."""
-        self.remainder().write_text(json.dumps({"source": source, "left": left}) + "\n")
-
-    def drop_deferred(self):
-        self.remainder().unlink(missing_ok=True)
 
     def owed(self, left, body):
         """What a hand-off shows the owner: the checks left after a usable screenshot review,
@@ -609,11 +596,10 @@ class Merger:
     # --- the review passed ---
     def merge_or_handoff(self, wt, screenshot=None):
         """Merge when auto-merge is on for the runner and for this repository, CI is green and
-        the checks section is none, the screenshot review verified every check (SCREENSHOT:
-        the reviewed checks and the round's screenshot review comment, #92), or the repository
-        defers checks (#48); otherwise label it ready-for-human."""
+        the checks section is none or the screenshot review verified every check (SCREENSHOT:
+        the reviewed checks and the round's screenshot review comment, #92); otherwise label it
+        ready-for-human."""
         pr, url = self.pr, self.url
-        deferred = self.env.repo.manual_checks == "defer"
         if self.env.config.scheduling.auto_merge is not True or self.env.repo.auto_merge is not True:
             where = "" if self.env.config.scheduling.auto_merge is not True else f" for {self.repo}"
             body = pr_helpers.body(pr)
@@ -622,7 +608,7 @@ class Merger:
             listed = self.left_text(left, owed)
             self.handoff("auto_merge_off", f"PR #{pr} review passed",
                          f"Auto-merge is off{where}; ready for you." + (f" {listed}\n{url}" if listed else f" {url}"))
-            if not deferred and (body is None or not pr_helpers.checks_none(body)):
+            if body is None or not pr_helpers.checks_none(body):
                 notify.send_shots(pr, note="Checks for you" if left is None else "", left=owed)
             return
         waiting = fix.Runner(self.env, self.hooks, pr, "ci").waiting_push(pr)
@@ -650,7 +636,7 @@ class Merger:
         try:
             body = pr_helpers.body(pr)
             left = self.left_for_owner(screenshot, body)
-            gate = pr_helpers.gate(pr, defer=deferred, cleared=screenshot["checks"] if left == [] else None)
+            gate = pr_helpers.gate(pr, cleared=screenshot["checks"] if left == [] else None)
         except Exception:
             gate = {"action": "manual_checks"}
         if gate.get("action") == "queue_review":
@@ -667,11 +653,6 @@ class Merger:
                          "Review and CI passed." + (f" {listed}\n{url}" if listed else f" {url}"))
             notify.send_shots(pr, note="Checks for you" if left is None else "", left=owed)
             return
-        if deferred:   # the remainder belongs to this attempt, never to an earlier one
-            if left is None:
-                self.drop_deferred()
-            else:
-                self.keep_deferred(checks.items(body), left)
 
         def recheck():
             """After a branch update, re-run checks clearance and metadata preflight (ADR 0006)."""
@@ -679,13 +660,12 @@ class Merger:
             try:
                 body = pr_helpers.body(pr)
                 left = self.left_for_owner(screenshot, body)
-                return pr_helpers.gate(pr, defer=deferred, cleared=screenshot["checks"] if left == [] else None)
+                return pr_helpers.gate(pr, cleared=screenshot["checks"] if left == [] else None)
             except Exception:
                 return {"action": "manual_checks"}
 
         result = self.merge_with_updates(45, before_merge=recheck)
         if not result.get("ok"):
-            self.drop_deferred()
             reason = result.get("reason")
             if reason == "ci_after_update_not_green":
                 self.handoff("ci_after_update_not_green", f"PR #{pr}: CI not green",
@@ -711,17 +691,12 @@ class Merger:
             self.handoff("merge_failed", f"PR #{pr} merge failed", f"{url}{detail}",
                          **self.observation("merge_failed", failure=reason))
             return
-        if deferred:   # a recheck may have refreshed left against the live body
-            if left is None:
-                self.drop_deferred()
-            else:
-                self.keep_deferred(checks.items(body) if body is not None else [], left)
         self.hooks.task("merged", "merged")
         notify.notify(f"PR #{pr} merged", url)
         # A partial PR keeps its issue open; release it for the next slice below.
         if remove_worktree(str(self.env.dirs.clone), wt):
             notify.log(f"cleaned up worktree {wt}")
-        if left == [] and not deferred:   # merged on the screenshot review: the owner can still look
+        if left == []:   # merged on the screenshot review: the owner can still look
             notify.send_shots(pr, note="merged after screenshot review", left=checks.items(body))
         session.run_process(["rm", "-rf", str(Path(self.ctx, f"pr-{pr}-shots"))])
         if self.issue:

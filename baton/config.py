@@ -84,9 +84,6 @@ class Repo:
     prompt_notes: Pairs
     # Agent commits get a Signed-off-by for their author before they are pushed (DCO, #44).
     signoff: bool = False
-    # "gate": a PR whose checks section is not none waits for the owner. "defer": it merges,
-    # and its checks go to one tracking issue for a later trial of the whole app (#48).
-    manual_checks: str = "gate"
     # A second model reviews the manual-check screenshots, and fixers re-shoot them (#50).
     screenshot_review: bool = False
     # false: every PR of this repository waits for the owner, whatever scheduling.auto_merge says.
@@ -740,8 +737,6 @@ def _check_repo(repo):
     for key, _ in repo.env:
         if not ENV_NAME.fullmatch(key) or key in RESERVED_ENV:
             raise ConfigError('repos.env: expected UPPER_CASE names the runner does not set itself')
-    if repo.manual_checks not in ('gate', 'defer'):
-        raise ConfigError('repos.manual_checks: expected "gate" or "defer"')
     if not repo.ci_command.strip():
         raise ConfigError('repos.ci_command: expected the command agents run before they finish')
     if any(not re.fullmatch(r'[a-z]+(-[a-z]+)*', key) for key, _ in repo.prompt_notes):

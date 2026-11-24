@@ -8,7 +8,6 @@ The Linear key is read here into a local variable; no agent inherits it.
 
 from . import session
 import argparse
-from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -17,7 +16,7 @@ import sys
 import urllib.error
 import urllib.request
 
-from . import checks as check_section, credentials, md, notify as notifier
+from . import credentials, md, notify as notifier
 from .notify import log, notify
 from .pr import body as pr_body, create_issue, gh, missing_requested_labels, view, why
 
@@ -343,117 +342,6 @@ def owner_actions(pr, issue):
     done.touch()
 
 
-TRACKER = "Checks to try"
-
-
-def defer_since(env=None):
-    """When this repository's `manual_checks = "defer"` took effect, as the UTC time in
-    `$STATE/deferred-checks-since`, written the first time it is seen on; None while it is off
-    (the file is removed, so turning defer on again starts a new cutoff). PRs merged before it
-    went through the gate, so their checks are not deferred (#52)."""
-    env = session.resolve(env)
-    path = Path(str(env.dirs.state), "deferred-checks-since")
-    if env.repo.manual_checks != "defer":
-        path.unlink(missing_ok=True)
-        return None
-    try:
-        return datetime.fromisoformat(path.read_text().strip())
-    except (OSError, ValueError):
-        now = datetime.now(timezone.utc).replace(microsecond=0)
-        path.write_text(now.isoformat() + "\n")
-        return now
-
-
-def open_tracker():
-    """The open tracker issue's number, "" when none is open, None when gh fails. Lists the
-    label rather than searching: the search index lags a just-created issue by seconds, so a
-    second PR in the same tick opened a second tracker (#52)."""
-    listed = stdout("issue", "list", "-R", repo(), "--state", "open", "--label", "ready-for-human",
-                    "--limit", "200", "--json", "number,title")
-    if listed is None:
-        return None
-    try:
-        return next((str(i["number"]) for i in json.loads(listed or "[]") if i.get("title") in (TRACKER, check_section.LEGACY_TRACKER)), "")
-    except (ValueError, TypeError, KeyError):
-        return None
-
-
-def deferred_remainder(path, body):
-    """The checks the merge step left for the owner, read from PATH; None unless the file is
-    readable and was computed from the very checks the merged BODY lists (a well-formed body
-    whose items equal the file's source items)."""
-    try:
-        saved = json.loads(path.read_text())
-        source, left = saved["source"], saved["left"]
-        if not isinstance(source, list) or not isinstance(left, list):
-            return None
-        if not all(isinstance(item, str) for item in (*source, *left)):
-            return None
-    except (OSError, ValueError, KeyError, TypeError):
-        return None
-    return left if check_section.items(body) == source and source else None
-
-
-def deferred_checks(pr, issue):
-    """With manual_checks = "defer" the PR merged without the owner's look, so its
-    checks go to one open tracking issue for a later trial of the whole app: a new issue, or a
-    comment on the open one. Once per PR (#48), and only for PRs merged after defer took effect
-    (#52). Checks the screenshot review verified are left out (#92) when the merge step's
-    `deferred-checks-items-pr-N` was computed from the checks the merged description still
-    lists; otherwise every check of every checks section is sent."""
-    env = session.resolve()
-    since = defer_since(env)
-    if since is None:
-        return
-    done = Path(str(env.dirs.state), f"deferred-checks-pr-{pr}")
-    if done.exists():
-        return
-    body = pr_body(pr)
-    if body is None:
-        log(f"PR #{pr}: reading its checks failed; retried after the next merge step")
-        return
-    left = deferred_remainder(Path(str(env.dirs.state), f"deferred-checks-items-pr-{pr}"), body)
-    listed_checks = left if left is not None else check_section.recovery_items(body)
-    if not listed_checks:   # no checks, none, or every one verified (#92)
-        done.touch()
-        return
-    listed = stdout("pr", "view", str(pr), "-R", repo(), "--json", "title,mergedAt")
-    try:
-        info = json.loads(listed or "")
-        title = info.get("title") or ""
-        merged = datetime.fromisoformat((info.get("mergedAt") or "").replace("Z", "+00:00"))
-    except (ValueError, TypeError, AttributeError):
-        log(f"PR #{pr}: reading its merge time failed; retried after the next merge step")
-        return
-    if merged < since:
-        done.touch()   # merged through the gate, before defer: the owner had their look
-        return
-    items = "".join(("- " if re.match(r"\[[ xX]\]", item) else "- [ ] ") + item.replace("\n", "\n  ") + "\n"
-                    for item in listed_checks)
-    section = f"### PR #{pr}: {title}\nhttps://github.com/{repo()}/pull/{pr}\n\n{items}"
-    tracker = open_tracker()
-    if tracker is None:
-        log(f"PR #{pr}: finding the {TRACKER!r} issue failed; retried after the next merge step")
-        return
-    done.touch()   # before writing: a half-written section is logged, never written twice
-    if tracker:
-        commented = gh("issue", "comment", tracker, "-R", repo(), "--body", section)
-        if commented.returncode != 0:
-            log(f"PR #{pr}: deferred checks lost{why(commented)}: {items}")
-        return
-    body = ("Checks of PRs that merged without the owner's look (`manual_checks = \"defer\"`). "
-            "Try them in one pass, tick what works, then close this issue; the next such PR opens "
-            f"a new one.\n\n{section}")
-    created, _applied = create_issue(
-        repo(), title=TRACKER, labels=("ready-for-human",), body=body,
-        allow_unlabelled=False, context=f"PR #{pr}: deferred checks")
-    if created.returncode == 0:
-        return
-    if missing_requested_labels(created, ("ready-for-human",)):
-        done.unlink(missing_ok=True)   # confirmed pre-write rejection: retry after labels exist
-    log(f"PR #{pr}: deferred checks lost{why(created)}: {items}")
-
-
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("pr")
@@ -461,7 +349,6 @@ def main(argv=None):
     args = parser.parse_args(argv)
     follow_ups(args.pr, args.issue)
     owner_actions(args.pr, args.issue)
-    deferred_checks(args.pr, args.issue)
     return 0
 
 
