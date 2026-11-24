@@ -2897,6 +2897,7 @@ def test_same_vendor_reply_review_checks_and_reports_actual_model(loop, monkeypa
     env = admit_stub(loop, monkeypatch)
     loop.gh.set(headRefName="owner/issue-1", author={"login": "owner"})
     monkeypatch.setattr(agents.ADAPTERS["stub"], "SAME_VENDOR_REVIEW", True)
+    monkeypatch.setattr(agents.ADAPTERS["stub"], "SAME_VENDOR_SAME_MODEL", True)
     vendors.record_author(loop.env["STATE"], PR, "stub")
     vendors.record_author_model(loop.env["STATE"], PR, "stub", "stub-1")
 
