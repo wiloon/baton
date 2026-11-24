@@ -1053,9 +1053,9 @@ class Spec:
             if row["text"] not in combined:
                 self.handoff(why + " Advisor citations no longer match the issue.", "spec_questions")
                 return "stop"
-            if advisor.owner_conflict(sources, row["citations"], row["text"]):
-                self.handoff(why + " Advisor answer conflicts with the owner instruction it cites.",
-                             "spec_questions")
+            if issue := advisor.owner_comment_issue(
+                    sources, row["citations"], row.get("considered", ()), row["text"]):
+                self.handoff(f"{why} Advisor {issue}.", "spec_questions")
                 return "stop"
         return self.publish_advisor_answers(binding, answers)
 

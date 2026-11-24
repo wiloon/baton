@@ -27,7 +27,7 @@ from . import credentials, notify, session
 
 PROMPT_VERSION = "3"
 OBSERVATION_PROMPT_VERSION = "4"
-QUESTIONS_PROMPT_VERSION = "5"
+QUESTIONS_PROMPT_VERSION = "6"
 KEY = "DEEPSEEK_API_KEY"
 HANDOFF = "handoff"
 DIGEST_SECONDS = 24 * 3600
@@ -58,11 +58,15 @@ own wording in reason. Use an empty evidence array when no exact quote applies."
 QUESTIONS_SYSTEM = """When answer_spec_questions is allowed, answer every listed question or choose handoff.
 For answer_spec_questions return the same JSON fields plus
 "answers": [{"id": "qN", "case": "grounded"|"reversible_default"|"owner_decision",
-"text": "<answer>", "citations": ["cN", ...]}, ...].
+"text": "<answer>", "citations": ["cN", ...], "considered": ["cN", ...]}, ...].
 Use grounded only when the citation excerpts already settle the question; copy the answer text
 character for character from those excerpts (no new decision wording). Use reversible_default for a
 technical default the owner could reverse, and owner_decision when only the owner can decide.
 If an owner comment addresses the question, cite the newest such comment and take the answer from it.
+For each answer, account for every owner comment newer than its grounding sources. Put comments
+that ground the answer in citations and comments you reviewed and found inapplicable in considered.
+Use only grounding citations to support the answer text. Issue bodies and documents do not
+establish owner-comment recency. Owner comment IDs are in chronological order.
 Any non-grounded case, missing question, duplicate id, or citation outside the snapshot means the
 runner will hand the whole set off. Prefer handoff when evidence is incomplete or conflicting."""
 
@@ -116,22 +120,29 @@ def extract_questions(text):
 
 
 def parse_citations(snapshot):
-    """Citation id → excerpt text from the runner-built Citation evidence block."""
-    found = {}
-    for match in CITATION_LINE.finditer(snapshot or ""):
-        found[match["id"]] = match["text"]
-    return found
+    """Citation id → (source, excerpt) from the runner-built Citation evidence block."""
+    _, _, block = (snapshot or "").partition("\nCitation evidence:\n")
+    rows = {}
+    for line in block.splitlines():
+        match = CITATION_LINE.fullmatch(line)
+        if not match:
+            break
+        rows[match["id"]] = (match["source"], match["text"])
+    return rows
 
 
-def owner_conflict(rows, cites, text):
-    """True when the newest owner comment among CITES does not contain the answer TEXT.
-
-    ROWS maps citation id → (source, text). An answer that cites no owner comment is not checked."""
-    owner = [c for c in cites if c in rows and rows[c][0] == "owner comment"]
-    if not owner:
-        return False
-    newest = max(owner, key=lambda c: int(c[1:]))
-    return text not in rows[newest][1]
+def owner_comment_issue(sources, cites, considered, text):
+    """Check coverage of newer owner comments and agreement with the newest one cited."""
+    owner = {i: excerpt for i, (source, excerpt) in sources.items() if source == "owner comment"}
+    if any(i not in owner for i in considered):
+        return "considered citations must be owner comments"
+    # Only owner comment IDs carry chronological order. Document IDs are assigned at collection.
+    newest = max((i for i in cites if i in owner), key=lambda i: int(i[1:]), default="c0")
+    if any(int(i[1:]) > int(newest[1:]) and i not in considered for i in owner):
+        return "answer omits a newer owner comment"
+    if newest in owner and text not in owner[newest]:
+        return "answer conflicts with the owner instruction it cites"
+    return ""
 
 
 def baseline_snapshot(snapshot):
@@ -155,18 +166,16 @@ def question_ids(snapshot):
     return [m.group(1) for m in re.finditer(r"^- (q\d+):", block.group(1), re.M)]
 
 
-def normalize_answers(raw, snapshot, unusable=frozenset()):
+def normalize_answers(raw, snapshot, sources, unusable):
     """Validate and normalize the answer set for answer_spec_questions; raise ValueError if unsafe.
 
     A set with any non-grounded case is structurally validated only: the runner hands it off.
-    UNUSABLE names citation ids whose row the snapshot cap cut or dropped."""
+    SOURCES includes all rows. UNUSABLE names rows the snapshot cap cut or dropped."""
     if not isinstance(raw, list) or not raw:
         raise ValueError("expected a nonempty answers array")
     expected = question_ids(snapshot)
     if not expected:
         raise ValueError("snapshot has no questions")
-    citations = parse_citations(snapshot)
-    sources = {m["id"]: (m["source"], m["text"]) for m in CITATION_LINE.finditer(snapshot or "")}
     seen, answers = set(), []
     for row in raw:
         if not isinstance(row, dict):
@@ -179,20 +188,24 @@ def normalize_answers(raw, snapshot, unusable=frozenset()):
             raise ValueError("invalid answer case, text or citations")
         if any(not isinstance(c, str) for c in cites):
             raise ValueError("citations must be strings")
+        considered = row.get("considered", [])
+        if not isinstance(considered, list) or any(not isinstance(c, str) for c in considered):
+            raise ValueError("considered citations must be a list of strings")
         text.encode("utf-8")
         if case != "grounded":
             answers.append({"id": qid, "case": case, "text": text, "citations": ()})
             continue
-        if not cites or any(c not in citations for c in cites):
+        if not cites or any(c not in sources for c in cites + considered):
             raise ValueError("citation outside the sent snapshot")
-        if any(c in unusable or citations[c].endswith(TRUNCATED) for c in cites):
+        if any(c in unusable or sources[c][1].endswith(TRUNCATED) for c in cites + considered):
             raise ValueError("citation excerpt was truncated")
-        combined = "\n".join(citations[c] for c in cites)
+        combined = "\n".join(sources[c][1] for c in cites)
         if not text or text not in combined:
             raise ValueError("answer text is not taken from its citations")
-        if owner_conflict(sources, cites, text):
-            raise ValueError("answer conflicts with the owner instruction it cites")
-        answers.append({"id": qid, "case": case, "text": text, "citations": tuple(cites)})
+        if issue := owner_comment_issue(sources, cites, considered, text):
+            raise ValueError(issue)
+        answers.append({"id": qid, "case": case, "text": text, "citations": tuple(cites),
+                        **({"considered": tuple(considered)} if considered else {})})
     if sorted(seen) != sorted(expected) or [a["id"] for a in answers] != expected:
         raise ValueError("answers must cover each question id exactly once in order")
     return tuple(answers)
@@ -417,8 +430,10 @@ def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=No
         values.add(key)
     full = redact(snapshot, values)
     text = full[: int(cfg.snapshot_chars)]
+    recordable = baseline_snapshot(text)
+    sources = parse_citations(full)
     kept = parse_citations(text)
-    cut_rows = {i for i, row in parse_citations(full).items() if kept.get(i) != row}
+    cut_rows = {i for i, row in sources.items() if kept.get(i) != row}
     digest = hashlib.sha256(text.encode()).hexdigest()
     for record in reversed(pending):
         if record["point"] == point and record["snapshot_sha"] == digest and record["actions"] == list(actions):
@@ -469,11 +484,10 @@ def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=No
                 failure = f"action outside the allowed set: {advised[:60]!r}"
             reason = redact(raw_reason, values)[:600]
             # Keep opted-in raw excerpts out of the decision record (#125).
-            recordable = baseline_snapshot(text)
             evidence = [redact(quote, values)[:300] for quote in raw_evidence[:5]
                         if quote in recordable]
             if not failure and advised == "answer_spec_questions":
-                answers = normalize_answers(reply.get("answers"), text, cut_rows)
+                answers = normalize_answers(reply.get("answers"), text, sources, cut_rows)
                 observed_only = any(row["case"] != "grounded" for row in answers)
                 for row in answers:
                     clean = redact(row["text"], values)
@@ -512,7 +526,13 @@ def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=No
             # Exclusive creation spends the grant even if a process stops before dispatch.
             with path.open("x") as file:
                 file.write(f"{decision_id}\n")
-        recorded = [{**row, "citations": list(row["citations"])} for row in answers]
+        recorded = []
+        for row in answers:
+            saved = {**row, "citations": list(row["citations"])}
+            if (any(sources[i][0].startswith("document ") for i in row["citations"])
+                    and row["text"] not in recordable):
+                del saved["text"]
+            recorded.append(saved)
         record.update(advised=advised, reason=reason, evidence=evidence, executed=executed, failure=failure,
                       latency_ms=int((time.monotonic() - started) * 1000), usage=usage,
                       **({"answers": recorded} if recorded else {}))
