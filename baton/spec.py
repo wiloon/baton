@@ -652,6 +652,7 @@ class Spec:
             pending = owner_handoff.load_retry(self.env, n, reason)
         except owner_handoff.RetryUnreadable as exc:
             return stop(str(exc))
+        resume_update = False
         if initial:
             if pending is not None:
                 raise Deferred("handoff-retry", reason, lends_slot=False)
@@ -660,8 +661,9 @@ class Spec:
                 return stop("The worker inputs could not be saved.")
         elif pending is not None:
             binding = pending["continuation"]
+            resume_update = pending_kind and merge.Merger(self.env, self.hooks, binding["pr"], n).has_update()
         confirmed = pending is not None and pending.get("confirmed", False)
-        if not initial:
+        if not initial and not resume_update:
             result = self.handoff(text(), reason, resume=True)
             if result.action == owner_handoff.DEFER:
                 raise Deferred("handoff-retry", reason, lends_slot=False)
@@ -672,6 +674,8 @@ class Spec:
         if not pending_kind:
             # The saved verdict operation now owns the continuation, even if a crash left both records.
             owner_handoff.clear_retry(self.env, n, owner_handoff.SPEC_PENDING_ACCEPT_POST)
+            if binding["pr"]:
+                merge.Merger(self.env, self.hooks, binding["pr"], n).clear_update()
 
         def confirm_verdict():
             nonlocal confirmed
@@ -711,13 +715,20 @@ class Spec:
         def reconcile():
             nonlocal status, adr_state
             status = self.check_accept_post(binding, pending=pending_kind)
-            if status == "landed" or (status == "absent" and not confirmed):
+            if not resume_update and (status == "landed" or (status == "absent" and not confirmed)):
                 adr_state, failure = self.check_accept_revision(binding, pending=pending_kind)
                 status = failure or status
             return status
 
         status, adr_state = "", ""
         reconcile()
+        if resume_update:
+            # The update owns the continuation once the pending comment is confirmed.
+            # Avoid consuming the posting retry or re-reading the original PR head.
+            if status == "landed":
+                return self.merge_adr_and_publish(binding)
+            if status in ("absent", "retry"):
+                return stop(f"Could not confirm the pending acceptance for the saved branch update ({status}).")
         posted = edited = None
         if not confirmed and status == "absent":
             posted = pr_helpers.gh("issue", "comment", n, "-R", self.repo, "--body", binding["body"],
@@ -1434,32 +1445,55 @@ class Spec:
         return self.post_accept(owner_handoff.SPEC_ACCEPT_POST, publication, initial=True)
 
     def merge_adr_and_publish(self, binding):
-        """CI + shared merge helper for an open ADR PR, then publish the verdict once MERGED."""
+        """Settle any saved update, check CI, and publish only a verified merged ADR head."""
         pr, verdict = binding["pr"], binding["verdict"]
         n, who = self.issue, binding["reviewer"]
         merger = merge.Merger(self.env, self.hooks, pr, n)
         ci_message = f"{who} accepted, but CI on the ADR PR #{pr} is not green."
 
-        def stop(why, reason, **status):
-            self.handoff(why, reason, **merger.observation(reason, acceptance=verdict, **status))
+        def stop(why, reason, *, observe=True, **status):
+            observation = merger.observation(reason, acceptance=verdict, **status) if observe else {}
+            self.handoff(why, reason, **observation)
+            owner_handoff.clear_retry(self.env, n, owner_handoff.SPEC_PENDING_ACCEPT_POST)
+            merger.clear_update()
             return "stop"
 
+        def merge_failed(result):
+            failure = result["reason"]
+            return stop(f"{who} accepted, but merging the ADR PR #{pr} failed.{result.get('detail') or ''}",
+                        "spec_adr_merge_failed", failure=failure, observe=not failure.startswith("update_"))
+
+        # An update saved by an earlier run settles first, and its deadline before any PR read.
+        accepted = binding["adr_head"]
+        pending = merger.settle_pending_update(accepted)
+        if isinstance(pending, dict):
+            return merge_failed(pending)
+        if pending:
+            merger.validated_head = pending
+            revision, _ = self.read_pr_revision(pr)
+            if not revision or revision["headRefOid"] != pending:
+                return merge_failed({"reason": "head_changed", "detail": " The verified ADR head changed."})
+            if revision["state"] == "MERGED":
+                return self.publish_accept({**binding, "adr_head": pending})
+            if revision["state"] != "OPEN":
+                return merge_failed({"reason": "state_changed", "detail": " The ADR PR is no longer open."})
+        if not accepted:
+            return merge_failed({"reason": "sha_unavailable", "detail": " The accepted ADR head is unavailable."})
         if not merger.ci_green(30):
             return stop(ci_message, "spec_adr_ci_before_merge_not_green", ci_failed=True)
-        result = merger.merge_with_updates(30)
+        result = merger.merge_with_updates(30, pinned=accepted)
         if not result.get("ok"):
             if result.get("reason") == "ci_after_update_not_green":
                 return stop(ci_message, "spec_adr_ci_after_update_not_green", ci_failed=True)
-            return stop(f"{who} accepted, but merging the ADR PR #{pr} failed.{result.get('detail') or ''}",
-                        "spec_adr_merge_failed", failure=result.get("reason") or "")
+            return merge_failed(result)
         revision, _ = self.read_pr_revision(pr)
-        if not revision or revision["state"] != "MERGED":
-            return stop(f"{who} accepted, but ADR PR #{pr} is still open after the merge attempt.",
+        if not revision or revision["state"] != "MERGED" or revision["headRefOid"] != merger.merge_head:
+            return stop(f"{who} accepted, but the merge of the validated ADR head for PR #{pr} is unconfirmed.",
                         "spec_adr_merge_unconfirmed")
         notify.notify(f"#{n}: ADR PR #{pr} merged", f"https://github.com/{self.repo}/pull/{pr}")
         return self.publish_accept({**binding, "adr_head": merger.merge_head})
 
-    def resume_pending_accept(self, binding, payload=None, *, recovering=False):
+    def resume_pending_accept(self, binding, payload=None):
         """Resume acceptance against the original inputs and one authoritative PR revision."""
         pr, verdict = binding["pr"], binding["verdict"]
         self.pr = pr
@@ -1467,6 +1501,7 @@ class Spec:
         why = f"Could not read inputs to resume acceptance of ADR PR #{pr}."
 
         inputs = None
+        saved_update = object()
 
         def read():
             nonlocal inputs
@@ -1483,15 +1518,17 @@ class Spec:
             if (current["pr"] != pr or current["verdict"] != verdict or current["head"] != binding["adr_head"]
                     or data["body"] != binding["issue_body"]):
                 return "CHANGED", False
+            if not binding["adr_head"]:
+                return "CHANGED", False
+            inputs = data
+            if merge.Merger(self.env, self.hooks, pr, self.issue).has_update():
+                return saved_update, False
             revision, transient = self.read_pr_revision(pr)
             if revision is None:
                 return None, transient
             state, head = revision["state"], revision["headRefOid"]
-            if (binding["adr_head"] and head != binding["adr_head"]
-                    or recovering and not binding["adr_head"]):
+            if head != binding["adr_head"]:
                 return "CHANGED", False
-            self.adr_head = head
-            inputs = data
             return state, False
 
         state = self.retry_read(read, why, reason, continuation=binding)
@@ -1505,7 +1542,7 @@ class Spec:
         if state == "CLOSED":
             self.handoff(f"ADR PR #{pr} was closed without merging; acceptance stays pending.", "spec_adr_closed")
             return False
-        if state not in ("OPEN", "MERGED"):
+        if state not in ("OPEN", "MERGED", saved_update):
             reason = "spec_adr_state_invalid"
             merger = merge.Merger(self.env, self.hooks, pr, self.issue)
             self.handoff(f"ADR PR #{pr} state is unreadable ({state}); acceptance stays pending.",
@@ -1517,6 +1554,7 @@ class Spec:
         if not round_m:
             self.handoff("Could not bind the accept verdict for a retry.", owner_handoff.SPEC_ACCEPT_POST)
             return False
+        self.adr_head = binding["adr_head"]
         publication = self.accept_post_binding(verdict, verdict, int(round_m.group(1)), reviewer,
                                                inputs, next_step="transition")
         if state == "MERGED":
@@ -2341,7 +2379,7 @@ class Spec:
         if waiting:
             binding = waiting["continuation"]
             if binding["step"] == "acceptance":
-                return self.resume_pending_accept(binding, issue_payload, recovering=True)
+                return self.resume_pending_accept(binding, issue_payload)
             adr = self.adr_discovery()
             if adr is None:
                 return False
