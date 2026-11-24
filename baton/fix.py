@@ -575,15 +575,12 @@ class Runner:
 
     # --- shared tail: after the commits are verified ---
     def record(self, pr, fixer, wt, agent_head, model, cursor_base):
-        """Who wrote what (author, author model, lines); False when the records failed.
-
-        CURSOR_BASE is the saved reply-protocol base; commits between it and AGENT_HEAD are credited to Cursor."""
+        """Who wrote what (author, author model, lines); False when the records failed."""
         try:
-            prior = "cursor"
-            if cursor_base and cursor_base != agent_head and prior not in self.attempt_authors:
-                self.add_author(prior)
-                vendors.record_author(self.state, pr, prior)
-                vendors.record_contrib(self.state, pr, prior, str(wt), cursor_base, agent_head)
+            if cursor_base and cursor_base != agent_head and "cursor" not in self.attempt_authors:
+                self.add_author("cursor")
+                vendors.record_author(self.state, pr, "cursor")
+                vendors.record_contrib(self.state, pr, "cursor", str(wt), cursor_base, agent_head)
             if self.head(wt) != agent_head:
                 if agents.ADAPTERS[fixer].RECORDS_AUTHOR_MODEL:
                     vendors.record_author_model(self.state, pr, fixer, model)
@@ -913,17 +910,18 @@ class Runner:
         notify.log(log)
         return 0, True, log
 
-    # --- a Claude or Codex fixer ---
+    # --- an artifact-protocol fixer ---
     def fix_pr(self, pr, wt, fixer, source, feedback, head="", *, owner_triggered=False):
         self.last_fixer = fixer
         url = f"https://github.com/{self.repo}/pull/{pr}"
         self.push_feedback = self.capture_push_feedback(pr)
         fix_file = Path(f"/tmp/baton-fix-{pr}.md")
-        _, cursor_base = self.foreign_base(pr, fixer)
+        base_file = Path(self.state, f"cursor-fix-base-{pr}")
+        cursor_base = base_file.read_text().strip() if base_file.is_file() else ""
         agent_head = self.head(wt)
         head = cursor_base or head or agent_head
         # A new adapter reads the live description and owns its own request.
-        self.clear_reply_request(pr, fixer, keep_base=True)
+        self.clear_cursor_request(pr, keep_base=True)
         self.fetch_main(wt)
         description_request = Path(f"{fix_file}.body")
         fix_file.unlink(missing_ok=True)
@@ -951,7 +949,7 @@ class Runner:
                                                    PR_DESCRIPTION_FILE=str(description), SHOTS_NOTE=shots_note),
                          f"pr-{pr}-fix{f'-{self.round}' if self.round else ''}", wt, str(fix_file), env)
         outcome, model = out["outcome"], out["model"] or "unknown"
-        # A failed denied-access (Codex) run has no reply worth posting; its commits still reach the owner below.
+        # Suppress failed replies from adapters with denied GitHub access. Partial commits still reach the owner.
         if not (adapter.GITHUB_ACCESS == "denied" and outcome.startswith("RESULT: failed")):
             if fix_file.is_file() and fix_file.stat().st_size:
                 try:
@@ -1058,29 +1056,14 @@ class Runner:
         self.clear_task_write(pr)
         return 0
 
-    # --- a reply-protocol fixer (Cursor, Stub, …) ---
-    def clear_reply_request(self, pr, fixer="cursor", *, keep_base=False):
-        """Drop shared body request files and every reply adapter's saved TASK / fix base.
-
-        FIXER is always included; pending requests are not scoped to a producer, so a new
-        attempt never inherits another adapter's request."""
+    # --- a reply-protocol fixer ---
+    def clear_reply_request(self, pr, fixer, *, keep_base=False):
+        """Drop the shared body request and the producer's saved task and fix base."""
         Path(self.state, f"pr-body-base-{pr}").unlink(missing_ok=True)
-        for rid in {fixer, *self.reply_ids()}:
-            Path(self.state, f"{rid}-fix-task-{pr}").unlink(missing_ok=True)
-            if not keep_base:
-                Path(self.state, f"{rid}-fix-base-{pr}").unlink(missing_ok=True)
+        Path(self.state, f"{fixer}-fix-task-{pr}").unlink(missing_ok=True)
+        if not keep_base:
+            Path(self.state, f"{fixer}-fix-base-{pr}").unlink(missing_ok=True)
         pr_helpers.remove_body_request(Path(self.ctx, f"pr-{pr}-body.md"))
-
-    def reply_ids(self):
-        return [rid for rid, a in agents.ADAPTERS.items() if a.FIX_RESUMABLE_VIA_REPLY]
-
-    def foreign_base(self, pr, fixer=""):
-        """(producer, SHA) of a saved fix base left by a reply adapter other than FIXER."""
-        for rid in self.reply_ids():
-            f = Path(self.state, f"{rid}-fix-base-{pr}")
-            if rid != fixer and f.is_file() and f.read_text().strip():
-                return rid, f.read_text().split("\n")[0].strip()
-        return "", ""
 
     def clear_cursor_request(self, pr, *, keep_base=False):
         """Compatibility name for Cursor's pending reply request (shared body files included)."""
@@ -1101,7 +1084,7 @@ class Runner:
         if base_file.is_file():
             head = base_file.read_text().split("\n")[0]
         else:
-            head = self.foreign_base(pr, fixer)[1] or head or self.head(wt)
+            head = head or agent_head
             base_file.write_text(head + "\n")
         request = Path(self.ctx, f"pr-{pr}-body.md")
         if task_file.is_file():
@@ -1267,8 +1250,7 @@ class Runner:
                                                       before_labels=lambda: self.verify_failed(pr, failure, rounds))
                 if action == "handoff":
                     return 1
-                vendor = alt if alt != fixer else fixer
-                rc, failure, more = self.verify_retry(wt, self.verified_base, vendor, "pr", pr, repairs=remaining,
+                rc, failure, more = self.verify_retry(wt, self.verified_base, alt, "pr", pr, repairs=remaining,
                                                 repairs_before=rounds)
                 rounds = more
                 if rc != 0:
@@ -1409,7 +1391,9 @@ def fix_pr(runner, pr, wt, fixer, source, feedback, head="", *, owner_triggered=
         rc = runner.finish_verified(
             pr, wt, last, prefix=prefix,
             description_rc=task.get("description_rc", 0), description_reason=task.get("description_reason", ""))
-        runner.clear_reply_request(pr, last)
+        if last != "cursor":
+            runner.clear_reply_request(pr, last)
+        # An artifact fixer can finish with a base saved by an earlier Cursor attempt.
         runner.clear_cursor_request(pr)
         recovery.clear(runner.env, runner.env.runtime.issue or pr, pr)
         return rc
@@ -1419,7 +1403,7 @@ def fix_pr(runner, pr, wt, fixer, source, feedback, head="", *, owner_triggered=
     if record["reason"] == "fix_task_invalid":
         feedback = correction(feedback, budget.get("validation_error", ""))
     if record["state"] != "progressed":   # a completed reply step reconciles from its saved request
-        runner.clear_reply_request(pr, fixer, keep_base=True)
+        runner.clear_cursor_request(pr, keep_base=True)
     return runner.dispatch_fixer(pr, wt, fixer, source, feedback, head)
 
 
