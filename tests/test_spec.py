@@ -3616,6 +3616,59 @@ def test_a_genuine_owner_reply_supersedes_saved_advisor_answers(advised, monkeyp
     assert "ready-for-human" in advised.gh.labels
 
 
+def test_a_conflicting_owner_instruction_hands_off_without_an_answer(advised):
+    """Issue-body grounding that disagrees with the latest owner comment hands off (#125)."""
+    advised.gh.body = f"Goal\n{EXCERPT}\n"
+    advised.gh._comment("Manual checks defer until the owner clears them.")
+    advised.script = [CHANGES, reviser(QUESTIONS, outcome="SPEC: human")]
+    advised.advice = advice(grounded(cite=("c1", "c2")))
+    assert advised.run() is False
+    assert not advised.gh.posted("<!-- baton-advisor-answer")
+    assert "ready-for-human" in advised.gh.labels
+    assert advised.advice_calls  # the advisor was consulted; validation refused the set
+
+
+@pytest.mark.parametrize("comment", [
+    "Unrelated: no longer deferred.",
+    "Manual checks defer until the owner clears them.",
+])
+def test_an_omitted_later_owner_comment_blocks_a_body_answer(advised, monkeypatch, comment):
+    advised.gh.body = f"Goal\n{EXCERPT}\n"
+    advised.gh._comment(comment)
+    advised.script = [CHANGES, reviser(QUESTIONS, outcome="SPEC: human"), reviser("adopted"), ACCEPT]
+    advised.advice = advice(grounded())
+    monkeypatch.setattr(dev, "setup_worktree", lambda *a, **k: ("", False))
+    assert advised.run() is False
+    assert not advised.gh.posted("<!-- baton-advisor-answer")
+    assert "ready-for-human" in advised.gh.labels and advised.advice_calls
+
+
+def test_a_considered_later_owner_comment_lets_a_body_answer_post(advised, monkeypatch):
+    advised.gh.body = f"Goal\n{EXCERPT}\n"
+    advised.gh._comment("Unrelated: no longer deferred.")
+    advised.script = [CHANGES, reviser(QUESTIONS, outcome="SPEC: human"), reviser("adopted"), ACCEPT]
+    advised.advice = advice({**grounded(), "considered": ["c2"]})
+    monkeypatch.setattr(dev, "setup_worktree", lambda *a, **k: ("", False))
+    advised.run()
+    assert len(advised.gh.posted("<!-- baton-advisor-answer")) == 1
+
+
+def test_answers_grounded_in_different_owner_comments_post_together(advised, monkeypatch):
+    advised.gh.body = "Goal"
+    advised.gh._comment(EXCERPT)
+    advised.gh._comment("Keep the old flag.")
+    advised.script = [CHANGES, reviser(TWO_QUESTIONS, outcome="SPEC: human"), reviser("adopted"), ACCEPT]
+    advised.advice = advice(
+        {**grounded(cite="c2"), "considered": ["c3"]},
+        grounded("Keep the old flag.", "c3", "q2"),
+    )
+    monkeypatch.setattr(dev, "setup_worktree", lambda *a, **k: ("", False))
+    assert advised.run() is True
+    [posted] = advised.gh.posted("<!-- baton-advisor-answer")
+    assert f"### q1\n{EXCERPT}\n\nCitations: c2" in posted
+    assert "### q2\nKeep the old flag.\n\nCitations: c3" in posted
+
+
 @pytest.mark.parametrize("change", ["owner reply", "issue closed", "ADR head", "new ADR"])
 def test_changed_inputs_during_advisor_publication_prevent_revision(advised, monkeypatch, change):
     advised.gh.body = f"Goal\n{EXCERPT}\n"
@@ -3885,7 +3938,8 @@ EXCERPT = "Manual checks use the existing gate path."
 
 
 def grounded(text=EXCERPT, cite="c1", qid="q1"):
-    return {"id": qid, "case": "grounded", "text": text, "citations": [cite]}
+    return {"id": qid, "case": "grounded", "text": text,
+            "citations": [cite] if isinstance(cite, str) else list(cite)}
 
 
 def advice(*answers):

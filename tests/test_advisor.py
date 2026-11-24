@@ -563,12 +563,125 @@ def test_a_citation_cut_by_the_snapshot_cap_cannot_support_an_answer(adv, monkey
     assert d.action == "handoff" and "truncated" in d.failure
 
 
+def test_a_later_owner_comment_cut_by_the_snapshot_cap_still_blocks_an_answer(adv, monkeypatch):
+    real = advisor.settings
+    snapshot = questions_snapshot([f"[c1] (issue body): {EXCERPT}", "[c2] (owner comment): " + "x" * 850,
+                                   "[c3] (owner comment): Defer manual checks."])
+    cap = snapshot.index("[c3]")
+    monkeypatch.setattr(advisor, "settings", lambda env: replace_cap(real(env), cap))
+    adv.replies = answer_reply()
+    adv.replies[0]["answers"][0]["considered"] = ["c2"]
+    d = advisor.advise(adv.env, "spec_questions", 23, snapshot, ("answer_spec_questions",),
+                       category=2, revalidate=lambda: True)
+    assert "[c3]" not in adv.calls[0]["snapshot"]
+    assert d.action == "handoff" and "omits a newer owner comment" in d.failure
+    assert not advisor.granted(adv.env, "spec_questions", 23)
+
+
 def test_an_answer_over_the_length_limit_is_rejected_not_trimmed(adv):
     long = "z" * 700
     adv.replies = answer_reply(long)
     d = advisor.advise(adv.env, "spec_questions", 16, questions_snapshot([f"[c1] (issue body): {long}"]),
                        ("answer_spec_questions",), category=2, revalidate=lambda: True)
     assert d.action == "handoff" and "length limit" in d.failure
+
+
+def test_a_grounded_answer_that_conflicts_with_the_latest_owner_instruction_hands_off(adv):
+    """Issue-body grounding is rejected when the latest owner comment settles differently (#125)."""
+    body = "Manual checks use the existing gate path."
+    owner = "Manual checks defer until the owner clears them."
+    snapshot = questions_snapshot([
+        f"[c1] (issue body): {body}",
+        f"[c2] (owner comment): {owner}",
+    ])
+    adv.replies = answer_reply(body, cites=("c1", "c2"))
+    d = advisor.advise(adv.env, "spec_questions", 17, snapshot, ("answer_spec_questions",),
+                       category=2, revalidate=lambda: True)
+    assert d.action == "handoff" and "owner instruction" in d.failure
+    assert not advisor.granted(adv.env, "spec_questions", 17)
+
+
+def test_a_grounded_answer_that_agrees_with_the_latest_owner_instruction_executes(adv):
+    body = "Manual checks use the existing gate path."
+    owner = f"Confirmed: {body}"
+    snapshot = questions_snapshot([
+        f"[c1] (issue body): {body}",
+        f"[c2] (owner comment): {owner}",
+    ])
+    adv.replies = answer_reply(body, cites=("c1", "c2"))
+    d = advisor.advise(adv.env, "spec_questions", 18, snapshot, ("answer_spec_questions",),
+                       category=2, revalidate=lambda: True)
+    assert d.action == "answer_spec_questions" and d.answers[0]["text"] == body
+    assert advisor.granted(adv.env, "spec_questions", 18)
+
+
+def test_considering_an_unrelated_later_owner_comment_keeps_body_grounding(adv):
+    snapshot = questions_snapshot([
+        f"[c1] (issue body): {EXCERPT}", "[c2] (owner comment): Unrelated: no longer deferred."])
+    adv.replies = answer_reply(EXCERPT, cites=("c1",))
+    adv.replies[0]["answers"][0]["considered"] = ["c2"]
+    d = advisor.advise(adv.env, "spec_questions", 20, snapshot, ("answer_spec_questions",),
+                       category=2, revalidate=lambda: True)
+    assert d.action == "answer_spec_questions"
+
+
+def test_a_considered_owner_comment_cannot_ground_an_answer(adv):
+    snapshot = questions_snapshot(["[c1] (issue body): Goal", f"[c2] (owner comment): {EXCERPT}"])
+    adv.replies = answer_reply()
+    adv.replies[0]["answers"][0]["considered"] = ["c2"]
+    d = advisor.advise(adv.env, "spec_questions", 24, snapshot, ("answer_spec_questions",),
+                       category=2, revalidate=lambda: True)
+    assert d.action == "handoff" and "not taken from its citations" in d.failure
+
+
+def test_answers_grounded_in_different_owner_comments_both_pass(adv):
+    snapshot = ("Decision point: spec_questions.\nQuestions:\n- q1: A?\n- q2: B?\nCitation evidence:\n"
+                "[c1] (owner comment): Use the gate path.\n[c2] (owner comment): Keep the old flag.\n")
+    adv.replies = [{"action": "answer_spec_questions", "reason": "r", "evidence": [], "answers": [
+        {"id": "q1", "case": "grounded", "text": "Use the gate path.", "citations": ["c1"], "considered": ["c2"]},
+        {"id": "q2", "case": "grounded", "text": "Keep the old flag.", "citations": ["c2"]}]}]
+    d = advisor.advise(adv.env, "spec_questions", 21, snapshot, ("answer_spec_questions",),
+                       category=2, revalidate=lambda: True)
+    assert d.action == "answer_spec_questions"
+
+
+@pytest.mark.parametrize("mode", ["live", "observe"])
+def test_document_grounded_answer_text_stays_out_of_the_decision_record(adv, mode):
+    from dataclasses import replace
+    enabled = replace(adv.env, repo=replace(adv.env.repo, advisor_local_documents=True))
+    adv.mode = mode
+    doc = "ADR eight keeps raw documents private."
+    snapshot = questions_snapshot([f"[c1] (issue body): {EXCERPT}",
+                                   f"[c2] (document docs/adr/0008.md): {doc}"])
+    adv.replies = [{"action": "answer_spec_questions", "reason": "r", "evidence": [EXCERPT, doc],
+                    "answers": [{"id": "q1", "case": "grounded", "text": doc, "citations": ["c2"]}]}]
+    d = advisor.advise(enabled, "spec_questions", 22, snapshot, ("answer_spec_questions",),
+                       category=2, revalidate=lambda: True)
+    assert d.answers[0]["text"] == doc
+    assert d.action == ("answer_spec_questions" if mode == "live" else "handoff")
+    [record] = adv.records()
+    assert record["evidence"] == [EXCERPT]
+    assert record["answers"] == [{"id": "q1", "case": "grounded", "citations": ["c2"]}]
+    assert doc not in str(record)
+
+
+def test_evidence_from_optional_excerpts_is_omitted_from_the_decision_record(adv):
+    """Provider quotes that only appear in opted-in raw excerpts stay out of the record (#125)."""
+    from dataclasses import replace
+    baseline = "Decision point: review_limit.\nDiff size: 1 file.\nbaseline quote about the tests."
+    enabled = replace(adv.env, repo=replace(adv.env.repo, advisor_diff_excerpts=True))
+    snapshot = advisor.augment_snapshot(
+        enabled, baseline, diff_excerpt="@@ -1 +1 @@\n-old assertion\n+new assertion\n")
+    assert "new assertion" in snapshot
+    adv.replies = [{"action": "extra_round", "reason": "only a test is missing",
+                    "evidence": ["baseline quote about the tests.", "new assertion"]}]
+    d = advisor.advise(enabled, "review_limit", 19, snapshot, ("extra_round",),
+                      revalidate=lambda: True)
+    assert d.action == "extra_round"
+    [record] = adv.records()
+    assert record["evidence"] == ["baseline quote about the tests."]
+    assert "new assertion" not in record["evidence"]
+    assert "@@" not in str(record)
 
 
 def replace_cap(cfg, chars):
