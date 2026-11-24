@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 
 import pytest
 
@@ -27,7 +28,7 @@ def sh(cwd, *cmd):
 
 
 @pytest.fixture
-def run(gh, tmp_path, monkeypatch):
+def fix_worktree(gh, tmp_path, monkeypatch):
     # A parent verification can export these. This fixture uses the configured repository.
     for name in ("VERIFY_HOOK", "GATE_HOOK", "CI_COMMAND"):
         monkeypatch.delenv(name, raising=False)
@@ -156,11 +157,17 @@ def run(gh, tmp_path, monkeypatch):
                 "defer": ""}
     state.agent_calls = []
     state.prompts = []
-    monkeypatch.setattr(fix.dispatch, "dispatch", stub)
+    state.dispatch_agent = stub
     state.verify_script("pass")
     yield state
     Path(f"/tmp/baton-fix-{PR}.md").unlink(missing_ok=True)
     Path(f"/tmp/baton-fix-{PR}.md.body").unlink(missing_ok=True)
+
+
+@pytest.fixture
+def run(fix_worktree, monkeypatch):
+    monkeypatch.setattr(fix.dispatch, "dispatch", fix_worktree.dispatch_agent)
+    return fix_worktree
 
 
 def section(body, heading):
@@ -2257,7 +2264,7 @@ def test_adapters_declare_fix_capabilities():
         "claude": ("fix-prompt.md", "settings", False),
         "codex": ("codex-fix-prompt.md", "denied", False),
         "cursor": ("cursor-fix-prompt.md", "runner", True),
-        "stub": ("stub-fix-prompt.md", "runner", False),
+        "stub": ("stub-fix-prompt.md", "runner", True),
     }
     for vendor, (template, access, reply) in expected.items():
         adapter = agents.ADAPTERS[vendor]
@@ -2300,17 +2307,17 @@ def _admit_stub_fixer(run, monkeypatch):
               " The runner posts it. Include no `<!-- baton-` markers."),
     ("cursor", "5. The runner posts your final message on the PR."
                " Put the checks section above the `TASK:`/`RESULT:` lines."),
-    ("stub", f"4. Write the Stub fix reply to `/tmp/baton-fix-{PR}.md`; do not post it."
-             " The runner posts it. Include no `<!-- baton-` markers."),
+    ("stub", "5. The runner posts your final message on the PR."
+             " Put the checks section above the `TASK:`/`RESULT:` lines."),
 ])
 def test_fix_templates_come_from_the_adapter(run, monkeypatch, fixer, template_line):
     _admit_stub_fixer(run, monkeypatch)
     reply = "## Must fix\nnone\n\n## Checks to verify\nnone\n\nRESULT: fixed\n"
-    run.agent(cursor_plan(reply) if fixer == "cursor" else {"file": reply})
+    run.agent(cursor_plan(reply) if fixer in ("cursor", "stub") else {"file": reply})
     assert run.fix(fixer)["rc"] == 0
     prompt = run.prompts[0]
     assert template_line in prompt.splitlines()
-    if fixer == "cursor":
+    if fixer in ("cursor", "stub"):
         assert f"pr-{PR}-body.md" in prompt
         assert not run.agent_calls[0][3]
     else:
@@ -2375,19 +2382,59 @@ def test_verification_resume_uses_the_fixer_protocol_and_clears_cursor_state(
     assert run.agent_calls == calls
 
 
-def test_stub_artifact_fix_discards_a_pending_cursor_request(run, monkeypatch, gh):
+def test_stub_reply_fix_discards_a_pending_cursor_request(run, monkeypatch, gh):
     _admit_stub_fixer(run, monkeypatch)
-    request = BODY.replace("## Checks to verify\nnone", "## Checks to verify\n- /billing: cursor badge")
+    request = BODY.replace("Disabled buttons.", "Cursor's superseded description.")
     run.agent(cursor_plan("## Checks to verify\n- /billing: cursor badge\n\nRESULT: fixed", request=request))
-    gh.fail("edit")
+    gh.fail("edit-before-write")
     assert run.fix("cursor")["rc"] == 75
-    gh.fail("edit", False)
+    gh.fail("edit-before-write", False)
 
-    run.agent({"file": "## Checks to verify\nnone\n\nRESULT: fixed\n"})
+    run.agent(cursor_plan("## Checks to verify\nnone\n\nRESULT: fixed"))
     assert run.fix("stub")["rc"] == 0
-    assert [call[0] for call in run.agent_calls] == ["cursor", "stub"]
-    assert run.agent_calls[-1][3] == f"/tmp/baton-fix-{PR}.md"
+    assert section(run.body(), "What changed") == "Disabled buttons."
     assert section(run.body(), "Checks to verify") == "none"
-    state = Path(os.environ["STATE"])
-    assert not (state / f"cursor-fix-task-{PR}").exists()
     assert not (Path(env_ctx()) / f"pr-{PR}-body.md").exists()
+    assert not (Path(os.environ["STATE"]) / f"cursor-fix-task-{PR}").exists()
+
+    feedback = "Round two: explain when the button becomes available."
+    run.agent(cursor_plan("## Checks to verify\nnone\n\nRESULT: fixed"))
+    assert run.fix("cursor", feedback=feedback)["rc"] == 0
+    assert [call[0] for call in run.agent_calls] == ["cursor", "stub", "cursor"]
+    feedback_file = re.search(rf"`([^`]+/pr-{PR}-cursor-fix-[^`]+\.md)`", run.prompts[-1])
+    assert feedback_file and Path(feedback_file[1]).read_text().startswith(feedback + "\n")
+
+
+def test_stub_fix_posts_its_marker_and_retries_a_description_update_without_a_cli_run(fix_worktree, monkeypatch, gh):
+    run = fix_worktree
+    _admit_stub_fixer(run, monkeypatch)
+    replacement = "Buttons stay disabled until billing details are saved."
+    request = BODY.replace("Disabled buttons.", replacement)
+    reply = "Updated the description.\n\n## Checks to verify\nnone\n\nRESULT: fixed"
+    calls = run.root / "stub-fix-calls"
+    cli = run.root / "stubs" / "stub-agent"
+    cli.write_text(f'''#!{sys.executable}
+import json, re, sys
+from pathlib import Path
+if sys.argv[1:] == ["--version"]:
+    print("stub-agent 1")
+    sys.exit(0)
+with Path({str(calls)!r}).open("a") as log:
+    log.write("stub-agent\\n")
+destination = re.search(r"PR-description artifact `([^`]+)`", sys.argv[-1])[1]
+Path(destination).write_text({request!r})
+print(json.dumps({{"type": "result", "subtype": "success", "model": "stub-1", "result": {reply!r}}}))
+''')
+    cli.chmod(0o755)
+    (cli.parent / "timeout").unlink()
+
+    gh.fail("edit-before-write")
+    assert run.fix("stub")["rc"] == 75
+    assert replacement not in run.body()
+    assert calls.read_text().splitlines() == ["stub-agent"]
+    assert run.comments()[0].startswith("<!-- baton-fix by=stub -->")
+
+    gh.fail("edit-before-write", False)
+    assert run.fix("stub")["rc"] == 0
+    assert section(run.body(), "What changed") == replacement
+    assert calls.read_text().splitlines() == ["stub-agent"]
