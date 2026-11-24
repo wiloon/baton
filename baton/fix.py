@@ -57,6 +57,7 @@ class Runner:
         self.push_caller = "ci" if round == "ci" else "review" if round else "standalone"
         self.last_fixer = ""
         self.attempt_authors = []
+        self.prior_author = ""   # the earlier reply producer whose commits this attempt carries
         self.retry_context = {}
         self.retry_start = None
         self.required_retry_label = ""
@@ -580,10 +581,11 @@ class Runner:
     def record(self, pr, fixer, wt, agent_head, model, cursor_base):
         """Who wrote what (author, author model, lines); False when the records failed."""
         try:
-            if cursor_base and cursor_base != agent_head and "cursor" not in self.attempt_authors:
-                self.add_author("cursor")
-                vendors.record_author(self.state, pr, "cursor")
-                vendors.record_contrib(self.state, pr, "cursor", str(wt), cursor_base, agent_head)
+            prior = self.prior_author or "cursor"   # a saved legacy base is Cursor's
+            if cursor_base and cursor_base != agent_head and prior not in self.attempt_authors:
+                self.add_author(prior)
+                vendors.record_author(self.state, pr, prior)
+                vendors.record_contrib(self.state, pr, prior, str(wt), cursor_base, agent_head)
             if self.head(wt) != agent_head:
                 if agents.ADAPTERS[fixer].RECORDS_AUTHOR_MODEL:
                     vendors.record_author_model(self.state, pr, fixer, model)
@@ -1178,10 +1180,9 @@ class Runner:
         url = f"https://github.com/{self.repo}/pull/{pr}"
         self.push_feedback = self.capture_push_feedback(pr)
         fix_file = Path(f"/tmp/baton-fix-{pr}.md")
-        base_file = Path(self.state, f"cursor-fix-base-{pr}")
-        cursor_base = base_file.read_text().strip() if base_file.is_file() else ""
         agent_head = self.head(wt)
-        head = cursor_base or head or agent_head
+        head = self.claim_fix(pr, fixer, head, agent_head)
+        cursor_base = head if self.prior_author else ""   # the earlier reply producer's commits
         # A new adapter reads the live description and owns its own request.
         self.clear_cursor_request(pr, keep_base=True)
         self.fetch_main(wt)
@@ -1334,6 +1335,62 @@ class Runner:
             Path(self.state, f"{fixer}-fix-base-{pr}").unlink(missing_ok=True)
         pr_helpers.remove_body_request(Path(self.ctx, f"pr-{pr}-body.md"))
 
+    # --- the runner-owned record of which attempt owns the shared request files ---
+    def read_owner(self, pr):
+        try:
+            data = json.loads(Path(self.state, f"pr-{pr}-fix-owner").read_text())
+        except (OSError, ValueError):
+            return None
+        if (isinstance(data, dict) and data.get("fixer") in agents.ADAPTERS
+                and isinstance(data.get("base"), str) and data["base"]):
+            return data
+        return None
+
+    def write_owner(self, pr, fixer, base):
+        path = Path(self.state, f"pr-{pr}-fix-owner")
+        temp = path.with_suffix(".tmp")
+        temp.write_text(json.dumps({"fixer": fixer, "base": base}))
+        temp.replace(path)
+
+    def clear_owner(self, pr):
+        Path(self.state, f"pr-{pr}-fix-owner").unlink(missing_ok=True)
+
+    def read_base(self, pr, fixer):
+        try:
+            return Path(self.state, f"{fixer}-fix-base-{pr}").read_text().split("\n")[0].strip()
+        except OSError:
+            return ""
+
+    def claim_fix(self, pr, fixer, head, agent_head):
+        """Publish this attempt as the owner of the shared fix files and return its fix base.
+
+        A different earlier producer's request, description baseline, saved checks and base files
+        are discarded first, but its original base carries over to the new fixer.
+        """
+        request = Path(self.ctx, f"pr-{pr}-body.md")
+        pair = Path(self.state, f"pr-body-base-{pr}").is_file() and request.is_file()
+        owner = self.read_owner(pr)
+        producer, base = "", ""
+        if owner:
+            producer, base = owner["fixer"], owner["base"]
+        elif pair:   # a request from before owner records is Cursor's
+            producer = "cursor"
+            base = self.read_base(pr, "cursor") or (agent_head if fixer == "cursor" else head or agent_head)
+        if not base:
+            base = self.read_base(pr, fixer) or self.read_base(pr, "cursor") or head or agent_head
+        self.prior_author = ""
+        if producer and producer != fixer:
+            for name, adapter in agents.ADAPTERS.items():
+                if adapter.FIX_RESUMABLE_VIA_REPLY:
+                    self.clear_reply_request(pr, name)
+            Path(self.ctx, f"pr-{pr}-fix-checks.json").unlink(missing_ok=True)
+            if agents.ADAPTERS[producer].FIX_RESUMABLE_VIA_REPLY:
+                self.prior_author = producer
+        elif not producer and self.read_base(pr, "cursor"):
+            self.prior_author = "cursor"
+        self.write_owner(pr, fixer, base)
+        return base
+
     def clear_cursor_request(self, pr, *, keep_base=False):
         """Compatibility name for Cursor's pending reply request (shared body files included)."""
         self.clear_reply_request(pr, "cursor", keep_base=keep_base)
@@ -1350,11 +1407,8 @@ class Runner:
         base_file = Path(self.state, f"{fixer}-fix-base-{pr}")
         baseline_file = Path(self.state, f"pr-body-base-{pr}")
         task_file = Path(self.state, f"{fixer}-fix-task-{pr}")
-        if base_file.is_file():
-            head = base_file.read_text().split("\n")[0]
-        else:
-            head = head or agent_head
-            base_file.write_text(head + "\n")
+        head = self.claim_fix(pr, fixer, head, agent_head)
+        base_file.write_text(head + "\n")
         request = Path(self.ctx, f"pr-{pr}-body.md")
         if task_file.is_file():
             want, _, feedback_digest = task_file.read_text().partition("\n")
@@ -1649,7 +1703,14 @@ def fix_scope(fixer, owner_triggered):
 
 
 def fix_pr(runner, pr, wt, fixer, source, feedback, head="", *, owner_triggered=False):
-    """Resume a saved fix step or dispatch the requested adapter."""
+    """Resume a saved fix step or dispatch the requested adapter; keep the owner record only on a deferral."""
+    rc = _fix_pr(runner, pr, wt, fixer, source, feedback, head, owner_triggered=owner_triggered)
+    if rc != 75:   # the attempt is finalized; a deferral keeps the owner for its re-entry
+        runner.clear_owner(pr)
+    return rc
+
+
+def _fix_pr(runner, pr, wt, fixer, source, feedback, head="", *, owner_triggered=False):
     from . import advisor
 
     runner.owner_triggered = owner_triggered
@@ -1682,6 +1743,12 @@ def fix_pr(runner, pr, wt, fixer, source, feedback, head="", *, owner_triggered=
     waiting_checks = runner.waiting_meta(pr, owner_handoff.FIX_CHECKS)
     if waiting_checks == "unreadable":
         return 1
+    if (isinstance(waiting_checks, dict) and waiting_checks.get("phase") != "landed"
+            and waiting_checks["continuation"].get("fixer") not in (fixer, None, "")):
+        # A switched fixer never applies the former producer's pending checks.
+        owner_handoff.clear_retry(runner.env, runner.push_episode(pr), owner_handoff.FIX_CHECKS, str(pr))
+        pr_helpers.checks_file(runner.ctx, pr).unlink(missing_ok=True)
+        waiting_checks = None
     if waiting_checks is not None:
         runner.clear_task_write(pr)
         binding = waiting_checks["continuation"]
@@ -1692,6 +1759,11 @@ def fix_pr(runner, pr, wt, fixer, source, feedback, head="", *, owner_triggered=
     waiting_task = runner.waiting_meta(pr, owner_handoff.FIX_TASK)
     if waiting_task == "unreadable":
         return 1
+    if (isinstance(waiting_task, dict) and waiting_task.get("phase") != "landed"
+            and waiting_task["continuation"]["fixer"] != fixer):
+        # A switched fixer never replays the former producer's pending task write.
+        runner.clear_task_write(pr)
+        waiting_task = None
     task = {}
     if waiting_task is not None:
         task = waiting_task["continuation"]

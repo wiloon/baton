@@ -2494,7 +2494,8 @@ def test_verification_resume_uses_the_fixer_protocol_and_clears_cursor_state(
     assert run.fix(fixer)["rc"] == 75
     saved = recovery.load(session.resolve(os.environ), "419", PR)
     assert saved["reason"] == "fix_verify_failed"
-    assert cursor_base.exists()
+    # The base survives the deferral: Cursor's own file, or the owner record once Claude took over.
+    assert cursor_base.exists() if fixer == "cursor" else _owner()["fixer"] == "claude"
 
     pushes = []
     push = fix.Runner.push_with_retry
@@ -2573,3 +2574,76 @@ print(json.dumps({{"type": "result", "subtype": "success", "model": "stub-1", "r
     assert not (state / f"stub-fix-base-{PR}").exists()
     assert not (state / f"stub-fix-task-{PR}").exists()
     assert not (state / f"cursor-fix-base-{PR}").exists()
+    assert not (state / f"pr-{PR}-fix-owner").exists()
+
+
+def _owner(pr=PR):
+    path = Path(os.environ["STATE"]) / f"pr-{pr}-fix-owner"
+    return json.loads(path.read_text()) if path.exists() else None
+
+
+def test_a_deferred_reply_fix_records_its_owner_and_clears_it_on_success(run, monkeypatch):
+    base = run.remote_head()
+    request = BODY.replace("Disabled buttons.", "Cursor's description.")
+    run.agent(cursor_plan("## Checks to verify\nnone\n\nRESULT: fixed", request=request))
+    clock, _ = _flaky_edits(monkeypatch, fail_until=1_060)
+    assert run.fix("cursor")["rc"] == 75
+    assert _owner() == {"fixer": "cursor", "base": base}
+    clock["now"] = 1_060
+    assert run.fix("cursor")["rc"] == 0
+    assert len(run.agent_calls) == 1
+    assert _owner() is None
+
+
+def test_a_switched_fixer_verifies_and_pushes_the_earlier_commits_from_the_original_base(run, monkeypatch):
+    _admit_stub_fixer(run, monkeypatch)
+    state = Path(os.environ["STATE"])
+    base = run.remote_head()
+    request = BODY.replace("Disabled buttons.", "Cursor's superseded description.")
+    run.agent(cursor_plan("## Checks to verify\n- /billing: cursor badge\n\nRESULT: fixed", request=request))
+    clock, _ = _flaky_edits(monkeypatch, fail_until=1_001)
+    assert run.fix("cursor")["rc"] == 75
+    assert not run.pushed()
+    clock["now"] = 1_001
+
+    run.agent(cursor_plan("## Checks to verify\nnone\n\nRESULT: fixed", commit=False))
+    assert run.fix("stub")["rc"] == 0
+    assert [call[0] for call in run.agent_calls] == ["cursor", "stub"]
+    assert run.pushed() and run.remote_head() != base
+    assert "Cursor's superseded description." not in run.body()
+    assert _owner() is None
+    assert not (state / f"cursor-fix-base-{PR}").exists() and not (state / f"stub-fix-base-{PR}").exists()
+    assert not (state / f"cursor-fix-task-{PR}").exists()
+
+
+def test_a_fixer_switch_chain_keeps_the_original_base_and_reaches_an_artifact_fixer(run, monkeypatch):
+    _admit_stub_fixer(run, monkeypatch)
+    base = run.remote_head()
+    request = BODY.replace("Disabled buttons.", "Cursor's superseded description.")
+    run.agent(cursor_plan("## Checks to verify\nnone\n\nRESULT: fixed", request=request))
+    clock, _ = _flaky_edits(monkeypatch, fail_until=2_000)
+    assert run.fix("cursor")["rc"] == 75
+    run.agent(cursor_plan("## Checks to verify\nnone\n\nRESULT: fixed", request=request, commit=False))
+    assert run.fix("stub")["rc"] == 75
+    assert _owner() == {"fixer": "stub", "base": base}
+    assert not (Path(os.environ["STATE"]) / f"cursor-fix-task-{PR}").exists()
+
+    run.agent({"commit": False, "file": "## Must fix\nnone\n\n## Checks to verify\nnone\n\nRESULT: fixed\n"})
+    assert run.fix("claude")["rc"] == 0
+    assert [call[0] for call in run.agent_calls] == ["cursor", "stub", "claude"]
+    assert run.pushed() and run.remote_head() != base
+    assert "Cursor's superseded description." not in run.body()
+    assert _owner() is None
+    assert not (Path(os.environ["STATE"]) / f"stub-fix-base-{PR}").exists()
+
+
+def test_a_legacy_cursor_request_without_an_owner_is_discarded_on_a_switch(run, monkeypatch):
+    _admit_stub_fixer(run, monkeypatch)
+    state, ctx = Path(os.environ["STATE"]), Path(env_ctx())
+    base = run.remote_head()
+    (state / f"pr-body-base-{PR}").write_text(BODY + "\n")
+    (ctx / f"pr-{PR}-body.md").write_text(BODY.replace("Disabled buttons.", "Legacy Cursor text."))
+    run.agent(cursor_plan("## Checks to verify\nnone\n\nRESULT: fixed", commit=False))
+    run.fix("stub", head=base)
+    assert [call[0] for call in run.agent_calls] == ["stub"]
+    assert "Legacy Cursor text." not in run.body()

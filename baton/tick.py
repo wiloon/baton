@@ -156,8 +156,16 @@ class Tick:
                 (state / f"spec-paused-{a['spec']}").unlink(missing_ok=True)
             if a["cursor_fix"] and not push_pending:
                 n = a["cursor_fix"]
-                for path in (state / f"cursor-fix-base-{n}", state / f"pr-body-base-{n}",
-                             state / f"cursor-fix-task-{n}", state / f"owner-fix-feedback-{n}",
+                producers = {"cursor"}   # legacy names, plus whoever the owner record names
+                try:
+                    producers.add(json.loads((state / f"pr-{n}-fix-owner").read_text())["fixer"])
+                except (OSError, ValueError, KeyError, TypeError):
+                    pass
+                for producer in producers:
+                    for kind in ("base", "task"):
+                        (state / f"{producer}-fix-{kind}-{n}").unlink(missing_ok=True)
+                (state / f"pr-{n}-fix-owner").unlink(missing_ok=True)
+                for path in (state / f"pr-body-base-{n}", state / f"owner-fix-feedback-{n}",
                              self.ctx / f"pr-{n}-fix-checks.json"):
                     path.unlink(missing_ok=True)
                 pr_helpers.remove_body_request(self.ctx / f"pr-{n}-body.md")
