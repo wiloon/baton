@@ -2,14 +2,28 @@
 resent when inconclusive, verified, and bounded by one saved deadline. The fake `gh` and the fake
 wall clock are test_spec's."""
 import json
+import subprocess
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
-
-from baton import merge, spec
 from conftest import sh
-from test_spec import (ACCEPTED, N, REAL_VERIFY, loop, merges, resume_pending, updates, wall_clock)  # noqa: F401
+from test_spec import (
+    ACCEPT,
+    ACCEPTED,
+    CHANGES,
+    REAL_VERIFY,
+    N,
+    merges,
+    resume_pending,
+    reviser,
+    updates,
+    wall_clock,
+)
+from test_spec import loop as loop  # noqa: PLC0414
+
+from baton import merge, pr, spec, tick
 
 SAVED, UPDATED = "a" * 40, "b" * 40
 
@@ -94,29 +108,118 @@ def test_an_unverified_updated_head_hands_off_without_a_merge(loop, monkeypatch)
     assert any("not a clean merge" in text for text in notes)
 
 
-def test_a_restart_after_a_saved_update_polls_without_resending_it(loop, monkeypatch):
+class Interrupted(Exception):
+    pass
+
+
+def run_spec(loop):
+    return spec.run(SimpleNamespace(issue=N), loop.env)["rc"]
+
+
+def record_handoffs(monkeypatch):
+    seen = []
+    original = spec.Spec.handoff
+
+    def handoff(self, why, reason, **kwargs):
+        seen.append(reason)
+        return original(self, why, reason, **kwargs)
+
+    monkeypatch.setattr(spec.Spec, "handoff", handoff)
+    return seen
+
+
+@pytest.mark.parametrize("expired", [False, True])
+def test_spec_restart_from_the_pending_post_and_update_files(loop, monkeypatch, expired):
+    clock = wall_clock(monkeypatch)
+    handoffs = record_handoffs(monkeypatch)
+    loop.script = [CHANGES, reviser(commit=True), ACCEPT]
+    loop.gh.merge_state = "BEHIND"
+    loop.gh.update_heads = [UPDATED]
+    original = pr.call
+
+    def interrupt(*args, **kwargs):
+        result = original(*args, **kwargs)
+        if args[0] == "api" and args[3:4] == ("repos/owner/app/pulls/77/update-branch",):
+            raise Interrupted
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(pr, "call", interrupt)
+        with pytest.raises(Interrupted):
+            run_spec(loop)
+    assert update_file(loop).is_file() and loop.gh.head_oid == UPDATED
+    assert spec.owner_handoff.load_retry(spec.session.resolve(loop.env), N,
+                                         spec.owner_handoff.SPEC_PENDING_ACCEPT_POST)
+    if not expired:
+        current_tick = tick.Tick(loop.env, (N,))
+        monkeypatch.setattr(current_tick, "item", lambda run: run())
+        monkeypatch.setattr(current_tick, "resume_spec", lambda issue: 1 if issue == N else 0)
+        assert current_tick.pick_issue() == 1  # No wait for the pending comment's retry deadline.
+    loop.gh.merge_state = "CLEAN"
+    if expired:
+        clock["t"] += 61
+        monkeypatch.setattr(merge.Merger, "observation",
+                            lambda *a, **kw: pytest.fail("handoff tried to observe the expired PR"))
+    before = len(loop.gh.calls)
+    assert run_spec(loop) == int(expired)
+    assert len(updates(loop)) == 1 and not update_file(loop).exists()
+    if expired:
+        assert handoffs == ["spec_adr_merge_failed"]
+        assert merges(loop) == [] and not loop.gh.posted(ACCEPTED)
+        assert not any(c[0] == "pr" for c in loop.gh.calls[before:])
+    else:
+        assert pin(merges(loop)[0]) == UPDATED and loop.gh.posted(ACCEPTED)
+
+
+def test_an_unrelated_merged_head_with_a_saved_update_cannot_publish(loop, monkeypatch):
     resume_pending(loop, monkeypatch)
     clock = wall_clock(monkeypatch)
     update_file(loop).write_text(json.dumps({"head": SAVED, "base": "main", "count": 0,
                                              "deadline": clock["t"] + 40, "response": None}))
-    loop.gh.head_oid = UPDATED   # the lost request had landed
-    assert loop.run() is True
-    assert updates(loop) == []
-    [merged] = merges(loop)
-    assert pin(merged) == UPDATED
-    assert not update_file(loop).exists()
+    loop.gh.head_oid, loop.gh.pr_state = "c" * 40, "MERGED"
+    monkeypatch.setattr(merge.Merger, "verify_updated_head", lambda self, *args: False)
+    assert run_spec(loop) == 1
+    assert updates(loop) == [] and merges(loop) == [] and not loop.gh.posted(ACCEPTED)
 
 
-def test_a_restart_after_the_saved_deadline_hands_off_without_merging(loop, monkeypatch):
-    notes = resume_pending(loop, monkeypatch)
+def test_a_headless_legacy_acceptance_cannot_update_or_merge(loop, monkeypatch):
+    resume_pending(loop, monkeypatch)
+    loop.gh.comments[0]["body"] = loop.gh.comments[0]["body"].replace(f" head={SAVED}", "")
+    loop.gh.merge_state = "BEHIND"
+    assert run_spec(loop) == 1
+    assert updates(loop) == [] and merges(loop) == [] and not loop.gh.posted(ACCEPTED)
+
+
+@pytest.mark.parametrize("exhausted", [False, True])
+def test_restart_after_verification_keeps_the_head_and_consumed_updates(loop, monkeypatch, exhausted):
+    resume_pending(loop, monkeypatch)
     clock = wall_clock(monkeypatch)
-    update_file(loop).write_text(json.dumps({"head": SAVED, "base": "main", "count": 0,
-                                             "deadline": clock["t"] - 1, "response": None}))
-    loop.gh.head_oid = UPDATED   # a valid head, too late
-    assert loop.run() is False
-    assert updates(loop) == [] and merges(loop) == []
-    assert any("not confirmed before its deadline" in text for text in notes)
-    assert not update_file(loop).exists()
+    if exhausted:
+        update_file(loop).write_text(json.dumps({"head": SAVED, "base": "main", "count": 2,
+                                                 "deadline": clock["t"] + 40, "response": None}))
+        loop.gh.head_oid = UPDATED
+    else:
+        loop.gh.update_heads = [UPDATED]
+    loop.gh.merge_state = "BEHIND"
+
+    def interrupt(self, minutes):
+        if loop.gh.head_oid == UPDATED:
+            raise Interrupted
+        return True
+
+    with monkeypatch.context() as patch:
+        patch.setattr(merge.Merger, "ci_green", interrupt)
+        with pytest.raises(Interrupted):
+            run_spec(loop)
+    clock["t"] += 61
+    if not exhausted:
+        loop.gh.merge_state = "CLEAN"
+    assert run_spec(loop) == int(exhausted)
+    if exhausted:
+        assert updates(loop) == [] and merges(loop) == [] and not loop.gh.posted(ACCEPTED)
+    else:
+        assert len(updates(loop)) == 1 and pin(merges(loop)[0]) == UPDATED
+        assert loop.gh.posted(ACCEPTED)
 
 
 @pytest.mark.parametrize("text", [
@@ -134,22 +237,76 @@ def test_a_damaged_saved_update_hands_off_without_an_update_or_merge(loop, monke
     assert any("damaged" in note for note in notes)
 
 
-def test_the_update_request_is_bounded_to_the_first_half_of_the_window_and_killed(loop, monkeypatch):
+def test_a_directory_at_the_update_record_hands_off_without_removing_its_contents(loop, monkeypatch):
     resume_pending(loop, monkeypatch)
-    seen = []
-    boundary = spec.pr_helpers.call
+    handoffs = record_handoffs(monkeypatch)
+    path = update_file(loop)
+    path.mkdir()
+    (path / "keep").touch()
+    assert run_spec(loop) == 1
+    assert handoffs == ["spec_adr_merge_failed"]
+    assert updates(loop) == [] and merges(loop) == [] and (path / "keep").is_file()
 
-    def watch(*args, **kwargs):
-        if args[:1] == ("api",) and "update-branch" in " ".join(args):
-            seen.append(kwargs)
-        return boundary(*args, **kwargs)
 
-    monkeypatch.setattr(spec.pr_helpers, "call", watch)
+@pytest.mark.parametrize("status, attempts", [("HTTP 403", 2), ("HTTP 502", 1), ("", 1)])
+def test_only_a_confirmed_secondary_rate_limit_refusal_repeats(loop, monkeypatch, status, attempts):
+    resume_pending(loop, monkeypatch)
     loop.gh.merge_state = "BEHIND"
     loop.gh.update_heads = [UPDATED]
-    assert loop.run() is True
-    [kwargs] = seen
-    assert kwargs["kill"] is True and 0 < kwargs["limit"] <= 30
+    if attempts == 1:
+        loop.gh.update_lost = f"{status} secondary rate limit"
+    else:
+        loop.gh.flaky["pr update-branch"] = [(f"{status} secondary rate limit", False)]
+    assert run_spec(loop) == 0
+    assert len(updates(loop)) == attempts
+    assert all(f"expected_head_sha={SAVED}" in call for call in updates(loop))
+
+
+def test_a_refused_update_cannot_use_verification_that_finishes_at_the_deadline(loop, monkeypatch):
+    resume_pending(loop, monkeypatch)
+    clock = wall_clock(monkeypatch)
+    loop.gh.merge_state = "BEHIND"
+    loop.gh.push_before_update = UPDATED
+
+    def verify(self, saved, new, base, deadline):
+        clock["t"] = deadline
+        return True
+
+    monkeypatch.setattr(merge.Merger, "verify_updated_head", verify)
+    assert run_spec(loop) == 1
+    assert len(updates(loop)) == 1 and merges(loop) == [] and not loop.gh.posted(ACCEPTED)
+
+
+def test_a_stalled_bounded_gh_call_is_killed_at_the_deadline(tmp_path, monkeypatch):
+    gh = tmp_path / "gh"
+    gh.write_text("#!/bin/sh\ntrap '' TERM\n: > \"$ADR_STARTED\"\nsleep 2\n")
+    gh.chmod(0o755)
+    started = tmp_path / "started"
+    monkeypatch.setenv("ADR_STARTED", str(started))
+    monkeypatch.setenv("PATH", f"{tmp_path}:/usr/bin:/bin")
+    start = time.monotonic()
+    result = pr.gh("pr", "view", "77", until=time.time() + 0.2)
+    assert started.is_file() and result.returncode != 0
+    assert time.monotonic() - start < 0.9
+
+
+def test_a_submillisecond_budget_never_starts_an_unbounded_call(monkeypatch):
+    clock = wall_clock(monkeypatch)
+    monkeypatch.setattr(pr, "call", lambda *args, **kwargs: pytest.fail("call started below timer resolution"))
+    result = pr.gh("pr", "view", "77", until=clock["t"] + 0.0001)
+    assert result.returncode == 124
+
+
+def test_a_bounded_gh_call_rejects_a_success_returned_at_its_deadline(monkeypatch):
+    clock = wall_clock(monkeypatch)
+    deadline = clock["t"] + 1
+
+    def late(*args, **kwargs):
+        clock["t"] = deadline
+        return subprocess.CompletedProcess(args, 0, '{"headRefOid": "abc"}', "")
+
+    monkeypatch.setattr(pr, "call", late)
+    assert pr.gh("pr", "view", "77", until=deadline).returncode == 124
 
 
 def head(repo, ref="HEAD"):
@@ -157,7 +314,7 @@ def head(repo, ref="HEAD"):
 
 
 def test_the_updated_head_must_be_a_clean_merge_of_the_saved_head_and_the_base(loop, worktree):
-    repo, origin = worktree.repo, worktree.origin
+    repo = worktree.repo
     sh(repo, "git", "checkout", "-q", "-b", "adr", "main")
     (repo / "adr.md").write_text("adr\n")
     sh(repo, "git", "add", "-A")

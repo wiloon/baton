@@ -39,9 +39,8 @@ STDERR_LINES = 3
 
 
 def call(*args, input=None, limit=None, kill=False):
-    """One `gh ARGS` run; LIMIT (seconds) runs it under `timeout`, and KILL also ends it a second
-    after the signal when gh ignores SIGTERM."""
-    command = ["gh", *args] if limit is None else ["timeout", *(["-k", "1"] if kill else []), str(limit), "gh", *args]
+    """One `gh ARGS` run. KILL uses SIGKILL at the limit for hard deadlines."""
+    command = ["gh", *args] if limit is None else ["timeout", *(["-s", "KILL"] if kill else []), str(limit), "gh", *args]
     return session.run_process(command, input=input, text=True, capture_output=True, check=False)
 
 
@@ -192,10 +191,12 @@ def gh(*args, input=None, limit=None, reconcile=None, repeat=None, until=None):
     def attempt():
         if until is None:
             return call(*args, input=input, limit=limit)
-        left = until - time.time()
-        if left <= 0:
-            return subprocess.CompletedProcess(["gh", *args], 124, "", "deadline reached before the call")
-        return call(*args, input=input, limit=round(left, 3) if limit is None else min(limit, round(left, 3)), kill=True)
+        budget = deadline_budget(until, limit)
+        if budget:
+            result = call(*args, input=input, limit=budget, kill=True)
+            if time.time() < until:
+                return result
+        return subprocess.CompletedProcess(["gh", *args], 124, "", "deadline reached")
 
     result = attempt()
     for pause in BACKOFF:
@@ -217,6 +218,14 @@ def gh(*args, input=None, limit=None, reconcile=None, repeat=None, until=None):
         from . import notify   # notify imports this module
         notify.log(f"gh {' '.join(args[:2])} failed after {len(BACKOFF) + 1} tries{why(result)}")
     return result
+
+
+def deadline_budget(until, limit=None):
+    """Round down to milliseconds. A zero budget must never reach GNU timeout."""
+    left = until - time.time()
+    if limit is not None:
+        left = min(left, limit)
+    return int(max(left, 0) * 1000) / 1000
 
 
 def view(pr, fields):

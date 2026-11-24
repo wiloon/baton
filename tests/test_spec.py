@@ -1605,7 +1605,7 @@ def test_pending_write_failure_skips_ci_and_merge(loop):
 def test_a_later_tick_resumes_an_open_adr_merge_without_spec_agents(loop, monkeypatch):
     wall_clock(monkeypatch)
     loop.gh.comments = [{"author": {"login": "owner"},
-                         "body": f"<!-- baton-spec-accept-pending pr=77 -->\n{VERDICT_BODY}"}]
+                         "body": f"<!-- baton-spec-accept-pending pr=77 head={'a' * 40} -->\n{VERDICT_BODY}"}]
     loop.gh.adr_pr, loop.gh.pr_state, loop.gh.merge_state = "77", "OPEN", ""
     loop.script = []  # no agent dispatch
     monkeypatch.setattr(spec.Spec, "worktree", lambda self: pytest.fail("spec worktree set up"))
@@ -1623,7 +1623,7 @@ def test_a_later_tick_resumes_an_open_adr_merge_without_spec_agents(loop, monkey
 def test_a_resumed_adr_merge_rechecks_ci_first(loop, monkeypatch):
     monkeypatch.setattr(spec.Spec, "worktree", lambda self: pytest.fail("spec worktree set up"))
     loop.gh.comments = [{"author": {"login": "owner"},
-                         "body": f"<!-- baton-spec-accept-pending pr=77 -->\n{VERDICT_BODY}"}]
+                         "body": f"<!-- baton-spec-accept-pending pr=77 head={'a' * 40} -->\n{VERDICT_BODY}"}]
     loop.gh.adr_pr, loop.gh.pr_state = "77", "OPEN"
     loop.ci = False
     assert loop.run() is False
@@ -1633,7 +1633,7 @@ def test_a_resumed_adr_merge_rechecks_ci_first(loop, monkeypatch):
 
 def test_a_merged_adr_pr_publishes_the_saved_verdict_without_ci_or_merge(loop):
     loop.gh.comments = [{"author": {"login": "owner"},
-                         "body": f"<!-- baton-spec-accept-pending pr=77 -->\n{VERDICT_BODY}"}]
+                         "body": f"<!-- baton-spec-accept-pending pr=77 head={'a' * 40} -->\n{VERDICT_BODY}"}]
     loop.gh.pr_state = "MERGED"
     loop.ci = False  # must not be consulted
     assert loop.run() is True
@@ -1644,7 +1644,7 @@ def test_a_merged_adr_pr_publishes_the_saved_verdict_without_ci_or_merge(loop):
 
 def test_a_closed_adr_pr_hands_off_without_a_verdict(loop):
     loop.gh.comments = [{"author": {"login": "owner"},
-                         "body": f"<!-- baton-spec-accept-pending pr=77 -->\n{VERDICT_BODY}"}]
+                         "body": f"<!-- baton-spec-accept-pending pr=77 head={'a' * 40} -->\n{VERDICT_BODY}"}]
     loop.gh.pr_state = "CLOSED"
     assert loop.run() is False
     assert "ready-for-human" in loop.gh.labels and not loop.gh.posted("<!-- baton-verdict: accept")
@@ -1653,7 +1653,7 @@ def test_a_closed_adr_pr_hands_off_without_a_verdict(loop):
 
 def test_verdict_write_failure_after_merge_retries_without_another_merge(loop):
     loop.gh.comments = [{"author": {"login": "owner"},
-                         "body": f"<!-- baton-spec-accept-pending pr=77 -->\n{VERDICT_BODY}"}]
+                         "body": f"<!-- baton-spec-accept-pending pr=77 head={'a' * 40} -->\n{VERDICT_BODY}"}]
     loop.gh.pr_state = "MERGED"
     loop.gh.fail_body_substr = "<!-- baton-verdict: accept"
     assert loop.run() is False
@@ -1677,7 +1677,7 @@ def test_deleting_the_pending_comment_restores_normal_spec_selection(loop):
 
 def test_merge_success_while_pr_stays_open_hands_off_without_a_verdict(loop):
     loop.gh.comments = [{"author": {"login": "owner"},
-                         "body": f"<!-- baton-spec-accept-pending pr=77 -->\n{VERDICT_BODY}"}]
+                         "body": f"<!-- baton-spec-accept-pending pr=77 head={'a' * 40} -->\n{VERDICT_BODY}"}]
     loop.gh.pr_state = "OPEN"
     loop.gh.keep_open_on_merge = True
     assert loop.run() is False
@@ -1724,7 +1724,7 @@ def resume_pending(loop, monkeypatch):
     wall_clock(monkeypatch)
     notes = []
     monkeypatch.setattr(spec.notify, "notify", lambda title, text="": notes.append(text))
-    loop.gh.comments = [{"author": {"login": "owner"}, "body": f"{PENDING} -->\n{VERDICT_BODY}"}]
+    loop.gh.comments = [{"author": {"login": "owner"}, "body": f"{PENDING} head={'a' * 40} -->\n{VERDICT_BODY}"}]
     loop.gh.adr_pr, loop.gh.pr_state = "77", "OPEN"
     return notes
 
@@ -2087,7 +2087,7 @@ def test_pending_adr_acceptance_records_observation_and_runs_the_existing_rule(
 
     fixture = advised.gh
     fixture.comments = [{"author": {"login": "owner"},
-                         "body": f"<!-- baton-spec-accept-pending pr=77 -->\n{VERDICT_BODY}"}]
+                         "body": f"<!-- baton-spec-accept-pending pr=77 head={'a' * 40} -->\n{VERDICT_BODY}"}]
     fixture.adr_pr, fixture.pr_state = "77", state
     fixture.merge_state = "BEHIND" if update else "CLEAN"
     fixture.update_heads = ["b" * 40] if update else []
