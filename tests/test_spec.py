@@ -1226,7 +1226,7 @@ def test_a_paused_revision_resumes_with_its_commits(loop):
 
 
 def test_codex_after_codex_needs_a_known_different_model(loop, monkeypatch):
-    monkeypatch.setattr(spec.Spec, "pick", lambda self, role, candidates, last_vendor, other_model: "codex")
+    monkeypatch.setattr(spec.Spec, "pick", lambda self, role, candidates, last_vendor, other_model, **_: "codex")
     loop.gh.comments.append({"author": {"login": "owner"}, "body": "<!-- baton-spec-reply round=1 by=codex -->\nx"})
     Path(loop.env["LOGS"], "runner.log").write_text("2026-10-27 10:00:00 [owner/app] end issue-516-spec-reply-1 rc=0 SPEC: revised model=gpt-a\n")
     same = {**ACCEPT, "model": "gpt-a"}
@@ -4134,3 +4134,17 @@ def test_only_the_referenced_documents_are_sent_when_local_documents_are_enabled
     assert len(advised.gh.posted("<!-- baton-advisor-answer")) == int(not truncated)
     if truncated:
         assert len(advised.runs) == 2 and "ready-for-human" in advised.gh.labels
+
+
+def test_claude_after_claude_takes_the_route_whose_model_differs(tmp_path, monkeypatch):
+    """Owner rule (2026-11-24): a same-vendor Claude spec round swaps Opus and Sonnet instead of stalling."""
+    from types import SimpleNamespace
+    routes = {("spec_review", False): "opus", ("spec_review", True): "sonnet",
+              ("spec", False): "opus", ("spec", True): "sonnet"}
+    models = SimpleNamespace(route=lambda role, vendor, followup=False: SimpleNamespace(model=routes[(role, followup)]))
+    fake = SimpleNamespace(env=SimpleNamespace(config=SimpleNamespace(models=models)))
+    pick_route = spec.Spec.claude_followup
+    assert pick_route(fake, "spec_review", True, "claude-sonnet-5-5") is False   # Sonnet wrote it: review on Opus
+    assert pick_route(fake, "spec_review", False, "claude-sonnet-5-5") is False
+    assert pick_route(fake, "spec", False, "claude-opus-5-5") is True             # Opus reviewed: revise on Sonnet
+    assert pick_route(fake, "spec", True, "claude-opus-5-5") is True
