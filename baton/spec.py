@@ -1438,14 +1438,24 @@ class Spec:
             self.handoff(why, reason, **merger.observation(reason, acceptance=verdict, **status))
             return "stop"
 
+        def merge_failed(result):
+            return stop(f"{who} accepted, but merging the ADR PR #{pr} failed.{result.get('detail') or ''}",
+                        "spec_adr_merge_failed", failure=result.get("reason") or "")
+
+        # An update saved by an earlier run settles first, and its deadline before any PR read.
+        pending = merger.settle_pending_update()
+        if isinstance(pending, dict):
+            return merge_failed(pending)
+        if pending:
+            merger.validated_head = pending
+            merger.update_count += 1
         if not merger.ci_green(30):
             return stop(ci_message, "spec_adr_ci_before_merge_not_green", ci_failed=True)
-        result = merger.merge_with_updates(30)
+        result = merger.merge_with_updates(30, pinned=binding.get("adr_head") or "")
         if not result.get("ok"):
             if result.get("reason") == "ci_after_update_not_green":
                 return stop(ci_message, "spec_adr_ci_after_update_not_green", ci_failed=True)
-            return stop(f"{who} accepted, but merging the ADR PR #{pr} failed.{result.get('detail') or ''}",
-                        "spec_adr_merge_failed", failure=result.get("reason") or "")
+            return merge_failed(result)
         revision, _ = self.read_pr_revision(pr)
         if not revision or revision["state"] != "MERGED":
             return stop(f"{who} accepted, but ADR PR #{pr} is still open after the merge attempt.",
@@ -1481,7 +1491,8 @@ class Spec:
             if revision is None:
                 return None, transient
             state, head = revision["state"], revision["headRefOid"]
-            if (binding["adr_head"] and head != binding["adr_head"]
+            updating = Path(self.state, f"adr-update-pr-{pr}.json").exists()   # its head moved by our own update
+            if (binding["adr_head"] and head != binding["adr_head"] and not updating
                     or recovering and not binding["adr_head"]):
                 return "CHANGED", False
             self.adr_head = head
