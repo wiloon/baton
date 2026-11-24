@@ -2586,3 +2586,15 @@ def test_a_saved_landed_dev_push_resumes_without_a_second_push(devrun, monkeypat
     assert len(pushes) == len(devrun.runs) == 1
     assert len(devrun.gh.ran("pr", "create")) == 1
     assert handoff.load_retry(env, "300", handoff.DEV_PUSH) is None
+
+
+def test_item_finalization_clears_the_recorded_reply_owner_files(ctx):
+    tick_run = ctx.make()
+    tick_run.begin_item()
+    tick_run.active["cursor_fix"] = "21"
+    names = ("pr-21-fix-owner", "stub-fix-base-21", "stub-fix-task-21", "cursor-fix-base-21", "pr-body-base-21")
+    for name in names:
+        ctx.path(name).write_text('{"fixer": "stub", "base": "abc"}' if name.endswith("owner") else "x\n")
+    tick_run.finish_item(1)
+    for name in names:
+        assert not ctx.path(name).exists(), name
