@@ -418,6 +418,12 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
         model = session.resolve().config.models.route(route_role, "codex").model
         if other_model and other_model != "unknown" and model and model != other_model:
             fallbacks = {"codex": "same-vendor-different-model"}
+    if role == "spec_reviewer" and "claude" in excluded and "claude" in candidates:
+        # Owner rule (2026-11-24): never stall on independence; Claude reviews Claude's revision
+        # on a distinct model (the caller picks the route that differs from OTHER_MODEL).
+        model = session.resolve().config.models.route("spec_review", "claude", followup=spec_followup).model
+        if claude_cli.distinct_models(model, other_model):
+            fallbacks["claude"] = "same-vendor-different-model"
     if role == "reviser" and "claude" in excluded and "claude" in candidates:
         model = session.resolve().config.models.route("spec", "claude", followup=spec_followup).model
         if claude_cli.distinct_models(model, other_model):

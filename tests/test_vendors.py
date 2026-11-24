@@ -421,6 +421,18 @@ class VendorTests(unittest.TestCase):
         self.snap("claude", 0.99)
         self.assertEqual(revise()[1], 75)
 
+    def test_a_claude_revised_spec_is_reviewed_by_claude_on_a_distinct_model_when_codex_cannot_run(self):
+        review = lambda followup: vendors.pick(self.state, POOL, "spec_reviewer", POOL, exclude=["claude"],
+                                               by="contrib", now=NOW, other_model="claude-sonnet-5-5",
+                                               spec_followup=followup)
+        self.snap("codex", 0.5)
+        self.assertEqual(review(False)[0]["vendor"], "codex")
+        self.snap("codex", 0.96)
+        result, rc = review(False)   # base spec_review route: Opus, distinct from the Sonnet revision
+        self.assertEqual((result["vendor"], rc), ("claude", 0))
+        self.assertEqual(result["review_mode"], "same-vendor-different-model")
+        self.assertNotEqual(review(True)[0]["vendor"], "claude")   # follow-up route is Sonnet: refused
+
     def test_spec_reviewer_falls_back_only_with_distinct_model(self):
         for vendor in ("claude", "cursor"):
             Path(self.state, f"{vendor}-cooldown-until").write_text(str(NOW + LONG_REST))

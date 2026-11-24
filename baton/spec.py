@@ -310,6 +310,15 @@ class Spec:
         so the revision takes the other one. A later review already ran on the followup model."""
         return round == 1 and reviser == "claude" and last_vendor == "claude"
 
+    def claude_followup(self, route_role, preferred, other_model):
+        """Claude after Claude: the preferred route when its model differs from OTHER_MODEL, else the
+        other route (Opus and Sonnet swap), so a same-vendor round never runs on the writer's model."""
+        routes = self.env.config.models
+        for followup in (preferred, not preferred):
+            if claude_cli.distinct_models(routes.route(route_role, "claude", followup=followup).model, other_model):
+                return followup
+        return preferred
+
     def agent(self, vendor, role, prompt, tag, settings, output="", followup=False, round_s=""):
         env = self.env.with_runtime(spec_followup=followup)
         saved_role = {"spec_review": "spec_reviewer", "spec": "reviser"}.get(role)
@@ -1324,11 +1333,17 @@ class Spec:
         head = git(wt, "rev-parse", "HEAD") or ""
         last_vendor = last_by(listed, env.owner, "reply")
         other_model = last_model(env, n, "reply", round - 1, last_vendor)
+        claude_followup = self.followup(round, "claude", last_vendor)
+        if last_vendor == "claude":
+            claude_followup = self.claude_followup("spec_review", claude_followup, other_model)
+
+        def review_followup(vendor):
+            return claude_followup if vendor == "claude" else self.followup(round, vendor, last_vendor)
         pending = self.resume_worker("spec_reviewer", "spec_review_run_failed", round, other_model)
         if pending is False:
             return "stop"
         reviewer = pending[1] if pending else self.pick("spec_reviewer", pick.all_vendors(env),
-                                                        last_vendor, other_model)
+                                                        last_vendor, other_model, spec_followup=claude_followup)
         attempt = int(bool(pending))
         while True:
             tag = f"issue-{n}-spec-{round}" + (f"-retry{attempt}" if attempt else "")
@@ -1336,10 +1351,11 @@ class Spec:
                 self.self_dir / "spec-review-prompt.md", VENDOR=reviewer, ISSUE=n, GH_REPO=self.repo, WORKTREE=str(wt),
                 BRANCH=self.branch, ROUND=str(round), MAX_ROUNDS=str(max_rounds), CONTEXT_FILE=str(context),
                 ADR_NOTE=adr_note, ROUND_NOTE=self.round_note(round)), tag, "review-settings.json",
-                followup=self.followup(round, reviewer, last_vendor), round_s=str(round))
+                followup=review_followup(reviewer), round_s=str(round))
             outcome, model = out["outcome"], out["model"] or ""
-            if self.unverified(reviewer, last_vendor, model, other_model):
-                self.handoff("Codex spec reviewer model was not verified as different from the reviser model.",
+            if (self.unverified(reviewer, last_vendor, model, other_model)
+                    or (reviewer == last_vendor == "claude" and not claude_cli.distinct_models(model, other_model))):
+                self.handoff(f"{reviewer.capitalize()} spec reviewer model was not verified as different from the reviser model.",
                              "spec_reviewer_model_unverified")
                 return "stop"
             mode_note = self.mode_note("Review", reviewer, last_vendor, model, other_model)
@@ -1381,7 +1397,7 @@ class Spec:
             retry = self.recover_worker(
                 f"{reviewer}'s spec review failed: {outcome}", "spec_review_run_failed", reviewer, outcome,
                 round_s=str(round), issue_body=issue_body, listed=listed, last_vendor=last_vendor,
-                other_model=other_model, spec_followup=self.followup(round, reviewer, last_vendor))
+                other_model=other_model, spec_followup=review_followup(reviewer))
             if not retry:
                 return "stop"
             _, reviewer = retry
@@ -2174,6 +2190,8 @@ class Spec:
         last_vendor = last_by(listed, env.owner, "review")
         other_model = last_model(env, n, "review", round, last_vendor)
         claude_followup = self.reviser_followup(round, "claude", last_vendor)
+        if last_vendor == "claude":
+            claude_followup = self.claude_followup("spec", claude_followup, other_model)
         pending = self.resume_worker("reviser", "spec_revision_run_failed", round, other_model, claude_followup)
         if pending is False:
             return "stop"
