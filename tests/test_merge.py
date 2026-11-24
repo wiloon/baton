@@ -638,6 +638,7 @@ HEAD = "a" * 40
 
 
 REAL_CI_FIX_ROUND = merge.Merger.ci_fix_round
+REAL_FIX_PR = merge.fix.fix_pr
 
 
 @pytest.fixture
@@ -704,6 +705,66 @@ def test_a_repair_failure_without_a_handoff_is_not_taken_for_one(repair):
     repair.fix_rc, repair.fix_hands_off = 1, False
     assert repair.merger().ci_fix_round(str(repair.wt)) == 1
     assert Path(repair.env["STATE"], f"ci-fix-{PR}-{HEAD}").exists()
+
+
+def test_a_reply_fixer_blocked_by_its_vendor_hands_the_head_off_without_marking_it(repair, monkeypatch):
+    """The real fix run: Cursor's agent is short-blocked, so fix_pr returns 75 through the reply path."""
+    from baton import agents, fix as fix_module
+    from baton.common import Deferred
+
+    monkeypatch.setattr(merge.fix, "fix_pr", REAL_FIX_PR)
+    monkeypatch.setattr(merge.pick, "choose", lambda *a, **k: "cursor")
+    ran = []
+
+    def blocked(self, vendor, role, prompt, tag, wt, output="", env=None):
+        ran.append(vendor)
+        raise Deferred(vendor, "quota exhausted")
+
+    monkeypatch.setattr(fix_module.Runner, "agent", blocked)
+    assert agents.ADAPTERS["cursor"].FIX_RESUMABLE_VIA_REPLY
+    assert repair.merger().ci_fix_round(str(repair.wt)) == 1
+    assert ran == ["cursor"]
+    assert any("CI repair deferred; handing off this head" in line for line in repair.log())
+    assert not Path(repair.env["STATE"], f"ci-fix-{PR}-{HEAD}").exists()
+
+
+def test_a_reply_fixers_refused_description_edit_keeps_the_repair_and_writes_no_marker(repair, monkeypatch):
+    """A validated description GitHub refuses waits for its retry: the Deferred passes through, unmarked."""
+    import subprocess
+    from baton import agents, fix as fix_module, handoff
+
+    monkeypatch.setattr(merge.fix, "fix_pr", REAL_FIX_PR)
+    monkeypatch.setattr(merge.pick, "choose", lambda *a, **k: "cursor")
+    monkeypatch.setattr(handoff, "clock", lambda: 1_000)
+    monkeypatch.setattr(fix_module.pr_helpers, "sleep", lambda *_: None)
+    task = ("<!-- baton-task issue=297 completion=complete -->\n\nCloses #297\n\n"
+            "## What changed\n%s\n\n## Checks to verify\nnone\n")
+    repair.gh.set(body=task % "Old.")
+    edits, call = [], fix_module.pr_helpers.call
+
+    def flaky(*args, input=None, limit=None):
+        if args[:2] == ("pr", "edit") and "--body-file" in args:
+            edits.append(args)
+            return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        return call(*args, input=input, limit=limit)
+
+    def cursor_agent(self, vendor, role, prompt, tag, wt, output="", env=None):
+        assert vendor == "cursor"
+        Path(wt, "repair.txt").write_text("x\n")
+        sh(wt, "git", "add", "-A")
+        sh(wt, "git", "commit", "-q", "-m", "repair")
+        Path(repair.env["CTX"], f"pr-{PR}-body.md").write_text(task % "Repaired.")
+        return {"rc": 0, "status": "ok", "outcome": "RESULT: fixed", "reply": "RESULT: fixed", "model": "m"}
+
+    monkeypatch.setattr(fix_module.pr_helpers, "call", flaky)
+    monkeypatch.setattr(fix_module.Runner, "agent", cursor_agent)
+    assert agents.ADAPTERS["cursor"].FIX_RESUMABLE_VIA_REPLY
+    with pytest.raises(merge.Deferred) as waiting:
+        repair.merger().ci_fix_round(str(repair.wt))
+    assert waiting.value.vendor == "handoff-retry"
+    assert edits, "the description edit was never attempted"
+    assert not repair.labelled("ready-for-human")
+    assert not Path(repair.env["STATE"], f"ci-fix-{PR}-{HEAD}").exists()
 
 
 def save_waiting_push(repair, fixer="codex"):

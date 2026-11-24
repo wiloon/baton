@@ -2723,3 +2723,34 @@ def test_a_stub_fix_that_fails_a_task_write_leaves_no_reply_files(run, monkeypat
     assert run.fix("stub")["rc"] == 1
     for name in (f"stub-fix-base-{PR}", f"stub-fix-task-{PR}", f"pr-{PR}-fix-owner", f"pr-body-base-{PR}"):
         assert not (state / name).exists(), name
+
+
+def test_a_fixer_switch_over_a_pending_cursor_request_applies_none_of_it_and_pushes_its_commits(run, monkeypatch):
+    _admit_stub_fixer(run, monkeypatch)
+    state, ctx = Path(os.environ["STATE"]), Path(env_ctx())
+    base = run.remote_head()
+    clock, _ = _flaky_edits(monkeypatch, fail_until=1_060)
+    run.fake_gh.set(body=COMPLETE)
+    request = COMPLETE.replace("Disabled buttons.", "Cursor's superseded description.")
+    run.agent(cursor_plan("## Checks to verify\n- /billing: brand colour\nTASK: partial\nRESULT: fixed", request=request))
+    assert run.fix("cursor")["rc"] == 75
+    assert run.pushed_new and run.remote_head() == base   # Cursor's commit is local only
+    # Pending Cursor state with no deferred write to replay: request, baseline, task, checks, owner.
+    for pending in _retry_files("fix_description_write_failed"):
+        pending.unlink()
+    assert (ctx / f"pr-{PR}-body.md").is_file() and (state / f"pr-body-base-{PR}").is_file()
+    assert (state / f"cursor-fix-task-{PR}").is_file() and (state / f"cursor-fix-base-{PR}").is_file()
+    assert _owner()["fixer"] == "cursor"
+
+    clock["now"] = 1_060   # a same-fixer re-entry would now apply Cursor's description
+    run.agent(cursor_plan("## Checks to verify\nnone\n\nRESULT: fixed", commit=False))
+    assert run.fix("stub")["rc"] == 0
+    assert [call[0] for call in run.agent_calls] == ["cursor", "stub"]
+    assert "Cursor's superseded description." not in run.body() and "brand colour" not in run.body()
+    assert "completion=partial" not in run.body()
+    # Stub committed nothing, so the pushed head is Cursor's earlier local commit.
+    assert run.pushed() and run.remote_head() != base
+    assert _owner() is None
+    for name in (f"cursor-fix-base-{PR}", f"cursor-fix-task-{PR}", f"pr-body-base-{PR}"):
+        assert not (state / name).exists(), name
+    assert not (ctx / f"pr-{PR}-body.md").exists() and not (ctx / f"pr-{PR}-fix-checks.json").exists()
