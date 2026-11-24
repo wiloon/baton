@@ -119,6 +119,8 @@ def test_stub_is_registered_with_declared_capabilities():
 
 def test_adapters_declare_same_vendor_review():
     assert {name: a.SAME_VENDOR_REVIEW for name, a in agents.ADAPTERS.items()} == {
+        "claude": True, "codex": True, "cursor": False, "stub": False}
+    assert {name: a.SAME_VENDOR_SAME_MODEL for name, a in agents.ADAPTERS.items()} == {
         "claude": False, "codex": True, "cursor": False, "stub": False}
 
 
