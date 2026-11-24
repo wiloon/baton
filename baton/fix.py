@@ -1291,7 +1291,10 @@ def fix_scope(fixer, owner_triggered):
         return ("The owner's words set the scope for the edits and the reply. Any `<findings>` block is context only. "
                 "Handle only the requests the owner makes, including the whole review if the owner asks for it. "
                 "Include only those requests in your reply.")
-    action = "Handle every Must fix point. Fixing nits is optional." if fixer == "cursor" else "Handle every point."
+    if agents.ADAPTERS[fixer].FIX_SCOPE_POLICY == "must_fix_nits_optional":
+        action = "Handle every Must fix point. Fixing nits is optional."
+    else:
+        action = "Handle every point."
     return f"{action} All review nits are in scope for the reply."
 
 

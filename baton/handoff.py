@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
-from . import advisor, notify, recovery
+from . import advisor, agents, notify, recovery
 from . import pr as pr_helpers
 from .quota import atomic_json
 
@@ -195,7 +195,7 @@ def _comment_post_valid(item, binding, *, marker):
     """A trusted review or screenshot comment and the inputs it was produced from (#151)."""
     body = binding.get("body")
     reviewer, round = binding.get("reviewer"), binding.get("round")
-    if (reviewer not in ("claude", "codex", "cursor") or type(round) is not int or round <= 0
+    if (reviewer not in agents.ADAPTERS or type(round) is not int or round <= 0
             or not isinstance(body, str)
             or not body.startswith(f"<!-- {marker} round={round} by={reviewer} -->\n")):
         return False
@@ -332,7 +332,8 @@ def _fix_push_binding_valid(item, binding):
     if (type(description_rc) is not int or description_rc not in (0, 1, 2)
             or not isinstance(binding.get("description_reason"), str)
             or not isinstance(binding.get("fixer"), str) or not binding["fixer"]
-            or (binding["fixer"] == "cursor" and description_rc == 1)):
+            or binding["fixer"] not in agents.ADAPTERS
+            or (agents.ADAPTERS[binding["fixer"]].FIX_RESUMABLE_VIA_REPLY and description_rc == 1)):
         return False
     if next_step in ("handoff", "recover"):
         if binding.get("handoff_reason") not in ("fix_run_failed", "fix_needs_info"):
@@ -456,8 +457,9 @@ def _fix_meta_write_binding_valid(item, binding, *, reason):
                     or not isinstance(context["fix_source"], str)):
                 return False
         resume = binding.get("resume")
-        if binding["fixer"] == "cursor" and resume is None:
-            return True    # Older Cursor records have a separate saved base.
+        if (binding["fixer"] in agents.ADAPTERS
+                and agents.ADAPTERS[binding["fixer"]].FIX_RESUMABLE_VIA_REPLY and resume is None):
+            return True    # Older reply-protocol records have a separate saved base.
         return (isinstance(resume, dict)
                 and all(isinstance(resume.get(key), str) and re.fullmatch(r"[0-9a-f]{40}", resume[key])
                         for key in ("head", "agent_head"))

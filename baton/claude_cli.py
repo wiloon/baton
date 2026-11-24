@@ -35,6 +35,12 @@ UNMARKED_AUTHOR_INFERENCE = True
 GITHUB_ACCESS = "settings"
 FIX_RESUMABLE_VIA_REPLY = False
 READONLY_RESET = False
+REVIEW_TEMPLATE = "review-prompt.md"
+REVIEW_DELIVERY = "artifact"
+REVIEW_SKILL_POLICY = "diff_size"
+SCREENSHOT_DELIVERY = "write"
+CONTINUITY_PIN = False
+FIX_SCOPE_POLICY = "every_point"
 # Short roles finish in minutes; a five-minute cache avoids writing the hour-long cache at 2x.
 FIVE_MINUTE_CACHE_ROLES = ("spec_review", "spec", "review", "screenshot_review", "fix")
 KINDS = ("RESULT", "REVIEW", "VERDICT", "SCAN", "SPEC")
