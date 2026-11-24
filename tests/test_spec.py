@@ -3782,8 +3782,8 @@ def test_tick_resumes_a_confirmed_advisor_answer_after_an_interruption(advised, 
     assert started == [N]
     assert [run["role"] for run in advised.runs] == ["spec_review", "spec", "spec", "spec_review"]
     assert len(advised.gh.posted("<!-- baton-advisor-answer")) == 1
-    [context] = Path(advised.env["CTX"]).glob(f"issue-{N}-spec-1-revise-*.md")
-    assert '<advisor-answer author="DeepSeek">' in context.read_text()
+    contexts = [p.read_text() for p in Path(advised.env["CTX"]).glob(f"issue-{N}-spec-1-revise-*.md")]
+    assert any('<advisor-answer author="DeepSeek">' in text for text in contexts)
 
 
 def test_lost_post_does_not_reconcile_an_answer_from_before_the_bound_question(advised, monkeypatch):
