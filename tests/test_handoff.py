@@ -422,6 +422,24 @@ def task_binding(item="1"):
                        "cursor_base": "", "description_changed": False}}
 
 
+@pytest.mark.parametrize("fixer", ["claude", "codex", "cursor"])
+def test_fix_push_binding_accepts_existing_fixers(fixer):
+    assert handoff._binding_valid("fix_push_failed", "1", {**push_binding("1"), "fixer": fixer}) is True
+
+
+def test_fix_push_binding_rejects_unknown_fixer_and_stub_description_rc_1():
+    assert handoff._binding_valid("fix_push_failed", "1", {**push_binding("1"), "fixer": "nobody"}) is False
+    stub = {**push_binding("1"), "fixer": "stub"}
+    assert handoff._binding_valid("fix_push_failed", "1", stub) is True
+    assert handoff._binding_valid("fix_push_failed", "1", {**stub, "description_rc": 1}) is False
+
+
+def test_task_binding_legacy_resume_exception_is_cursor_only():
+    base = {**task_binding("1"), "resume": None}
+    assert handoff._binding_valid("fix_task_write_failed", "1", {**base, "fixer": "cursor"}) is True
+    assert handoff._binding_valid("fix_task_write_failed", "1", {**base, "fixer": "stub"}) is False
+
+
 def test_every_category_1_reason_is_rule_mode_with_retry_budget():
     assert handoff.RETRY_REASONS == {
         "review_comment_missing", "spec_comments_read_failed", "spec_pending_adr_read_failed",

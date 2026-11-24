@@ -109,6 +109,11 @@ def test_stub_is_registered_with_declared_capabilities():
     assert stub.IMAGES is False
     assert stub.QUOTA_WINDOWS == frozenset({"seven_day"})
     assert stub.QUOTA_ERROR
+    assert stub.REVIEW_TEMPLATE == "stub-review-prompt.md"
+    assert stub.REVIEW_DELIVERY == "reply"
+    assert stub.REVIEW_SKILL_POLICY == "none"
+    assert stub.CONTINUITY_PIN is True
+    assert stub.FIX_SCOPE_POLICY == "must_fix_nits_optional"
 
 
 def test_config_load_admits_stub_and_rejects_unsupported_role(tmp_path):

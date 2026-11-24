@@ -150,7 +150,8 @@ def test_authors_try_before_claiming_a_limit_and_run_terminal_checks(name):
     assert RUN_IT in prompt
 
 
-@pytest.mark.parametrize("name", ["review-prompt.md", "codex-review-prompt.md", "cursor-review-prompt.md"])
+@pytest.mark.parametrize("name", ["review-prompt.md", "codex-review-prompt.md", "cursor-review-prompt.md",
+                                  "stub-review-prompt.md"])
 def test_reviewers_flag_an_unproven_limitation(name):
     assert UNPROVEN in text(name)
 

@@ -10,13 +10,14 @@ import uuid
 
 import pytest
 
-from baton import checkpoint, merge, pick, review, session, tick, vendors
+from baton import agents, checkpoint, handoff, merge, pick, review, session, tick, vendors
 from baton import config
 from baton.config import load
 from baton.dispatch import dispatch as dispatch_run
 from baton.fix import fix_pr as fix_pr_run
-from baton.common import Deferred
-from conftest import sh
+from baton.common import Deferred, changed
+from conftest import full_text, sh
+from test_adapter_capabilities import with_stub
 
 REAL_MERGE = merge.Merger.merge_or_handoff
 REAL_FIX = review.fix.fix_pr
@@ -2822,3 +2823,205 @@ def test_a_landed_ci_repair_advances_the_approved_head_across_restart(loop, monk
                         lambda self, wt, screenshot=None: loop.merged.append(self.approved_head))
     assert loop.run(fixer="cursor", reviewer="codex") == 0
     assert loop.merged == [repaired] and workers == ["claude"] and pushes == [1_000, 1_060]
+
+
+# --- stage 2 review capability routing (#113) ----------------------------------------------
+
+def admit_stub(loop, monkeypatch):
+    """Load a config that grants stub reviewer into this loop's session."""
+    from dataclasses import replace
+    path = Path(loop.env["CTX"], "stub-review.toml")
+    path.write_text(with_stub(full_text()))
+    cfg = config.load(path, home=Path(loop.env.get("HOME") or Path.home()))
+    cfg = replace(cfg, paths=replace(cfg.paths, self_dir=BIN,
+                                     state=Path(loop.env["STATE"]),
+                                     logs=Path(loop.env["LOGS"]),
+                                     ctx=Path(loop.env["CTX"])))
+    # Match the flat STATE/CTX/LOGS layout the loop fixture uses (not repos/<slug>/).
+    repo = replace(cfg.repos[0], gh_repo=loop.env["GH_REPO"], owner=loop.env["OWNER"])
+    cfg = replace(cfg, repos=(repo,))
+    sess = session.create(cfg, repo=repo)
+    sess = replace(sess, dirs=replace(
+        sess.dirs, state=Path(loop.env["STATE"]), logs=Path(loop.env["LOGS"]),
+        ctx=Path(loop.env["CTX"]), clone=Path(loop.env["REPO_DIR"]),
+        worktrees=Path(loop.env["WT_ROOT"])))
+
+    def resolve(value=None):
+        if isinstance(value, session.Session):
+            return value
+        return sess
+
+    monkeypatch.setattr(session, "resolve", resolve)
+    return sess
+
+
+def test_adapters_declare_review_capabilities():
+    expected = {
+        "claude": ("review-prompt.md", "artifact", "diff_size", "write", False),
+        "codex": ("codex-review-prompt.md", "artifact", "direct", "final_message", False),
+        "cursor": ("cursor-review-prompt.md", "reply", "none", "", True),
+        "stub": ("stub-review-prompt.md", "reply", "none", "", True),
+    }
+    for vendor, (template, delivery, skill, shots, pin) in expected.items():
+        adapter = agents.ADAPTERS[vendor]
+        assert adapter.REVIEW_TEMPLATE == template
+        assert adapter.REVIEW_DELIVERY == delivery
+        assert adapter.REVIEW_SKILL_POLICY == skill
+        assert adapter.SCREENSHOT_DELIVERY == shots
+        assert adapter.CONTINUITY_PIN is pin
+
+
+def test_stub_reply_review_posts_baton_review_by_stub(loop, monkeypatch):
+    admit_stub(loop, monkeypatch)
+    loop.gh.set(headRefName="owner/issue-1", author={"login": "owner"})
+    loop.reviews[:] = ["pass"]
+
+    def agent(vendor, role, prompt, tag, cwd, settings="", output="", env=None, hooks=None):
+        loop.agents.append({"vendor": vendor, "role": role, "tag": tag, "prompt": prompt})
+        assert vendor == "stub" and role == "review"
+        assert "running unattended as a **read-only code reviewer**" in prompt
+        assert not output
+        return {"rc": 0, "status": "success", "outcome": "REVIEW: pass",
+                "reply": "stub review findings\nREVIEW: pass", "model": "stub-1", "defer": ""}
+
+    monkeypatch.setattr(review.dispatch, "dispatch", agent)
+    assert loop.run(fixer="pool", reviewer="stub") == 0
+    assert loop.comments()[0].startswith("<!-- baton-review round=1 by=stub -->\nstub review findings")
+    assert any(a["tag"] == f"pr-{PR}-stub-review-1" for a in loop.agents)
+
+
+def test_stub_dirty_reply_review_restores_and_posts_no_verdict(loop, monkeypatch):
+    admit_stub(loop, monkeypatch)
+    loop.gh.set(headRefName="owner/issue-1", author={"login": "owner"})
+    head = sh(loop.wt, "git", "rev-parse", "HEAD")
+
+    def agent(vendor, role, prompt, tag, cwd, settings="", output="", env=None, hooks=None):
+        (Path(cwd) / "dirty-from-stub.txt").write_text("x\n")
+        return {"rc": 0, "status": "success", "outcome": "REVIEW: pass",
+                "reply": "ok\nREVIEW: pass", "model": "stub-1", "defer": ""}
+
+    monkeypatch.setattr(review.dispatch, "dispatch", agent)
+    env = session.resolve(loop.env)
+    rv = review.Review(env, review.telemetry.from_env(env, issue="297", pr=PR), PR, loop.wt, "297", "")
+    outcome = rv.run_review(1, "", "stub")
+    assert outcome.startswith("RESULT: failed") and "read-only" in outcome
+    assert not loop.comments()
+    assert not changed(loop.wt, head)
+    assert not (Path(loop.wt) / "dirty-from-stub.txt").exists()
+
+
+def test_review_templates_and_skill_policy_come_from_the_adapter(loop, monkeypatch):
+    cases = []
+
+    def agent(vendor, role, prompt, tag, cwd, settings="", output="", env=None, hooks=None):
+        cases.append((vendor, prompt, output, settings))
+        if agents.ADAPTERS[vendor].REVIEW_DELIVERY == "reply":
+            return {"rc": 0, "status": "success", "outcome": "REVIEW: pass",
+                    "reply": "ok\nREVIEW: pass", "model": "", "defer": ""}
+        Path(output).write_text("ok")
+        return {"rc": 0, "status": "success", "outcome": "REVIEW: pass",
+                "reply": "ok", "model": "gpt-test" if vendor == "codex" else "", "defer": ""}
+
+    monkeypatch.setattr(review.dispatch, "dispatch", agent)
+    env = session.resolve(loop.env)
+    for vendor in ("claude", "codex", "cursor"):
+        cases.clear()
+        if vendor == "cursor":
+            loop.gh.set(headRefName="owner/issue-1", author={"login": "owner"})
+            Path(loop.env["STATE"], f"pr-{PR}-authors").write_text("owner\nclaude\n")
+        else:
+            loop.gh.set(headRefName="cursor/issue-297", author={"login": "cursor"})
+            Path(loop.env["STATE"], f"pr-{PR}-authors").write_text("cursor\n")
+        rv = review.Review(env, review.telemetry.from_env(env, issue="297", pr=PR), PR, loop.wt, "297", "")
+        assert rv.run_review(1, "", vendor) == "REVIEW: pass"
+        prompt, output, settings = cases[0][1], cases[0][2], cases[0][3]
+        adapter = agents.ADAPTERS[vendor]
+        if adapter.REVIEW_SKILL_POLICY == "direct":
+            assert "don't read the `code-review` skill" in prompt
+        elif adapter.REVIEW_SKILL_POLICY == "diff_size":
+            assert "mattpocock-skills:code-review" in prompt or "review it yourself" in prompt
+        else:
+            assert "mattpocock-skills:code-review" not in prompt
+            assert "don't read the `code-review` skill" not in prompt
+        if adapter.REVIEW_DELIVERY == "reply":
+            assert not output
+        else:
+            assert output.endswith(f"baton-review-{PR}-1.md")
+            assert settings.endswith("review-settings.json")
+
+
+def test_screenshot_delivery_follows_adapter_constant(loop, monkeypatch):
+    shoot(loop, "01-a.png")
+    seen = []
+
+    def agent(vendor, role, prompt, tag, cwd, settings="", output="", env=None, hooks=None):
+        if role == "screenshot_review":
+            seen.append(prompt)
+            Path(output).write_text("## Must fix\nnone\n## Checks\n1. verified\n## Screenshots\n- 01-a.png — ok")
+            return {"rc": 0, "status": "success", "outcome": "REVIEW: pass", "reply": "", "model": "", "defer": ""}
+        if output:
+            Path(output).write_text("ok")
+        return {"rc": 0, "status": "success", "outcome": "REVIEW: pass",
+                "reply": "ok\nREVIEW: pass", "model": "", "defer": ""}
+
+    monkeypatch.setattr(review.dispatch, "dispatch", agent)
+    for vendor in ("claude", "codex"):
+        seen.clear()
+        loop.reviews[:] = ["pass"]
+        loop.merged.clear()
+        monkeypatch.setenv("PREFER_SCREENSHOT_REVIEWER", vendor)
+        assert screen_run(loop) == 0
+        prompt = seen[0]
+        if agents.ADAPTERS[vendor].SCREENSHOT_DELIVERY == "final_message":
+            assert "Include the full review in your final message" in prompt
+        else:
+            assert "Write the comment to" in prompt and "Write tool" in prompt
+
+
+def test_handoff_accepts_stub_review_comment_retry():
+    body = "<!-- baton-review round=1 by=stub -->\nfindings"
+    binding = {"pr": "1", "round": 1, "head": "a" * 40, "base": "main", "issue": "9",
+               "body": body, "digest": handoff.body_digest(body), "description": "c" * 64,
+               "feedback": "d" * 64, "outcome": "REVIEW: changes", "run_id": "",
+               "comment_ids": [], "author": "owner", "reviewer": "stub"}
+    assert handoff._binding_valid(handoff.REVIEW_POST, "1", binding) is True
+
+
+def test_review_loop_pins_when_adapter_declares_continuity(loop, monkeypatch):
+    pins = []
+    real_resume = review.Review.resume_worker
+
+    def tracking_resume(self, role, pinned=False):
+        pins.append(pinned)
+        return real_resume(self, role, pinned=pinned)
+
+    monkeypatch.setattr(review.Review, "resume_worker", tracking_resume)
+    loop.gh.set(headRefName="owner/issue-1", author={"login": "owner"})
+    loop.reviews[:] = ["pass"]
+    assert loop.run(fixer="pool", reviewer="cursor") == 0
+    assert pins and pins[0] is True
+
+    pins.clear()
+    loop.agents.clear()
+    loop.fixes.clear()
+    loop.merged.clear()
+    loop.reviews[:] = ["pass"]
+    loop.gh.set(headRefName="cursor/issue-297", author={"login": "cursor"})
+    assert loop.run(fixer="cursor", reviewer="claude") == 0
+    assert pins and pins[0] is False
+
+
+
+@pytest.mark.parametrize("vendor,expected", [("stub", True), ("cursor", True), ("claude", False), ("codex", False)])
+def test_review_vendor_selection_pins_by_adapter_continuity(monkeypatch, vendor, expected):
+    seen = {}
+
+    def fake_choose(env, role, current, *args, pinned=False, **kwargs):
+        seen["pinned"] = pinned
+        return current
+
+    monkeypatch.setattr(review.pick, "choose", fake_choose)
+    monkeypatch.setattr(review.pick, "all_vendors", lambda env: [])
+    rv = review.Review({}, None, "1", "/tmp", "1", "")
+    assert rv.review_vendor(vendor) == vendor
+    assert seen["pinned"] is expected

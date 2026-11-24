@@ -1,5 +1,5 @@
 """The review loop for the bash runner (migration slice 4c, #280): `run_review`,
-`cursor_review`, `review_loop` and the review context of run.sh.
+`review_loop` and the review context of run.sh.
 
 One reviewer run reads the PR's context file and returns REVIEW: pass or REVIEW: changes;
 on changes a fixer is picked by contribution and baton.fix runs, then the next round
@@ -35,6 +35,12 @@ MARKER_LINE = re.compile(r"^(REVIEW|RESULT): ")
 FIX_NEEDS_INFO = re.compile(r"^<!-- baton-fix\b[^>]*\boutcome=needs-info\b")
 REVIEW_ROUND = re.compile(r"^<!-- baton-review\b[^>]*\bround=(\d+)\b")
 OWNER_WORDS_NOTE = "Later items override earlier ones where they conflict."
+
+
+def continuity_pin(reviewer):
+    """Whether this selection retains the reviewer across short blocks (CONTINUITY_PIN)."""
+    adapter = agents.ADAPTERS.get(reviewer)
+    return bool(adapter and adapter.CONTINUITY_PIN)
 
 
 class HumanFeedback(NamedTuple):
@@ -772,7 +778,7 @@ class Review:
         """The reviewer with the fewest lines in the PR. When every vendor is excluded, Exhausted
         ends the step with a ready-for-human handoff."""
         return pick.choose(self.env, "reviewer", current, "review", self.vendors(), pr=str(self.pr),
-                           issue=self.issue, fixed_by=self.fixed_by, pinned=current == "cursor")
+                           issue=self.issue, fixed_by=self.fixed_by, pinned=continuity_pin(current))
 
     def review_allowed(self, vendor, model=""):
         """Persisted authors survive restarts and role changes: a vendor that wrote the PR does
@@ -803,26 +809,42 @@ class Review:
             notify.log(f"PR #{self.pr}: commit {commit} has no known vendor; not counted")
 
     # --- one reviewer run ---
-    def cursor_review(self, round, note, context, data, head):
-        """Cursor reviews a PR the owner wrote with Claude (principle P-4). Read-only, so the
-        runner posts its review as <!-- baton-review round=N by=cursor -->.
+    def skill_step(self, reviewer, lines):
+        """REVIEW_SKILL_POLICY: Claude's diff-size rule, Codex's direct review, or none for reply."""
+        policy = agents.ADAPTERS[reviewer].REVIEW_SKILL_POLICY
+        if policy == "direct":
+            return ("Review the diff yourself, following AGENTS.md; no Claude plugins or hooks are available, "
+                    "so don't read the `code-review` skill.")
+        if policy == "none":
+            return ""
+        if lines > int(self.env.config.scheduling.review_skill_min_lines or 800) and self.env.skills:
+            return (f"The diff is {lines} lines: run the `mattpocock-skills:code-review` skill on it and use "
+                    "its findings.")
+        return (f"The diff is {lines} lines: review it yourself; don't run the `mattpocock-skills:code-review` "
+                "skill or start sub-agents.")
+
+    def reply_review(self, reviewer, round, note, context, data, head):
+        """A reply-delivery reviewer: the runner posts its final message as <!-- baton-review ... -->.
         Returns (outcome, reply)."""
         pr, wt = self.pr, self.wt
-        out = self.agent("cursor", "review", self.render(
-            "cursor-review-prompt.md", PR=str(pr), GH_REPO=self.repo, WORKTREE=str(wt), ROUND=str(round),
-            MAX_ROUNDS=str(self.max_rounds), ROUND_NOTE=note, CONTEXT_FILE=str(context),
-            NIT_RULE=nit_rule(self.repo, self.issue)), f"pr-{pr}-cursor-review-{round}",
-            env=self.env.with_runtime(review_followup=self.review_followup(round, "cursor")))
+        adapter = agents.ADAPTERS[reviewer]
+        out = self.agent(reviewer, "review", self.render(
+            adapter.REVIEW_TEMPLATE, PR=str(pr), ISSUE=self.issue or "unknown", GH_REPO=self.repo,
+            WORKTREE=str(wt), ROUND=str(round), MAX_ROUNDS=str(self.max_rounds), ROUND_NOTE=note,
+            CONTEXT_FILE=str(context), NIT_RULE=nit_rule(self.repo, self.issue)),
+            f"pr-{pr}-{reviewer}-review-{round}",
+            env=self.env.with_runtime(review_followup=self.review_followup(round, reviewer)))
         outcome, reply = out["outcome"], out["reply"] or ""
         if changed(wt, head):
             restore(wt, head)
-            return "RESULT: failed Cursor changed files in a read-only review", reply
+            name = adapter.DISPLAY_NAME
+            return f"RESULT: failed {name} changed files in a read-only review", reply
         if not outcome.startswith(REVIEWED):
             return outcome, reply
         posted = "\n".join(line for line in strip_markers(reply).split("\n") if not MARKER_LINE.match(line)).rstrip("\n")
-        body = f"<!-- baton-review round={round} by=cursor -->\n{posted[:REPLY_CAP]}"
-        binding = self.comment_post_binding(body, round, outcome, "cursor", head, data)
-        return self.post_review_comment(round, "cursor", binding), reply
+        body = f"<!-- baton-review round={round} by={reviewer} -->\n{posted[:REPLY_CAP]}"
+        binding = self.comment_post_binding(body, round, outcome, reviewer, head, data)
+        return self.post_review_comment(round, reviewer, binding), reply
 
     def run_review(self, round, note, reviewer=None):
         """One reviewer run; returns OUTCOME. Use the loop's selected reviewer when supplied.
@@ -842,15 +864,7 @@ class Review:
             return self.failed(ALREADY, "RESULT: failed reviewer model may be a PR author")
         numstat = git(wt, "diff", "--numstat", "origin/main...HEAD") or ""
         lines = sum(int(f) for row in numstat.splitlines() for f in row.split()[:2] if f.isdecimal())
-        # The code-review skill is the Matt skills plugin's; without the plugin, review in one pass.
-        if lines > int(self.env.config.scheduling.review_skill_min_lines or 800) and self.env.skills:
-            skill = f"The diff is {lines} lines: run the `mattpocock-skills:code-review` skill on it and use its findings."
-        else:
-            skill = (f"The diff is {lines} lines: review it yourself; don't run the `mattpocock-skills:code-review` "
-                     "skill or start sub-agents.")
-        if reviewer == "codex":
-            skill = ("Review the diff yourself, following AGENTS.md; no Claude plugins or hooks are available, "
-                     "so don't read the `code-review` skill.")
+        skill = self.skill_step(reviewer, lines)
         context = Path(self.ctx, f"pr-{pr}-review-{round}-{time.strftime('%Y%m%d-%H%M%S')}.md")
         data, status = self.read_post_inputs()
         if status == "paused":
@@ -867,15 +881,15 @@ class Review:
             text += (f"\n<runner-preflight>\n{error}\nReport this as Must fix; description-only changes use the "
                      "runner artifact.\n</runner-preflight>\n")
         context.write_text(text)
-        if reviewer == "cursor":
-            outcome, _ = self.cursor_review(round, note, context, data, head)
+        adapter = agents.ADAPTERS[reviewer]
+        if adapter.REVIEW_DELIVERY == "reply":
+            outcome, _ = self.reply_review(reviewer, round, note, context, data, head)
             return outcome
         review_file = Path(f"/tmp/baton-review-{pr}-{round}.md")
         review_file.unlink(missing_ok=True)
-        template = "codex-review-prompt.md" if reviewer == "codex" else "review-prompt.md"
         out = self.agent(reviewer, "review", self.render(
-            template, PR=str(pr), ISSUE=self.issue or "unknown", GH_REPO=self.repo, WORKTREE=str(wt), ROUND=str(round),
-            MAX_ROUNDS=str(self.max_rounds), ROUND_NOTE=note, SKILL_STEP=skill,
+            adapter.REVIEW_TEMPLATE, PR=str(pr), ISSUE=self.issue or "unknown", GH_REPO=self.repo, WORKTREE=str(wt),
+            ROUND=str(round), MAX_ROUNDS=str(self.max_rounds), ROUND_NOTE=note, SKILL_STEP=skill,
             CONTEXT_FILE=str(context),
             NIT_RULE=nit_rule(self.repo, self.issue)), f"pr-{pr}-review-{round}",
             str(self.self_dir / "review-settings.json"), str(review_file),
@@ -941,8 +955,10 @@ class Review:
         context.write_text(issue_context(self.env, self.issue) if re.fullmatch(r"\d+", str(self.issue or "")) else "")
         review_file = Path(f"/tmp/baton-screenshot-review-{pr}-{round}.md")
         review_file.unlink(missing_ok=True)
-        delivery = ("Include the full review in your final message, above the verdict line." if vendor == "codex"
-                    else f"Write the comment to `{review_file}` with the Write tool.")
+        if agents.ADAPTERS[vendor].SCREENSHOT_DELIVERY == "final_message":
+            delivery = "Include the full review in your final message, above the verdict line."
+        else:
+            delivery = f"Write the comment to `{review_file}` with the Write tool."
         out = self.agent(vendor, "screenshot_review", self.render(
             "screenshot-review-prompt.md", PR=str(pr), ISSUE=self.issue or "unknown", GH_REPO=self.repo,
             WORKTREE=str(wt), ROUND=str(round), MAX_ROUNDS=str(self.max_rounds), CONTEXT_FILE=str(context),
@@ -1156,7 +1172,7 @@ class Review:
                         pending_post = False
                     else:
                         try:
-                            pending = self.resume_worker("reviewer", pinned=reviewer == "cursor")
+                            pending = self.resume_worker("reviewer", pinned=continuity_pin(reviewer))
                             if pending is False:
                                 self.drop()
                                 return 0
@@ -1178,7 +1194,7 @@ class Review:
                             reason = self.fail_reason or "review_run_failed"
                             action, reviewer = self.recover_worker(
                                 reason, f"PR #{pr} review failed ({reviewer})", outcome, reviewer,
-                                pinned=reviewer == "cursor")
+                                pinned=continuity_pin(reviewer))
                             if action == owner_handoff.HANDOFF:
                                 self.drop()
                                 return 0
@@ -1292,9 +1308,9 @@ class Review:
                                screenshot_checks="")
             self.save()
             runner = fix.Runner(self.env.with_runtime(fix_followup=round > 1), self.hooks, pr, str(round))
-            # The next round's reviewer must stay free: a fixed reviewer, or a sole pool vendor.
+            # The next round's reviewer must stay free: a continuity-pinned reviewer, or a sole pool vendor.
             pool = self.env.config.quota.vendor_pool
-            exclude = "cursor" if reviewer == "cursor" else ("" if len(pool) > 1 else pool[0])
+            exclude = reviewer if continuity_pin(reviewer) else ("" if len(pool) > 1 else pool[0])
             runner.retry_exclusions = exclude.split()
             waiting = runner.waiting_push(pr)
             waiting_meta = None
