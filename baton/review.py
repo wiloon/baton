@@ -1297,12 +1297,19 @@ class Review:
             exclude = "cursor" if reviewer == "cursor" else ("" if len(pool) > 1 else pool[0])
             runner.retry_exclusions = exclude.split()
             waiting = runner.waiting_push(pr)
-            if waiting is not None:
-                # A saved push resumes first: no reads, vendor choice or notification before it is due (#151).
-                if waiting == "unreadable":
+            waiting_meta = None
+            if waiting is None:
+                for meta_reason in (owner_handoff.FIX_CHECKS, owner_handoff.FIX_TASK):
+                    waiting_meta = runner.waiting_meta(pr, meta_reason)
+                    if waiting_meta is not None:
+                        break
+            if waiting is not None or waiting_meta is not None:
+                # A saved push or metadata write resumes first: no reads or vendor choice (#151).
+                if waiting == "unreadable" or waiting_meta == "unreadable":
                     self.drop()
                     return 0
-                fixer = waiting["continuation"].get("fixer") or fixer
+                saved = (waiting or waiting_meta)["continuation"]
+                fixer = saved.get("fixer") or fixer
                 self.values["fixer"] = fixer
                 rc = fix.fix_pr(runner, pr, wt, fixer, f"the reviewer agent (round {round})", "", fix_head)
             else:

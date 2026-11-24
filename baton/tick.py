@@ -597,7 +597,8 @@ class Tick:
 
     # --- pick work: an agent PR the owner labelled agent-fix --------------------------------------
     def fix_push_episodes(self):
-        found = owner_handoff.operation_episodes(self.env, (owner_handoff.FIX_PUSH,))
+        found = owner_handoff.operation_episodes(
+            self.env, (owner_handoff.FIX_PUSH, *owner_handoff.FIX_META_WRITES))
         for flag in self.state.glob("fix-push-waiting-*"):
             pr = flag.name.removeprefix("fix-push-waiting-")
             if not pr.isdecimal() or pr in found:
@@ -745,18 +746,33 @@ class Tick:
         issue = episode if episode != pr else ""
         runner = fix.Runner(self.env.with_runtime(issue=issue, pr=pr), self.hooks(issue, pr), pr)
         waiting = runner.waiting_push(pr)
-        if waiting is None or waiting == "unreadable":
-            if waiting == "unreadable":
+        waiting_meta = None
+        if waiting is None:
+            for meta_reason in owner_handoff.FIX_META_WRITES:
+                waiting_meta = runner.waiting_meta(pr, meta_reason)
+                if waiting_meta is not None:
+                    break
+        if (waiting is None and waiting_meta is None) or waiting == "unreadable" or waiting_meta == "unreadable":
+            if waiting == "unreadable" or waiting_meta == "unreadable":
                 pr_helpers.gh("pr", "edit", pr, "-R", self.gh_repo, "--remove-label", "agent-fix")
             return 80
-        binding = waiting["continuation"]
-        if len(episodes) != 1 or binding["caller"] != "standalone":
-            for key in episodes - {episode}:
-                owner_handoff.clear_retry(self.env, key, owner_handoff.FIX_PUSH, pr)
-            runner.handoff(pr, owner_handoff.FIX_PUSH, f"PR #{pr}: pushing fix failed",
-                           "The saved push has no matching caller.")
-            return self.finish_standalone_fix(pr, "", "", "", issue, 1)
-        issue, wt, fixer = binding["issue"], binding["wt"], binding["fixer"]
+        if waiting is not None:
+            binding = waiting["continuation"]
+            if len(episodes) != 1 or binding["caller"] != "standalone":
+                for key in episodes - {episode}:
+                    owner_handoff.clear_retry(self.env, key, owner_handoff.FIX_PUSH, pr)
+                runner.handoff(pr, owner_handoff.FIX_PUSH, f"PR #{pr}: pushing fix failed",
+                               "The saved push has no matching caller.")
+                return self.finish_standalone_fix(pr, "", "", "", issue, 1)
+            issue, wt, fixer = binding["issue"], binding["wt"], binding["fixer"]
+        else:
+            binding = waiting_meta["continuation"]
+            issue = binding.get("issue") or issue
+            fixer = binding.get("fixer") or "fixer"
+            # Metadata writes keep no worktree path; reopen from the live head when needed.
+            head_ref = (self.gh("pr", "view", pr, "-R", self.gh_repo, "--json", "headRefName",
+                                "--jq", ".headRefName") or "").strip()
+            wt = str(names.worktree_for(self.wt_root, head_ref)) if head_ref else ""
         feedback_file = self.state / f"owner-fix-feedback-{pr}"
         feedback = (review.format_fix_feedback(*self.cached_owner_feedback(feedback_file))
                     if feedback_file.is_file() else "")

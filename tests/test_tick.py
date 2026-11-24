@@ -2326,7 +2326,7 @@ def test_a_forced_fix_push_without_a_label_is_resumed_by_the_scheduler(ctx, work
 
     monkeypatch.setattr(fix.dispatch, "dispatch", worker)
     monkeypatch.setattr(fix, "push", push)
-    monkeypatch.setattr(fix.Runner, "refresh_checks", lambda *a: 0)
+    monkeypatch.setattr(fix.Runner, "refresh_checks", lambda *a, **k: 0)
     assert ctx.make("pr", "20").run() == 75
     if changed == "branch":
         sh(worktree.wt, "git", "checkout", "-qb", "unrelated")
@@ -2346,7 +2346,7 @@ def test_a_forced_fix_push_without_a_label_is_resumed_by_the_scheduler(ctx, work
     assert ctx.make("pr", "21").run() == 2
     assert pushes == [1_000] and "handoff fix_" not in ctx.log()
     if changed == "interrupted continuation":
-        def interrupt(*args):
+        def interrupt(*args, **kwargs):
             raise InterruptedError("stopped during checks refresh")
 
         with monkeypatch.context() as stopped:
