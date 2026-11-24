@@ -274,12 +274,20 @@ def review_excluded(state, pr, fixed_by=""):
     return fixed_by.split() if fixed_by else _lines(state_path(state, pr, "authors"))
 
 
-def codex_review_mode(state, pr, model):
-    """How a Codex reviewer may audit Codex code: with a different model, or, as the last
-    resort, with the same model in a fresh session (every review run starts one). "" when a
-    model is not proven: unknown authors are never review eligible."""
+def same_vendor_review(vendor):
+    """VENDOR may review its own code on a proven model (SAME_VENDOR_REVIEW)."""
+    adapter = agents.ADAPTERS.get(vendor)
+    return bool(adapter and adapter.SAME_VENDOR_REVIEW)
+
+
+def same_vendor_review_mode(state, pr, vendor, model):
+    """How a same-vendor reviewer may audit its own code: with a different model, or, as the last
+    resort, with the same model in a fresh session (every review run starts one). "" when the
+    adapter does not allow it or a model is not proven: unknown authors are never review eligible."""
+    if not same_vendor_review(vendor):
+        return ""
     written = [row.split(maxsplit=1)[1] for row in _lines(state_path(state, pr, "author-models"))
-               if row.startswith("codex ")]
+               if row.startswith(f"{vendor} ")]
     if not (model and model != "unknown" and written and "unknown" not in written):
         return ""
     return "same-model-fresh-context" if model in written else "same-vendor-different-model"
@@ -288,7 +296,7 @@ def codex_review_mode(state, pr, model):
 def review_allowed(state, pr, vendor, model="", fixed_by=""):
     if vendor not in review_excluded(state, pr, fixed_by):
         return True
-    return vendor == "codex" and bool(codex_review_mode(state, pr, model))
+    return bool(same_vendor_review_mode(state, pr, vendor, model))
 
 
 def screenshot_allowed(state, pr, vendor, model="", fixed_by=""):
@@ -296,7 +304,7 @@ def screenshot_allowed(state, pr, vendor, model="", fixed_by=""):
     other than the one that wrote it (a same-model fresh session does not count)."""
     if vendor not in review_excluded(state, pr, fixed_by):
         return True
-    return vendor == "codex" and codex_review_mode(state, pr, model) == "same-vendor-different-model"
+    return same_vendor_review_mode(state, pr, vendor, model) == "same-vendor-different-model"
 
 
 def _quota_horizon(state, vendor, now):
@@ -377,24 +385,27 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
     preferred = f"preferred for {prefer_label}: {' '.join(prefer)}; " if prefer else ""
     excluded = set(exclude)
     shots = role == "screenshot_reviewer"
-    same_vendor_review = False
+    fallback = ""
     review_mode = "same-vendor-different-model"
     if review:
         excluded.update(review_excluded(pr_state, pr, fixed_by))
-        if "codex" in excluded and "codex" in candidates:
-            review_mode = codex_review_mode(pr_state, pr, session.resolve().config.models.route(
-                "screenshot_review" if shots else "review", "codex").model)
-            same_vendor_review = review_mode == "same-vendor-different-model" if shots else bool(review_mode)
+        for same in candidates:
+            if same not in excluded or not same_vendor_review(same):
+                continue
+            mode = same_vendor_review_mode(pr_state, pr, same, session.resolve().config.models.route(
+                "screenshot_review" if shots else "review", same).model)
+            if mode == "same-vendor-different-model" if shots else mode:
+                fallback, review_mode = same, mode
+                break
         review_pool = [v for v in (candidates if shots else all_vendors(pool, extra=extra)) if v in eligible]
-        if review_pool and all(v in excluded for v in review_pool) and not same_vendor_review:
+        if review_pool and all(v in excluded for v in review_pool) and not fallback:
             return {"vendor": "", "reason": "all eligible reviewers excluded by authorship",
                     "probe": [], "blocked": {}, "exhausted": True}, 0
     if role in ("reviser", "spec_reviewer") and "codex" in excluded and "codex" in candidates:
         route_role = "spec" if role == "reviser" else "spec_review"
         model = session.resolve().config.models.route(route_role, "codex").model
-        same_vendor_review = bool(other_model and other_model != "unknown" and model
-                                  and model != other_model)
-    fallback = "codex" if same_vendor_review else ""
+        if other_model and other_model != "unknown" and model and model != other_model:
+            fallback = "codex"
     if fallback and fallback not in eligible:
         fallback = ""
     if role == "reviser" and "claude" in excluded and "claude" in candidates:

@@ -762,7 +762,8 @@ class Review:
     def review_followup(self, round, reviewer):
         """A later round mostly re-checks the fix commits, so it runs on the cheaper model. Codex keeps
         its usual one on code Codex wrote: the two must be different models."""
-        return round > 1 and not (reviewer == "codex" and "codex" in vendors.review_excluded(self.state, self.pr, self.fixed_by))
+        return round > 1 and not (vendors.same_vendor_review(reviewer)
+                                  and reviewer in vendors.review_excluded(self.state, self.pr, self.fixed_by))
 
     def agent(self, vendor, role, prompt, tag, settings="", output="", env=None):
         """One agent run in the worktree; Deferred when the vendor cannot run now."""
@@ -898,9 +899,9 @@ class Review:
         if not self.review_allowed(reviewer, model):
             return self.failed(ALREADY, "RESULT: failed actual reviewer model may be a PR author")
         review_note = ""
-        if reviewer == "codex" and "codex" in vendors.review_excluded(self.state, pr, self.fixed_by):
-            mode = vendors.codex_review_mode(self.state, pr, model)
-            review_note = f"Review mode: {mode} (codex/{model}).\n\n"
+        if vendors.same_vendor_review(reviewer) and reviewer in vendors.review_excluded(self.state, pr, self.fixed_by):
+            mode = vendors.same_vendor_review_mode(self.state, pr, reviewer, model)
+            review_note = f"Review mode: {mode} ({reviewer}/{model}).\n\n"
         if outcome.startswith(REVIEWED):
             if review_file.is_file() and review_file.stat().st_size:
                 body = strip_markers(review_file.read_text()).rstrip("\n")
@@ -971,9 +972,9 @@ class Review:
         if outcome.startswith(REVIEWED):
             if review_file.is_file() and review_file.stat().st_size:
                 body = strip_markers(review_file.read_text()).rstrip("\n")
-                mode = (vendors.codex_review_mode(self.state, pr, model)
-                        if vendor == "codex" and "codex" in vendors.review_excluded(self.state, pr, self.fixed_by) else "")
-                review_note = f"Review mode: {mode} (codex/{model}).\n\n" if mode else ""
+                mode = (vendors.same_vendor_review_mode(self.state, pr, vendor, model)
+                        if vendor in vendors.review_excluded(self.state, pr, self.fixed_by) else "")
+                review_note = f"Review mode: {mode} ({vendor}/{model}).\n\n" if mode else ""
                 posted_body = f"<!-- baton-screenshot-review round={round} by={vendor} -->\n{review_note}{body}"
                 binding = self.comment_post_binding(posted_body, round, outcome, vendor, head, data)
                 return self.post_screenshot_comment(round, vendor, binding)

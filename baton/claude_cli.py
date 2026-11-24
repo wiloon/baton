@@ -20,6 +20,7 @@ SKIP_SCREENSHOT_AFTER_REVIEW = False
 ROUTE_FIELDS = frozenset({"model", "effort", "subagent_model"})
 EMPTY_MODEL_OK = False
 RECORDS_AUTHOR_MODEL = False
+SAME_VENDOR_REVIEW = False
 DEFAULT_MAX_MINUTES = 150
 PREFLIGHT_CHECKS = (("claude", "--version"),)
 VERSION_EXECUTABLE = "claude"

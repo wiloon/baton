@@ -117,6 +117,11 @@ def test_stub_is_registered_with_declared_capabilities():
     assert stub.FIX_SCOPE_POLICY == "must_fix_nits_optional"
 
 
+def test_adapters_declare_same_vendor_review():
+    assert {name: a.SAME_VENDOR_REVIEW for name, a in agents.ADAPTERS.items()} == {
+        "claude": False, "codex": True, "cursor": False, "stub": False}
+
+
 def test_config_load_admits_stub_and_rejects_unsupported_role(tmp_path):
     path = tmp_path / "config.toml"
     path.write_text(with_stub(full_text()))

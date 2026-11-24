@@ -303,8 +303,8 @@ class VendorTests(unittest.TestCase):
             self.assertEqual(result["review_mode"], "same-model-fresh-context")
         # A PR written by two Codex models is still reviewable by either.
         vendors.record_author_model(self.state, "16", "codex", "gpt-6.1-terra")
-        self.assertEqual(vendors.codex_review_mode(self.state, "16", "gpt-6.1-terra"), "same-model-fresh-context")
-        self.assertEqual(vendors.codex_review_mode(self.state, "16", "gpt-6.2"), "same-vendor-different-model")
+        self.assertEqual(vendors.same_vendor_review_mode(self.state, "16", "codex", "gpt-6.1-terra"), "same-model-fresh-context")
+        self.assertEqual(vendors.same_vendor_review_mode(self.state, "16", "codex", "gpt-6.2"), "same-vendor-different-model")
 
     def test_review_does_not_accept_an_unknown_codex_model(self):
         for vendor in ("claude", "cursor"):
