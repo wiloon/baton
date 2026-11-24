@@ -2248,3 +2248,116 @@ def test_a_deferred_replacement_description_preserves_the_owners_issue_correctio
     gh.fail("edit-before-write", False)
     assert run.fix("cursor")["rc"] == 1 and run.labelled()
     assert run.body() == corrected and len(run.agent_calls) == 1
+
+# --- stage 2 fix capability routing (#113) -------------------------------------------------
+
+def test_adapters_declare_fix_capabilities():
+    from baton import agents
+    expected = {
+        "claude": ("fix-prompt.md", "settings", False),
+        "codex": ("codex-fix-prompt.md", "denied", False),
+        "cursor": ("cursor-fix-prompt.md", "runner", True),
+        "stub": ("stub-fix-prompt.md", "runner", True),
+    }
+    for vendor, (template, access, reply) in expected.items():
+        adapter = agents.ADAPTERS[vendor]
+        assert adapter.FIX_TEMPLATE == template
+        assert adapter.GITHUB_ACCESS == access
+        assert adapter.FIX_RESUMABLE_VIA_REPLY is reply
+
+
+def _admit_stub_fixer(run, monkeypatch):
+    from dataclasses import replace
+    from baton import config, session
+    from conftest import full_text
+    from test_adapter_capabilities import with_stub
+
+    path = Path(run.root, "stub-fix.toml")
+    path.write_text(with_stub(full_text()))
+    cfg = config.load(path, home=run.root / "home")
+    cfg = replace(cfg, paths=replace(cfg.paths, self_dir=run.bin,
+                                     state=Path(os.environ["STATE"]),
+                                     logs=Path(os.environ["LOGS"]),
+                                     ctx=Path(os.environ["CTX"])))
+    sess = session.create(cfg, repo=cfg.repos[0])
+    sess = replace(sess, dirs=replace(
+        sess.dirs, state=Path(os.environ["STATE"]), logs=Path(os.environ["LOGS"]),
+        ctx=Path(os.environ["CTX"])))
+
+    def resolve(value=None):
+        if isinstance(value, session.Session):
+            return value
+        return sess
+
+    monkeypatch.setattr(session, "resolve", resolve)
+    return sess
+
+
+@pytest.mark.parametrize("fixer", ["claude", "codex", "cursor"])
+def test_fix_templates_come_from_the_adapter(run, fixer):
+    from baton import agents
+    adapter = agents.ADAPTERS[fixer]
+    if adapter.FIX_RESUMABLE_VIA_REPLY:
+        run.agent(cursor_plan("## Must fix\nnone\n\n## Checks to verify\nnone\n\nRESULT: fixed"))
+    else:
+        run.agent({"file": "## Must fix\nnone\n\n## Checks to verify\nnone\n\nRESULT: fixed\n"})
+    assert run.fix(fixer)["rc"] == 0
+    prompt = run.prompts[0]
+    assert adapter.FIX_TEMPLATE.replace(".md", "") in prompt or "unattended" in prompt.lower() or "coding agent" in prompt.lower() or "You are" in prompt
+    if adapter.FIX_RESUMABLE_VIA_REPLY:
+        assert f"pr-{PR}-body.md" in prompt
+        assert not run.agent_calls[0][3]   # no req.output artifact
+    else:
+        assert run.agent_calls[0][3]  # artifact path names an output file
+        assert str(Path(os.environ["CTX"]) / f"pr-{PR}-description.md") in prompt or f"pr-{PR}-description.md" in prompt
+
+
+def test_stub_reply_fix_posts_baton_fix_by_stub(run, monkeypatch):
+    _admit_stub_fixer(run, monkeypatch)
+    run.agent(cursor_plan("## Must fix\nnone\n\n## Checks to verify\nnone\n\nRESULT: fixed"))
+    assert run.fix("stub")["rc"] == 0
+    assert run.comments()[0].startswith("<!-- baton-fix by=stub -->")
+    assert run.agent_calls[0][0] == "stub"
+    assert run.agent_calls[0][2] == f"pr-{PR}-stub-fix"
+    assert not run.agent_calls[0][3]
+    assert "Stub" in run.prompts[0]
+    assert f"pr-{PR}-body.md" in run.prompts[0]
+
+
+def test_stub_same_producer_description_retry_skips_cli(run, monkeypatch, gh):
+    _admit_stub_fixer(run, monkeypatch)
+    request = BODY.replace("## Checks to verify\nnone", "## Checks to verify\n- /billing: stub badge")
+    run.agent(cursor_plan("## Checks to verify\n- /billing: stub badge\n\nRESULT: fixed", request=request))
+    gh.fail("edit")
+    assert run.fix("stub")["rc"] == 75
+    assert len(run.agent_calls) == 1 and not run.labelled()
+    gh.fail("edit", False)
+    assert run.fix("stub")["rc"] == 0 and len(run.agent_calls) == 1
+    assert section(run.body(), "Checks to verify") == "- /billing: stub badge"
+
+
+@pytest.mark.parametrize("fixer", ["cursor", "claude"])
+def test_finish_verified_uses_reply_capability_for_push_ref(run, monkeypatch, fixer):
+    """Reply-protocol fixers push the branch tip; artifact fixers push HEAD."""
+    from baton import agents
+    seen = []
+    real = fix.Runner.push_with_retry
+
+    def tracking(self, pr, wt, ref, **kwargs):
+        seen.append((kwargs.get("fixer"), ref, kwargs.get("clear_cursor")))
+        return real(self, pr, wt, ref, **kwargs)
+
+    monkeypatch.setattr(fix.Runner, "push_with_retry", tracking)
+    if agents.ADAPTERS[fixer].FIX_RESUMABLE_VIA_REPLY:
+        run.agent(cursor_plan("RESULT: fixed"))
+    else:
+        run.agent({"file": "RESULT: fixed\n"})
+    assert run.fix(fixer)["rc"] == 0
+    fixer_seen, ref, clear = seen[-1]
+    assert fixer_seen == fixer
+    if agents.ADAPTERS[fixer].FIX_RESUMABLE_VIA_REPLY:
+        assert ref == "cursor/issue-1"
+        assert clear is True
+    else:
+        assert ref == "HEAD"
+        assert not clear

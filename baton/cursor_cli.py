@@ -34,6 +34,7 @@ LEGACY_SEED_WITH_OWNER = False
 UNMARKED_AUTHOR_INFERENCE = False
 GITHUB_ACCESS = "runner"
 FIX_RESUMABLE_VIA_REPLY = True
+FIX_TEMPLATE = "cursor-fix-prompt.md"
 READONLY_RESET = True
 REVIEW_TEMPLATE = "cursor-review-prompt.md"
 REVIEW_DELIVERY = "reply"

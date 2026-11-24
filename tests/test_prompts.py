@@ -58,7 +58,7 @@ def test_fix_prompts_route_description_fixes_through_the_runner():
 
 
 def test_fix_prompts_answer_nits_in_the_form_the_runner_reads():
-    for name in ("fix-prompt.md", "codex-fix-prompt.md", "cursor-fix-prompt.md"):
+    for name in ("fix-prompt.md", "codex-fix-prompt.md", "cursor-fix-prompt.md", "stub-fix-prompt.md"):
         assert "`## Nits` section" in text(name), name
         assert "`- <citation> adopted — what you changed`" in text(name), name
 
@@ -143,7 +143,8 @@ RUN_IT = "run it yourself and report its output"
 UNPROVEN = "without the quoted command and its exact error is Must fix"
 
 
-@pytest.mark.parametrize("name", ["dev-prompt.md", "fix-prompt.md", "codex-fix-prompt.md", "cursor-fix-prompt.md"])
+@pytest.mark.parametrize("name", ["dev-prompt.md", "fix-prompt.md", "codex-fix-prompt.md",
+                                  "cursor-fix-prompt.md", "stub-fix-prompt.md"])
 def test_authors_try_before_claiming_a_limit_and_run_terminal_checks(name):
     prompt = text(name)
     assert TRY_FIRST in prompt
@@ -190,6 +191,7 @@ def first_line(name):
 @pytest.mark.parametrize("name, role_partial", [
     ("dev-prompt.md", None),
     ("fix-prompt.md", "fix-reply"), ("codex-fix-prompt.md", "fix-reply"), ("cursor-fix-prompt.md", "fix-reply"),
+    ("stub-fix-prompt.md", "fix-reply"),
     ("review-prompt.md", "checks-review"), ("codex-review-prompt.md", "checks-review"),
     ("cursor-review-prompt.md", "checks-review"),
     ("spec-prompt.md", "checks-keep"), ("codex-spec-prompt.md", "checks-keep"),
