@@ -1072,8 +1072,8 @@ class Runner:
             return PUSH_SUPERSEDED, False, "", False, False
         if status == "landed":
             self.clear_description_write(pr)
-            if binding["fixer"] == "cursor":
-                # Cursor keeps its request and baseline until the fix completes, so a crash
+            if agents.ADAPTERS[binding["fixer"]].FIX_RESUMABLE_VIA_REPLY:
+                # A reply fixer keeps its request and baseline until the fix completes, so a crash
                 # replays the landed edit as progress (clear_cursor_request removes them).
                 pass
             else:
@@ -1417,7 +1417,7 @@ class Runner:
         body_changed, description_reason, task_changed, discarded = False, "", False, False
         if has_request:
             rc, body_changed, description_reason, task_changed, discarded = self.write_description(
-                pr, str(request), want=want or "", fixer="cursor", resume=resume,
+                pr, str(request), want=want or "", fixer=fixer, resume=resume,
                 baseline=baseline_file, wt=str(wt))
             if rc == PUSH_SUPERSEDED:
                 return rc
@@ -1494,13 +1494,13 @@ class Runner:
                     validation_error=log)
                 if action == "handoff":
                     return 1
-                self.clear_cursor_request(pr, keep_base=True)
+                self.clear_reply_request(pr, fixer, keep_base=True)
                 return self.dispatch_fixer(pr, wt, alt, source, correction(feedback, log), saved["head"])
         else:
             saved = {**saved, "description_changed": bool(body_changed)}
         branch = git(wt, "branch", "--show-current") or ""
-        return self.finish_cursor_fix(
-            pr, wt, branch, url, source, feedback, saved["head"], agent_head=saved["agent_head"],
+        return self.finish_reply_fix(
+            pr, wt, fixer, branch, url, source, feedback, saved["head"], agent_head=saved["agent_head"],
             body_changed=saved["description_changed"], task_changed=task_changed, discarded=discarded,
             description_reason=description_reason)
 
@@ -1670,7 +1670,7 @@ def fix_pr(runner, pr, wt, fixer, source, feedback, head="", *, owner_triggered=
     if waiting_description == "unreadable":
         return 1
     if (isinstance(waiting_description, dict)
-            and not Path(runner.state, f"{fixer}-fix-base-{pr}").is_file()):
+            and waiting_description["continuation"]["fixer"] != fixer):
         # Another fixer never applies a pending description it did not write: drop it.
         runner.clear_description_write(pr)
         for name, adapter in agents.ADAPTERS.items():

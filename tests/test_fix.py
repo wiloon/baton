@@ -2568,3 +2568,8 @@ print(json.dumps({{"type": "result", "subtype": "success", "model": "stub-1", "r
     assert run.fix("stub")["rc"] == 0
     assert section(run.body(), "What changed") == replacement
     assert calls.read_text().splitlines() == ["stub-agent"]
+    state = Path(os.environ["STATE"])
+    assert (state / f"pr-{PR}-authors").read_text().split() == ["stub"]
+    assert not (state / f"stub-fix-base-{PR}").exists()
+    assert not (state / f"stub-fix-task-{PR}").exists()
+    assert not (state / f"cursor-fix-base-{PR}").exists()
