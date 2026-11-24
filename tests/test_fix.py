@@ -2292,5 +2292,88 @@ def test_claude_discards_a_description_at_once_when_the_edit_is_confirmed_absent
     # The discarded description made no progress, so the no-commit fix takes fix_no_commit.
     assert run.fix("claude")["rc"] == 1 and len(run.agent_calls) == 1
     assert any("made no commit" in line for line in run.runner_log())
-    assert set(edits) == {1_000} and "Corrected description" not in run.body()
+    # Each repeat follows a lookup that confirmed the body unchanged (section 3).
+    assert len(edits) == len(fix.pr_helpers.BACKOFF) + 1 and "Corrected description" not in run.body()
     assert sum("baton-description-discarded" in c for c in run.comments()) == 1
+
+
+def _body_view_fails(monkeypatch, *, landed=False, views_failing=10_000):
+    """Edits answer 503 (after landing, if LANDED); the first VIEWS_FAILING body views error."""
+    import subprocess
+    from baton import handoff
+
+    clock, edits, views = {"now": 1_000}, [], {"n": 0}
+    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
+    monkeypatch.setattr(fix.pr_helpers, "sleep", lambda *_: None)
+    call = fix.pr_helpers.call
+
+    def wrapped(*args, input=None, limit=None):
+        if args[:2] == ("pr", "edit") and "--body-file" in args:
+            edits.append(clock["now"])
+            if landed:
+                call(*args, input=input, limit=limit)
+            return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+        if args[:2] == ("pr", "view") and edits and "body" in " ".join(args):
+            views["n"] += 1
+            if views["n"] <= views_failing:
+                return subprocess.CompletedProcess(args, 1, "", "HTTP 404 unreadable")
+        return call(*args, input=input, limit=limit)
+
+    monkeypatch.setattr(fix.pr_helpers, "call", wrapped)
+    return clock, edits
+
+
+_CLAUDE_DESCRIPTION = {"commit": False, "description": BODY.replace("Disabled buttons.", "Corrected description"),
+                       "file": "## Must fix\n1. adopted\n\n## Checks to verify\nnone\n\nRESULT: fixed\n"}
+
+
+def test_claude_does_not_resend_a_lost_description_edit_that_landed(run, monkeypatch):
+    _, edits = _body_view_fails(monkeypatch, landed=True, views_failing=0)
+    run.agent(_CLAUDE_DESCRIPTION)
+    assert run.fix("claude")["rc"] == 0
+    assert edits == [1_000] and "Corrected description" in run.body()
+    assert not any("baton-description-discarded" in c for c in run.comments())
+    assert not any("made no commit" in line for line in run.runner_log())
+
+
+def test_an_unreadable_description_lookup_discards_with_could_not_confirm(run, monkeypatch):
+    _, edits = _body_view_fails(monkeypatch, views_failing=2)
+    run.agent(_CLAUDE_DESCRIPTION)
+    run.fix("claude")
+    assert edits == [1_000]
+    discards = [c for c in run.comments() if "baton-description-discarded" in c]
+    assert len(discards) == 1 and "could not confirm" in discards[0]
+
+
+def test_an_unreadable_lookup_that_later_finds_the_edit_landed_counts_it(run, monkeypatch):
+    _, edits = _body_view_fails(monkeypatch, landed=True, views_failing=2)
+    run.agent(_CLAUDE_DESCRIPTION)
+    assert run.fix("claude")["rc"] == 0
+    assert edits == [1_000] and "Corrected description" in run.body()
+    assert not any("baton-description-discarded" in c for c in run.comments())
+    assert not any("made no commit" in line for line in run.runner_log())
+
+
+def test_a_consumed_cursor_description_attempt_is_not_repeated_after_an_interrupted_tick(run, monkeypatch):
+    clock, edits = _flaky_edits(monkeypatch, fail_until=10_000)
+    run.agent(cursor_plan("## Checks to verify\nnone\n\nRESULT: fixed",
+                          request=BODY.replace("Disabled buttons.", "Corrected description")))
+    assert run.fix("cursor")["rc"] == 75
+    first = len(edits)
+    clock["now"] = 1_060
+    call = fix.pr_helpers.call
+
+    def boom(*args, input=None, limit=None):
+        if args[:2] == ("pr", "view"):
+            raise RuntimeError("tick killed")
+        return call(*args, input=input, limit=limit)
+
+    monkeypatch.setattr(fix.pr_helpers, "call", boom)
+    with pytest.raises(RuntimeError):
+        run.fix("cursor")
+    monkeypatch.setattr(fix.pr_helpers, "call", call)
+    assert run.fix("cursor")["rc"] == 75
+    assert len(edits) == first   # the consumed attempt made no edit and was not repeated
+    clock["now"] = 1_360
+    assert run.fix("cursor")["rc"] == 0   # attempt two was the last: it discards
+    assert edits.count(1_360) == first and len(edits) == 2 * first

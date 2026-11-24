@@ -28,6 +28,7 @@ from .common import Deferred, Exhausted, child_env, git, push, strip_markers
 
 REPLY_CAP = 60000
 PUSH_SUPERSEDED = 80
+UNCONFIRMED_DESCRIPTION = "The runner could not confirm whether the description edit landed"
 # The verify output a repair run gets in its prompt: the tail, where the errors are. The whole
 # output stays in the failure file (#38: a Claude agent could not read the ctx dir with the shell).
 FAILURE_PROMPT_CAP = 20000
@@ -51,6 +52,7 @@ class Runner:
         self.gate_applies = True   # dev.run clears it for a partial slice
         self.handed_off = False    # set once handoff() labels the PR; callers tell it apart from rc 1
         self.push_feedback = None
+        self.changed_input = ""
         self.ci_failed_head = ""
         self.push_caller = "ci" if round == "ci" else "review" if round else "standalone"
         self.last_fixer = ""
@@ -638,11 +640,13 @@ class Runner:
             if feedback is None:
                 return "retry"
             if feedback != binding["feedback"]:
+                self.changed_input = "the owner feedback"
                 return "changed"
         head = data.get("headRefOid")
         if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
             return "retry"
         if head != binding["head"]:
+            self.changed_input = "the PR head"
             return "changed"
         body = (data.get("body") or "").rstrip("\n")
         if body == binding["intended"]:
@@ -652,6 +656,7 @@ class Runner:
         if pending_description and body == pending_description:
             # Section 5: a failed description edit that landed after all is the new starting body.
             return "absent" if binding["intended"] != pending_description else "landed"
+        self.changed_input = "the PR description"
         return "changed"
 
     def capture_head(self, pr):
@@ -858,7 +863,7 @@ class Runner:
             now = int(owner_handoff.clock())
             if pending["attempts"] >= owner_handoff.MAX_ATTEMPTS:
                 # A restart after attempt two: no third try (#151).
-                detail = binding.get("last_reason") or "GitHub could not update the PR description"
+                detail = binding.get("last_reason") or UNCONFIRMED_DESCRIPTION
                 if request:
                     pr_helpers.remove_body_request(Path(request))
                 self.clear_description_write(pr)
@@ -958,9 +963,20 @@ class Runner:
         def reconcile():
             return self.check_meta_write(pr, binding)
 
+        original = pending
+        if pending is not None and not initial and budgeted:
+            # Consume first: a crash after this point must not repeat the attempt (#151).
+            now = int(owner_handoff.clock())
+            used = pending["attempts"] + 1
+            pending = {**pending, "attempts": used, "scheduled": now,
+                       "due": now + owner_handoff.DELAYS[min(used, owner_handoff.MAX_ATTEMPTS - 1)]}
+            owner_handoff.restore_retry(self.env, episode, reason, str(pr), pending)
+        self.changed_input = ""
+
         # Initial attempt just read the body while building the binding; resume revalidates first.
         status = "absent" if initial else reconcile()
         edited = None
+        unconfirmed = status == "retry"
         if status == "absent":
             body_text = prepared if prepared is not None else binding["intended"] + "\n"
             if not body_text.endswith("\n"):
@@ -972,15 +988,19 @@ class Runner:
             try:
                 edited = pr_helpers.gh(
                     "pr", "edit", str(pr), "-R", self.repo, "--body-file", file.name,
-                    reconcile=reconcile if pending is not None else None)
+                    reconcile=reconcile if pending is not None
+                    else (lambda: self._description_after_failure(pr, binding)))
             finally:
                 Path(file.name).unlink(missing_ok=True)
             if edited.returncode == 0:
                 status = "landed"
             else:
                 status = reconcile() if pending is not None else self._description_after_failure(pr, binding)
+                unconfirmed = status == "retry"
                 if status in ("absent", "retry"):
                     if not pr_helpers.transient(edited):
+                        if unconfirmed:
+                            return {"status": "discard", "detail": UNCONFIRMED_DESCRIPTION, "unconfirmed": True}
                         return {"status": "discard",
                                 "detail": f"GitHub could not update the PR description{pr_helpers.why(edited)}"}
                     status = "retry"
@@ -993,27 +1013,29 @@ class Runner:
             return {"status": "superseded"}
         if status == "paused":
             if pending is not None:
-                owner_handoff.restore_retry(self.env, episode, reason, str(pr), pending)
+                owner_handoff.restore_retry(self.env, episode, reason, str(pr), original)
             raise Deferred("handoff-retry", reason, lends_slot=False)
         if status == "changed":
-            return {"status": "discard", "detail": "the PR description changed during the edit"}
+            return {"status": "discard",
+                    "detail": f"{self.changed_input or 'the PR description'} changed during the edit"}
         if status == "retry" and not budgeted:
-            detail = ("GitHub could not confirm whether the description edit landed"
-                      if edited is None
-                      else f"GitHub could not update the PR description{pr_helpers.why(edited)}")
-            return {"status": "discard", "detail": detail}
-        attempts = (pending or {}).get("attempts", 0) + (0 if initial else 1)
+            if unconfirmed or edited is None:
+                return {"status": "discard", "detail": UNCONFIRMED_DESCRIPTION, "unconfirmed": True}
+            return {"status": "discard",
+                    "detail": f"GitHub could not update the PR description{pr_helpers.why(edited)}"}
+        attempts = (pending or {}).get("attempts", 0)
         if status == "retry" and pending is not None and attempts < owner_handoff.MAX_ATTEMPTS:
-            now = int(owner_handoff.clock())
-            owner_handoff.restore_retry(
-                self.env, episode, reason, str(pr),
-                {**pending, "attempts": attempts, "scheduled": now,
-                 "due": now + owner_handoff.DELAYS[attempts]})
             notify.log(f"PR #{pr}: description update deferred after GitHub failure")
+            if initial:
+                now = int(owner_handoff.clock())
+                owner_handoff.restore_retry(
+                    self.env, episode, reason, str(pr),
+                    {**pending, "scheduled": now, "due": now + owner_handoff.DELAYS[0]})
             raise Deferred("handoff-retry", reason, lends_slot=False)
-        detail = ("GitHub could not update the PR description"
-                  + (pr_helpers.why(edited) if edited is not None else ""))
-        return {"status": "discard", "detail": detail}
+        if unconfirmed or edited is None:
+            return {"status": "discard", "detail": UNCONFIRMED_DESCRIPTION, "unconfirmed": True}
+        return {"status": "discard",
+                "detail": f"GitHub could not update the PR description{pr_helpers.why(edited)}"}
 
     def _description_after_failure(self, pr, binding):
         """Classify the body after a failed description edit with no saved retry yet."""
@@ -1034,6 +1056,11 @@ class Runner:
                             text_changed=None):
         """Finish a description attempt: clear state, discard, or report progress."""
         status = outcome["status"]
+        if status == "discard" and outcome.get("unconfirmed") and self._description_after_failure(
+                pr, binding) == "landed":
+            # The edit landed after all: count it and skip the discard (section 5).
+            outcome = {"status": "landed"}
+            status = "landed"
         if status == "superseded":
             if request:
                 pr_helpers.remove_body_request(Path(request))
