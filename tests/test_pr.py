@@ -263,9 +263,11 @@ def test_body_retry_recognizes_a_write_with_a_lost_response(gh, dirs, tmp_path):
     request = tmp_path / "request.md"
     request.write_text("Refs #297\n\nCorrected description")
     gh.fail("edit")
+    assert pr.apply_body(335, request, state, ctx) == (
+        1, False, "GitHub could not update the PR description", False)
+    gh.fail("edit", False)
     assert pr.apply_body(335, request, state, ctx) == (0, True, "", False)
-    assert "Corrected description" in gh.pr["body"]
-    assert len(edits(gh)) == 1   # the lost response still counted as one write
+    assert len(edits(gh)) == 1   # the retry found the body already written
 
 
 def test_body_without_task_validates_against_the_current_completion(gh, dirs, tmp_path):

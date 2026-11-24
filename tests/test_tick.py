@@ -927,59 +927,54 @@ def test_a_github_description_update_failure_does_not_lend_a_slot(ctx, monkeypat
     original_view = ctx.gh.answers["pr view"]
     feedback = "<!-- baton-review round=1 by=claude -->\nfix"
     head = sh(ctx.repo, "git", "rev-parse", "HEAD")
-    clock = {"now": 1_000}
-    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
-    monkeypatch.setattr(fix.pr_helpers, "sleep", lambda *_: None)
 
     def view_pr(args):
-        data = {"body": body, "headRefName": "agent/issue-5", "state": "OPEN",
-                "comments": [{"author": {"login": "owner"}, "body": feedback}],
-                "headRefOid": head, "baseRefName": "main"}
-        if "--jq" in args:
-            return data.get(args[args.index("--jq") + 1].lstrip("."), "")
         fields = args[args.index("--json") + 1] if "--json" in args else ""
         if fields == "body":
             return body
-        if fields:
-            return {k: data[k] for k in fields.split(",") if k in data}
+        if fields == "headRefName,body":
+            return {"headRefName": "agent/issue-5", "body": body}
+        if "comments" in fields:
+            return {"comments": [{"author": {"login": "owner"}, "body": feedback}], "state": "OPEN",
+                    "headRefName": "agent/issue-5", "headRefOid": head, "body": body, "baseRefName": "main"}
         return original_view(args)
 
     ctx.gh.answers["pr view"] = view_pr
     ctx.gh.answers["pr edit"] = lambda args: (
-        subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable") if "--body-file" in args else "")
+        subprocess.CompletedProcess(args, 1, "", "boom") if "--body-file" in args else "")
     ctx.path("pr-body-base-11").write_text(body)
     Path(ctx.env["CTX"], "pr-11-body.md").write_text(body + "\n## Summary\nCorrected description.\n")
     checkpoint(ctx, pr="11", step="fix", wt=str(ctx.repo), ISSUE="5", fix_head=head, feedback=feedback)
     monkeypatch.setattr(tick.Tick, "review_loop", ORIGINAL_REVIEW_LOOP)
     monkeypatch.setattr(pick, "choose", lambda *args, **kwargs: "cursor")
     assert ctx.make().pending_reviews() is None
-    assert list(Path(ctx.env["STATE"]).glob("handoff-*-*fix_description_write_failed.json"))
+    assert "PR #11: description update deferred after GitHub failure" in ctx.log()
     assert not ctx.path("slot-deferred-11").exists()
 
 
-def test_a_second_tick_finishes_a_deferred_description_edit(ctx, worktree, monkeypatch):
-    """Tick resumes a Cursor description write after the 60s budget (#151 section 5)."""
+@pytest.mark.parametrize("route", ["review", "owner", "switch", "switch-no-commit", "switch-review"])
+def test_a_second_tick_finishes_a_deferred_description_edit(ctx, worktree, monkeypatch, request, route):
     pr = "11"
     original = ("<!-- baton-task issue=297 completion=complete -->\n\nCloses #297\n\n"
                 "## Summary\nOld.\n\n## Checks to verify\nnone\n")
     live = original
-    labelled = False
+    resumes_review = route in ("review", "switch-review")
+    labelled = not resumes_review
     fail_edit = True
+    switched = False
     agent_calls, verified, reviewed, handoffs = [], [], [], []
-    clock = {"now": 1_000}
-    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
-    monkeypatch.setattr(fix.pr_helpers, "sleep", lambda *_: None)
     comments = [{"author": {"login": "owner"}, "createdAt": "2026-11-20T00:00:01Z",
-                 "body": "<!-- baton-review round=1 by=claude -->\nRevise the description."}]
+                 "body": "Revise the description."}]
+    if resumes_review:
+        comments[0]["body"] = "<!-- baton-review round=1 by=claude -->\nRevise the description."
     remote_before = sh(worktree.origin, "git", "rev-parse", worktree.branch)
 
     def view(args):
+        if "--jq" in args:
+            return live if args[-1] == ".body" else "OPEN"
+        fields = args[args.index("--json") + 1] if "--json" in args else ""
         data = {"body": live, "headRefName": worktree.branch, "state": "OPEN", "comments": comments,
                 "headRefOid": sh(worktree.origin, "git", "rev-parse", worktree.branch), "baseRefName": "main"}
-        if "--jq" in args:
-            jq = args[args.index("--jq") + 1].lstrip(".")
-            return data.get(jq, "")
-        fields = args[args.index("--json") + 1] if "--json" in args else ""
         if fields:
             return {k: data[k] for k in fields.split(",") if k in data}
         return data
@@ -987,9 +982,11 @@ def test_a_second_tick_finishes_a_deferred_description_edit(ctx, worktree, monke
     def edit(args):
         nonlocal live, labelled
         if "--body-file" in args:
-            if fail_edit:
-                return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
+            if fail_edit and route == "owner":
+                return subprocess.CompletedProcess(args, 1, "", "edit refused")
             live = Path(args[args.index("--body-file") + 1]).read_text()
+            if fail_edit:
+                return subprocess.CompletedProcess(args, 1, "", "lost response")
         if "--remove-label" in args and "agent-fix" in args:
             labelled = False
         if "--add-label" in args and "ready-for-human" in args:
@@ -998,13 +995,28 @@ def test_a_second_tick_finishes_a_deferred_description_edit(ctx, worktree, monke
 
     def agent(vendor, role, prompt, tag, cwd, settings, output, env, hooks):
         agent_calls.append(vendor)
-        assert vendor == "cursor"
-        (Path(cwd) / "cursor.txt").write_text("Cursor's fix.\n")
-        sh(cwd, "git", "add", "cursor.txt")
-        sh(cwd, "git", "commit", "-q", "-m", "Cursor fix")
-        Path(ctx.env["CTX"], f"pr-{pr}-body.md").write_text(original.replace("Old.", "Revised."))
-        return {**DONE, "outcome": "RESULT: fixed",
-                "reply": "## Checks to verify\nnone\n\nTASK: partial\nRESULT: fixed"}
+        if vendor == "cursor":
+            if agent_calls == ["cursor", "codex", "cursor"]:
+                return {**DONE, "outcome": "RESULT: fixed",
+                        "reply": "## Checks to verify\nnone\n\nRESULT: fixed"}
+            if route != "switch-no-commit":
+                (Path(cwd) / "cursor.txt").write_text("Cursor's fix.\n")
+                sh(cwd, "git", "add", "cursor.txt")
+                sh(cwd, "git", "commit", "-q", "-m", "Cursor fix")
+            Path(ctx.env["CTX"], f"pr-{pr}-body.md").write_text(original.replace("Old.", "Revised."))
+            return {**DONE, "outcome": "RESULT: fixed",
+                    "reply": "## Checks to verify\nnone\n\nTASK: partial\nRESULT: fixed"}
+        assert vendor == "codex"
+        assert Path(ctx.env["CTX"], f"pr-{pr}-description.md").read_text().rstrip("\n") == live.rstrip("\n")
+        Path(f"{output}.body").write_text(live)
+        if route in ("switch", "switch-review"):
+            Path(output).write_text("## Checks to verify\nnone\n\nRESULT: fixed\n")
+            request.addfinalizer(lambda: Path(output).unlink(missing_ok=True))
+        if route == "switch-review":
+            (Path(cwd) / "codex.txt").write_text("Codex's fix.\nAnother line.\n")
+            sh(cwd, "git", "add", "codex.txt")
+            sh(cwd, "git", "commit", "-q", "-m", "Codex fix")
+        return {**DONE, "outcome": "RESULT: fixed", "reply": "RESULT: fixed"}
 
     def comment(args):
         comments.append({"author": {"login": "owner"}, "createdAt": "2026-11-20T00:00:02Z",
@@ -1024,7 +1036,8 @@ def test_a_second_tick_finishes_a_deferred_description_edit(ctx, worktree, monke
         [{"user": c["author"], "body": c["body"], "created_at": c["createdAt"]} for c in comments]
         if route == "issues" else []))
     monkeypatch.setattr(review, "agent_review", lambda *args: "Revise the description.")
-    monkeypatch.setattr(pick, "choose", lambda *args, **kwargs: "cursor")
+    monkeypatch.setattr(pick, "choose", lambda *args, **kwargs: (
+        "codex" if switched and "codex" not in agent_calls else "cursor"))
     monkeypatch.setattr(fix.dispatch, "dispatch", agent)
     monkeypatch.setattr(fix.Runner, "verify", lambda self, wt, *args: verified.append(sh(wt, "git", "rev-parse", "HEAD")) or (0, "", 0))
     monkeypatch.setattr(merge.Merger, "merge_or_handoff", lambda *args: reviewed.append(True))
@@ -1034,29 +1047,59 @@ def test_a_second_tick_finishes_a_deferred_description_edit(ctx, worktree, monke
         return "REVIEW: pass"
 
     monkeypatch.setattr(review.Review, "run_review", passing_review)
-    checkpoint(ctx, pr=pr, step="fix", wt=str(worktree.wt), ISSUE="297", fix_head=remote_before,
-               feedback=comments[0]["body"], extra="")
+    if route == "switch-review":
+        def review_with_changes(self, round, note, reviewer):
+            comments.append({"author": {"login": "owner"}, "createdAt": "2026-11-20T00:00:02Z",
+                             "body": f"<!-- baton-review round={round} by={reviewer} -->\nRevise the description."})
+            head = sh(self.wt, "git", "rev-parse", "HEAD")
+            self.save_binding(reviewed_head=head, base_branch="main", reviewed_issue="297", verdict_round=str(round))
+            self.capture_feedback(comments[-1]["body"], "verdict_digest")
+            return "REVIEW: changes"
+
+        monkeypatch.setattr(review.Review, "run_review", review_with_changes)
+    if resumes_review:
+        checkpoint(ctx, pr=pr, step="fix", wt=str(worktree.wt), ISSUE="297", fix_head=remote_before,
+                   feedback=comments[0]["body"], extra="1" if route == "switch-review" else "")
     monkeypatch.setattr(tick.Tick, "review_loop", ORIGINAL_REVIEW_LOOP)
 
     assert ctx.make().run() == 0, ctx.log()
     fix_head = sh(worktree.wt, "git", "rev-parse", "HEAD")
     assert agent_calls == ["cursor"] and not verified and not handoffs
     assert sh(worktree.origin, "git", "rev-parse", worktree.branch) == remote_before
-    assert list(Path(ctx.env["STATE"]).glob("handoff-*-*fix_description_write_failed.json"))
     assert ctx.path(f"cursor-fix-task-{pr}").is_file()
-    assert ctx.path(f"review-pending-{pr}").is_file()
+    if resumes_review:
+        assert ctx.path(f"review-pending-{pr}").is_file()
+    else:
+        assert labelled
+    if route == "owner":
+        assert live == original
 
     fail_edit = False
-    clock["now"] = 1_060
+    switched = route.startswith("switch")
     assert ctx.make().run() == 0, ctx.log()
-    assert agent_calls == ["cursor"]
+    expected_agents = ["cursor", "codex"] if switched else ["cursor"]
+    if route == "switch-review":
+        expected_agents.append("cursor")
+    assert agent_calls == expected_agents
     assert "completion=partial" in live and "Refs #297" in live and "Revised." in live
+    if route == "switch-review":
+        assert sh(worktree.wt, "git", "rev-parse", "HEAD^") == fix_head
+        fix_head = sh(worktree.wt, "git", "rev-parse", "HEAD")
     assert sh(worktree.origin, "git", "rev-parse", worktree.branch) == fix_head
     assert not labelled and not ctx.path(f"review-pending-{pr}").exists()
     assert not ctx.path(f"cursor-fix-task-{pr}").exists()
     assert not ctx.path(f"owner-fix-feedback-{pr}").exists()
-    assert not handoffs and verified == [fix_head], (handoffs, ctx.log())
-    assert reviewed or ctx.loops
+    if route == "switch-no-commit":
+        assert handoffs and not verified and "made no commit" in ctx.log()
+    elif route == "switch-review":
+        assert verified == [fix_head]
+        assert handoffs and "made no commit" in ctx.log()
+        assert ctx.path(f"pr-{pr}-contrib").read_text().splitlines() == ["claude 1", "cursor 1", "codex 2"]
+    else:
+        assert not handoffs and verified == [fix_head], (handoffs, ctx.log())
+        assert reviewed or ctx.loops
+        if route == "switch":
+            assert ctx.path(f"pr-{pr}-contrib").read_text().splitlines() == ["claude 1", "cursor 1"]
 
 
 def test_tick_discards_a_directory_request_after_a_fix_needs_info(ctx, worktree, monkeypatch):
