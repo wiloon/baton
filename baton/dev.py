@@ -535,7 +535,7 @@ def run(tick, issue):
         payload = runner.issue_payload()
     if payload is None:
         return 80
-    plan = spec.cursor_plan(env, issue, listed=payload["comments"])
+    plan = spec.verdict_plan(env, issue, listed=payload["comments"])
     if not plan:
         tick.recovered_issues[str(issue)] = payload
         if not tick.spec_loop(issue):
@@ -544,7 +544,7 @@ def run(tick, issue):
         payload = runner.issue_payload()
         if payload is None:
             return 80
-        plan = spec.cursor_plan(env, issue, listed=payload["comments"])
+        plan = spec.verdict_plan(env, issue, listed=payload["comments"])
         if not plan:
             tick.notify(f"#{issue}: spec accepted but no plan comment found", url)
             return 1

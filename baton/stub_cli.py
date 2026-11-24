@@ -53,6 +53,9 @@ USAGE_FIELDS = {"input_tokens": "input_tokens", "cache_read_tokens": "cache_read
                 "cache_write_tokens": "cache_creation_input_tokens", "output_tokens": "output_tokens"}
 USAGE_CACHE_IN_INPUT = False
 SPEC_STAGE = "spec-reply"
+SPEC_SAME_VENDOR = ""
+SPEC_TEMPLATE = "spec-prompt.md"
+SPEC_UNMARKED_REVIEWER = False
 PROBE_PROMPT = "Reply with the word ok."
 
 
@@ -80,6 +83,10 @@ def telemetry_env(role, run):
 
 
 def end_line_identity(model):
+    return ""
+
+
+def end_line_model(fields):
     return ""
 
 

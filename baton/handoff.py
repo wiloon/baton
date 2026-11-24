@@ -224,7 +224,7 @@ def _comment_post_valid(item, binding, *, marker):
 def _spec_comment_post_valid(item, binding, *, reason):
     """A trusted spec review or reply comment and the inputs it was produced from (#151)."""
     body, reviewer, round = binding.get("body"), binding.get("reviewer"), binding.get("round")
-    if reviewer not in ("claude", "codex", "cursor") or type(round) is not int or round <= 0 or not isinstance(body, str):
+    if reviewer not in agents.ADAPTERS or type(round) is not int or round <= 0 or not isinstance(body, str):
         return False
     if reason == SPEC_REVIEW_POST:
         if not body.startswith(f"<!-- baton-spec-review round={round} by={reviewer} -->\n"):
@@ -258,7 +258,7 @@ def _spec_comment_post_valid(item, binding, *, reason):
 def _spec_accept_post_valid(item, binding, *, reason):
     """A trusted accept or pending-accept comment and the inputs it was produced from (#151)."""
     body, reviewer, round = binding.get("body"), binding.get("reviewer"), binding.get("round")
-    if reviewer not in ("claude", "codex", "cursor") or type(round) is not int or round <= 0 or not isinstance(body, str):
+    if reviewer not in agents.ADAPTERS or type(round) is not int or round <= 0 or not isinstance(body, str):
         return False
     verdict = binding.get("verdict")
     if not isinstance(verdict, str) or not verdict.startswith(f"<!-- baton-verdict: accept by={reviewer} -->\n"):
@@ -377,7 +377,7 @@ def _dev_push_binding_valid(item, binding):
 def _spec_adr_push_binding_valid(item, binding):
     boundary = binding.get("comment_ids")
     return (binding.get("issue") == item
-            and binding.get("reviser") in ("claude", "codex", "cursor")
+            and binding.get("reviser") in agents.ADAPTERS
             and type(binding.get("round")) is int and binding["round"] > 0
             and isinstance(binding.get("issue_body"), str)
             and bool(re.fullmatch(r"[0-9a-f]{64}", binding["issue_body"]))
@@ -400,7 +400,7 @@ def _spec_revision_continuation_valid(item, binding):
     """Shared fields for a body edit or ADR open that finishes the reviser's round (#151)."""
     boundary = binding.get("comment_ids")
     return (binding.get("issue") == item
-            and binding.get("reviser") in ("claude", "codex", "cursor")
+            and binding.get("reviser") in agents.ADAPTERS
             and type(binding.get("round")) is int and binding["round"] > 0
             and isinstance(binding.get("reply"), str)
             and isinstance(binding.get("mode_note"), str)

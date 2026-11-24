@@ -31,7 +31,7 @@ import subprocess
 import sys
 import time
 
-from . import advisor, agents, checks as check_section, claude_cli, dispatch, e2e_gate, fix, handoff as owner_handoff, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, recovery, review, vendors
+from . import advisor, agents, checks as check_section, dispatch, e2e_gate, fix, handoff as owner_handoff, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, recovery, review, vendors
 from .common import Deferred, changed, child_env, git, permission_denials, push, restore, strip_markers
 from .quota import atomic_json
 
@@ -39,7 +39,9 @@ REPLY_CAP = 60000
 DENIED_NOTE = ("\n\nA previous attempt at this round ended with `RESULT: failed` after this command was denied: "
                "`{command}`. Only that command was refused. Finish the round with the other allowed commands "
                "and the Read, Edit and Write tools; the worktree keeps whatever that attempt left.\n")
-VERDICT = re.compile(r"<!-- baton-verdict: (accept|revise)( by=(cursor|codex|claude))? -->")
+# Every registered vendor marks its verdicts; "cursor" also stands for the external Cursor identity.
+VERDICT = re.compile(r"<!-- baton-verdict: (accept|revise)( by=(%s))? -->" % "|".join(
+    re.escape(vendor) for vendor in dict.fromkeys(("cursor", *agents.ADAPTERS))))
 STATE_RE = re.compile(r"<!-- baton-spec-(?P<k>review|reply) round=(?P<r>[0-9]+)(?P<h> human)?")
 KIND_RE = r"<!-- baton-spec-%s round=[0-9]+( human)? by=(?P<v>[a-z]+) -->"
 VERDICT_LINE = re.compile(r"^(SPEC|RESULT): ")
@@ -208,9 +210,9 @@ def accept_pending(env, issue, listed=None):
 
 
 @session.scoped
-def cursor_plan(env, issue, listed=None):
+def verdict_plan(env, issue, listed=None):
     """The body of the latest accept/revise verdict comment of the owner, Cursor or an agent
-    posting for Cursor; empty when there is none, or while an acceptance is still pending (#122)."""
+    posting for Cursor, whichever vendor marked it; empty when there is none, or while an acceptance is still pending (#122)."""
     env = session.resolve(env)
     login_re = env.config.scheduling.cursor_login_re or r"^(app/cursor|cursor(\[bot\])?)$"
     if listed is None:
@@ -225,6 +227,11 @@ def spec_state(env, issue, listed=None):
     if listed is None:
         return state_from(comments(env, issue), env.owner)
     return state_from(listed, env.owner)
+
+
+def unmarked_reviewer():
+    """The vendor credited with a verdict that carries no by= marker: it predates the markers (SPEC_UNMARKED_REVIEWER)."""
+    return next((vendor for vendor, adapter in agents.ADAPTERS.items() if adapter.SPEC_UNMARKED_REVIEWER), "")
 
 
 def pending_role(kind):
@@ -249,13 +256,9 @@ def last_model(env, issue, kind, round, vendor=""):
         fields = line.split()
         if (len(fields) >= 6 and fields[2:4] == [repo, "end"]
                 and fields[4] in (tag, f"{tag}-rerun") and fields[5] == "rc=0"):
-            first = fields[6] if len(fields) > 6 else ""
-            if first.startswith("claude_model="):
-                found = "" if vendor == "codex" else first.split("=", 1)[1]
-            else:
-                # Codex end lines put the reported model after the outcome and usage.
-                found = "" if vendor == "claude" else next(
-                    (field.split("=", 1)[1] for field in fields[6:] if field.startswith("model=")), "")
+            adapter = agents.ADAPTERS.get(vendor)
+            found = adapter.end_line_model(fields[6:]) if adapter else next(
+                (model for other in agents.ADAPTERS.values() if (model := other.end_line_model(fields[6:]))), "")
     return found
 
 
@@ -300,22 +303,25 @@ class Spec:
 
     @staticmethod
     def followup(round, reviewer, last_vendor):
-        """A later round mostly re-checks earlier points, so it runs on the cheaper model. Codex
-        keeps its usual one after its own revision: the two must be different models."""
-        return round > 1 and not (reviewer == "codex" and last_vendor == "codex")
+        """A later round mostly re-checks earlier points, so it runs on the cheaper model. A
+        "known-distinct-model" vendor keeps its usual one after its own revision: the two must be
+        different models."""
+        return round > 1 and not (reviewer == last_vendor and vendors.spec_same_vendor(reviewer) == "known-distinct-model")
 
     @staticmethod
     def reviser_followup(round, reviser, last_vendor):
-        """Claude revising Claude's review, the last resort: round 1's review ran on the usual model,
-        so the revision takes the other one. A later review already ran on the followup model."""
-        return round == 1 and reviser == "claude" and last_vendor == "claude"
+        """An "alternating-phase" vendor revising its own review, the last resort: round 1's review
+        ran on the usual model, so the revision takes the other one. A later review already ran on
+        the followup model."""
+        return round == 1 and reviser == last_vendor and vendors.spec_same_vendor(reviser) == "alternating-phase"
 
-    def claude_followup(self, route_role, preferred, other_model):
-        """Claude after Claude: the preferred route when its model differs from OTHER_MODEL, else the
-        other route (Opus and Sonnet swap), so a same-vendor round never runs on the writer's model."""
+    def alternating_followup(self, vendor, route_role, preferred, other_model):
+        """An alternating-phase vendor after itself: the preferred route when its model differs from
+        OTHER_MODEL, else the other route (Opus and Sonnet swap), so a same-vendor round never runs
+        on the writer's model."""
         routes = self.env.config.models
         for followup in (preferred, not preferred):
-            if claude_cli.distinct_models(routes.route(route_role, "claude", followup=followup).model, other_model):
+            if vendors.models_distinct(vendor, routes.route(route_role, vendor, followup=followup).model, other_model):
                 return followup
         return preferred
 
@@ -1228,17 +1234,19 @@ class Spec:
 
     @staticmethod
     def unverified(vendor, last_vendor, model, other_model):
-        """A Codex run after a Codex run must be a different, known model."""
-        return vendor == "codex" and last_vendor == "codex" and (
-            other_model in ("", "unknown") or model in ("", "unknown") or model == other_model)
+        """A same-vendor run must be on a model the adapter's evidence shows to differ from the
+        other phase's, for a "known-distinct-model" or "alternating-phase" vendor."""
+        return (vendor == last_vendor and bool(vendors.spec_same_vendor(vendor))
+                and not vendors.models_distinct(vendor, model, other_model))
 
     @staticmethod
     def mode_note(label, vendor, last_vendor, model, other_model):
-        if vendor == "claude" and last_vendor == "claude":
-            return f"{label} mode: same-vendor-different-model (claude after claude).\n\n"
-        if vendor != "codex" or last_vendor != "codex":
-            return ""
-        return f"{label} mode: same-vendor-different-model (codex/{model} after codex/{other_model}).\n\n"
+        policy = vendors.spec_same_vendor(vendor) if vendor == last_vendor else ""
+        if policy == "alternating-phase":
+            return f"{label} mode: same-vendor-different-model ({vendor} after {vendor}).\n\n"
+        if policy == "known-distinct-model":
+            return f"{label} mode: same-vendor-different-model ({vendor}/{model} after {vendor}/{other_model}).\n\n"
+        return ""
 
     def record(self, vendor, model):
         if not self.pr:
@@ -1333,17 +1341,18 @@ class Spec:
         head = git(wt, "rev-parse", "HEAD") or ""
         last_vendor = last_by(listed, env.owner, "reply")
         other_model = last_model(env, n, "reply", round - 1, last_vendor)
-        claude_followup = self.followup(round, "claude", last_vendor)
-        if last_vendor == "claude":
-            claude_followup = self.claude_followup("spec_review", claude_followup, other_model)
+        alternating = vendors.alternating_spec_vendor()
+        alt_followup = self.followup(round, alternating, last_vendor)
+        if alternating and last_vendor == alternating:
+            alt_followup = self.alternating_followup(alternating, "spec_review", alt_followup, other_model)
 
         def review_followup(vendor):
-            return claude_followup if vendor == "claude" else self.followup(round, vendor, last_vendor)
+            return alt_followup if vendor == alternating else self.followup(round, vendor, last_vendor)
         pending = self.resume_worker("spec_reviewer", "spec_review_run_failed", round, other_model)
         if pending is False:
             return "stop"
         reviewer = pending[1] if pending else self.pick("spec_reviewer", pick.all_vendors(env),
-                                                        last_vendor, other_model, spec_followup=claude_followup)
+                                                        last_vendor, other_model, spec_followup=alt_followup)
         attempt = int(bool(pending))
         while True:
             tag = f"issue-{n}-spec-{round}" + (f"-retry{attempt}" if attempt else "")
@@ -1353,8 +1362,7 @@ class Spec:
                 ADR_NOTE=adr_note, ROUND_NOTE=self.round_note(round)), tag, "review-settings.json",
                 followup=review_followup(reviewer), round_s=str(round))
             outcome, model = out["outcome"], out["model"] or ""
-            if (self.unverified(reviewer, last_vendor, model, other_model)
-                    or (reviewer == last_vendor == "claude" and not claude_cli.distinct_models(model, other_model))):
+            if self.unverified(reviewer, last_vendor, model, other_model):
                 self.handoff(f"{reviewer.capitalize()} spec reviewer model was not verified as different from the reviser model.",
                              "spec_reviewer_model_unverified")
                 return "stop"
@@ -1565,7 +1573,7 @@ class Spec:
                          reason, **merger.observation(reason, acceptance=verdict))
             return False
         match = VERDICT.match(verdict)
-        reviewer = (match[3] if match else None) or "claude"
+        reviewer = (match[3] if match else None) or unmarked_reviewer()
         round_m = re.search(r"round (\d+): accept", verdict)
         if not round_m:
             self.handoff("Could not bind the accept verdict for a retry.", owner_handoff.SPEC_ACCEPT_POST)
@@ -2189,14 +2197,15 @@ class Spec:
             stale.unlink()
         last_vendor = last_by(listed, env.owner, "review")
         other_model = last_model(env, n, "review", round, last_vendor)
-        claude_followup = self.reviser_followup(round, "claude", last_vendor)
-        if last_vendor == "claude":
-            claude_followup = self.claude_followup("spec", claude_followup, other_model)
-        pending = self.resume_worker("reviser", "spec_revision_run_failed", round, other_model, claude_followup)
+        alternating = vendors.alternating_spec_vendor()
+        alt_followup = self.reviser_followup(round, alternating, last_vendor)
+        if alternating and last_vendor == alternating:
+            alt_followup = self.alternating_followup(alternating, "spec", alt_followup, other_model)
+        pending = self.resume_worker("reviser", "spec_revision_run_failed", round, other_model, alt_followup)
         if pending is False:
             return "stop"
         reviser = pending[1] if pending else self.pick(
-            "reviser", list(env.config.quota.vendor_pool), last_vendor, other_model, spec_followup=claude_followup)
+            "reviser", list(env.config.quota.vendor_pool), last_vendor, other_model, spec_followup=alt_followup)
         self.mark_base(round)
         budget = pending[0]["remaining_budget"] if pending else {}
         saved_answer = answer_intent or {}
@@ -2208,11 +2217,11 @@ class Spec:
         restored = denied_spent  # a saved, already-spent denied retry: the first dispatch repeats its note
         human = ""
         while True:
-            template = self.self_dir / ("codex-spec-prompt.md" if reviser == "codex" else "spec-prompt.md")
+            template = self.self_dir / agents.ADAPTERS[reviser].SPEC_TEMPLATE
             prompt = self.render(
                 template, ISSUE=n, GH_REPO=self.repo, WORKTREE=str(wt), BRANCH=self.branch, ROUND=str(round),
                 CONTEXT_FILE=str(context), OUT=out_base)
-            followup = reviser == "claude" and claude_followup
+            followup = bool(alternating) and reviser == alternating and alt_followup
             for suffix in (".body", ".comment"):
                 Path(f"{out_base}{suffix}").unlink(missing_ok=True)
             tag = f"issue-{n}-spec-reply-{round}" + (f"-retry{attempt}" if attempt else "")
@@ -2236,8 +2245,7 @@ class Spec:
                 denied = permission_denials(out.get("log", "")) if out["outcome"].startswith("RESULT: failed") else []
             self.settle_answer_intent()
             outcome, model = out["outcome"], out["model"] or ""
-            if (self.unverified(reviser, last_vendor, model, other_model)
-                    or (reviser == last_vendor == "claude" and not claude_cli.distinct_models(model, other_model))):
+            if self.unverified(reviser, last_vendor, model, other_model):
                 self.handoff(f"{reviser.capitalize()} spec reviser model was not verified as different from the reviewer model.",
                              "spec_reviser_model_unverified")
                 return "stop"
@@ -2259,7 +2267,7 @@ class Spec:
             retry = self.recover_worker(
                 f"{reviser} spec run failed: {outcome}{why}", "spec_revision_run_failed", reviser, outcome,
                 role="reviser", round_s=str(round), issue_body=issue_body, listed=listed,
-                last_vendor=last_vendor, other_model=other_model, spec_followup=claude_followup,
+                last_vendor=last_vendor, other_model=other_model, spec_followup=alt_followup,
                 budget={"denied_spent": denied_spent, "denied_command": denied_command})
             if not retry:
                 return "stop"
@@ -2582,7 +2590,7 @@ def main(argv=None):
         print(*spec_state(env, args.issue))
         return 0
     if args.command == "plan":
-        print(cursor_plan(env, args.issue))
+        print(verdict_plan(env, args.issue))
         return 0
     out = run(args, env)
     print(json.dumps(out, ensure_ascii=False))

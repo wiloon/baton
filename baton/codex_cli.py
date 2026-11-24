@@ -61,6 +61,9 @@ USAGE_FIELDS = {"input_tokens": "input_tokens", "cache_read_tokens": "cached_inp
 # Codex counts cached tokens inside input_tokens; telemetry stores them separately.
 USAGE_CACHE_IN_INPUT = True
 SPEC_STAGE = "spec-reply"
+SPEC_SAME_VENDOR = "known-distinct-model"
+SPEC_TEMPLATE = "codex-spec-prompt.md"
+SPEC_UNMARKED_REVIEWER = False
 OTEL = "http://127.0.0.1:4318/v1/"
 OTEL_STAGE = {"spec": "spec-reply", "spec_review": "spec-review", "review": "review",
               "screenshot_review": "review", "fix": "fix"}
@@ -104,6 +107,14 @@ def telemetry_env(role, run):
 
 def end_line_identity(model):
     return ""
+
+
+def end_line_model(fields):
+    """The model a runner.log end line records, given its fields after "rc=N": Codex puts the
+    reported model after the outcome and usage."""
+    if fields and fields[0].startswith("claude_model="):
+        return ""
+    return next((field.split("=", 1)[1] for field in fields if field.startswith("model=")), "")
 
 
 def work_started(log_text):

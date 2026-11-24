@@ -52,6 +52,9 @@ USAGE_FIELDS = {"input_tokens": "inputTokens", "cache_read_tokens": "cacheReadTo
                 "cache_write_tokens": "cacheWriteTokens", "output_tokens": "outputTokens"}
 USAGE_CACHE_IN_INPUT = False
 SPEC_STAGE = "spec-review"
+SPEC_SAME_VENDOR = ""
+SPEC_TEMPLATE = "spec-prompt.md"
+SPEC_UNMARKED_REVIEWER = False
 
 
 def configure(role, route, settings, env):
@@ -75,6 +78,10 @@ def telemetry_env(role, run):
 
 
 def end_line_identity(model):
+    return ""
+
+
+def end_line_model(fields):
     return ""
 
 

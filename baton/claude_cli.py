@@ -55,6 +55,9 @@ USAGE_FIELDS = {"input_tokens": "input_tokens", "cache_read_tokens": "cache_read
                 "cache_write_tokens": "cache_creation_input_tokens", "output_tokens": "output_tokens"}
 USAGE_CACHE_IN_INPUT = False
 SPEC_STAGE = "spec-reply"
+SPEC_SAME_VENDOR = "alternating-phase"
+SPEC_TEMPLATE = "spec-prompt.md"
+SPEC_UNMARKED_REVIEWER = True
 PROBE_PROMPT = "Reply with the word ok."
 MODEL = re.compile(
     r"(?P<prefix>claude-)?(?P<family>opus|sonnet|haiku)(?P<version>(?:-[0-9]+)*?)(?:-(?P<snapshot>[0-9]{8}))?"
@@ -95,6 +98,12 @@ def telemetry_env(role, run):
 
 def end_line_identity(model):
     return f"claude_model={model or 'unknown'} "
+
+
+def end_line_model(fields):
+    """The model a runner.log end line records, given its fields after "rc=N"."""
+    first = fields[0] if fields else ""
+    return first.split("=", 1)[1] if first.startswith("claude_model=") else ""
 
 
 def work_started(log_text):

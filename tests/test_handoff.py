@@ -448,6 +448,30 @@ def test_task_binding_legacy_resume_exception_is_cursor_only():
     assert handoff._binding_valid("fix_task_write_failed", "1", {**base, "fixer": "stub"}) is False
 
 
+def _as_stub(binding, key="reviewer"):
+    stub = {**binding, key: "stub"}
+    for field in ("body", "verdict"):
+        if isinstance(stub.get(field), str):
+            stub[field] = stub[field].replace("by=claude", "by=stub").replace("(claude)", "(stub)")
+    if "digest" in stub:
+        stub["digest"] = handoff.body_digest(stub["body"])
+    return stub
+
+
+@pytest.mark.parametrize("reason,binding,key", [
+    ("spec_review_comment_post_failed", spec_post_binding("1"), "reviewer"),
+    ("spec_reply_post_failed", spec_post_binding("1", reply=True), "reviewer"),
+    ("spec_accept_post_failed", accept_post_binding("1"), "reviewer"),
+    ("spec_pending_accept_post_failed", accept_post_binding("1", pending=True), "reviewer"),
+    ("spec_adr_push_failed", issue_push_binding("1", reason="spec_adr_push_failed"), "reviser"),
+    ("spec_body_edit_failed", body_edit_binding("1"), "reviser"),
+    ("spec_adr_open_failed", adr_open_binding("1"), "reviser"),
+])
+def test_spec_bindings_validate_every_registered_vendor_and_no_other(reason, binding, key):
+    assert handoff._binding_valid(reason, "1", _as_stub(binding, key)) is True
+    assert handoff._binding_valid(reason, "1", {**binding, key: "nobody"}) is False
+
+
 def test_description_binding_is_cursor_only():
     assert handoff._binding_valid("fix_description_write_failed", "1", description_binding("1")) is True
     assert handoff._binding_valid(
