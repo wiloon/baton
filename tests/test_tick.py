@@ -1412,6 +1412,20 @@ def test_scan_fallback_skips_when_no_vendor_has_scan_role(ctx, monkeypatch):
     assert not ctx.path("scan-last").exists()
 
 
+def test_scan_fallback_skips_when_the_only_scan_holder_cannot_scan(ctx, monkeypatch):
+    from baton import agents
+    holders = fallback(ctx).env.config.for_role("scan")
+    assert holders
+    for v in holders:
+        monkeypatch.setattr(agents.ADAPTERS[v], "SCAN", False)
+    t = fallback(ctx)
+    ctx.path("scan-area").write_text("1\n")
+    assert t.scan_fallback() is None
+    assert not ctx.scans
+    assert "scan skipped: no vendor with scan role" in ctx.log()
+    assert not ctx.path("scan-last").exists()
+
+
 # --- follow-ups of owner-merged PRs -----------------------------------------------------------------------------------
 def test_follow_ups_are_filed_for_pr_the_owner_merged(ctx, monkeypatch):
     reviewed = {"number": 5, "headRefName": "cursor/issue-9", "body": "Refs #9",

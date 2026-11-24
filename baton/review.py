@@ -762,7 +762,8 @@ class Review:
     def review_followup(self, round, reviewer):
         """A later round mostly re-checks the fix commits, so it runs on the cheaper model. Codex keeps
         its usual one on code Codex wrote: the two must be different models."""
-        return round > 1 and not (reviewer == "codex" and "codex" in vendors.review_excluded(self.state, self.pr, self.fixed_by))
+        return round > 1 and not (vendors.same_vendor_review(reviewer)
+                                  and reviewer in vendors.review_excluded(self.state, self.pr, self.fixed_by))
 
     def agent(self, vendor, role, prompt, tag, settings="", output="", env=None):
         """One agent run in the worktree; Deferred when the vendor cannot run now."""
@@ -823,29 +824,6 @@ class Review:
         return (f"The diff is {lines} lines: review it yourself; don't run the `mattpocock-skills:code-review` "
                 "skill or start sub-agents.")
 
-    def reply_review(self, reviewer, round, note, context, data, head):
-        """A reply-delivery reviewer: the runner posts its final message as <!-- baton-review ... -->.
-        Returns (outcome, reply)."""
-        pr, wt = self.pr, self.wt
-        adapter = agents.ADAPTERS[reviewer]
-        out = self.agent(reviewer, "review", self.render(
-            adapter.REVIEW_TEMPLATE, PR=str(pr), ISSUE=self.issue or "unknown", GH_REPO=self.repo,
-            WORKTREE=str(wt), ROUND=str(round), MAX_ROUNDS=str(self.max_rounds), ROUND_NOTE=note,
-            CONTEXT_FILE=str(context), NIT_RULE=nit_rule(self.repo, self.issue)),
-            f"pr-{pr}-{reviewer}-review-{round}",
-            env=self.env.with_runtime(review_followup=self.review_followup(round, reviewer)))
-        outcome, reply = out["outcome"], out["reply"] or ""
-        if changed(wt, head):
-            restore(wt, head)
-            name = adapter.DISPLAY_NAME
-            return f"RESULT: failed {name} changed files in a read-only review", reply
-        if not outcome.startswith(REVIEWED):
-            return outcome, reply
-        posted = "\n".join(line for line in strip_markers(reply).split("\n") if not MARKER_LINE.match(line)).rstrip("\n")
-        body = f"<!-- baton-review round={round} by={reviewer} -->\n{posted[:REPLY_CAP]}"
-        binding = self.comment_post_binding(body, round, outcome, reviewer, head, data)
-        return self.post_review_comment(round, reviewer, binding), reply
-
     def run_review(self, round, note, reviewer=None):
         """One reviewer run; returns OUTCOME. Use the loop's selected reviewer when supplied.
         The code-review skill (two sub-agents) only pays off on a big diff.
@@ -882,34 +860,41 @@ class Review:
                      "runner artifact.\n</runner-preflight>\n")
         context.write_text(text)
         adapter = agents.ADAPTERS[reviewer]
-        if adapter.REVIEW_DELIVERY == "reply":
-            outcome, _ = self.reply_review(reviewer, round, note, context, data, head)
-            return outcome
-        review_file = Path(f"/tmp/baton-review-{pr}-{round}.md")
-        review_file.unlink(missing_ok=True)
-        out = self.agent(reviewer, "review", self.render(
-            adapter.REVIEW_TEMPLATE, PR=str(pr), ISSUE=self.issue or "unknown", GH_REPO=self.repo, WORKTREE=str(wt),
-            ROUND=str(round), MAX_ROUNDS=str(self.max_rounds), ROUND_NOTE=note, SKILL_STEP=skill,
-            CONTEXT_FILE=str(context),
-            NIT_RULE=nit_rule(self.repo, self.issue)), f"pr-{pr}-review-{round}",
-            str(self.self_dir / "review-settings.json"), str(review_file),
-            self.env.with_runtime(review_followup=followup))
+        review_file = None if adapter.REVIEW_DELIVERY == "reply" else Path(f"/tmp/baton-review-{pr}-{round}.md")
+        fields = {"PR": str(pr), "ISSUE": self.issue or "unknown", "GH_REPO": self.repo, "WORKTREE": str(wt),
+                  "ROUND": str(round), "MAX_ROUNDS": str(self.max_rounds), "ROUND_NOTE": note,
+                  "CONTEXT_FILE": str(context), "NIT_RULE": nit_rule(self.repo, self.issue)}
+        runtime = self.env.with_runtime(review_followup=followup)
+        if review_file is None:
+            out = self.agent(reviewer, "review", self.render(adapter.REVIEW_TEMPLATE, **fields),
+                             f"pr-{pr}-{reviewer}-review-{round}", env=runtime)
+            if changed(wt, head):
+                restore(wt, head)
+                return f"RESULT: failed {adapter.DISPLAY_NAME} changed files in a read-only review"
+        else:
+            review_file.unlink(missing_ok=True)
+            out = self.agent(reviewer, "review", self.render(adapter.REVIEW_TEMPLATE, SKILL_STEP=skill, **fields),
+                             f"pr-{pr}-review-{round}", str(self.self_dir / "review-settings.json"),
+                             str(review_file), runtime)
         outcome, model = out["outcome"], out["model"] or ""
         if not self.review_allowed(reviewer, model):
             return self.failed(ALREADY, "RESULT: failed actual reviewer model may be a PR author")
+        if not outcome.startswith(REVIEWED):
+            return outcome
         review_note = ""
-        if reviewer == "codex" and "codex" in vendors.review_excluded(self.state, pr, self.fixed_by):
-            mode = vendors.codex_review_mode(self.state, pr, model)
-            review_note = f"Review mode: {mode} (codex/{model}).\n\n"
-        if outcome.startswith(REVIEWED):
-            if review_file.is_file() and review_file.stat().st_size:
-                body = strip_markers(review_file.read_text()).rstrip("\n")
-                posted_body = f"<!-- baton-review round={round} by={reviewer} -->\n{review_note}{body}"
-                binding = self.comment_post_binding(posted_body, round, outcome, reviewer, head, data)
-                return self.post_review_comment(round, reviewer, binding)
-            else:
-                outcome = self.failed("review_run_failed", "RESULT: failed no review artifact")
-        return outcome
+        if vendors.same_vendor_review(reviewer) and reviewer in vendors.review_excluded(self.state, pr, self.fixed_by):
+            mode = vendors.same_vendor_review_mode(self.state, pr, reviewer, model)
+            review_note = f"Review mode: {mode} ({reviewer}/{model}).\n\n"
+        if review_file is None:
+            reply = strip_markers(out["reply"] or "")
+            body = "\n".join(line for line in reply.split("\n") if not MARKER_LINE.match(line)).rstrip("\n")[:REPLY_CAP]
+        elif review_file.is_file() and review_file.stat().st_size:
+            body = strip_markers(review_file.read_text()).rstrip("\n")
+        else:
+            return self.failed("review_run_failed", "RESULT: failed no review artifact")
+        posted_body = f"<!-- baton-review round={round} by={reviewer} -->\n{review_note}{body}"
+        binding = self.comment_post_binding(posted_body, round, outcome, reviewer, head, data)
+        return self.post_review_comment(round, reviewer, binding)
 
     # --- the screenshot review (#67): its own run after a successful code review ---
     def screenshot_enabled(self, reviewer):
@@ -919,19 +904,20 @@ class Review:
                 and "owner" not in vendors.review_excluded(self.state, self.pr))
 
     def screenshot_vendor(self):
-        """Claude or Codex, by the code review's exclusions; Cursor never looks at screenshots."""
+        """An image-capable adapter (IMAGES), by the code review's exclusions."""
         return pick.choose(self.env, "screenshot_reviewer", "", "review", self.vendors(), pr=str(self.pr),
                            issue=self.issue, fixed_by=self.fixed_by)
 
-    def shots_step(self, shots):
+    def shots_step(self, shots, vendor):
         """The screenshot reviewer's look at the manual-check screenshots (#50): every valid PNG,
         or one Must fix when there are none."""
         if not shots:
             return (f"This PR has `## {check_section.HEADING}` but there are no screenshots: report one Must fix asking the "
                     "author to shoot every manual-check item the way the repository's agent docs describe.")
         listed = "".join(f"\n   - `{path}`" for path in shots)
-        return ("Look at every one of the screenshots of this PR's manual checks (Claude: the Read tool; "
-                f"Codex: view_image):{listed}\n"
+        tool = agents.ADAPTERS[vendor].SCREENSHOT_TOOL
+        return ("Look at every one of the screenshots of this PR's manual checks "
+                f"({tool}):{listed}\n"
                 "   Compare each with the manual checks above and the issue.")
 
     def run_screenshot_review(self, round, data, checks, vendor=""):
@@ -962,7 +948,7 @@ class Review:
         out = self.agent(vendor, "screenshot_review", self.render(
             "screenshot-review-prompt.md", PR=str(pr), ISSUE=self.issue or "unknown", GH_REPO=self.repo,
             WORKTREE=str(wt), ROUND=str(round), MAX_ROUNDS=str(self.max_rounds), CONTEXT_FILE=str(context),
-            MANUAL_CHECKS=cut(check_verdicts.numbered(checks), limit), SHOTS_STEP=self.shots_step(notify.shots(pr, self.ctx)), DELIVERY=delivery),
+            MANUAL_CHECKS=cut(check_verdicts.numbered(checks), limit), SHOTS_STEP=self.shots_step(notify.shots(pr, self.ctx), vendor), DELIVERY=delivery),
             f"pr-{pr}-screenshot-review-{round}", str(self.self_dir / "review-settings.json"), str(review_file), self.env)
         outcome, model = out["outcome"], out["model"] or ""
         if not vendors.screenshot_allowed(self.state, pr, vendor, model, self.fixed_by):
@@ -971,9 +957,9 @@ class Review:
         if outcome.startswith(REVIEWED):
             if review_file.is_file() and review_file.stat().st_size:
                 body = strip_markers(review_file.read_text()).rstrip("\n")
-                mode = (vendors.codex_review_mode(self.state, pr, model)
-                        if vendor == "codex" and "codex" in vendors.review_excluded(self.state, pr, self.fixed_by) else "")
-                review_note = f"Review mode: {mode} (codex/{model}).\n\n" if mode else ""
+                mode = (vendors.same_vendor_review_mode(self.state, pr, vendor, model)
+                        if vendor in vendors.review_excluded(self.state, pr, self.fixed_by) else "")
+                review_note = f"Review mode: {mode} ({vendor}/{model}).\n\n" if mode else ""
                 posted_body = f"<!-- baton-screenshot-review round={round} by={vendor} -->\n{review_note}{body}"
                 binding = self.comment_post_binding(posted_body, round, outcome, vendor, head, data)
                 return self.post_screenshot_comment(round, vendor, binding)

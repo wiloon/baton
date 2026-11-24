@@ -72,6 +72,23 @@ def test_a_codex_pr_may_be_reviewed_by_codex_on_a_proven_model(env, monkeypatch)
     assert vendors.review_allowed(env["STATE"], 15, "codex", "gpt-6.1-sol")
     assert not vendors.review_allowed(env["STATE"], 15, "codex", "unknown")
 
+def test_same_vendor_review_follows_the_adapter_capability(env, monkeypatch):
+    """Writer-model evidence and same-vendor eligibility come from SAME_VENDOR_REVIEW, not the vendor name."""
+    from baton import agents
+    state = env["STATE"]
+    vendors.record_author(state, 16, "stub")
+    Path(state, "pr-16-author-models").write_text("stub model-a\n")
+    assert not vendors.review_allowed(state, 16, "stub", "model-b")
+    monkeypatch.setattr(agents.ADAPTERS["stub"], "SAME_VENDOR_REVIEW", True, raising=False)
+    monkeypatch.setattr(agents.ADAPTERS["stub"], "SAME_VENDOR_SAME_MODEL", True, raising=False)
+    assert vendors.review_allowed(state, 16, "stub", "model-b")
+    assert vendors.review_allowed(state, 16, "stub", "model-a")
+    assert vendors.screenshot_allowed(state, 16, "stub", "model-b")
+    assert not vendors.screenshot_allowed(state, 16, "stub", "model-a")
+    assert not vendors.review_allowed(state, 16, "stub", "unknown")
+    assert vendors.same_vendor_review_mode(state, 16, "stub", "model-a") == "same-model-fresh-context"
+
+
 @pytest.mark.parametrize("enabled", [True, False])
 def test_stale_cursor_uses_api_refresh_only_when_declared(tmp_path, monkeypatch, enabled):
     from dataclasses import replace

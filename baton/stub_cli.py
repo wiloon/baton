@@ -1,6 +1,6 @@
 """Test-double adapter (`stub-agent`): registered for capability-routing coverage (#112).
 
-Declares runner-mediated GitHub access, reply-based resumable fixes, after-run read-only
+Declares runner-mediated GitHub access, reply-protocol fixes, after-run read-only
 reset and no image support. Production hosts leave it undeclared; tests admit it with
 `[vendors.stub]` and the four role grants.
 """
@@ -21,6 +21,8 @@ SKIP_SCREENSHOT_AFTER_REVIEW = False
 ROUTE_FIELDS = frozenset({"model", "effort"})
 EMPTY_MODEL_OK = False
 RECORDS_AUTHOR_MODEL = False
+SAME_VENDOR_REVIEW = False
+SAME_VENDOR_SAME_MODEL = False
 DEFAULT_MAX_MINUTES = 30
 PREFLIGHT_CHECKS = (("stub-agent", "--version"),)
 VERSION_EXECUTABLE = "stub-agent"
@@ -35,11 +37,13 @@ LEGACY_SEED_WITH_OWNER = False
 UNMARKED_AUTHOR_INFERENCE = True
 GITHUB_ACCESS = "runner"
 FIX_RESUMABLE_VIA_REPLY = True
+FIX_TEMPLATE = "stub-fix-prompt.md"
 READONLY_RESET = True
 REVIEW_TEMPLATE = "stub-review-prompt.md"
 REVIEW_DELIVERY = "reply"
 REVIEW_SKILL_POLICY = "none"
 SCREENSHOT_DELIVERY = ""
+SCREENSHOT_TOOL = ""
 CONTINUITY_PIN = True
 FIX_SCOPE_POLICY = "must_fix_nits_optional"
 FIVE_MINUTE_CACHE_ROLES = ()

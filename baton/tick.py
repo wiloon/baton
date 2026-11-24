@@ -37,7 +37,7 @@ import sys
 import tempfile
 import time
 
-from . import advisor, after_merge, checkpoint, dev, fix, handoff as owner_handoff, hooks as telemetry, maintenance, merge, names, notify, pick, pr as pr_helpers, pr_contract, review, scan, spec, tmp_sweep, vendors
+from . import advisor, after_merge, agents, checkpoint, dev, fix, handoff as owner_handoff, hooks as telemetry, maintenance, merge, names, notify, pick, pr as pr_helpers, pr_contract, review, scan, spec, tmp_sweep, vendors
 from .common import Deferred, git
 
 AGENT_REVIEW_NOTE = ("The PR description{issue} give the problem, its cause and the fix. Check the diagnosis first: does the "
@@ -1067,14 +1067,18 @@ class Tick:
         if waiting >= max_waiting:
             self.log(f"no scan; {waiting} claude-found issue(s) still wait for Cursor")
             return None
-        if not self.env.config.for_role("scan"):
+        if not self.scanners():
             self.log("scan skipped: no vendor with scan role")
             return None
         self.item(self.scan_item)
         return 0
 
+    def scanners(self):
+        """Vendors holding the scan role whose adapter can scan."""
+        return tuple(v for v in self.env.config.for_role("scan") if agents.ADAPTERS[v].SCAN)
+
     def scan_item(self):
-        scanners = self.env.config.for_role("scan")
+        scanners = self.scanners()
         if not scanners:
             self.log("scan skipped: no vendor with scan role")
             return None

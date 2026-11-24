@@ -156,10 +156,11 @@ class Runner:
 
     def finish_verified(self, pr, wt, fixer, *, prefix="", description_rc=0, description_reason=""):
         url = f"https://github.com/{self.repo}/pull/{pr}"
-        ref = (git(wt, "branch", "--show-current") or "HEAD") if fixer == "cursor" else "HEAD"
+        reply = agents.ADAPTERS[fixer].FIX_RESUMABLE_VIA_REPLY
+        ref = (git(wt, "branch", "--show-current") or "HEAD") if reply else "HEAD"
         return self.push_with_retry(pr, wt, ref, next_step="done", url=url, who=prefix, fixer=fixer,
                                     description_rc=description_rc, description_reason=description_reason,
-                                    clear_cursor=fixer == "cursor")
+                                    clear_cursor=reply)
 
     def add_author(self, vendor):
         if vendor not in self.attempt_authors:
@@ -743,7 +744,7 @@ class Runner:
                     self.description_discarded(pr, fixer or self.last_fixer or "fixer",
                                                description_reason or "")
                 if clear_cursor:
-                    self.clear_cursor_request(pr)
+                    self.clear_reply_request(pr, fixer or self.last_fixer or "cursor")
                 recovery.clear(self.env, episode, pr)
                 return 0
             if self.push_feedback is None:
@@ -790,8 +791,11 @@ class Runner:
         from . import handoff as owner_handoff
         if binding["description_rc"]:
             self.description_discarded(pr, binding["fixer"], binding["description_reason"])
-        if binding["clear_cursor"] or (resumed and binding["consume"] and binding["fixer"] == "cursor"):
-            self.clear_cursor_request(pr)
+        fixer = binding["fixer"]
+        if binding["clear_cursor"] or (resumed and binding["consume"]
+                                       and fixer in agents.ADAPTERS
+                                       and agents.ADAPTERS[fixer].FIX_RESUMABLE_VIA_REPLY):
+            self.clear_reply_request(pr, fixer)
         owner_handoff.clear_retry(self.env, self.push_episode(pr), owner_handoff.FIX_CHECKS, str(pr))
         recovery.clear(self.env, self.push_episode(pr), pr)
         return 0
@@ -1168,7 +1172,7 @@ class Runner:
         notify.log(log)
         return 0, True, log
 
-    # --- a Claude or Codex fixer ---
+    # --- an artifact-protocol fixer ---
     def fix_pr(self, pr, wt, fixer, source, feedback, head="", *, owner_triggered=False):
         self.last_fixer = fixer
         url = f"https://github.com/{self.repo}/pull/{pr}"
@@ -1185,9 +1189,11 @@ class Runner:
         fix_file.unlink(missing_ok=True)
         pr_helpers.remove_body_request(description_request)
         Path(self.ctx, f"pr-{pr}-fix-checks.json").unlink(missing_ok=True)
-        template = "codex-fix-prompt.md" if fixer == "codex" else "fix-prompt.md"
+        adapter = agents.ADAPTERS[fixer]
+        template = adapter.FIX_TEMPLATE
         description = Path(self.ctx, f"pr-{pr}-description.md")
-        # Claude and Codex edit the description through /tmp; the runner applies it (#75).
+        # Artifact fixers edit the description through /tmp; the runner applies it (#75).
+        # The adapter's FIX_TEMPLATE tells it how to reach that file.
         description.write_text(pr_helpers.body(pr) or "")
         shots_note, env = "", None
         if self.env.repo.screenshot_review:   # the next review looks at fresh screenshots (#50)
@@ -1205,8 +1211,8 @@ class Runner:
                                                    PR_DESCRIPTION_FILE=str(description), SHOTS_NOTE=shots_note),
                          f"pr-{pr}-fix{f'-{self.round}' if self.round else ''}", wt, str(fix_file), env)
         outcome, model = out["outcome"], out["model"] or "unknown"
-        # A failed Codex run has no reply worth posting; its commits still reach the owner below.
-        if not (fixer in ("cursor", "codex") and outcome.startswith("RESULT: failed")):
+        # Suppress failed replies from adapters with denied GitHub access. Partial commits still reach the owner.
+        if not (adapter.GITHUB_ACCESS == "denied" and outcome.startswith("RESULT: failed")):
             if fix_file.is_file() and fix_file.stat().st_size:
                 try:
                     rest = pr_helpers.split_checks(pr, strip_markers(fix_file.read_text()), self.ctx)
@@ -1319,49 +1325,62 @@ class Runner:
         self.clear_task_write(pr)
         return 0
 
-    # --- a Cursor fixer ---
-    def clear_cursor_request(self, pr, *, keep_base=False):
-        for name in ("pr-body-base", "cursor-fix-task"):
-            Path(self.state, f"{name}-{pr}").unlink(missing_ok=True)
-        pr_helpers.remove_body_request(Path(self.ctx, f"pr-{pr}-body.md"))
+    # --- a reply-protocol fixer ---
+    def clear_reply_request(self, pr, fixer, *, keep_base=False):
+        """Drop the shared body request and the producer's saved task and fix base."""
+        Path(self.state, f"pr-body-base-{pr}").unlink(missing_ok=True)
+        Path(self.state, f"{fixer}-fix-task-{pr}").unlink(missing_ok=True)
         if not keep_base:
-            Path(self.state, f"cursor-fix-base-{pr}").unlink(missing_ok=True)
+            Path(self.state, f"{fixer}-fix-base-{pr}").unlink(missing_ok=True)
+        pr_helpers.remove_body_request(Path(self.ctx, f"pr-{pr}-body.md"))
+
+    def clear_cursor_request(self, pr, *, keep_base=False):
+        """Compatibility name for Cursor's pending reply request (shared body files included)."""
+        self.clear_reply_request(pr, "cursor", keep_base=keep_base)
 
     def cursor_fix(self, pr, wt, source, feedback, head="", *, owner_triggered=False):
+        return self.reply_fix(pr, wt, "cursor", source, feedback, head, owner_triggered=owner_triggered)
+
+    def reply_fix(self, pr, wt, fixer, source, feedback, head="", *, owner_triggered=False):
+        adapter = agents.ADAPTERS[fixer]
+        name = adapter.DISPLAY_NAME
         agent_head = self.head(wt)
         url = f"https://github.com/{self.repo}/pull/{pr}"
         branch = git(wt, "branch", "--show-current") or ""
-        base_file = Path(self.state, f"cursor-fix-base-{pr}")
+        base_file = Path(self.state, f"{fixer}-fix-base-{pr}")
         baseline_file = Path(self.state, f"pr-body-base-{pr}")
-        task_file = Path(self.state, f"cursor-fix-task-{pr}")
+        task_file = Path(self.state, f"{fixer}-fix-task-{pr}")
         if base_file.is_file():
             head = base_file.read_text().split("\n")[0]
         else:
-            head = head or self.head(wt)
+            head = head or agent_head
             base_file.write_text(head + "\n")
         request = Path(self.ctx, f"pr-{pr}-body.md")
         if task_file.is_file():
             want, _, feedback_digest = task_file.read_text().partition("\n")
             self.push_feedback = feedback_digest.strip() or self.capture_push_feedback(pr)
-        elif baseline_file.is_file() and request.is_file():
-            # Legacy pending body requests have no saved TASK intent.
+        elif baseline_file.is_file() and request.is_file() and fixer == "cursor":
+            # Legacy pending body requests have no saved TASK intent (Cursor only).
             want = ""
             self.push_feedback = self.capture_push_feedback(pr)
         else:
             self.push_feedback = self.capture_push_feedback(pr)
-            feedback_file = Path(self.ctx, f"pr-{pr}-cursor-fix-{time.strftime('%Y%m%d-%H%M%S')}.md")
+            feedback_file = Path(self.ctx, f"pr-{pr}-{fixer}-fix-{time.strftime('%Y%m%d-%H%M%S')}.md")
             feedback_file.write_text(f"{feedback}\n\n<pr-description>\n{pr_helpers.body(pr) or ''}\n</pr-description>\n")
             self.fetch_main(wt)
             shots = Path(self.ctx, f"pr-{pr}-shots")
             session.run_process(["rm", "-rf", str(shots)])
             shots.mkdir(parents=True)
-            self.clear_cursor_request(pr, keep_base=True)
+            if fixer != "cursor":
+                # A later Cursor round must not resume the request this run supersedes.
+                Path(self.state, f"cursor-fix-task-{pr}").unlink(missing_ok=True)
+            self.clear_reply_request(pr, fixer, keep_base=True)
             Path(self.ctx, f"pr-{pr}-fix-checks.json").unlink(missing_ok=True)
-            out = self.agent("cursor", "fix", self.render(
-                "cursor-fix-prompt.md", PR=str(pr), ISSUE=self.env.runtime.issue or "unknown", GH_REPO=self.repo,
+            out = self.agent(fixer, "fix", self.render(
+                adapter.FIX_TEMPLATE, PR=str(pr), ISSUE=self.env.runtime.issue or "unknown", GH_REPO=self.repo,
                 WORKTREE=str(wt), BRANCH=branch, SOURCE=source, FEEDBACK_FILE=str(feedback_file),
-                FIX_SCOPE=fix_scope("cursor", owner_triggered),
-                SHOTS_DIR=str(shots), PR_BODY_FILE=str(request)), f"pr-{pr}-cursor-fix", wt)
+                FIX_SCOPE=fix_scope(fixer, owner_triggered),
+                SHOTS_DIR=str(shots), PR_BODY_FILE=str(request)), f"pr-{pr}-{fixer}-fix", wt)
             outcome, reply_raw = out["outcome"], out["reply"] or ""
             self.reply = reply_raw
             want = pr_helpers.task_wanted(reply_raw)
@@ -1369,21 +1388,21 @@ class Runner:
             if reply_raw:
                 reply = pr_helpers.split_checks(pr, reply, self.ctx).rstrip("\n")
             if reply.strip():
-                marker = ("<!-- baton-fix by=cursor outcome=needs-info -->"
+                marker = (f"<!-- baton-fix by={fixer} outcome=needs-info -->"
                           if outcome.startswith("RESULT: needs-info")
-                          else "<!-- baton-fix by=cursor -->")
-                self.comment(pr, f"{marker}\n{reply[:REPLY_CAP]}", f"PR #{pr}: posting Cursor's reply failed")
+                          else f"<!-- baton-fix by={fixer} -->")
+                self.comment(pr, f"{marker}\n{reply[:REPLY_CAP]}", f"PR #{pr}: posting {name}'s reply failed")
             if not outcome.startswith("RESULT: fixed"):
                 if self.head(wt) != head:
-                    if not self.record(pr, "cursor", wt, head, out["model"] or "unknown", ""):
+                    if not self.record(pr, fixer, wt, head, out["model"] or "unknown", ""):
                         return 1
-                    return self.push_partial_fix(pr, wt, branch, url, outcome, "cursor", source, feedback, head)
+                    return self.push_partial_fix(pr, wt, branch, url, outcome, fixer, source, feedback, head)
                 if outcome.startswith("RESULT: needs-info"):
-                    return self.handoff(pr, "fix_needs_info", f"Cursor PR #{pr} has questions", url)
-                if not self.record(pr, "cursor", wt, agent_head, "", ""):
+                    return self.handoff(pr, "fix_needs_info", f"{name} PR #{pr} has questions", url)
+                if not self.record(pr, fixer, wt, agent_head, "", ""):
                     return 1
-                action, alt, _ = self.recover(pr, "fix_run_failed", f"Cursor PR #{pr} fix failed", f"{outcome} {url}",
-                                              "cursor", wt=wt, head=head)
+                action, alt, _ = self.recover(pr, "fix_run_failed", f"{name} PR #{pr} fix failed", f"{outcome} {url}",
+                                              fixer, wt=wt, head=head)
                 if action == "handoff":
                     return 1
                 return self.dispatch_fixer(pr, wt, alt, source, feedback, head)
@@ -1409,7 +1428,7 @@ class Runner:
                 has_request = False
         if not has_request or discarded:
             rc, task_changed, log = self.write_task(
-                pr, url, want=want, fixer="cursor", baseline=baseline_file,
+                pr, url, want=want, fixer=fixer, baseline=baseline_file,
                 description_rc=2 if discarded else 0, description_reason=description_reason, resume=resume)
             if rc == PUSH_SUPERSEDED:
                 return rc
@@ -1418,17 +1437,17 @@ class Runner:
             if rc != 0 and (rc != 2 or not discarded):
                 reason = "fix_task_invalid"
                 start = agent_head if self.attempt_authors else head
-                if not self.record(pr, "cursor", wt, start, "", ""):
+                if not self.record(pr, fixer, wt, start, "", ""):
                     return 1
-                action, alt, _ = self.recover(pr, reason, f"PR #{pr}: task completion change failed (cursor)",
-                                              f"Invalid task relation from cursor. {url}", "cursor", wt=wt, head=head,
+                action, alt, _ = self.recover(pr, reason, f"PR #{pr}: task completion change failed ({fixer})",
+                                              f"Invalid task relation from {fixer}. {url}", fixer, wt=wt, head=head,
                                               validation_error=log)
                 if action == "handoff":
                     return 1
-                self.clear_cursor_request(pr, keep_base=True)
+                self.clear_reply_request(pr, fixer, keep_base=True)
                 return self.dispatch_fixer(pr, wt, alt, source, correction(feedback, log), head)
-        return self.finish_cursor_fix(
-            pr, wt, branch, url, source, feedback, head, agent_head=agent_head,
+        return self.finish_reply_fix(
+            pr, wt, fixer, branch, url, source, feedback, head, agent_head=agent_head,
             body_changed=body_changed, task_changed=task_changed, discarded=discarded,
             description_reason=description_reason)
 
@@ -1503,72 +1522,80 @@ class Runner:
         rc, task_changed, _ = self.write_task(pr, url, pending=pending, fixer=fixer)
         if rc != 0:
             return rc
-        if fixer != "cursor":
+        if not agents.ADAPTERS[fixer].FIX_RESUMABLE_VIA_REPLY:
             return self.finish_fix(
                 pr, wt, fixer, source, feedback, saved["head"], agent_head=saved["agent_head"],
                 model=saved["model"], cursor_base=saved["cursor_base"], task_changed=task_changed,
                 description_rc=binding["description_rc"], description_changed=saved["description_changed"],
                 description_reason=binding["description_reason"])
         branch = git(wt, "branch", "--show-current") or ""
-        return self.finish_cursor_fix(
-            pr, wt, branch, url, source, feedback, saved["head"], agent_head=saved["agent_head"],
+        return self.finish_reply_fix(
+            pr, wt, fixer, branch, url, source, feedback, saved["head"], agent_head=saved["agent_head"],
             body_changed=saved["description_changed"], task_changed=task_changed, discarded=binding["description_rc"] == 2,
             description_reason=binding["description_reason"])
 
     def finish_cursor_fix(self, pr, wt, branch, url, source, feedback, head, *, agent_head,
                           body_changed, task_changed, discarded, description_reason):
+        return self.finish_reply_fix(
+            pr, wt, "cursor", branch, url, source, feedback, head, agent_head=agent_head,
+            body_changed=body_changed, task_changed=task_changed, discarded=discarded,
+            description_reason=description_reason)
+
+    def finish_reply_fix(self, pr, wt, fixer, branch, url, source, feedback, head, *, agent_head,
+                         body_changed, task_changed, discarded, description_reason):
+        name = agents.ADAPTERS[fixer].DISPLAY_NAME
+        who = f"{name} "
         moved = self.head(wt) != head
         recorded_before_retry = False
         if not moved:
             rc, checks_changed = self.recheck_without_commit(
-                pr, "Cursor ", url, body_changed, fixer="cursor",
+                pr, who, url, body_changed, fixer=fixer,
                 description_rc=2 if discarded else 0, description_reason=description_reason)
             if rc != 0:
                 return rc
             if not (body_changed or task_changed or checks_changed):
-                action, alt, _ = self.recover(pr, "fix_no_commit", f"Cursor PR #{pr} needs you",
-                                                f"Cursor's fix run made no commit. {url}", "cursor", wt=wt, head=head)
+                action, alt, _ = self.recover(pr, "fix_no_commit", f"{name} PR #{pr} needs you",
+                                                f"{name}'s fix run made no commit. {url}", fixer, wt=wt, head=head)
                 if action == "handoff":
-                    self.clear_cursor_request(pr)
+                    self.clear_reply_request(pr, fixer)
                     return 1
-                self.clear_cursor_request(pr, keep_base=True)
+                self.clear_reply_request(pr, fixer, keep_base=True)
                 return self.dispatch_fixer(pr, wt, alt, source, feedback, head)
         else:
-            rc, failure, rounds = self.verify(wt, "origin/main", "cursor", "pr", pr)
+            rc, failure, rounds = self.verify(wt, "origin/main", fixer, "pr", pr)
             if rc != 0:
                 start = agent_head if self.attempt_authors else head
-                if not self.record(pr, "cursor", wt, start, "", ""):
+                if not self.record(pr, fixer, wt, start, "", ""):
                     return 1
                 recorded_before_retry = True
                 action, alt, remaining = self.recover(pr, "fix_verify_failed",
-                                                      f"Cursor PR #{pr}: local CI verification failed",
+                                                      f"{name} PR #{pr}: local CI verification failed",
                                                       recovery.verify_status(repairs_used=rounds, max_repairs=self.max_verify,
-                                                                             failure=failure), "cursor", wt=wt,
+                                                                             failure=failure), fixer, wt=wt,
                                                       repairs_used=rounds, head=head,
                                                       before_labels=lambda: self.verify_failed(pr, failure, rounds))
                 if action == "handoff":
                     return 1
-                vendor = alt if alt != "cursor" else "cursor"
-                rc, failure, more = self.verify_retry(wt, self.verified_base, vendor, "pr", pr, repairs=remaining,
+                rc, failure, more = self.verify_retry(wt, self.verified_base, alt, "pr", pr, repairs=remaining,
                                                 repairs_before=rounds)
                 rounds = more
                 if rc != 0:
                     self.verify_failed(pr, failure, rounds)
-                    return self.handoff(pr, "fix_verify_failed", f"Cursor PR #{pr}: local CI verification failed", url)
+                    return self.handoff(pr, "fix_verify_failed", f"{name} PR #{pr}: local CI verification failed", url)
         try:
-            vendors.record_author(self.state, pr, "cursor")
+            vendors.record_author(self.state, pr, fixer)
         except OSError:
             return 1
         if not recorded_before_retry:
             start = agent_head if self.attempt_authors else head
-            self.add_author("cursor")
-            vendors.record_contrib(self.state, pr, "cursor", str(wt), start)
+            self.add_author(fixer)
+            vendors.record_contrib(self.state, pr, fixer, str(wt), start)
         if moved:
             return self.push_with_retry(
                 pr, wt, branch, next_step="done", url=url, description_rc=2 if discarded else 0,
-                description_reason=description_reason, who="Cursor ", fixer="cursor",
+                description_reason=description_reason, who=who, fixer=fixer,
                 clear_cursor=True)
-        self.clear_cursor_request(pr)
+        self.clear_reply_request(pr, fixer)
         episode = self.env.runtime.issue or str(pr)
         recovery.clear(self.env, str(episode), str(pr))
         self.clear_task_write(pr)
@@ -1579,12 +1606,12 @@ class Runner:
         self.last_fixer = fixer
         scope = {"owner_triggered": self.owner_triggered}
         with self.dispatching(pr, wt):
-            if fixer != "cursor":
+            if not agents.ADAPTERS[fixer].FIX_RESUMABLE_VIA_REPLY:
                 return self.fix_pr(pr, wt, fixer, source, feedback, head, **scope)
-            rc = self.cursor_fix(pr, wt, source, feedback, head, **scope)
+            rc = self.reply_fix(pr, wt, fixer, source, feedback, head, **scope)
             if rc == 75:   # a short block reported by return value, e.g. a description update
                 recovery.settle(self.env, self.env.runtime.issue or pr, pr, lambda: self.retry_binding(wt, pr))
-        self.hooks.fix("cursor", self.round or 0, self.reply)
+        self.hooks.fix(fixer, self.round or 0, self.reply)
         return rc
 
     def finish_progressed(self, pr, wt, fixer, head, budget):
@@ -1690,17 +1717,22 @@ def fix_pr(runner, pr, wt, fixer, source, feedback, head="", *, owner_triggered=
         if rc:
             runner.verify_failed(pr, failure, rounds)
             return runner.handoff(pr, "fix_verify_failed", f"PR #{pr}: local CI verification failed", failure)
+        last = runner.last_fixer
+        prefix = f"{agents.ADAPTERS[last].DISPLAY_NAME} " if agents.ADAPTERS[last].FIX_RESUMABLE_VIA_REPLY else ""
         rc = runner.finish_verified(
-            pr, wt, runner.last_fixer, prefix="Cursor " if runner.last_fixer == "cursor" else "",
+            pr, wt, last, prefix=prefix,
             description_rc=task.get("description_rc", 0), description_reason=task.get("description_reason", ""))
+        runner.clear_reply_request(pr, last)
+        # An artifact fixer can finish with a base saved by an earlier Cursor attempt.
         runner.clear_cursor_request(pr)
         recovery.clear(runner.env, runner.env.runtime.issue or pr, pr)
         return rc
-    if record["state"] == "progressed" and fixer != "cursor" and runner.head(wt) != head:
+    if (record["state"] == "progressed" and not agents.ADAPTERS[fixer].FIX_RESUMABLE_VIA_REPLY
+            and runner.head(wt) != head):
         return runner.finish_progressed(pr, wt, fixer, head, budget)
     if record["reason"] == "fix_task_invalid":
         feedback = correction(feedback, budget.get("validation_error", ""))
-    if record["state"] != "progressed":   # a completed Cursor step reconciles from its saved request
+    if record["state"] != "progressed":   # a completed reply step reconciles from its saved request
         runner.clear_cursor_request(pr, keep_base=True)
     return runner.dispatch_fixer(pr, wt, fixer, source, feedback, head)
 

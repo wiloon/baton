@@ -105,6 +105,7 @@ def test_stub_is_registered_with_declared_capabilities():
     stub = agents.ADAPTERS["stub"]
     assert stub.GITHUB_ACCESS == "runner"
     assert stub.FIX_RESUMABLE_VIA_REPLY is True
+    assert stub.FIX_TEMPLATE == "stub-fix-prompt.md"
     assert stub.READONLY_RESET is True
     assert stub.IMAGES is False
     assert stub.QUOTA_WINDOWS == frozenset({"seven_day"})
@@ -114,6 +115,13 @@ def test_stub_is_registered_with_declared_capabilities():
     assert stub.REVIEW_SKILL_POLICY == "none"
     assert stub.CONTINUITY_PIN is True
     assert stub.FIX_SCOPE_POLICY == "must_fix_nits_optional"
+
+
+def test_adapters_declare_same_vendor_review():
+    assert {name: a.SAME_VENDOR_REVIEW for name, a in agents.ADAPTERS.items()} == {
+        "claude": True, "codex": True, "cursor": False, "stub": False}
+    assert {name: a.SAME_VENDOR_SAME_MODEL for name, a in agents.ADAPTERS.items()} == {
+        "claude": False, "codex": True, "cursor": False, "stub": False}
 
 
 def test_config_load_admits_stub_and_rejects_unsupported_role(tmp_path):

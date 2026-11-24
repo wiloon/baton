@@ -19,7 +19,11 @@ SCAN = True
 SKIP_SCREENSHOT_AFTER_REVIEW = False
 ROUTE_FIELDS = frozenset({"model", "effort", "subagent_model"})
 EMPTY_MODEL_OK = False
-RECORDS_AUTHOR_MODEL = False
+RECORDS_AUTHOR_MODEL = True
+# Owner, 2026-11-24 (temporary while Codex and Cursor are out of weekly quota): Claude may review
+# Claude-written code, but only on a distinct model (e.g. Opus after Sonnet); never the same model.
+SAME_VENDOR_REVIEW = True
+SAME_VENDOR_SAME_MODEL = False
 DEFAULT_MAX_MINUTES = 150
 PREFLIGHT_CHECKS = (("claude", "--version"),)
 VERSION_EXECUTABLE = "claude"
@@ -34,11 +38,13 @@ LEGACY_SEED_WITH_OWNER = True
 UNMARKED_AUTHOR_INFERENCE = True
 GITHUB_ACCESS = "settings"
 FIX_RESUMABLE_VIA_REPLY = False
+FIX_TEMPLATE = "fix-prompt.md"
 READONLY_RESET = False
 REVIEW_TEMPLATE = "review-prompt.md"
 REVIEW_DELIVERY = "artifact"
 REVIEW_SKILL_POLICY = "diff_size"
 SCREENSHOT_DELIVERY = "write"
+SCREENSHOT_TOOL = "the Read tool"
 CONTINUITY_PIN = False
 FIX_SCOPE_POLICY = "every_point"
 # Short roles finish in minutes; a five-minute cache avoids writing the hour-long cache at 2x.

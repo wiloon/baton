@@ -130,17 +130,21 @@ def record_author(state, pr, vendor):
 def record_author_model(state, pr, vendor, model):
     """Persist the model that actually wrote a PR; unknown is never review eligible."""
     path = state_path(state, pr, "author-models")
+    rows = _lines(path)
+    row = f"{vendor} {model or 'unknown'}"
+    if row in rows:
+        return
     adapter = agents.ADAPTERS.get(vendor)
-    if (adapter and adapter.RECORDS_AUTHOR_MODEL and not path.exists()
+    unknown = f"{vendor} unknown"
+    if (row != unknown and adapter and adapter.RECORDS_AUTHOR_MODEL
+            and not any(existing.startswith(f"{vendor} ") for existing in rows)
             and vendor in _lines(state_path(state, pr, "authors"))
             and state_path(state, pr, "contrib").exists()):
         # A pre-migration contribution has no model proof. A later fix cannot
         # retroactively make the entire PR eligible for same-vendor review.
-        path.write_text(f"{vendor} unknown\n")
-    row = f"{vendor} {model or 'unknown'}"
-    if row not in _lines(path):
-        with path.open("a") as file:
-            file.write(row + "\n")
+        row = f"{unknown}\n{row}"
+    with path.open("a") as file:
+        file.write(row + "\n")
 
 
 def seed_authors(state, pr, repo, cursor_branch_re, cursor_login_re):
@@ -274,21 +278,39 @@ def review_excluded(state, pr, fixed_by=""):
     return fixed_by.split() if fixed_by else _lines(state_path(state, pr, "authors"))
 
 
-def codex_review_mode(state, pr, model):
-    """How a Codex reviewer may audit Codex code: with a different model, or, as the last
-    resort, with the same model in a fresh session (every review run starts one). "" when a
-    model is not proven: unknown authors are never review eligible."""
+def same_vendor_review(vendor):
+    """VENDOR may review its own code on a proven model (SAME_VENDOR_REVIEW)."""
+    adapter = agents.ADAPTERS.get(vendor)
+    return bool(adapter and adapter.SAME_VENDOR_REVIEW)
+
+
+def same_vendor_review_mode(state, pr, vendor, model):
+    """How a same-vendor reviewer may audit its own code: with a different model, or, as the last
+    resort, with the same model in a fresh session (every review run starts one). "" when the
+    adapter does not allow it or a model is not proven: unknown authors are never review eligible.
+    An adapter's distinct_models(a, b) compares aliases and IDs (Claude's "sonnet" is
+    claude-sonnet-*); SAME_VENDOR_SAME_MODEL says whether the fresh-session last resort is allowed."""
+    if not same_vendor_review(vendor):
+        return ""
     written = [row.split(maxsplit=1)[1] for row in _lines(state_path(state, pr, "author-models"))
-               if row.startswith("codex ")]
+               if row.startswith(f"{vendor} ")]
     if not (model and model != "unknown" and written and "unknown" not in written):
         return ""
-    return "same-model-fresh-context" if model in written else "same-vendor-different-model"
+    adapter = agents.ADAPTERS[vendor]
+    distinct = getattr(adapter, "distinct_models", None)
+    if distinct is None:
+        different = model not in written
+    else:
+        different = all(distinct(model, author_model) for author_model in written)
+    if different:
+        return "same-vendor-different-model"
+    return "same-model-fresh-context" if getattr(adapter, "SAME_VENDOR_SAME_MODEL", False) else ""
 
 
 def review_allowed(state, pr, vendor, model="", fixed_by=""):
     if vendor not in review_excluded(state, pr, fixed_by):
         return True
-    return vendor == "codex" and bool(codex_review_mode(state, pr, model))
+    return bool(same_vendor_review_mode(state, pr, vendor, model))
 
 
 def screenshot_allowed(state, pr, vendor, model="", fixed_by=""):
@@ -296,7 +318,7 @@ def screenshot_allowed(state, pr, vendor, model="", fixed_by=""):
     other than the one that wrote it (a same-model fresh session does not count)."""
     if vendor not in review_excluded(state, pr, fixed_by):
         return True
-    return vendor == "codex" and codex_review_mode(state, pr, model) == "same-vendor-different-model"
+    return same_vendor_review_mode(state, pr, vendor, model) == "same-vendor-different-model"
 
 
 def _quota_horizon(state, vendor, now):
@@ -309,17 +331,17 @@ def _quota_horizon(state, vendor, now):
                          config.five_hour_max_of(vendor), now) or vendor_policy.SHORT
 
 
-def _waiting_for_cross_vendor(fallback, runnable, blocked, horizons, slot_blockers):
-    """ADR 0002: when only the same-vendor FALLBACK could run, but another vendor is blocked
+def _waiting_for_cross_vendor(fallbacks, runnable, blocked, horizons, slot_blockers):
+    """ADR 0002: when only same-vendor fallbacks could run, but another vendor is blocked
     just for a short while, return its wait reason and whether the wait can lend a slot."""
-    if not fallback or list(runnable) != [fallback]:
+    if not runnable or any(vendor not in fallbacks for vendor in runnable):
         return "", False
     short = {vendor: why for vendor, why in blocked.items()
-             if vendor != fallback and horizons.get(vendor) == vendor_policy.SHORT}
+             if vendor not in fallbacks and horizons.get(vendor) == vendor_policy.SHORT}
     if not short:
         return "", False
     details = ", ".join(f"{vendor} ({why})" for vendor, why in short.items())
-    return f"waiting for {details} instead of same-vendor {fallback}", bool(slot_blockers.intersection(short))
+    return f"waiting for {details} instead of same-vendor {', '.join(runnable)}", bool(slot_blockers.intersection(short))
 
 
 def _quota_pick(state, vendors, now, current=None, prefer=()):
@@ -377,30 +399,29 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
     preferred = f"preferred for {prefer_label}: {' '.join(prefer)}; " if prefer else ""
     excluded = set(exclude)
     shots = role == "screenshot_reviewer"
-    same_vendor_review = False
-    review_mode = "same-vendor-different-model"
+    fallbacks = {}
     if review:
         excluded.update(review_excluded(pr_state, pr, fixed_by))
-        if "codex" in excluded and "codex" in candidates:
-            review_mode = codex_review_mode(pr_state, pr, session.resolve().config.models.route(
-                "screenshot_review" if shots else "review", "codex").model)
-            same_vendor_review = review_mode == "same-vendor-different-model" if shots else bool(review_mode)
+        for same in candidates:
+            if same not in excluded or not same_vendor_review(same):
+                continue
+            mode = same_vendor_review_mode(pr_state, pr, same, config.models.route(
+                "screenshot_review" if shots else "review", same).model)
+            if mode and (not shots or mode == "same-vendor-different-model"):
+                fallbacks[same] = mode
         review_pool = [v for v in (candidates if shots else all_vendors(pool, extra=extra)) if v in eligible]
-        if review_pool and all(v in excluded for v in review_pool) and not same_vendor_review:
+        if review_pool and all(v in excluded for v in review_pool) and not fallbacks:
             return {"vendor": "", "reason": "all eligible reviewers excluded by authorship",
                     "probe": [], "blocked": {}, "exhausted": True}, 0
     if role in ("reviser", "spec_reviewer") and "codex" in excluded and "codex" in candidates:
         route_role = "spec" if role == "reviser" else "spec_review"
         model = session.resolve().config.models.route(route_role, "codex").model
-        same_vendor_review = bool(other_model and other_model != "unknown" and model
-                                  and model != other_model)
-    fallback = "codex" if same_vendor_review else ""
-    if fallback and fallback not in eligible:
-        fallback = ""
+        if other_model and other_model != "unknown" and model and model != other_model:
+            fallbacks = {"codex": "same-vendor-different-model"}
     if role == "reviser" and "claude" in excluded and "claude" in candidates:
         model = session.resolve().config.models.route("spec", "claude", followup=spec_followup).model
         if claude_cli.distinct_models(model, other_model):
-            fallback = "claude"
+            fallbacks = {"claude": "same-vendor-different-model"}
     ordered = ([current, *candidates] if by == "pool" else candidates)
     ready, blocked, probe = [], {}, []
     horizons = {}   # blocked vendor -> vendor_policy.SHORT or LONG
@@ -422,8 +443,8 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
                                                        int(config.quota.quota_stale_minutes)):
             probe.append(vendor)
         ready.append(vendor)
-    if fallback and fallback in eligible and fallback not in ready and fallback not in blocked:
-        status = vendor_policy.availability(state, session.resolve().config.quota, fallback, now)
+    for fallback in fallbacks:
+        status = vendor_policy.availability(state, config.quota, fallback, now)
         why = status.detail
         if why:
             blocked[fallback] = why
@@ -431,12 +452,12 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
                 slot_blockers.add(fallback)
         else:
             ready.append(fallback)
-            if quota.stale(state, fallback, now, int(session.resolve().config.quota.quota_stale_minutes)):
+            if quota.stale(state, fallback, now, int(config.quota.quota_stale_minutes)):
                 probe.append(fallback)
     if probe_only:
         return {"vendor": "", "reason": "", "probe": probe, "blocked": blocked}, 0
     if by == "pool":
-        waiting, lends_slot = _waiting_for_cross_vendor(fallback, ready, blocked, horizons, slot_blockers)
+        waiting, lends_slot = _waiting_for_cross_vendor(fallbacks, ready, blocked, horizons, slot_blockers)
         if waiting:
             return {"vendor": "", "reason": waiting, "probe": [], "blocked": blocked, "lends_slot": lends_slot}, 75
         if not ready:
@@ -446,14 +467,19 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
         try:
             chosen, summary = _quota_pick(state, ready, now, current, prefer)
         except Exception:
-            return {"vendor": ready[0], "reason": "", "probe": [], "blocked": blocked,
-                    "quota_error": True}, 0
+            result = {"vendor": ready[0], "reason": "", "probe": [], "blocked": blocked, "quota_error": True}
+            if review:
+                result["review_mode"] = fallbacks.get(ready[0], "cross-vendor")
+            return result, 0
         if not chosen:
             return {"vendor": "", "reason": f"quota limits: {summary}",
                     "probe": [], "blocked": blocked, "lends_slot": True}, 75
         if chosen == current or len(ready) < 2:
             preferred = ""
-        return {"vendor": chosen, "reason": preferred + summary, "probe": [], "blocked": blocked}, 0
+        result = {"vendor": chosen, "reason": preferred + summary, "probe": [], "blocked": blocked}
+        if review:
+            result["review_mode"] = fallbacks.get(chosen, "cross-vendor")
+        return result, 0
 
     # Contribution picks check each pool vendor's quota independently. A quota
     # command error used to leave that vendor eligible in the shell implementation.
@@ -472,15 +498,14 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
                 continue
         eligible.append(vendor)
     blocked = {vendor: blocked[vendor] for vendor in ordered if vendor in blocked}
-    waiting, lends_slot = _waiting_for_cross_vendor(fallback, eligible, blocked, horizons, slot_blockers)
+    waiting, lends_slot = _waiting_for_cross_vendor(fallbacks, eligible, blocked, horizons, slot_blockers)
     if waiting:
         return {"vendor": "", "reason": waiting, "probe": [], "blocked": blocked, "lends_slot": lends_slot}, 75
     if not eligible:
         details = "".join(f"; {v}: {why}" for v, why in blocked.items())
         return {"vendor": "", "reason": f"no vendor can run now{details}",
                 "probe": [], "blocked": blocked, "lends_slot": bool(slot_blockers)}, 75
-    if fallback in eligible and any(v != fallback for v in eligible):
-        eligible.remove(fallback)
+    eligible = [vendor for vendor in eligible if vendor not in fallbacks] or eligible
     counts = {v: contrib_of(pr_state, pr, v) for v in eligible}
     minimum = min(counts.values())
     tied = [v for v in eligible if counts[v] == minimum]
@@ -503,7 +528,7 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
     lines = "".join(f" {v}={counts[v]}" for v in eligible)
     skipped = "".join(f"; {v}: {why}" for v, why in blocked.items())
     return {"vendor": chosen, "reason": f"{preferred}lines:{lines}{skipped}",
-            "review_mode": review_mode if fallback and chosen == fallback else "cross-vendor",
+            "review_mode": fallbacks.get(chosen, "cross-vendor"),
             "probe": [], "blocked": blocked}, 0
 
 
