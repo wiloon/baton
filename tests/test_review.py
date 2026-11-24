@@ -3003,6 +3003,10 @@ def test_screenshot_delivery_follows_adapter_constant(loop, monkeypatch):
             assert "Include the full review in your final message" in prompt
         else:
             assert "Write the comment to" in prompt and "Write tool" in prompt
+        tool = agents.ADAPTERS[vendor].SCREENSHOT_TOOL
+        assert f"({tool})" in prompt and tool
+        other = {"claude", "codex"} - {vendor}
+        assert all(agents.ADAPTERS[o].SCREENSHOT_TOOL not in prompt for o in other)
 
 
 def test_handoff_accepts_stub_review_comment_retry():

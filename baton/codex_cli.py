@@ -50,6 +50,7 @@ REVIEW_TEMPLATE = "codex-review-prompt.md"
 REVIEW_DELIVERY = "artifact"
 REVIEW_SKILL_POLICY = "direct"
 SCREENSHOT_DELIVERY = "final_message"
+SCREENSHOT_TOOL = "view_image"
 CONTINUITY_PIN = False
 FIX_SCOPE_POLICY = "every_point"
 FIVE_MINUTE_CACHE_ROLES = ()

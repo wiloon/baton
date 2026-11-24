@@ -44,6 +44,7 @@ REVIEW_TEMPLATE = "review-prompt.md"
 REVIEW_DELIVERY = "artifact"
 REVIEW_SKILL_POLICY = "diff_size"
 SCREENSHOT_DELIVERY = "write"
+SCREENSHOT_TOOL = "the Read tool"
 CONTINUITY_PIN = False
 FIX_SCOPE_POLICY = "every_point"
 # Short roles finish in minutes; a five-minute cache avoids writing the hour-long cache at 2x.
