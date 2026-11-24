@@ -1391,8 +1391,7 @@ def fix_pr(runner, pr, wt, fixer, source, feedback, head="", *, owner_triggered=
         rc = runner.finish_verified(
             pr, wt, last, prefix=prefix,
             description_rc=task.get("description_rc", 0), description_reason=task.get("description_reason", ""))
-        if last != "cursor":
-            runner.clear_reply_request(pr, last)
+        runner.clear_reply_request(pr, last)
         # An artifact fixer can finish with a base saved by an earlier Cursor attempt.
         runner.clear_cursor_request(pr)
         recovery.clear(runner.env, runner.env.runtime.issue or pr, pr)
