@@ -846,11 +846,13 @@ class Tick:
                     post = owner_handoff.load_retry(self.env, issue, reason)
                 except owner_handoff.RetryUnreadable:
                     post = None  # Let the spec/dev path handle damaged state.
+                adr_update = (post and reason == owner_handoff.SPEC_PENDING_ACCEPT_POST
+                              and merge.Merger(self.env, None, post["continuation"]["pr"], issue).has_update())
                 if (post and (post.get("reads") is not None
                               or (accept_post or not post.get("confirmed"))
                               and post["attempts"] < owner_handoff.MAX_ATTEMPTS)
                         and owner_handoff.clock() < post["due"]
-                        and not post.get("phase")):
+                        and not post.get("phase") and not adr_update):
                     if self.force_issue:
                         return self.defer("handoff-retry", reason)
                     continue

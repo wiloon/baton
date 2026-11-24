@@ -325,17 +325,205 @@ class Merger:
             time.sleep(2)
         return ""
 
-    def merge_with_updates(self, minutes, *, before_merge=None):
+    # --- the ADR branch update: pinned, verified and bounded (#151, section 6) ---
+    UPDATE_WINDOW = 60       # seconds, wall clock, from the save that precedes the request
+    REQUEST_WINDOW = 30      # the request and any repeat get only the first half
+    update_count = 0
+    validated_head = ""
+    update_reason = ""
+
+    def update_file(self):
+        return Path(self.state, f"adr-update-pr-{self.pr}.json")
+
+    def has_update(self):
+        path = self.update_file()
+        return path.exists() or path.is_symlink()
+
+    def save_update(self, record):
+        path = self.update_file()
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(record) + "\n")
+        os.replace(tmp, path)
+
+    def clear_update(self):
+        try:
+            self.update_file().unlink(missing_ok=True)
+        except IsADirectoryError:
+            pass  # Leave a damaged directory and its contents in place.
+
+    def load_update(self, accepted):
+        """None when no update is saved; the record when whole and in range; False when the file
+        is not a regular file, unreadable, malformed or out of range (fail closed)."""
+        path = self.update_file()
+        if not self.has_update():
+            return None
+        try:
+            if path.is_symlink() or not path.is_file():
+                return False
+            record = json.loads(path.read_text())
+            if (not isinstance(record, dict) or not isinstance(record.get("head"), str)
+                    or not re.fullmatch(r"[0-9a-f]{40}", record["head"])
+                    or not accepted or record.get("accepted", record["head"]) != accepted
+                    or type(record.get("count")) is not int):
+                return False
+            if set(record) == {"accepted", "head", "count"}:
+                return record if 1 <= record["count"] <= 3 and record["head"] != accepted else False
+            fields = {"head", "base", "count", "deadline", "response"}
+            if (set(record) - {"accepted"} != fields
+                    or not isinstance(record["base"], str) or not record["base"]
+                    or not 0 <= record["count"] <= 2
+                    or (record["count"] == 0 and record["head"] != accepted)
+                    or type(record["deadline"]) not in (int, float)
+                    or record["response"] not in (None, "accepted", "inconclusive")
+                    or not 0 <= record["deadline"] <= time.time() + self.UPDATE_WINDOW):
+                return False
+            return record
+        except (OSError, ValueError):
+            return False
+
+    def bounded(self, deadline, command):
+        """COMMAND under the time left until DEADLINE, killed then; None when none is left."""
+        budget = pr_helpers.deadline_budget(deadline)
+        if not budget:
+            return None
+        done = session.run_process(["timeout", "-s", "KILL", str(budget), *command],
+                                   capture_output=True, text=True, check=False)
+        return done if time.time() < deadline else None
+
+    def verify_updated_head(self, saved, new, base, deadline):
+        """True when NEW is a merge commit of SAVED and a head already on BASE, with the tree of a
+        clean merge of the two. A call that fails, or cannot start in time, is False."""
+        clone = ["git", "-C", str(self.env.dirs.clone)]
+
+        def run(*args):
+            done = self.bounded(deadline, [*clone, *args])
+            return done if done is not None and done.returncode == 0 else None
+
+        if not run("fetch", "-q", "origin", f"+refs/heads/{base}:refs/remotes/origin/{base}",
+                   f"+refs/pull/{self.pr}/head:refs/remotes/origin/baton-pr-{self.pr}"):
+            return False
+        parents = run("rev-list", "--parents", "-n", "1", new)
+        fields = parents.stdout.split() if parents else []
+        if len(fields) != 3 or fields[0] != new or fields[1] != saved:
+            return False
+        if not run("merge-base", "--is-ancestor", fields[2], f"refs/remotes/origin/{base}"):
+            return False
+        merged, tree = run("merge-tree", "--write-tree", saved, fields[2]), run("rev-parse", f"{new}^{{tree}}")
+        return bool(merged and tree and merged.stdout.split()[:1] == tree.stdout.split()[:1] != [])
+
+    def read_head(self, deadline):
+        """The PR's head within DEADLINE; '' when unreadable. One call, no inner repeat."""
+        done = pr_helpers.gh("pr", "view", str(self.pr), "-R", self.repo, "--json", "headRefOid",
+                             until=deadline, repeat=lambda result: False)
+        if time.time() >= deadline or done.returncode != 0:
+            return ""
+        try:
+            head = json.loads(done.stdout).get("headRefOid")
+            return head if isinstance(head, str) and re.fullmatch(r"[0-9a-f]{40}", head) else ""
+        except (ValueError, AttributeError):
+            return ""
+
+    def settle_update(self, record):
+        """Poll for the head the saved update produces until its one deadline. A new head is
+        returned only after it is verified; None, with `update_reason` saying why."""
+        saved, deadline = record["head"], record["deadline"]
+        self.update_reason = "update_deadline"
+        while deadline - time.time() > 0:
+            sha = self.read_head(deadline)
+            if sha and sha != saved:
+                verified = self.verify_updated_head(saved, sha, record["base"], deadline)
+                if time.time() >= deadline:
+                    return None
+                if verified:
+                    return sha
+                self.update_reason = "update_unverified"
+                return None
+            time.sleep(max(0, min(2, deadline - time.time())))
+        return None
+
+    def finish_update(self, record):
+        new = self.settle_update(record)
+        if new:
+            return self.confirm_update(record, new)
+        return self.update_failure(self.update_reason)
+
+    def update_failure(self, reason):
+        return {"ok": False, "reason": reason, "detail": {
+            "update_deadline": " the branch update was not confirmed before its deadline",
+            "update_unverified": " the updated head is not a clean merge of the saved head and the base",
+        }[reason]}
+
+    def confirm_update(self, record, head):
+        # Atomically replace the in-flight phase before entering CI or attempting the merge.
+        self.save_update({"accepted": record.get("accepted", record["head"]),
+                          "head": head, "count": record["count"] + 1})
+        return head
+
+    def pinned_update(self, accepted, saved, base, count):
+        """One conditional update from SAVED: the verified new head, or a failure dict."""
+        record = {"accepted": accepted, "head": saved, "base": base, "count": count,
+                  "deadline": time.time() + self.UPDATE_WINDOW, "response": None}
+        self.save_update(record)
+
+        def refused(result):
+            status = re.search(r"\bHTTP ([1-5]\d\d)\b", result.stderr or "")
+            return result.returncode != 0 and status is not None and status[1].startswith("4")
+
+        def secondary(result):
+            return bool(refused(result) and re.search(r"secondary rate limit", result.stderr, re.IGNORECASE))
+
+        sent = pr_helpers.gh("api", "-X", "PUT", f"repos/{self.repo}/pulls/{self.pr}/update-branch",
+                             "-f", f"expected_head_sha={saved}", repeat=secondary,
+                             until=record["deadline"] - self.UPDATE_WINDOW + self.REQUEST_WINDOW)
+        if refused(sent):
+            # Refused: this request was not accepted. It counts as landed only if the head already passes.
+            sha = self.read_head(record["deadline"])
+            verified = sha and sha != saved and self.verify_updated_head(saved, sha, base, record["deadline"])
+            if time.time() >= record["deadline"]:
+                return self.update_failure("update_deadline")
+            if verified:
+                return self.confirm_update(record, sha)
+            return {"ok": False, "reason": "update_failed", "detail": pr_helpers.why(sent)}
+        record["response"] = "accepted" if sent.returncode == 0 else "inconclusive"
+        self.save_update(record)
+        return self.finish_update(record)
+
+    def settle_pending_update(self, accepted):
+        """A saved update from an earlier run: None when there is none, else the verified head or a
+        failure dict. The deadline is checked before any read of the PR."""
+        record = self.load_update(accepted)
+        if record is None:
+            return None
+        if record is False:
+            return {"ok": False, "reason": "update_state_invalid", "detail": " the saved branch update is damaged"}
+        self.update_count = record["count"]
+        if "deadline" not in record:
+            return record["head"]
+        head = self.finish_update(record)
+        if isinstance(head, str):
+            self.update_count += 1
+        return head
+
+    def merge_with_updates(self, minutes, *, before_merge=None, pinned=None):
         """Merge the PR, updating a behind branch at most three times (#122).
 
         BEFORE_MERGE: optional callable() -> gate-style dict. Called after a confirmed
         update and its CI wait, before each merge attempt. A result whose action is not
         "merge" stops further attempts.
 
+        PINNED: the originally accepted head for an ADR PR (#151, section 6). The update is then the conditional,
+        verified and bounded API call, and every merge carries --match-head-commit with a
+        validated head.
+
         Returns {"ok": True} or {"ok": False, "reason": ..., "detail": ..., "gate": ...}.
         """
         pr, repo = str(self.pr), self.repo
-        updates, match_sha = 0, self.approved_head or None
+        updates, match_sha = self.update_count, self.approved_head or None
+        validated = self.validated_head or pinned
+        if pinned is not None:
+            if not validated:
+                return {"ok": False, "reason": "sha_unavailable", "detail": " the accepted head is unavailable"}
+            match_sha = validated
         data = self.pr_merge_state()
         while True:
             self.merge_head = (data or {}).get("headRefOid") or ""
@@ -349,13 +537,23 @@ class Merger:
                 if not before:
                     return {"ok": False, "reason": "sha_unavailable",
                             "detail": " mergeStateStatus is BEHIND but headRefOid is unavailable"}
-                updated = pr_helpers.gh("pr", "update-branch", pr, "-R", repo)
-                if updated.returncode != 0:
-                    return {"ok": False, "reason": "update_failed", "detail": pr_helpers.why(updated)}
-                new_sha = self.confirm_new_head(before)
-                if not new_sha:
-                    return {"ok": False, "reason": "head_unchanged",
-                            "detail": " branch head did not change after update-branch"}
+                if pinned is not None:
+                    base = (pr_helpers.view(pr, "baseRefName") or {}).get("baseRefName") or ""
+                    if not validated or not base:
+                        return {"ok": False, "reason": "sha_unavailable",
+                                "detail": " the validated head or the base branch is unavailable"}
+                    new_sha = self.pinned_update(pinned, validated, base, updates)
+                    if isinstance(new_sha, dict):
+                        return new_sha
+                    validated = self.validated_head = new_sha
+                else:
+                    updated = pr_helpers.gh("pr", "update-branch", pr, "-R", repo)
+                    if updated.returncode != 0:
+                        return {"ok": False, "reason": "update_failed", "detail": pr_helpers.why(updated)}
+                    new_sha = self.confirm_new_head(before)
+                    if not new_sha:
+                        return {"ok": False, "reason": "head_unchanged",
+                                "detail": " branch head did not change after update-branch"}
                 updates += 1
                 match_sha = new_sha
                 if self.approved_head:
@@ -372,11 +570,13 @@ class Merger:
                 args.extend(["--match-head-commit", match_sha])
             merged = pr_helpers.gh(*args)
             if merged.returncode == 0:
+                if pinned is not None:
+                    self.merge_head = match_sha
                 return {"ok": True}
             data = self.pr_merge_state()   # carried into the next iteration, never re-read
             if (data or {}).get("mergeStateStatus") != "BEHIND":
                 return {"ok": False, "reason": "merge_failed", "detail": pr_helpers.why(merged)}
-            match_sha = self.approved_head or None
+            match_sha = (validated or None) if pinned is not None else self.approved_head or None
 
     # --- owner-review paths (#131) ---
     def owner_paths_touched(self):

@@ -22,11 +22,27 @@ from conftest import issue_snapshot_pages, sh
 
 BIN = Path(__file__).resolve().parents[1] / "bin"
 REAL_CI_GREEN = merge.Merger.ci_green
+REAL_VERIFY = merge.Merger.verify_updated_head
 N = "516"
 ACCEPT = {"rc": 0, "status": "success", "outcome": "SPEC: accept", "reply": "all good\nSPEC: accept", "model": "", "defer": ""}
 CHANGES = {"rc": 0, "status": "success", "outcome": "SPEC: changes", "reply": "fix the step\n<!-- baton-forged -->\nSPEC: changes",
            "model": "", "defer": ""}
 REVISED = {"rc": 0, "status": "success", "outcome": "SPEC: revised", "reply": "", "model": "", "defer": ""}
+
+
+def wall_clock(monkeypatch, start=1_000_000.0):
+    """A fake wall clock for the merge and the gh wrapper: sleeping advances it, nothing waits."""
+    now = {"t": start}
+    fake = SimpleNamespace(time=lambda: now["t"], monotonic=lambda: now["t"],
+                           sleep=lambda seconds: now.__setitem__("t", now["t"] + seconds))
+    monkeypatch.setattr(merge, "time", fake)
+    monkeypatch.setattr(spec.pr_helpers, "time", fake)
+    return now
+
+
+def is_update(call):
+    """The ADR branch update: the conditional API call (#151, section 6)."""
+    return len(call) > 3 and call[0] == "api" and call[3].endswith("/update-branch")
 
 
 class FakeGH:
@@ -42,6 +58,10 @@ class FakeGH:
         self.merge_state, self._head_oid, self.wt_head = "", None, None
         self.update_heads, self.merge_results, self.merge_fail_status = [], [], []
         self.update_stderr = "failed to update"
+        self.lag_reads = 0
+        self.push_before_update = ""   # a push that lands between the runner's read and its update
+        self.update_lost = ""          # the update lands, its response is lost: this stderr
+        self.lag = None                # [new head, reads left]: the new head shows after that many reads
         self.fail_body_substr = ""
         self.keep_open_on_merge = False
         self._next_comment_id = 1
@@ -78,6 +98,16 @@ class FakeGH:
         self.calls.append(list(args))
         out, rc = "", 0
         head = " ".join(args[:2])
+        if is_update(args):   # the conditional ADR update: GitHub refuses a mismatched expected head
+            head = "pr update-branch"
+            expected = next(a.split("=", 1)[1] for a in args if a.startswith("expected_head_sha="))
+            if self.push_before_update:
+                self.head_oid = self.push_before_update
+            if self.update_lost and expected == self.head_oid and self.update_heads:
+                self.lag = [self.update_heads.pop(0), self.lag_reads]
+                return subprocess.CompletedProcess(args, 1, "", self.update_lost)
+            if expected != self.head_oid and head not in self.fails:
+                return subprocess.CompletedProcess(args, 1, "", "HTTP 422: expected head sha didn't match")
         key = "issue view" if head == "api graphql" else head
         if key in self.fails:
             err = self.update_stderr if head == "pr update-branch" else (
@@ -131,7 +161,12 @@ class FakeGH:
             out = "https://github.com/owner/app/pull/77\n"
         elif head == "pr view":
             fields = args[args.index("--json") + 1] if "--json" in args else ""
-            data = {"state": self.pr_state, "mergeStateStatus": self.merge_state, "headRefOid": self.head_oid}
+            if self.lag and "headRefOid" in fields:
+                self.lag[1] -= 1
+                if self.lag[1] < 0:
+                    self.head_oid, self.lag = self.lag[0], None
+            data = {"state": self.pr_state, "mergeStateStatus": self.merge_state, "headRefOid": self.head_oid,
+                    "baseRefName": "main"}
             if "--jq" in args:
                 out = str(data.get(args[args.index("--jq") + 1].lstrip("."), "") or "")
             else:
@@ -169,10 +204,11 @@ def loop(worktree, tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))   # no telegram.env: no network
     monkeypatch.setenv("LOGS", env["LOGS"])
     monkeypatch.setattr(pick.settle, "probe", lambda *args: None)
+    monkeypatch.setattr(merge.Merger, "verify_updated_head", lambda self, *args: True)
     fake = FakeGH("owner")
     fake.wt_head = lambda: spec.git(tmp_path / "worktrees" / f"spec-{N}", "rev-parse", "HEAD")
     # Below baton.pr.gh, so the loop runs through its retries (#46).
-    monkeypatch.setattr(spec.pr_helpers, "call", lambda *args, input=None, limit=None: fake(*args, input=input))
+    monkeypatch.setattr(spec.pr_helpers, "call", lambda *args, input=None, limit=None, **_: fake(*args, input=input))
     monkeypatch.setattr(spec.pr_helpers, "sleep", lambda seconds: None)
     state = SimpleNamespace(env=env, gh=fake, repo=worktree.repo, runs=[], script=[], ci=True, merged=[])
     monkeypatch.setattr(merge.Merger, "ci_green", lambda self, minutes: state.ci)
@@ -1567,9 +1603,9 @@ def test_pending_write_failure_skips_ci_and_merge(loop):
 
 
 def test_a_later_tick_resumes_an_open_adr_merge_without_spec_agents(loop, monkeypatch):
-    monkeypatch.setattr(merge.time, "sleep", lambda s: None)
+    wall_clock(monkeypatch)
     loop.gh.comments = [{"author": {"login": "owner"},
-                         "body": f"<!-- baton-spec-accept-pending pr=77 -->\n{VERDICT_BODY}"}]
+                         "body": f"<!-- baton-spec-accept-pending pr=77 head={'a' * 40} -->\n{VERDICT_BODY}"}]
     loop.gh.adr_pr, loop.gh.pr_state, loop.gh.merge_state = "77", "OPEN", ""
     loop.script = []  # no agent dispatch
     monkeypatch.setattr(spec.Spec, "worktree", lambda self: pytest.fail("spec worktree set up"))
@@ -1587,7 +1623,7 @@ def test_a_later_tick_resumes_an_open_adr_merge_without_spec_agents(loop, monkey
 def test_a_resumed_adr_merge_rechecks_ci_first(loop, monkeypatch):
     monkeypatch.setattr(spec.Spec, "worktree", lambda self: pytest.fail("spec worktree set up"))
     loop.gh.comments = [{"author": {"login": "owner"},
-                         "body": f"<!-- baton-spec-accept-pending pr=77 -->\n{VERDICT_BODY}"}]
+                         "body": f"<!-- baton-spec-accept-pending pr=77 head={'a' * 40} -->\n{VERDICT_BODY}"}]
     loop.gh.adr_pr, loop.gh.pr_state = "77", "OPEN"
     loop.ci = False
     assert loop.run() is False
@@ -1597,7 +1633,7 @@ def test_a_resumed_adr_merge_rechecks_ci_first(loop, monkeypatch):
 
 def test_a_merged_adr_pr_publishes_the_saved_verdict_without_ci_or_merge(loop):
     loop.gh.comments = [{"author": {"login": "owner"},
-                         "body": f"<!-- baton-spec-accept-pending pr=77 -->\n{VERDICT_BODY}"}]
+                         "body": f"<!-- baton-spec-accept-pending pr=77 head={'a' * 40} -->\n{VERDICT_BODY}"}]
     loop.gh.pr_state = "MERGED"
     loop.ci = False  # must not be consulted
     assert loop.run() is True
@@ -1608,7 +1644,7 @@ def test_a_merged_adr_pr_publishes_the_saved_verdict_without_ci_or_merge(loop):
 
 def test_a_closed_adr_pr_hands_off_without_a_verdict(loop):
     loop.gh.comments = [{"author": {"login": "owner"},
-                         "body": f"<!-- baton-spec-accept-pending pr=77 -->\n{VERDICT_BODY}"}]
+                         "body": f"<!-- baton-spec-accept-pending pr=77 head={'a' * 40} -->\n{VERDICT_BODY}"}]
     loop.gh.pr_state = "CLOSED"
     assert loop.run() is False
     assert "ready-for-human" in loop.gh.labels and not loop.gh.posted("<!-- baton-verdict: accept")
@@ -1617,7 +1653,7 @@ def test_a_closed_adr_pr_hands_off_without_a_verdict(loop):
 
 def test_verdict_write_failure_after_merge_retries_without_another_merge(loop):
     loop.gh.comments = [{"author": {"login": "owner"},
-                         "body": f"<!-- baton-spec-accept-pending pr=77 -->\n{VERDICT_BODY}"}]
+                         "body": f"<!-- baton-spec-accept-pending pr=77 head={'a' * 40} -->\n{VERDICT_BODY}"}]
     loop.gh.pr_state = "MERGED"
     loop.gh.fail_body_substr = "<!-- baton-verdict: accept"
     assert loop.run() is False
@@ -1641,7 +1677,7 @@ def test_deleting_the_pending_comment_restores_normal_spec_selection(loop):
 
 def test_merge_success_while_pr_stays_open_hands_off_without_a_verdict(loop):
     loop.gh.comments = [{"author": {"login": "owner"},
-                         "body": f"<!-- baton-spec-accept-pending pr=77 -->\n{VERDICT_BODY}"}]
+                         "body": f"<!-- baton-spec-accept-pending pr=77 head={'a' * 40} -->\n{VERDICT_BODY}"}]
     loop.gh.pr_state = "OPEN"
     loop.gh.keep_open_on_merge = True
     assert loop.run() is False
@@ -1650,19 +1686,19 @@ def test_merge_success_while_pr_stays_open_hands_off_without_a_verdict(loop):
 
 
 def test_spec_accept_updates_a_behind_adr_pr_before_merging(loop, monkeypatch):
-    monkeypatch.setattr(merge.time, "sleep", lambda s: None)
+    wall_clock(monkeypatch)
     loop.script = [CHANGES, reviser(commit=True), ACCEPT]
     loop.gh.merge_state = "BEHIND"
     loop.gh.update_heads = ["b" * 40]
     assert loop.run() is True
-    assert any(c[:2] == ["pr", "update-branch"] for c in loop.gh.calls)
+    assert any(is_update(c) for c in loop.gh.calls)
     merges = [c for c in loop.gh.calls if c[:2] == ["pr", "merge"]]
     assert merges and "--match-head-commit" in merges[0] and "b" * 40 in merges[0]
     assert loop.gh.posted("<!-- baton-verdict: accept")
 
 
 def test_three_behind_updates_on_the_spec_path_hand_off_with_merge_failed(loop, monkeypatch):
-    monkeypatch.setattr(merge.time, "sleep", lambda s: None)
+    wall_clock(monkeypatch)
     notes = []
     monkeypatch.setattr(spec.notify, "notify", lambda title, text="": notes.append(text))
     loop.script = [CHANGES, reviser(commit=True), ACCEPT]
@@ -1671,7 +1707,7 @@ def test_three_behind_updates_on_the_spec_path_hand_off_with_merge_failed(loop, 
     loop.gh.merge_results = [1, 1, 1]
     loop.gh.merge_fail_status = ["BEHIND", "BEHIND", "BEHIND"]
     assert loop.run() is False
-    assert len([c for c in loop.gh.calls if c[:2] == ["pr", "update-branch"]]) == 3
+    assert len([c for c in loop.gh.calls if is_update(c)]) == 3
     assert "ready-for-human" in loop.gh.labels and not loop.gh.posted("<!-- baton-verdict: accept")
     assert loop.gh.posted("<!-- baton-spec-accept-pending pr=77")
     assert any("merging the ADR PR #77 failed" in text for text in notes)
@@ -1685,10 +1721,10 @@ ACCEPTED = "<!-- baton-verdict: accept"
 
 def resume_pending(loop, monkeypatch):
     """An open ADR PR whose acceptance is pending; the handoff texts land in the returned list."""
-    monkeypatch.setattr(merge.time, "sleep", lambda s: None)
+    wall_clock(monkeypatch)
     notes = []
     monkeypatch.setattr(spec.notify, "notify", lambda title, text="": notes.append(text))
-    loop.gh.comments = [{"author": {"login": "owner"}, "body": f"{PENDING} -->\n{VERDICT_BODY}"}]
+    loop.gh.comments = [{"author": {"login": "owner"}, "body": f"{PENDING} head={'a' * 40} -->\n{VERDICT_BODY}"}]
     loop.gh.adr_pr, loop.gh.pr_state = "77", "OPEN"
     return notes
 
@@ -1698,7 +1734,7 @@ def merges(loop):
 
 
 def updates(loop):
-    return [c for c in loop.gh.calls if c[:2] == ["pr", "update-branch"]]
+    return [c for c in loop.gh.calls if is_update(c)]
 
 
 def test_a_failed_adr_merge_that_is_now_behind_updates_and_retries(loop, monkeypatch):
@@ -1726,7 +1762,7 @@ def test_an_adr_update_branch_failure_hands_off_with_ghs_stderr(loop, monkeypatc
     notes = resume_pending(loop, monkeypatch)
     loop.gh.merge_state = "BEHIND"
     loop.gh.fails.add("pr update-branch")
-    loop.gh.update_stderr = "refusing to merge unrelated histories"
+    loop.gh.update_stderr = "HTTP 422: refusing to merge unrelated histories"
     assert loop.run() is False
     assert merges(loop) == []
     assert any("refusing to merge unrelated histories" in text for text in notes)
@@ -1735,19 +1771,13 @@ def test_an_adr_update_branch_failure_hands_off_with_ghs_stderr(loop, monkeypatc
 
 def test_an_unchanged_adr_head_after_update_skips_ci_and_merge(loop, monkeypatch):
     notes = resume_pending(loop, monkeypatch)
-    ticks = {"n": 0}
-
-    def mono():
-        ticks["n"] += 1
-        return 0 if ticks["n"] < 3 else 100
-    monkeypatch.setattr(merge.time, "monotonic", mono)
     greens = []
     monkeypatch.setattr(merge.Merger, "ci_green", lambda self, minutes: greens.append(minutes) or True)
     loop.gh.merge_state = "BEHIND"   # the update succeeds but the head stays the same
     assert loop.run() is False
     assert len(updates(loop)) == 1 and merges(loop) == []
     assert greens == [30]   # only the gate before the update
-    assert any("did not change" in text for text in notes)
+    assert any("not confirmed before its deadline" in text for text in notes)
 
 
 def test_red_ci_after_a_confirmed_adr_update_hands_off_without_merging(loop, monkeypatch):
@@ -1944,7 +1974,7 @@ def test_spec_run_recovers_adr_discovery_and_checks_identity(loop, monkeypatch, 
 def accept_now(loop, monkeypatch):
     """A review round that ends in an accept with ADR edits, so Spec.accept posts the pending
     comment and merges the ADR PR in the same run; the handoff texts land in the returned list."""
-    monkeypatch.setattr(merge.time, "sleep", lambda s: None)
+    wall_clock(monkeypatch)
     notes = []
     monkeypatch.setattr(spec.notify, "notify", lambda title, text="": notes.append(text))
     loop.script = [CHANGES, reviser(commit=True), ACCEPT]
@@ -1977,7 +2007,7 @@ def test_accept_hands_off_an_adr_update_branch_failure_with_ghs_stderr(loop, mon
     notes = accept_now(loop, monkeypatch)
     loop.gh.merge_state = "BEHIND"
     loop.gh.fails.add("pr update-branch")
-    loop.gh.update_stderr = "refusing to merge unrelated histories"
+    loop.gh.update_stderr = "HTTP 422: refusing to merge unrelated histories"
     assert loop.run() is False
     assert merges(loop) == []
     assert any("refusing to merge unrelated histories" in text for text in notes)
@@ -1992,7 +2022,7 @@ def test_accept_skips_ci_and_merge_when_the_adr_head_does_not_change(loop, monke
     assert loop.run() is False
     assert len(updates(loop)) == 1 and merges(loop) == []
     assert greens == [30]   # only the gate before the update
-    assert any("did not change" in text for text in notes)
+    assert any("not confirmed before its deadline" in text for text in notes)
     assert not loop.gh.posted(ACCEPTED) and loop.gh.posted(PENDING)
 
 
@@ -2057,7 +2087,7 @@ def test_pending_adr_acceptance_records_observation_and_runs_the_existing_rule(
 
     fixture = advised.gh
     fixture.comments = [{"author": {"login": "owner"},
-                         "body": f"<!-- baton-spec-accept-pending pr=77 -->\n{VERDICT_BODY}"}]
+                         "body": f"<!-- baton-spec-accept-pending pr=77 head={'a' * 40} -->\n{VERDICT_BODY}"}]
     fixture.adr_pr, fixture.pr_state = "77", state
     fixture.merge_state = "BEHIND" if update else "CLEAN"
     fixture.update_heads = ["b" * 40] if update else []
@@ -2089,7 +2119,7 @@ def test_pending_adr_acceptance_records_observation_and_runs_the_existing_rule(
         assert "30 minutes" in snapshot
     assert not ci_watches and advised.runs == []
     assert sum(c[:2] == ["pr", "merge"] for c in fixture.calls) == len(merge_results)
-    assert sum(c[:2] == ["pr", "update-branch"] for c in fixture.calls) == int(update)
+    assert sum(is_update(c) for c in fixture.calls) == int(update)
     assert not fixture.posted("<!-- baton-verdict: accept")
     assert "ready-for-human" in fixture.labels
 
@@ -2947,7 +2977,7 @@ def test_a_transient_pending_accept_post_defers_then_recovers_without_a_second_w
     clock = _spec_clock(monkeypatch)
     call, posts = spec.pr_helpers.call, []
     loop.script = [CHANGES, reviser(commit=True), ACCEPT]
-    monkeypatch.setattr(merge.time, "sleep", lambda s: None)
+    wall_clock(monkeypatch)
 
     def flaky(*args, input=None, limit=None):
         if args[:2] == ("issue", "comment"):
@@ -3008,7 +3038,7 @@ def test_a_pending_accept_post_exhausts_across_both_delays(loop, monkeypatch, sp
     clock = _spec_clock(monkeypatch)
     loop.script = [CHANGES, reviser(commit=True), ACCEPT]
     call, writes = spec.pr_helpers.call, []
-    monkeypatch.setattr(merge.time, "sleep", lambda s: None)
+    wall_clock(monkeypatch)
 
     def unavailable(*args, input=None, limit=None):
         if args[:2] == ("issue", "comment") and "baton-spec-accept-pending" in (
@@ -3174,7 +3204,7 @@ def test_a_pending_accept_post_that_finds_its_verdict_continues_without_repostin
     clock = _spec_clock(monkeypatch)
     call, posts = spec.pr_helpers.call, []
     loop.script = [CHANGES, reviser(commit=True), ACCEPT]
-    monkeypatch.setattr(merge.time, "sleep", lambda s: None)
+    wall_clock(monkeypatch)
 
     def flaky(*args, input=None, limit=None):
         if args[:2] == ("issue", "comment"):
@@ -3210,7 +3240,7 @@ def test_a_pending_accept_post_that_finds_its_verdict_continues_without_repostin
 def test_a_lost_pending_accept_response_merges_and_publishes_once(loop, monkeypatch):
     call = spec.pr_helpers.call
     loop.script = [CHANGES, reviser(commit=True), ACCEPT]
-    monkeypatch.setattr(merge.time, "sleep", lambda s: None)
+    wall_clock(monkeypatch)
 
     def write_then_fail(*args, input=None, limit=None):
         result = call(*args, input=input, limit=limit)
@@ -3315,7 +3345,7 @@ def test_resumed_accept_checks_saved_adr_identity_and_head(loop, monkeypatch, sp
     clock = _spec_clock(monkeypatch)
     call = spec.pr_helpers.call
     loop.script = [ACCEPT] if change == "new ADR" else [CHANGES, reviser(commit=True), ACCEPT]
-    monkeypatch.setattr(merge.time, "sleep", lambda s: None)
+    wall_clock(monkeypatch)
 
     pending = change in ("different merged head", "expected merged head")
     marker = "<!-- baton-spec-accept-pending" if pending else "<!-- baton-verdict: accept"
@@ -3401,7 +3431,7 @@ def _defer_accept_verdict(loop, monkeypatch):
 def test_edit_during_adr_merge_blocks_verdict_publication(loop, monkeypatch, spec_handoffs, edit):
     call = spec.pr_helpers.call
     loop.script = [CHANGES, reviser(commit=True), ACCEPT]
-    monkeypatch.setattr(merge.time, "sleep", lambda s: None)
+    wall_clock(monkeypatch)
 
     def change_during_merge(*args, input=None, limit=None):
         result = call(*args, input=input, limit=limit)

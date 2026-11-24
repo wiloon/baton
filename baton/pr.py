@@ -38,9 +38,9 @@ sleep = time.sleep
 STDERR_LINES = 3
 
 
-def call(*args, input=None, limit=None):
-    """One `gh ARGS` run; LIMIT (seconds) runs it under `timeout`."""
-    command = ["gh", *args] if limit is None else ["timeout", str(limit), "gh", *args]
+def call(*args, input=None, limit=None, kill=False):
+    """One `gh ARGS` run. KILL uses SIGKILL at the limit for hard deadlines."""
+    command = ["gh", *args] if limit is None else ["timeout", *(["-s", "KILL"] if kill else []), str(limit), "gh", *args]
     return session.run_process(command, input=input, text=True, capture_output=True, check=False)
 
 
@@ -174,17 +174,33 @@ def _landed(args, input):
     return None
 
 
-def gh(*args, input=None, limit=None, reconcile=None):
+def gh(*args, input=None, limit=None, reconcile=None, repeat=None, until=None):
     """`gh ARGS`, retried on transient failures (TLS or connection errors, 502/503/504, the
     secondary rate limit) with BACKOFF; a 4xx or any other failure is returned at once. Before
     retrying a write that is not idempotent (a comment, `pr create`, `issue create`,
     `pr merge`), it checks whether the first try landed. The one entry point for every
     baton `gh` call (#46); the final failure's stderr is in the result (why()). A saved
     write can supply RECONCILE, which returns landed, absent, or a state that stops repeats.
-    It also checks the final transient failure, when no inner repeat remains (#151)."""
-    result = call(*args, input=input, limit=limit)
+    It also checks the final transient failure, when no inner repeat remains (#151).
+
+    REPEAT replaces `transient` as the test for an inner repeat (a call that must not be resent
+    after an inconclusive failure). UNTIL is a wall-clock time (`time.time()`): every call gets only
+    the time left, is killed then, and none starts after it (#151)."""
+    retryable = repeat or transient
+
+    def attempt():
+        if until is None:
+            return call(*args, input=input, limit=limit)
+        budget = deadline_budget(until, limit)
+        if budget:
+            result = call(*args, input=input, limit=budget, kill=True)
+            if time.time() < until:
+                return result
+        return subprocess.CompletedProcess(["gh", *args], 124, "", "deadline reached")
+
+    result = attempt()
     for pause in BACKOFF:
-        if result.returncode == 0 or not transient(result):
+        if result.returncode == 0 or not retryable(result) or (until is not None and time.time() + pause >= until):
             break
         sleep(pause)
         if reconcile is not None:
@@ -195,13 +211,21 @@ def gh(*args, input=None, limit=None, reconcile=None):
                 return result
         elif (done := _landed(args, input)) is not None:
             return done
-        result = call(*args, input=input, limit=limit)
-    if result.returncode != 0 and transient(result):
+        result = attempt()
+    if result.returncode != 0 and retryable(result):
         if reconcile is not None and reconcile() == "landed":
             return subprocess.CompletedProcess(result.args, 0, "", "")
         from . import notify   # notify imports this module
         notify.log(f"gh {' '.join(args[:2])} failed after {len(BACKOFF) + 1} tries{why(result)}")
     return result
+
+
+def deadline_budget(until, limit=None):
+    """Round down to milliseconds. A zero budget must never reach GNU timeout."""
+    left = until - time.time()
+    if limit is not None:
+        left = min(left, limit)
+    return int(max(left, 0) * 1000) / 1000
 
 
 def view(pr, fields):
