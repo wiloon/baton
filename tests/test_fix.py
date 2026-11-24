@@ -2468,6 +2468,7 @@ def test_verification_resume_uses_the_fixer_protocol_and_clears_cursor_state(
     cursor_base = state / f"cursor-fix-base-{PR}"
     cursor_task = state / f"cursor-fix-task-{PR}"
     reply = "## Checks to verify\nnone\n\nRESULT: fixed"
+    original_base = run.remote_head()
     if fixer == "claude":
         request = BODY.replace("## Checks to verify\nnone", "## Checks to verify\n- /billing: cursor badge")
         run.agent(cursor_plan(reply, request=request))
@@ -2495,7 +2496,8 @@ def test_verification_resume_uses_the_fixer_protocol_and_clears_cursor_state(
     saved = recovery.load(session.resolve(os.environ), "419", PR)
     assert saved["reason"] == "fix_verify_failed"
     # The base survives the deferral: Cursor's own file, or the owner record once Claude took over.
-    assert cursor_base.exists() if fixer == "cursor" else _owner()["fixer"] == "claude"
+    assert (cursor_base.exists() if fixer == "cursor"
+            else _owner() == {"fixer": "claude", "base": original_base})
 
     pushes = []
     push = fix.Runner.push_with_retry
@@ -2612,6 +2614,9 @@ def test_a_switched_fixer_verifies_and_pushes_the_earlier_commits_from_the_origi
     assert run.pushed() and run.remote_head() != base
     assert "Cursor's superseded description." not in run.body()
     assert _owner() is None
+    assert (state / f"pr-{PR}-authors").read_text().split() == ["cursor", "stub"]
+    contrib = (state / f"pr-{PR}-contrib").read_text().split("\n")
+    assert any(row.startswith("cursor ") for row in contrib)
     assert not (state / f"cursor-fix-base-{PR}").exists() and not (state / f"stub-fix-base-{PR}").exists()
     assert not (state / f"cursor-fix-task-{PR}").exists()
 
@@ -2643,7 +2648,57 @@ def test_a_legacy_cursor_request_without_an_owner_is_discarded_on_a_switch(run, 
     base = run.remote_head()
     (state / f"pr-body-base-{PR}").write_text(BODY + "\n")
     (ctx / f"pr-{PR}-body.md").write_text(BODY.replace("Disabled buttons.", "Legacy Cursor text."))
-    run.agent(cursor_plan("## Checks to verify\nnone\n\nRESULT: fixed", commit=False))
-    run.fix("stub", head=base)
+    run.agent(cursor_plan("## Checks to verify\nnone\n\nRESULT: fixed"))
+    assert run.fix("stub", head=base)["rc"] == 0
+    assert run.pushed() and run.remote_head() != base
     assert [call[0] for call in run.agent_calls] == ["stub"]
     assert "Legacy Cursor text." not in run.body()
+
+
+def _retry_files(reason):
+    return list(Path(os.environ["STATE"]).glob(f"handoff-*-*{reason}.json"))
+
+
+def test_a_switched_fixer_drops_the_former_producers_pending_task_write(run, monkeypatch):
+    _admit_stub_fixer(run, monkeypatch)
+    clock, _ = _flaky_edits(monkeypatch, fail_until=1_060)
+    initial = COMPLETE.replace("## Checks to verify\nnone", "## Checks to verify\n- /billing: badge")
+    run.fake_gh.set(body=initial, headRefName="cursor/issue-419")
+    run.agent(cursor_plan("Agreed.\nTASK: partial\nRESULT: fixed", commit=False))
+    assert run.fix("cursor")["rc"] == 75
+    assert _retry_files("fix_task_write_failed")
+
+    clock["now"] = 1_060   # a same-fixer re-entry would now replay Cursor's task write
+    run.agent(cursor_plan("## Checks to verify\n- /billing: badge\n\nRESULT: fixed"))
+    assert run.fix("stub")["rc"] == 0
+    assert [call[0] for call in run.agent_calls] == ["cursor", "stub"]
+    assert "completion=partial" not in run.body()
+    assert not _retry_files("fix_task_write_failed")
+
+
+def test_a_switched_fixer_drops_the_former_producers_pending_checks_refresh(run, monkeypatch):
+    _admit_stub_fixer(run, monkeypatch)
+    clock, _ = _flaky_edits(monkeypatch, fail_until=1_060)
+    run.agent(cursor_plan("## Checks to verify\n- /billing: brand colour\n\nRESULT: fixed", commit=False))
+    assert run.fix("cursor")["rc"] == 75
+    assert _retry_files("fix_checks_refresh_failed")
+
+    clock["now"] = 1_060
+    run.agent(cursor_plan("## Checks to verify\nnone\n\nRESULT: fixed"))
+    assert run.fix("stub")["rc"] == 0
+    assert [call[0] for call in run.agent_calls] == ["cursor", "stub"]
+    assert "brand colour" not in run.body()
+    assert not _retry_files("fix_checks_refresh_failed")
+    assert not (Path(env_ctx()) / f"pr-{PR}-fix-checks.json").exists()
+
+
+def test_a_stub_fix_that_fails_a_task_write_leaves_no_reply_files(run, monkeypatch, gh):
+    _admit_stub_fixer(run, monkeypatch)
+    state = Path(os.environ["STATE"])
+    initial = COMPLETE.replace("## Checks to verify\nnone", "## Checks to verify\n- /billing: badge")
+    gh.set(body=initial, headRefName="cursor/issue-419")
+    run.agent(cursor_plan("Agreed.\nTASK: partial\nRESULT: fixed", commit=False))
+    gh.fail("edit-before-write")
+    assert run.fix("stub")["rc"] == 1
+    for name in (f"stub-fix-base-{PR}", f"stub-fix-task-{PR}", f"pr-{PR}-fix-owner", f"pr-body-base-{PR}"):
+        assert not (state / name).exists(), name

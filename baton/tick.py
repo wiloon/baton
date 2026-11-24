@@ -158,17 +158,19 @@ class Tick:
                 n = a["cursor_fix"]
                 producers = {"cursor"}   # legacy names, plus whoever the owner record names
                 try:
-                    producers.add(json.loads((state / f"pr-{n}-fix-owner").read_text())["fixer"])
+                    recorded = json.loads((state / f"pr-{n}-fix-owner").read_text())["fixer"]
+                    if recorded in agents.ADAPTERS:
+                        producers.add(recorded)
                 except (OSError, ValueError, KeyError, TypeError):
                     pass
                 for producer in producers:
                     for kind in ("base", "task"):
                         (state / f"{producer}-fix-{kind}-{n}").unlink(missing_ok=True)
-                (state / f"pr-{n}-fix-owner").unlink(missing_ok=True)
                 for path in (state / f"pr-body-base-{n}", state / f"owner-fix-feedback-{n}",
                              self.ctx / f"pr-{n}-fix-checks.json"):
                     path.unlink(missing_ok=True)
                 pr_helpers.remove_body_request(self.ctx / f"pr-{n}-body.md")
+                (state / f"pr-{n}-fix-owner").unlink(missing_ok=True)
         elif a["issue"]:
             pr_helpers.gh("issue", "edit", a["issue"], "-R", self.gh_repo, "--remove-label", "agent-wip")
 

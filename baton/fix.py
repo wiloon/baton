@@ -1619,7 +1619,7 @@ class Runner:
             rc, failure, rounds = self.verify(wt, "origin/main", fixer, "pr", pr)
             if rc != 0:
                 start = agent_head if self.attempt_authors else head
-                if not self.record(pr, fixer, wt, start, "", ""):
+                if not self.record(pr, fixer, wt, start, "", head if self.prior_author else ""):
                     return 1
                 recorded_before_retry = True
                 action, alt, remaining = self.recover(pr, "fix_verify_failed",
@@ -1637,6 +1637,13 @@ class Runner:
                     self.verify_failed(pr, failure, rounds)
                     return self.handoff(pr, "fix_verify_failed", f"{name} PR #{pr}: local CI verification failed", url)
         try:
+            prior = self.prior_author
+            if (not recorded_before_retry and prior and head != agent_head
+                    and prior not in self.attempt_authors):
+                # The earlier producer's commits (original base..agent_head) are its own.
+                self.add_author(prior)
+                vendors.record_author(self.state, pr, prior)
+                vendors.record_contrib(self.state, pr, prior, str(wt), head, agent_head)
             vendors.record_author(self.state, pr, fixer)
         except OSError:
             return 1
@@ -1706,6 +1713,14 @@ def fix_pr(runner, pr, wt, fixer, source, feedback, head="", *, owner_triggered=
     """Resume a saved fix step or dispatch the requested adapter; keep the owner record only on a deferral."""
     rc = _fix_pr(runner, pr, wt, fixer, source, feedback, head, owner_triggered=owner_triggered)
     if rc != 75:   # the attempt is finalized; a deferral keeps the owner for its re-entry
+        from . import handoff as owner_handoff
+        pending = owner_handoff.operation_episodes(
+            runner.env, (owner_handoff.FIX_PUSH, *owner_handoff.FIX_META_WRITES))
+        if str(pr) not in pending and not Path(runner.state, f"fix-push-waiting-{pr}").exists():
+            # Shared and producer files go before the record that names the producer.
+            owner = runner.read_owner(pr)
+            for name in {fixer, owner["fixer"] if owner else fixer}:
+                runner.clear_reply_request(pr, name)
         runner.clear_owner(pr)
     return rc
 
