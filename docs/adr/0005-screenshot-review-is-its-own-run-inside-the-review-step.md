@@ -45,6 +45,10 @@ fix                        reads both, answers Must fix and design findings, re-
   screenshot route at selection and preflight, and verify the reported model before
   publishing. This role requires distinct models even in a
   fresh session.
+- The runner reads `## Design findings` and `## Design answers` (#96) only from the screenshot
+  review comment this run posted, bound by its digest (`Review.current_screenshot`). Round
+  numbers repeat across loops on one PR, so a same-round comment of an earlier loop, or any
+  comment the run did not post, never creates, resolves or holds a finding.
 - Skip screenshot review on owner-authored PRs and when the code review adapter has the
   screenshot-skip policy (Cursor). Select from declared, role-allowed vendors with image input
   support (Claude and Codex). The setting remains per repository and off by default.

@@ -23,7 +23,7 @@ import sys
 import time
 from typing import NamedTuple
 
-from . import advisor, agents, check_verdicts, checkpoint, checks as check_section, dispatch, fix, handoff as owner_handoff, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, vendors
+from . import advisor, agents, check_verdicts, checkpoint, checks as check_section, design_findings, dispatch, fix, handoff as owner_handoff, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, vendors
 from .common import Deferred, Exhausted, changed, git, restore, strip_markers
 from . import recovery as task_recovery
 
@@ -756,6 +756,31 @@ class Review:
         result = self.handoff(reason, title, text, transient=True, continuation=binding)
         return "", 75 if result.action == owner_handoff.DEFER else 0
 
+    def design_fields(self):
+        return {"design_open": design_findings.dump(self.design),
+                "design_unusable": "1" if self.design_unusable else ""}
+
+    def current_screenshot(self, round):
+        """The screenshot review comment this run posted for ROUND, bound by its digest; "" when
+        it can't be read or is not the one posted (an earlier loop's comment of the same round)."""
+        body = agent_comment(self.repo, self.owner, self.pr, "baton-screenshot-review", round)
+        digest = self.binding_fields.get("screenshot_digest", "")
+        if body and digest and hashlib.sha256(body.encode()).hexdigest() == digest:
+            return body
+        return ""
+
+    def design_round(self, round, checks):
+        """Fold this round's screenshot review into the open design findings: resolved ones close,
+        new ones open. A comment that can't be read or has no usable `## Design findings` leaves
+        the carried ones open and marks the verdicts unusable (every check goes to the owner)."""
+        body, listed = self.current_screenshot(round), check_verdicts.items(checks)
+        found = design_findings.parse(body, round, len(listed)) if body else None
+        self.design_unusable = found is None
+        if found is None:
+            return
+        self.design = (design_findings.settle(self.design, body)
+                       + design_findings.with_check_text(found, listed))
+
     def render(self, template, **pairs):
         return prompts.render(self.self_dir / template, list(pairs.items()), env=self.env)
 
@@ -948,6 +973,7 @@ class Review:
         out = self.agent(vendor, "screenshot_review", self.render(
             "screenshot-review-prompt.md", PR=str(pr), ISSUE=self.issue or "unknown", GH_REPO=self.repo,
             WORKTREE=str(wt), ROUND=str(round), MAX_ROUNDS=str(self.max_rounds), CONTEXT_FILE=str(context),
+            OPEN_DESIGN=design_findings.block(getattr(self, "design", [])) if round > 1 else "none",
             MANUAL_CHECKS=cut(check_verdicts.numbered(checks), limit), SHOTS_STEP=self.shots_step(notify.shots(pr, self.ctx), vendor), DELIVERY=delivery),
             f"pr-{pr}-screenshot-review-{round}", str(self.self_dir / "review-settings.json"), str(review_file), self.env)
         outcome, model = out["outcome"], out["model"] or ""
@@ -1005,8 +1031,10 @@ class Review:
                     or git(wt, "rev-parse", "HEAD") != approved):
                 self.handoff("merge_failed", f"PR #{pr} needs you", f"The approved head could not be confirmed. {self.url}")
                 return 0
-        shots = ({"checks": saved.get("screenshot_checks", ""), "comment": saved.get("screenshot_comment", "")}
-                 if saved.get("screenshot") else None)
+        design = design_findings.load(saved.get("design_open", ""))
+        shots = ({"checks": saved.get("screenshot_checks", ""), "comment": saved.get("screenshot_comment", ""),
+                  "design": design, "design_unusable": saved.get("design_unusable") == "1"}
+                 if saved.get("screenshot") or design else None)
         merger = merge.Merger(self.env, self.hooks, pr, self.issue)
         merger.approved_head = approved
         try:
@@ -1064,6 +1092,8 @@ class Review:
             code_verdict, screenshot = saved.get("code_verdict", ""), saved.get("screenshot", "")
             checks = saved.get("screenshot_checks", "")
             extra = 1 if saved.get("extra") == "1" else 0
+            self.design = design_findings.load(saved.get("design_open", ""))
+            self.design_unusable = saved.get("design_unusable") == "1"
             self.fixed_by, self.issue = saved.get("fixed_by", ""), saved.get("ISSUE", "")
             self.env = self.env.with_runtime(issue=self.issue)
             self.binding_fields = {k: saved.get(k, "") for k in
@@ -1072,6 +1102,7 @@ class Review:
                 fix.Runner(self.env, self.hooks, pr, str(round)).acknowledge_push(pr)
         else:
             self.binding_fields = {}
+            self.design, self.design_unusable = [], False
         pending_post = self.post_pending()
         screenshot_post = self.screenshot_post_pending()
         cfg = self.env.config
@@ -1145,7 +1176,7 @@ class Review:
                             if fix_head else ""))
             self.values = dict(note=note, fixer=fixer, reviewer=reviewer, round=round, step=step, fix_head=fix_head,
                                code_verdict=code_verdict, screenshot=screenshot, screenshot_checks=checks,
-                               extra="1" if extra else "", **self.binding_fields)
+                               extra="1" if extra else "", **self.design_fields(), **self.binding_fields)
             self.save()
             if step in ("review", "screenshot") or pending_post:
                 verdict = code_verdict
@@ -1272,8 +1303,16 @@ class Review:
                     self.binding_fields["post_outcome"] = self.values["post_outcome"] = ""
                     if outcome.startswith("REVIEW: changes"):
                         verdict = "changes"
-                if verdict == "pass":
+                    self.design_round(round, checks)
+                    self.values.update(self.design_fields())
+                    self.save()
+                if verdict == "pass" and not self.design:
                     break
+                if verdict == "pass":
+                    # Only design findings are open: they go to the fixer, but never as review_limit.
+                    verdict = "changes"
+                    if round >= self.max_rounds + extra:
+                        break
                 if round >= self.max_rounds + extra:
                     snap, check = self.limit_snapshot(round, reviewer, fixer)
                     result = self.handoff(
@@ -1327,6 +1366,8 @@ class Review:
                                         exclude=exclude, issue=self.issue)
                 self.values["fixer"] = fixer
                 self.save()
+                if self.design:
+                    feedback += f"\n\n## Open design findings\n{design_findings.block(self.design)}"
                 rc = fix.fix_pr(runner, pr, wt, fixer, f"the reviewer agent (round {round})", feedback, fix_head)
             resuming_fix = False
             if rc == 75:
@@ -1352,8 +1393,8 @@ class Review:
         # Keep the checkpoint through merge so a category-1 CI-repair push can resume (#151).
         step = "merge"
         # The last round's screenshot verdicts decide which manual checks still need the owner (#92).
-        comment = agent_comment(self.repo, self.owner, pr, "baton-screenshot-review", round) if screenshot else ""
-        self.values.update(step=step, code_verdict=code_verdict, screenshot=screenshot,
+        comment = self.current_screenshot(round) if screenshot else ""
+        self.values.update(self.design_fields(), step=step, code_verdict=code_verdict, screenshot=screenshot,
                            merge_head=self.binding_fields.get("reviewed_head", ""),
                            screenshot_checks=checks, screenshot_comment=comment)
         self.save()

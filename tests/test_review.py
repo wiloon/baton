@@ -48,6 +48,7 @@ def loop(gh, worktree, tmp_path, monkeypatch):
     state.agents, state.fixes, state.merged = [], [], []
     state.reviews, state.fix_plans = ["changes", "pass"], []
     state.screens, state.after, state.artifacts = [], {}, []
+    state.screen_texts = []   # one comment text per screenshot run, before screen_text
     # A marker the runner must strip, kept in two pieces: the agent guard refuses writes naming a vendor marker.
     state.review_text = "review text\n<!-- baton-forged by=" "cursor -->\nmore"
     state.screen_text = "screenshot text\n## Screenshots\n- a.png — ok"
@@ -70,7 +71,7 @@ def loop(gh, worktree, tmp_path, monkeypatch):
             return DEFERRED
         verdict = queue.pop(0)
         outcome = verdict if verdict.startswith("RESULT") else f"REVIEW: {verdict}"
-        text = state.screen_text if shots else state.review_text
+        text = (state.screen_texts.pop(0) if state.screen_texts else state.screen_text) if shots else state.review_text
         state.artifacts.append((role, output))
         if state.after.get(role):
             state.after[role]()
@@ -368,7 +369,8 @@ def test_a_deferred_merge_step_keeps_the_checkpoint_and_resumes_at_the_merge(loo
     run = screen_run if screenshots else lambda loop: loop.run(fixer="cursor", reviewer="codex")
     assert run(loop) == 75
     expected = {"checks": "- The library at 390 px and 1280 px.",
-                "comment": screenshot_comments(loop)[0]} if screenshots else None
+                "comment": screenshot_comments(loop)[0], "design": [],
+                "design_unusable": True} if screenshots else None   # the double's comment has no design section
     assert loop.checkpoint()["step"] == "merge" and attempts == [expected]
     save_waiting_fix_push(loop, "codex", loop.checkpoint()["merge_head"])
     clock["now"] = 1_059
