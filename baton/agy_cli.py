@@ -213,6 +213,16 @@ def init_event(text):
     return {}
 
 
+def init_model(row):
+    """The model of an init event: the real CLI nests it (`{"event":"init","init":{"model":...}}`,
+    #233); a top-level `model` is still accepted for older recorded logs."""
+    nested = row.get("init")
+    model = nested.get("model") if isinstance(nested, dict) else None
+    if not (isinstance(model, str) and model):
+        model = row.get("model")
+    return model if isinstance(model, str) and model else ""
+
+
 def usage_of(row):
     """The result's usage with snake_case token names, whatever case the CLI spells them in."""
     raw = (row.get("result") or {}).get("usage")
@@ -253,8 +263,8 @@ def cli_log_model(conversation, path=None):
 def reported(text, log_path=None):
     """(model, source): init.model when present, else the cli.log entry of this run's conversation."""
     init = init_event(text)
-    if isinstance(init.get("model"), str) and init["model"]:
-        return init["model"], "init"
+    if model := init_model(init):
+        return model, "init"
     conversation = init.get("conversation_id") or result_event(text).get("conversation_id") or ""
     return cli_log_model(conversation, log_path), "cli.log"
 
@@ -279,8 +289,7 @@ def failure(req, result, model):
 def log_model(row, codex_home=None):
     """(done, model) for one log row; done stops the scan."""
     if row.get("event") == "init":
-        model = row.get("model")
-        return True, model if isinstance(model, str) and model else None
+        return True, init_model(row) or None
     return False, None
 
 

@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from baton import agents, config, dispatch, quota, session, settle, vendors
+from baton import agents, agy_cli, config, dispatch, quota, session, settle, vendors
 from conftest import full_text
 from test_agents import lines
 
@@ -44,9 +44,9 @@ REVIEW_MODEL = "gemini-3.8-flash-high"
 
 
 def stream(response="done\nRESULT: ready", *, model=MODEL, status="SUCCESS", denied=None, conversation="c1"):
-    init = {"event": "init", "conversation_id": conversation}
+    init = {"event": "init", "conversation_id": conversation, "init": {"cwd": "/w"}}
     if model:
-        init["model"] = model
+        init["init"]["model"] = model   # the real CLI nests the model (#233)
     result = {"status": status, "response": response, "conversation_id": conversation,
               "usage": {"inputTokens": 100, "outputTokens": 7}}
     if denied:
@@ -432,3 +432,17 @@ def test_a_dev_push_handoff_by_agy_is_a_valid_binding():
 def test_docs_name_agy():
     assert "agy" in (ROOT / "README.md").read_text().lower()
     assert "Antigravity" in (ROOT / "SECURITY.md").read_text()
+
+
+REAL_INIT = ('{"event":"init","conversation_id":"8d1f187b","init":{"model":"gemini-4-argon-high",'
+             '"cwd":"/w","tools":["view_file"],"permission_mode":"request-review"}}\n')
+
+
+def test_real_cli_nested_init_model_is_read():
+    """#233: agy 1.5.16 nests the model under init; a top-level model still reads for old logs."""
+    assert agy_cli.reported(REAL_INIT)[0] == "gemini-4-argon-high"
+    assert agy_cli.reported(REAL_INIT)[1] == "init"
+    assert agy_cli.log_model(json.loads(REAL_INIT)) == (True, "gemini-4-argon-high")
+    legacy = '{"event":"init","conversation_id":"c","model":"gemini-4-neon-medium"}\n'
+    assert agy_cli.reported(legacy)[0] == "gemini-4-neon-medium"
+    assert agy_cli.log_model({"event": "init", "init": {}}) == (True, None)
