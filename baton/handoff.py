@@ -46,6 +46,7 @@ SPEC_ADR_PUSH = "spec_adr_push_failed"
 FIX_CHECKS = "fix_checks_refresh_failed"
 FIX_TASK = "fix_task_write_failed"
 FIX_DESCRIPTION = "fix_description_write_failed"
+SPEC_ADR_MERGE = "spec_adr_merge_failed"
 COMMENT_POSTS = (REVIEW_POST, SCREENSHOT_POST)
 SPEC_POSTS = (SPEC_REVIEW_POST, SPEC_REPLY_POST)
 SPEC_ACCEPT_POSTS = (SPEC_PENDING_ACCEPT_POST, SPEC_ACCEPT_POST)
@@ -61,7 +62,7 @@ PUSH_REASONS = frozenset({FIX_PUSH, *ISSUE_PUSHES})
 FIX_META_WRITES = (FIX_DESCRIPTION, FIX_CHECKS, FIX_TASK)
 RETRY_REASONS = frozenset({
     "review_comment_missing", "spec_comments_read_failed", "spec_pending_adr_read_failed",
-    *COMMENT_POSTS, *SPEC_WRITE_POSTS, *PUSH_REASONS, *FIX_META_WRITES,
+    *COMMENT_POSTS, *SPEC_WRITE_POSTS, *PUSH_REASONS, *FIX_META_WRITES, SPEC_ADR_MERGE,
 })
 
 # Categories: 1 rule-decided, 2 judgement, 3 needs investigation, 4 owner-only.
@@ -545,6 +546,16 @@ def _binding_valid(reason, item, binding):
                 and isinstance(binding.get("issue_body"), str)
                 and isinstance(binding.get("adr_head"), str)
                 and (binding["adr_head"] == "" or bool(re.fullmatch(r"[0-9a-f]{40}", binding["adr_head"]))))
+    if reason == SPEC_ADR_MERGE:
+        return (binding.get("step") == "merge"
+                and isinstance(binding.get("pr"), str) and binding["pr"].isdecimal()
+                and isinstance(binding.get("verdict"), str) and bool(binding["verdict"])
+                and isinstance(binding.get("issue_body"), str)
+                and bool(re.fullmatch(r"[0-9a-f]{64}", binding["issue_body"]))
+                and isinstance(binding.get("feedback"), str)
+                and bool(re.fullmatch(r"[0-9a-f]{64}", binding["feedback"]))
+                and isinstance(binding.get("adr_head"), str)
+                and bool(re.fullmatch(r"[0-9a-f]{40}", binding["adr_head"])))
     if reason == REVIEW_POST:
         return _comment_post_valid(item, binding, marker="baton-review")
     if reason == SCREENSHOT_POST:
@@ -776,13 +787,17 @@ def _finish(env, reason, entry, *, kind, number, title, text, hooks, remove, ite
 
 
 def _category1(env, reason, entry, *, kind, number, title, text, hooks, remove, item, episode,
-               after_labels, transient, continuation, resume):
-    """Rule-decided recovery: schedule, consume a due attempt, or hand off (#151)."""
+               after_labels, transient, continuation, resume, open_finish=False):
+    """Rule-decided recovery: schedule, consume a due attempt, or hand off (#151).
+
+    OPEN_FINISH: return None instead of handing off, so the caller applies the reason's usual handling."""
     now = int(clock())
     item = str(item or number)
     path = retry_path(env, episode, reason, item)
 
     def finish():
+        if open_finish:
+            return None
         return _finish(env, reason, entry, kind=kind, number=number, title=title, text=text, hooks=hooks,
                        remove=remove, item=item, episode=episode,
                        after_labels=after_labels)
@@ -847,10 +862,14 @@ def perform(env, reason, *, kind, number, title, text, hooks, remove=(), item=""
                        decision=decision, before_labels=before_labels)
 
     if reason in RETRY_REASONS:
-        return _category1(env, reason, entry, kind=kind, number=number, title=title, text=text,
-                          hooks=hooks, remove=remove, item=item, episode=episode,
-                          after_labels=after_labels, transient=transient,
-                          continuation=continuation, resume=resume)
+        # The ADR merge replays a transport failure, then hands off with its usual observation (#151).
+        scheduled = _category1(env, reason, entry, kind=kind, number=number, title=title, text=text,
+                               hooks=hooks, remove=remove, item=item, episode=episode,
+                               after_labels=after_labels, transient=transient,
+                               continuation=continuation, resume=resume,
+                               open_finish=reason == SPEC_ADR_MERGE)
+        if scheduled is not None:
+            return scheduled
 
     # Callers that have not opted in keep today's handoff. Observation always passes the
     # actions the current evidence supports; live worker/investigation retries do the same

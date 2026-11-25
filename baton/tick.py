@@ -825,7 +825,7 @@ class Tick:
         """Resume durable spec reads, comment posts and issue-scoped pushes before new work can be blocked."""
         found = {}
         for reason in ("spec_comments_read_failed", "spec_pending_adr_read_failed",
-                       *owner_handoff.SPEC_WRITE_POSTS, *owner_handoff.ISSUE_PUSHES):
+                       *owner_handoff.SPEC_WRITE_POSTS, *owner_handoff.ISSUE_PUSHES, owner_handoff.SPEC_ADR_MERGE):
             for prefix in ("waiting", "retry"):
                 for path in self.state.glob(f"handoff-{prefix}-*-{reason}.json"):
                     issue = path.name.removeprefix(f"handoff-{prefix}-").removesuffix(f"-{reason}.json")
@@ -852,7 +852,8 @@ class Tick:
                 continue
             reason = pending[issue]
             accept_post = reason in owner_handoff.SPEC_ACCEPT_POSTS
-            write_or_push = reason in (*owner_handoff.SPEC_WRITE_POSTS, *owner_handoff.ISSUE_PUSHES)
+            write_or_push = reason in (*owner_handoff.SPEC_WRITE_POSTS, *owner_handoff.ISSUE_PUSHES,
+                                       owner_handoff.SPEC_ADR_MERGE)
             if write_or_push:
                 try:
                     post = owner_handoff.load_retry(self.env, issue, reason)
@@ -873,6 +874,8 @@ class Tick:
                 if not isinstance(data, dict) or data.get("state") not in ("OPEN", "CLOSED"):
                     continue
                 if data["state"] == "CLOSED":
+                    if reason == owner_handoff.SPEC_ADR_MERGE and post:
+                        merge.Merger(self.env, None, post["continuation"]["pr"], issue).clear_update()
                     owner_handoff.clear_episode(self.env, issue)
                     continue
                 labels = data.get("labels")
@@ -880,7 +883,7 @@ class Tick:
                                                       or label.get("name") == "ready-for-human" for label in labels):
                     continue
             if reason in ("spec_pending_adr_read_failed", *owner_handoff.SPEC_WRITE_POSTS,
-                          owner_handoff.SPEC_ADR_PUSH):
+                          owner_handoff.SPEC_ADR_PUSH, owner_handoff.SPEC_ADR_MERGE):
                 done = self.after_item(self.item(lambda: self.resume_spec(issue)))
             else:
                 done = self.after_item(self.item(lambda: dev.run(self, issue)))
