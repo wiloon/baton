@@ -854,10 +854,8 @@ def stub_config(tmp_path, *, aliases=True, retro=''):
     text = text.replace('adapter = "stub"\nroles = ["dev", "fixer", "reviewer", "spec_reviewer"]',
                         'adapter = "stub"\nroles = ["dev", "fixer", "reviewer", "spec_reviewer", "retrospective"]')
     if not aliases:
-        text = text.replace('stub_fast = "stub-1"\n', '')
-        text = text.replace('stub = { model = "stub_fast", effort = "low" }\n', '')
-        text = text.replace('fallback_models = ["stub_fast"]\nquota_probe_model = "stub_fast"\n',
-                            'fallback_models = []\nquota_probe_model = ""\n')
+        # Routes, fallbacks and the probe model move to another alias; only the analyst alias is gone.
+        text = text.replace('stub_fast', 'stub_other')
     text = text.replace('enabled = false\n# Deprecated', f'enabled = true\n{retro}# Deprecated', 1)
     path = tmp_path / 'stub-config.toml'
     path.write_text(text)
@@ -886,7 +884,7 @@ def test_stub_analyst_runs_through_adapter_capabilities(host, tmp_path):
 
 
 def test_an_unknown_analyst_alias_is_a_config_error(tmp_path):
-    with pytest.raises(config.ConfigError, match='expected a known model alias'):
+    with pytest.raises(config.ConfigError, match=r'retrospectives\.model_stub: expected a known model alias'):
         config.load(stub_config(tmp_path, aliases=False))
 
 
@@ -908,6 +906,15 @@ CODEX_ARGV = ['exec', '--ignore-user-config', '--ignore-rules', '--ephemeral', '
               '-c', 'project_doc_max_bytes=0', '-c', 'skills.bundled.enabled=false',
               '-c', 'mcp_servers={}', '-c', 'skills.include_instructions=false',
               '-c', 'model_reasoning_effort="high"', '--json']
+CODEX_FEATURE_ARGV = [
+    '-c', 'skills.include_instructions=false', '-c', 'features.plugins=false', '-c', 'features.apps=false',
+    '-c', 'features.image_generation=false', '-c', 'features.browser_use=false',
+    '-c', 'features.browser_use_external=false', '-c', 'features.computer_use=false',
+    '-c', 'features.in_app_browser=false',
+    '--disable', 'shell_tool', '--disable', 'unified_exec', '--disable', 'view_image',
+    '--disable', 'multi_agent', '--disable', 'hooks', '--disable', 'memories',
+    '--disable', 'skill_mcp_dependency_install', '--disable', 'skill_search',
+    '--disable', 'tool_suggest', '--disable', 'goals', '--disable', 'sleep_tool', '-']
 CURSOR_ARGV = ['-p', '--mode', 'ask', '--trust', '--model', 'grok-4.7-high', '--output-format', 'stream-json']
 DENIED = ['Shell(*)', 'Read(**)', 'Read(/**)', 'Write(**)', 'Write(/**)', 'WebFetch(*)', 'Mcp(*:*)']
 
@@ -953,8 +960,7 @@ def test_codex_analyst_sandbox_is_pinned(host, monkeypatch, tmp_path):
     assert host.run()[0]['state'] == 'success'
     call = host.calls()[0]
     args = call['args']
-    assert call['vendor'] == 'codex' and args[:len(CODEX_ARGV)] == CODEX_ARGV and args[-1] == '-'
-    assert 'features.plugins=false' in args and 'features.apps=false' in args and args.count('--disable') == 11
+    assert call['vendor'] == 'codex' and args == CODEX_ARGV + CODEX_FEATURE_ARGV
     check_environment(call['env'], tmp_path)
     attempt = host.report(pipe)['analysis_attempts'][0]
     assert attempt['budget_enforcement'] == 'deadline_and_call_caps' and attempt['cli_version'] == '2.1.100'
