@@ -311,10 +311,13 @@ def test_telemetry_usage_is_unavailable_with_two_result_events(tmp_path):
 def test_allowlist_is_derived_from_the_ci_command():
     from baton import agy_cli
     allow = lambda role, ci, hook=None: json.loads(agy_cli.permissions_settings(role, ci, hook))["permissions"]["allow"]
-    assert allow("review", "task ci && rm -rf /") == ["command(git)", "command(rg)", "command(ls)", "command(cat)"]
+    reads = [f"command({name})" for name in agy_cli.READ_COMMANDS]
+    assert allow("review", "task ci && rm -rf /") == reads   # read roles ignore the CI command
+    assert {"command(find)", "command(sort)", "command(grep)", "command(head)"} <= set(reads)   # PR #244
+    assert not {"command(rm)", "command(sed)", "command(python3)", "command(task ci)"} & set(reads)
     got = allow("dev", "uv run --frozen pytest -q && task ci:changed BASE=x; FOO=1 bash bin/verify.sh | tee out",
                 "/r/hooks/verify.sh")
-    assert got == ["command(git)", "command(rg)", "command(ls)", "command(cat)", "command(python3)",
+    assert got == [*reads, "command(python3)",
                    "command(mkdir)", "command(uv run)", "command(task ci:changed)", "command(bash bin/verify.sh)",
                    "command(tee out)", "command(/r/hooks/verify.sh)"]
     assert all("*" not in rule for rule in got)
