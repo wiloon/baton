@@ -1,10 +1,11 @@
 """A transport-failed ADR `gh pr merge` replays across ticks (#151, section 6): two later attempts after
 60 s and 300 s, no worker, revalidated inputs, then the usual `spec_adr_merge_failed` handoff."""
+import json
 from pathlib import Path
 
 import pytest
-from test_adr_update import SAVED, pin, record_handoffs
-from test_spec import ACCEPTED, N, _spec_clock, merges, resume_pending
+from test_adr_update import SAVED, UPDATED, pin, record_handoffs
+from test_spec import ACCEPTED, N, _spec_clock, merges, resume_pending, updates
 from test_spec import loop as loop  # noqa: PLC0414
 
 from baton import tick
@@ -122,3 +123,94 @@ def test_the_tick_finds_a_waiting_adr_merge_from_saved_state(loop, monkeypatch):
     monkeypatch.setattr(current, "item", lambda run: run())
     monkeypatch.setattr(current, "resume_spec", lambda issue: pytest.fail("resumed before it was due"))
     assert current.pick_issue() is None
+
+
+def update_file(loop):
+    return Path(loop.env["STATE"], "adr-update-pr-77.json")
+
+
+def wait_behind(loop):
+    """A BEHIND branch that updates to UPDATED, then a transport-failed merge."""
+    gh = loop.gh
+
+    class Heads(list):
+        def pop(self, *args):   # the update lands: the branch is no longer behind
+            gh.merge_state = "CLEAN"
+            return super().pop(*args)
+
+    gh.merge_state = "BEHIND"
+    gh.update_heads = Heads([UPDATED])
+    failing_merges(loop)
+    with pytest.raises(Deferred):
+        loop.run()
+
+
+def test_an_owner_comment_during_the_wait_hands_off_instead_of_merging(loop, monkeypatch):
+    clock = _spec_clock(monkeypatch)
+    resume_pending(loop, monkeypatch)
+    wait_behind(loop)
+    loop.gh.comments.append({"author": {"login": "owner"}, "body": "wait, one more thing"})
+    clock["now"] = 1_060
+    assert loop.run() is False
+    assert owner_handoffs(loop) == 1 and len(merges(loop)) == 4 and not retry_files(loop)
+    assert not loop.gh.posted(ACCEPTED) and not update_file(loop).exists()
+
+
+def test_a_damaged_replay_record_clears_the_branch_update_record(loop, monkeypatch):
+    clock = _spec_clock(monkeypatch)
+    resume_pending(loop, monkeypatch)
+    wait_behind(loop)
+    assert update_file(loop).exists()
+    retry = next(path for path in retry_files(loop) if "retry" in path.name)
+    retry.write_text("{")
+    clock["now"] = 1_060
+    assert loop.run() is False
+    assert not update_file(loop).exists()
+
+
+def test_a_replay_after_a_validated_update_merges_pinned_without_a_second_update(loop, monkeypatch):
+    clock = _spec_clock(monkeypatch)
+    resume_pending(loop, monkeypatch)
+    wait_behind(loop)
+    assert len(updates(loop)) == 1
+    loop.gh.merge_state = "CLEAN"
+    clock["now"] = 1_060
+    assert loop.run() is True
+    assert len(updates(loop)) == 1 and pin(merges(loop)[-1]) == UPDATED
+    assert not update_file(loop).exists()
+
+
+def test_a_replay_that_is_behind_again_after_three_updates_hands_off_exhausted(loop, monkeypatch):
+    clock = _spec_clock(monkeypatch)
+    resume_pending(loop, monkeypatch)
+    wait_behind(loop)
+    update_file(loop).write_text(json.dumps({"accepted": SAVED, "head": UPDATED, "count": 3}) + "\n")
+    loop.gh.merge_state = "BEHIND"
+    failing_merges(loop)
+    clock["now"] = 1_060
+    assert loop.run() is False
+    assert len(updates(loop)) == 1 and owner_handoffs(loop) == 1
+    assert not update_file(loop).exists()
+
+
+def test_a_closed_issue_during_the_wait_ends_the_replay_quietly(loop, monkeypatch):
+    clock = _spec_clock(monkeypatch)
+    resume_pending(loop, monkeypatch)
+    wait_behind(loop)
+    loop.gh.issue_state = "CLOSED"
+    clock["now"] = 1_060
+    assert loop.run() is False
+    assert len(merges(loop)) == 4 and owner_handoffs(loop) == 0
+    assert not retry_files(loop) and not update_file(loop).exists()
+
+
+def test_an_acceptance_completed_another_way_publishes_nothing_and_clears_the_records(loop, monkeypatch):
+    clock = _spec_clock(monkeypatch)
+    resume_pending(loop, monkeypatch)
+    wait_behind(loop)
+    verdict = loop.gh.comments[0]["body"].split("-->\n", 1)[1]
+    loop.gh.comments[:] = [{"author": {"login": "owner"}, "body": verdict}]
+    clock["now"] = 1_060
+    assert loop.run() is True
+    assert len(merges(loop)) == 4 and owner_handoffs(loop) == 0
+    assert not retry_files(loop) and not update_file(loop).exists()

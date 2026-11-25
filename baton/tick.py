@@ -874,6 +874,8 @@ class Tick:
                 if not isinstance(data, dict) or data.get("state") not in ("OPEN", "CLOSED"):
                     continue
                 if data["state"] == "CLOSED":
+                    if reason == owner_handoff.SPEC_ADR_MERGE and post:
+                        merge.Merger(self.env, None, post["continuation"]["pr"], issue).clear_update()
                     owner_handoff.clear_episode(self.env, issue)
                     continue
                 labels = data.get("labels")

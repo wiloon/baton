@@ -552,6 +552,8 @@ def _binding_valid(reason, item, binding):
                 and isinstance(binding.get("verdict"), str) and bool(binding["verdict"])
                 and isinstance(binding.get("issue_body"), str)
                 and bool(re.fullmatch(r"[0-9a-f]{64}", binding["issue_body"]))
+                and isinstance(binding.get("feedback"), str)
+                and bool(re.fullmatch(r"[0-9a-f]{64}", binding["feedback"]))
                 and isinstance(binding.get("adr_head"), str)
                 and bool(re.fullmatch(r"[0-9a-f]{40}", binding["adr_head"])))
     if reason == REVIEW_POST:

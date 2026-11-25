@@ -1495,7 +1495,7 @@ class Spec:
             replay = None
             if failure == "merge_failed" and result.get("transient") and binding["adr_head"]:
                 replay = {"step": "merge", "pr": str(pr), "verdict": verdict, "issue_body": binding["issue_body"],
-                          "adr_head": binding["adr_head"]}
+                          "feedback": binding["feedback"], "adr_head": binding["adr_head"]}
             return stop(f"{who} accepted, but merging the ADR PR #{pr} failed.{result.get('detail') or ''}",
                         "spec_adr_merge_failed", failure=failure, observe=not failure.startswith("update_"),
                         continuation=replay)
@@ -1560,6 +1560,8 @@ class Spec:
             if (current["pr"] != pr or current["verdict"] != verdict or current["head"] != binding["adr_head"]
                     or body != binding["issue_body"]):
                 return "CHANGED", False
+            if merge_replay and self.owner_feedback_digest(data["comments"]) != binding["feedback"]:
+                return "CHANGED", False
             if not binding["adr_head"]:
                 return "CHANGED", False
             inputs = data
@@ -1574,11 +1576,13 @@ class Spec:
             return state, False
 
         state = self.retry_read(read, why, reason, continuation=binding, keep=merge_replay)
+        if merge_replay and state not in ("OPEN", "MERGED", saved_update):
+            # Every terminal exit of the replay takes its branch update record with it (#151, section 1).
+            merge.Merger(self.env, self.hooks, pr, self.issue).clear_update()
         if state is None:
             return False
         if state == "SUPERSEDED":
             owner_handoff.clear_retry(self.env, self.issue, reason)
-            merge.Merger(self.env, self.hooks, pr, self.issue).clear_update()
             return False
         if state == "PUBLISHED":
             owner_handoff.clear_retry(self.env, self.issue, reason)
@@ -2389,6 +2393,11 @@ class Spec:
         except owner_handoff.RetryUnreadable as exc:
             notify.log(f"#{n}: {owner_handoff.SPEC_ADR_MERGE} retry unreadable: {exc}")
             self.handoff("Could not read the saved ADR merge.", owner_handoff.SPEC_ADR_MERGE)
+            # The damaged record no longer names the PR; the pending acceptance comment still does.
+            data = issue_payload if issue_payload is not None else read_issue(env, n, once=True)[0]
+            pending = accept_pending(env, n, listed=data["comments"]) if data else None
+            if pending:
+                merge.Merger(env, self.hooks, pending["pr"], n).clear_update()
             return False
         if merge_wait is not None:
             # The saved merge owns the continuation: no reviewer, no worker, no vendor.
