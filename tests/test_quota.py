@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from baton import quota
+from baton import claude_cli, codex_cli, cursor_cli, quota
 
 NOW = 1_793_000_000
 HOUR, WEEK = 3600, 7 * 24 * 3600
@@ -48,12 +48,12 @@ FIVE = {"claude": 0.90, "codex": 0.90}
 class ParseTests(unittest.TestCase):
     def test_claude_takes_the_last_rate_limit_event(self):
         lines = [claude_event(0.10, 0.20), '{"type":"assistant"}', claude_event(0.12, 0.21)]
-        self.assertEqual(quota.parse_claude(lines), {
+        self.assertEqual(claude_cli.parse_quota_log(lines), {
             "five_hour": {"used": 0.12, "resets_at": NOW + 2 * HOUR},
             "seven_day": {"used": 0.21, "resets_at": NOW + 3 * 24 * HOUR}})
 
     def test_claude_rejection_marks_its_window_full(self):
-        windows = quota.parse_claude([claude_event(0.97, 0.50, status="rejected")])
+        windows = claude_cli.parse_quota_log([claude_event(0.97, 0.50, status="rejected")])
         self.assertEqual(windows["five_hour"]["used"], 1.0)
         self.assertEqual(windows["seven_day"]["used"], 0.50)
 
@@ -65,17 +65,17 @@ class ParseTests(unittest.TestCase):
             (day / f"rollout-2026-10-25T10-00-00-{thread}.jsonl").write_text(
                 codex_rollout(1.0, 10.0) + "\n" + codex_rollout(2.0, 11.0) + "\n")
             run_log = [json.dumps({"type": "thread.started", "thread_id": thread}), '{"type":"turn.completed"}']
-            self.assertEqual(quota.parse_codex(run_log, home), {
+            self.assertEqual(codex_cli.parse_quota_in(run_log, home), {
                 "five_hour": {"used": 0.02, "resets_at": NOW + HOUR},
                 "seven_day": {"used": 0.11, "resets_at": NOW + 4 * 24 * HOUR}})
 
     def test_cursor_usage_is_its_weekly_window(self):
-        self.assertEqual(quota.parse_cursor(cursor_usage(2.25)),
+        self.assertEqual(cursor_cli.parse_usage(cursor_usage(2.25)),
                          {"seven_day": {"used": 0.0225, "resets_at": NOW + 4 * 24 * HOUR}})
 
     def test_cursor_usage_without_a_plan_gives_no_window(self):
         for payload in ({}, {"planUsage": {}}, {"billingCycleEnd": "x", "planUsage": {"totalPercentUsed": 1}}):
-            self.assertEqual(quota.parse_cursor(payload), {})
+            self.assertEqual(cursor_cli.parse_usage(payload), {})
 
     def test_cursor_refresh_reads_the_login_and_records_the_snapshot(self):
         with tempfile.TemporaryDirectory() as state:
@@ -86,14 +86,14 @@ class ParseTests(unittest.TestCase):
             def fetch(token):
                 seen["token"] = token
                 return cursor_usage(40)
-            windows = quota.refresh_cursor(state, NOW, auth, fetch)
+            windows = cursor_cli.refresh_quota(state, NOW, auth, fetch)
             self.assertEqual(seen["token"], "tok")
             self.assertEqual(windows["seven_day"]["used"], 0.4)
             self.assertEqual(quota.load(state, "cursor")["windows"]["seven_day"]["observed_at"], NOW)
 
     def test_cursor_refresh_without_a_login_records_nothing(self):
         with tempfile.TemporaryDirectory() as state:
-            self.assertEqual(quota.refresh_cursor(state, NOW, Path(state, "auth.json"), None), {})
+            self.assertEqual(cursor_cli.refresh_quota(state, NOW, Path(state, "auth.json"), None), {})
             self.assertIsNone(quota.load(state, "cursor"))
 
     def test_cursor_refresh_reads_a_login_kept_in_the_secret_store(self):
@@ -105,7 +105,7 @@ class ParseTests(unittest.TestCase):
             def fetch(token):
                 seen["token"] = token
                 return cursor_usage(15)
-            windows = quota.refresh_cursor(state, NOW, auth, fetch,
+            windows = cursor_cli.refresh_quota(state, NOW, auth, fetch,
                                            lambda: json.dumps({"accessToken": "kept", "refreshToken": "r"}) + "\n")
             self.assertEqual(seen["token"], "kept")
             self.assertEqual(windows["seven_day"]["used"], 0.15)
@@ -116,8 +116,8 @@ class ParseTests(unittest.TestCase):
                 auth = Path(state, "auth.json")
                 auth.write_text(json.dumps({"storedIn": "os-secret-store"}))
                 quota.record(state, "cursor", {"seven_day": {"used": 0.002, "resets_at": NOW + HOUR}}, NOW - HOUR)
-                with self.assertRaises(quota.CursorLoginUnreadable):
-                    quota.refresh_cursor(state, NOW, auth, lambda token: self.fail("fetched"), lookup)
+                with self.assertRaises(cursor_cli.LoginUnreadable):
+                    cursor_cli.refresh_quota(state, NOW, auth, lambda token: self.fail("fetched"), lookup)
                 self.assertEqual(json.loads(Path(state, "credential-cursor.json").read_text())["result"], "probe_failed")
                 self.assertEqual(quota.load(state, "cursor")["observed_at"], NOW - HOUR)
 
@@ -126,19 +126,19 @@ class ParseTests(unittest.TestCase):
             auth = Path(state, "auth.json")
             for content in ("{}", "not json"):
                 auth.write_text(content)
-                with self.assertRaises(quota.CursorLoginUnreadable):
-                    quota.cursor_token(auth, lambda: self.fail("looked up"))
+                with self.assertRaises(cursor_cli.LoginUnreadable):
+                    cursor_cli.access_token(auth, lambda: self.fail("looked up"))
 
     def test_cursor_signed_out_is_no_login(self):
         with tempfile.TemporaryDirectory() as state:
             auth = Path(state, "auth.json")
             auth.write_text(json.dumps({"signedOut": True}))
-            self.assertIsNone(quota.cursor_token(auth, lambda: self.fail("looked up")))
+            self.assertIsNone(cursor_cli.access_token(auth, lambda: self.fail("looked up")))
 
     def test_output_without_quota_data_records_nothing(self):
-        self.assertEqual(quota.parse_claude(["not json", '{"type":"result"}']), {})
+        self.assertEqual(claude_cli.parse_quota_log(["not json", '{"type":"result"}']), {})
         with tempfile.TemporaryDirectory() as home:
-            self.assertEqual(quota.parse_codex(['{"type":"thread.started","thread_id":"missing"}'], home), {})
+            self.assertEqual(codex_cli.parse_quota_in(['{"type":"thread.started","thread_id":"missing"}'], home), {})
 
 
 class RecordTests(unittest.TestCase):
@@ -251,7 +251,7 @@ def test_storage_lock_serializes_processes_and_preserves_merged_windows(tmp_path
     state = str(tmp_path)
     marker = tmp_path/'writer-started'
     script = '''
-from baton import quota
+from baton import claude_cli, codex_cli, cursor_cli, quota
 from pathlib import Path
 import sys
 Path(sys.argv[2]).touch()
