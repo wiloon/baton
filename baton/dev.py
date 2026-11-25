@@ -184,6 +184,22 @@ def finish_opening(tick, intent, path):
     return 75 if rc == 75 else 80
 
 
+def _matches_merged_view(tick, remote, branch, issue):
+    """True when a gh pr view payload matches the intent's branch, base, repo, owner and issue."""
+    if remote.get("headRefName") != branch:
+        return False
+    return tick.matches_merged_issue(remote, issue)
+
+
+def _matches_closed_intent(tick, item, intent, issue):
+    """True when a REST history entry is closed/merged and matches the saved intent."""
+    if (item.get("state") or "").lower() != "closed" and not item.get("merged_at"):
+        return False
+    if (item.get("head") or {}).get("sha") != intent["head"]:
+        return False
+    return tick.matches_merged_issue(item, issue)
+
+
 def resume_opening(tick, path):
     """Reconcile a saved creation intent with GitHub before resuming its review."""
     try:
@@ -200,12 +216,37 @@ def resume_opening(tick, path):
             raise ValueError("saved branch identity is invalid")
         pr = str(intent.get("pr") or "")
         if pr and (tick.state / f"review-pending-{pr}").exists():
+            if not pr.isdecimal():
+                raise ValueError("invalid PR number")
+            remote = tick.gh_json("pr", "view", pr, "-R", tick.gh_repo, "--json",
+                                  "state,headRefName,baseRefName,isCrossRepository,author,body")
+            if isinstance(remote, dict) and remote.get("state") == "MERGED" and _matches_merged_view(tick, remote, branch, issue):
+                if not tick.record_merged_settlement(pr, issue):
+                    raise OSError("could not write settlement record")
+                tick.settle_recorded_merge(pr, issue)
             path.unlink(missing_ok=True)
             return 0
         if not pr:
             listed = tick.gh_json("pr", "list", "-R", tick.gh_repo, "--state", "open", "--head", branch,
                                   "--json", "number")
-            if listed is None or len(listed) != 1:
+            if listed is None:
+                raise ValueError("expected exactly one open PR for saved branch")
+            if len(listed) == 0:
+                history = pr_helpers.branch_history(tick.gh_repo, branch)
+                if history is None:
+                    raise ValueError("expected exactly one open PR for saved branch")
+                matches = [item for item in history if _matches_closed_intent(tick, item, intent, issue)]
+                if len(matches) != 1:
+                    raise ValueError("expected exactly one open PR for saved branch")
+                matched = matches[0]
+                if matched.get("merged_at"):
+                    matched_pr = str(matched["number"])
+                    if not tick.record_merged_settlement(matched_pr, issue):
+                        raise OSError("could not write settlement record")
+                    tick.settle_recorded_merge(matched_pr, issue)
+                path.unlink(missing_ok=True)
+                return 0
+            if len(listed) != 1:
                 raise ValueError("expected exactly one open PR for saved branch")
             pr = str(listed[0]["number"])
         if not pr.isdecimal():
@@ -214,7 +255,14 @@ def resume_opening(tick, path):
                               "state,headRefName,headRefOid,baseRefName,isCrossRepository,isDraft,author,body,labels")
         if not isinstance(remote, dict):
             raise ValueError("could not read PR from GitHub")
-        if remote.get("state") in ("MERGED", "CLOSED"):
+        if remote.get("state") == "MERGED":
+            if _matches_merged_view(tick, remote, branch, issue):
+                if not tick.record_merged_settlement(pr, issue):
+                    raise OSError("could not write settlement record")
+                tick.settle_recorded_merge(pr, issue)
+            path.unlink(missing_ok=True)
+            return 0
+        if remote.get("state") == "CLOSED":
             path.unlink(missing_ok=True)
             return 0
         related_issue, _ = pr_contract.relation(remote)

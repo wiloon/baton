@@ -2698,3 +2698,369 @@ def test_run_keeps_an_unreleasable_label_uncounted_and_starts_another(ctx, monke
     assert ctx.make().run() == 0
     assert not released(ctx, 5)
     assert started == ["12"]
+
+
+# --- settlement records, ownership, worktree selection & intent reconciliation (#155) ----------------------------
+REAL_REMOVE_WORKTREE = merge.remove_worktree
+
+
+def rest_pr(number, branch, *, state="closed", merged_at=None, sha="a" * 40, login="owner", body="",
+            repo="owner/app", base="main"):
+    return {
+        "number": number,
+        "state": state,
+        "merged_at": merged_at,
+        "base": {"ref": base},
+        "head": {"ref": branch, "sha": sha, "repo": {"full_name": repo}},
+        "user": {"login": login},
+        "body": body,
+    }
+
+
+def set_branch_history(ctx, branch, pages, fail=False):
+    key = f"api repos/owner/app/pulls?state=all&head=owner:{branch}&per_page=100"
+    if fail:
+        ctx.gh.answers[key] = subprocess.CompletedProcess(["gh", "api", key], 1, "", "boom")
+    else:
+        ctx.gh.answers[key] = pages
+
+
+def test_numberless_intent_for_old_merged_partial_pr_settles_and_enables_next_slice(devrun, monkeypatch):
+    monkeypatch.setattr(merge, "remove_worktree", REAL_REMOVE_WORKTREE)
+    wt = Path(devrun.env["WT_ROOT"]) / "agent-300"
+    sh(devrun.repo, "git", "worktree", "add", "-q", "-b", "agent/issue-300", str(wt), "origin/main")
+    (wt / "slice1.txt").write_text("one\n")
+    sh(wt, "git", "add", "-A")
+    sh(wt, "git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "-m", "slice 1")
+    head = sh(wt, "git", "rev-parse", "HEAD")
+    base = sh(devrun.repo, "git", "rev-parse", "origin/main")
+    sh(wt, "git", "push", "-q", "origin", "HEAD:main")
+    sh(devrun.repo, "git", "fetch", "-q", "origin")
+
+    intent_path = dev.opening_path(devrun.make(), "300")
+    dev.save_opening(intent_path, {
+        "issue": "300", "branch": "agent/issue-300", "wt": str(wt),
+        "vendor": "codex", "model": "gpt-x", "head": head, "base": base,
+    })
+    body = "<!-- baton-task issue=300 completion=partial -->\n\nRefs #300\n\n## Acceptance advanced\n- one\n"
+    devrun.gh.answers["pr list"] = []
+    set_branch_history(devrun, "agent/issue-300", [[
+        rest_pr(301, "agent/issue-300", merged_at="2025-01-01T00:00:00Z", sha=head, body=body)
+    ]])
+    set_branch_history(devrun, "cursor/issue-300", [[]])
+    devrun.gh.answers["pr view"] = {"headRefName": "agent/issue-300", "body": body}
+    devrun.gh.answers["issue view"] = lambda args: "OPEN\n" if "--jq" in args else {"title": "T", "body": "B", "comments": []}
+    after_calls = []
+    monkeypatch.setattr(merge.after_merge, "follow_ups", lambda pr, issue: after_calls.append(("follow_ups", pr, issue)))
+    monkeypatch.setattr(merge.after_merge, "owner_actions", lambda pr, issue: after_calls.append(("owner_actions", pr, issue)))
+
+    assert devrun.make().run() == 0
+    assert not intent_path.exists()
+    assert devrun.path("task-merged-pr-301").exists()
+    assert not devrun.path("task-settle-pr-301.json").exists()
+    assert not wt.exists()
+    assert ("follow_ups", "301", "300") in after_calls and ("owner_actions", "301", "300") in after_calls
+    edits = [c for c in devrun.gh.ran("issue", "edit", "300") if "--remove-label" in c and "agent-wip" in c]
+    assert edits and "--add-label" in edits[0] and "ready-for-agent" in edits[0]
+
+
+def test_complete_merged_pr_settles_across_two_ticks_via_record(ctx, monkeypatch):
+    started = []
+    monkeypatch.setattr(dev, "run", lambda t, n: started.append(n) or 80)
+    monkeypatch.setattr(spec, "verdict_plan", lambda env, n, listed=None: "plan")
+    after_calls = []
+    monkeypatch.setattr(merge.after_merge, "follow_ups", lambda pr, issue: after_calls.append(("follow_ups", pr, issue)))
+    monkeypatch.setattr(merge.after_merge, "owner_actions", lambda pr, issue: after_calls.append(("owner_actions", pr, issue)))
+
+    body = "<!-- baton-task issue=5 completion=complete -->\n\nCloses #5\n"
+    wip(ctx, n=5, ready=[issue(12)])
+    set_branch_history(ctx, "agent/issue-5", [[
+        rest_pr(7, "agent/issue-5", merged_at="2025-01-01T00:00:00Z", body=body)
+    ]])
+    set_branch_history(ctx, "cursor/issue-5", [[]])
+    ctx.gh.answers["pr view"] = {"headRefName": "agent/issue-5", "body": body}
+    ctx.gh.answers["issue view"] = lambda args: "OPEN\n" if "--jq" in args else {"title": "T", "body": "B", "comments": []}
+
+    assert ctx.make().run() == 0
+    assert ctx.path("task-settle-pr-7.json").exists()
+    assert not ctx.path("task-merged-pr-7").exists()
+    assert not released(ctx, 5)
+    assert started == ["12"]
+
+    # Second tick: issue #5 is closed and absent from open listing; retry settles it.
+    started.clear()
+    ctx.gh.answers["issue list"] = []
+    ctx.gh.answers["issue view"] = lambda args: "CLOSED\n" if "--jq" in args else {"title": "T", "body": "B", "comments": []}
+    assert ctx.make().run() == 0
+    assert ctx.path("task-merged-pr-7").exists()
+    assert not ctx.path("task-settle-pr-7.json").exists()
+    edits = [c for c in ctx.gh.ran("issue", "edit", "5") if "--remove-label" in c]
+    assert edits and "agent-wip" in edits[-1] and "ready-for-agent" in edits[-1]
+
+
+@pytest.mark.parametrize("mode", ["numberless_intent", "numbered_intent", "numbered_intent_and_checkpoint", "checkpoint_only"])
+def test_intent_and_checkpoint_settle_merged_pr_after_issue_closed(ctx, monkeypatch, mode):
+    after_calls = []
+    monkeypatch.setattr(merge.after_merge, "follow_ups", lambda pr, issue: after_calls.append(("follow_ups", pr, issue)))
+    monkeypatch.setattr(merge.after_merge, "owner_actions", lambda pr, issue: after_calls.append(("owner_actions", pr, issue)))
+    body = "<!-- baton-task issue=5 completion=complete -->\n\nCloses #5\n"
+    head, base = "a" * 40, "b" * 40
+    wt = Path(ctx.env["WT_ROOT"]) / "agent-5"
+
+    intent_path = dev.opening_path(ctx.make(), "5")
+    if mode in ("numberless_intent", "numbered_intent", "numbered_intent_and_checkpoint"):
+        intent = {"issue": "5", "branch": "agent/issue-5", "wt": str(wt), "vendor": "codex",
+                  "model": "gpt-x", "head": head, "base": base}
+        if mode != "numberless_intent":
+            intent["pr"] = "7"
+        dev.save_opening(intent_path, intent)
+    if mode in ("numbered_intent_and_checkpoint", "checkpoint_only"):
+        checkpoint(ctx, pr="7", ISSUE="5")
+
+    ctx.gh.answers["issue list"] = []
+    ctx.gh.answers["pr list"] = []
+    set_branch_history(ctx, "agent/issue-5", [[
+        rest_pr(7, "agent/issue-5", merged_at="2025-01-01T00:00:00Z", sha=head, body=body)
+    ]])
+    set_branch_history(ctx, "cursor/issue-5", [[]])
+    view_payload = {"state": "MERGED", "headRefName": "agent/issue-5", "headRefOid": "c" * 40,
+                    "baseRefName": "main", "isCrossRepository": False, "isDraft": False,
+                    "author": {"login": "owner"}, "body": body, "labels": []}
+    ctx.gh.answers["pr view"] = lambda args: "MERGED\n" if "--jq" in args else view_payload
+    ctx.gh.answers["issue view"] = lambda args: "CLOSED\n" if "--jq" in args else {"title": "T", "body": "B", "comments": []}
+
+    assert ctx.make().run() == 0
+    assert ctx.path("task-merged-pr-7").exists()
+    assert not intent_path.exists()
+    assert not ctx.path("review-pending-7").exists()
+    assert not ctx.path("task-settle-pr-7.json").exists()
+
+
+@pytest.mark.parametrize("mode", ["numbered_intent_and_checkpoint", "checkpoint_only"])
+def test_failed_record_write_keeps_intent_or_checkpoint(ctx, monkeypatch, mode):
+    body = "<!-- baton-task issue=5 completion=complete -->\n\nCloses #5\n"
+    wt = Path(ctx.env["WT_ROOT"]) / "agent-5"
+    intent_path = dev.opening_path(ctx.make(), "5")
+    if mode == "numbered_intent_and_checkpoint":
+        dev.save_opening(intent_path, {"issue": "5", "pr": "7", "branch": "agent/issue-5", "wt": str(wt),
+                                       "vendor": "codex", "model": "gpt-x", "head": "a" * 40, "base": "b" * 40})
+    checkpoint(ctx, pr="7", ISSUE="5")
+    view_payload = {"state": "MERGED", "headRefName": "agent/issue-5", "baseRefName": "main",
+                    "isCrossRepository": False, "author": {"login": "owner"}, "body": body}
+    ctx.gh.answers["pr view"] = lambda args: "MERGED\n" if "--jq" in args else view_payload
+    monkeypatch.setattr(tick.Tick, "record_merged_settlement", lambda self, pr, issue: False)
+
+    ctx.make().run()
+    if mode == "numbered_intent_and_checkpoint":
+        assert intent_path.exists()
+    else:
+        assert ctx.path("review-pending-7").exists()
+
+
+def test_failed_settlement_keeps_record_without_blocking_other_work(ctx, monkeypatch):
+    started = []
+    monkeypatch.setattr(dev, "run", lambda t, n: started.append(n) or 80)
+    monkeypatch.setattr(spec, "verdict_plan", lambda env, n, listed=None: "plan")
+    ctx.path("task-settle-pr-7.json").write_text(json.dumps({"pr": "7", "issue": "5"}) + "\n")
+    body = "<!-- baton-task issue=5 completion=partial -->\n\nRefs #5\n"
+    set_branch_history(ctx, "agent/issue-5", [[]])
+    set_branch_history(ctx, "cursor/issue-5", [[]])
+    ctx.gh.answers["pr view"] = {"headRefName": "agent/issue-5", "body": body}
+    ctx.gh.answers["issue view"] = lambda args: subprocess.CompletedProcess(args, 1, "", "boom") if "--jq" in args else {"title": "T", "body": "B", "comments": []}
+    ctx.gh.answers["issue list"] = lambda args: [] if ("agent-wip" in args or "claude-found" in args) else [issue(12)]
+    label_history(ctx, 12, [label_event(1, "owner")])
+
+    assert ctx.make().run() == 0
+    assert ctx.path("task-settle-pr-7.json").exists()
+    assert not ctx.path("task-merged-pr-7").exists()
+    assert started == ["12"]
+
+
+@pytest.mark.parametrize("path_kind", ["scan", "record", "intent"])
+def test_superseded_merged_partial_pr_leaves_task_alone_on_every_path(ctx, monkeypatch, path_kind):
+    monkeypatch.setattr(merge, "remove_worktree", REAL_REMOVE_WORKTREE)
+    after_calls = []
+    monkeypatch.setattr(merge.after_merge, "follow_ups", lambda pr, issue: after_calls.append(("follow_ups", pr, issue)))
+    monkeypatch.setattr(merge.after_merge, "owner_actions", lambda pr, issue: after_calls.append(("owner_actions", pr, issue)))
+    wt_root = Path(ctx.env["WT_ROOT"])
+    wt_root.mkdir(exist_ok=True)
+    wt_cursor = wt_root / "cursor-5"
+    wt_agent = wt_root / "agent-5"
+    sh(ctx.repo, "git", "worktree", "add", "-q", "-b", "cursor/issue-5", str(wt_cursor), "origin/main")
+    sh(ctx.repo, "git", "worktree", "add", "-q", "-b", "agent/issue-5", str(wt_agent), "origin/main")
+
+    body7 = "<!-- baton-task issue=5 completion=partial -->\n\nRefs #5\n"
+    head7 = sh(wt_cursor, "git", "rev-parse", "HEAD")
+    wip(ctx, n=5)
+    set_branch_history(ctx, "cursor/issue-5", [[
+        rest_pr(7, "cursor/issue-5", merged_at="2025-01-01T00:00:00Z", sha=head7, body=body7)
+    ]])
+    set_branch_history(ctx, "agent/issue-5", [[
+        rest_pr(9, "agent/issue-5", merged_at=None, body="Refs #5")
+    ]])
+    ctx.gh.answers["pr view"] = {"state": "MERGED", "headRefName": "cursor/issue-5", "headRefOid": head7,
+                                 "baseRefName": "main", "isCrossRepository": False, "isDraft": False,
+                                 "author": {"login": "owner"}, "body": body7, "labels": []}
+    ctx.gh.answers["issue view"] = lambda args: "OPEN\n" if "--jq" in args else {"title": "T", "body": "B", "comments": []}
+    if path_kind == "scan":
+        ctx.gh.answers["pr list"] = lambda args: [
+            {"number": 7, "headRefName": "cursor/issue-5", "body": body7,
+             "comments": [{"author": {"login": "owner"}, "body": "<!-- baton-review by=codex -->\nLGTM"}]}
+        ] if "--state" in args and args[args.index("--state") + 1] == "merged" else []
+    elif path_kind == "record":
+        ctx.path("task-settle-pr-7.json").write_text(json.dumps({"pr": "7", "issue": "5"}) + "\n")
+    else:
+        dev.save_opening(dev.opening_path(ctx.make(), "5"), {
+            "issue": "5", "pr": "7", "branch": "cursor/issue-5", "wt": str(wt_cursor),
+            "vendor": "codex", "model": "gpt-x", "head": head7, "base": head7,
+        })
+
+    assert ctx.make().run() == 0
+    assert ctx.path("task-merged-pr-7").exists()
+    assert not ctx.path("task-settle-pr-7.json").exists()
+    assert wt_cursor.is_dir() and wt_agent.is_dir()
+    assert "PR #7: superseded by PR #9; task left alone" in ctx.log()
+    assert ("follow_ups", "7", "5") in after_calls
+    # Part 1 release still ran for #5 because its newest PR #9 is closed.
+    assert released(ctx, 5)
+    assert not [c for c in ctx.gh.ran("issue", "edit", "5") if "--add-label" in c]
+
+
+def test_failed_newer_pr_lookup_changes_nothing_and_retries(ctx, monkeypatch):
+    monkeypatch.setattr(merge, "remove_worktree", REAL_REMOVE_WORKTREE)
+    wt_root = Path(ctx.env["WT_ROOT"])
+    wt_root.mkdir(exist_ok=True)
+    wt_cursor = wt_root / "cursor-5"
+    sh(ctx.repo, "git", "worktree", "add", "-q", "-b", "cursor/issue-5", str(wt_cursor), "origin/main")
+    ctx.path("task-settle-pr-7.json").write_text(json.dumps({"pr": "7", "issue": "5"}) + "\n")
+    body7 = "<!-- baton-task issue=5 completion=partial -->\n\nRefs #5\n"
+    set_branch_history(ctx, "cursor/issue-5", [[rest_pr(7, "cursor/issue-5", merged_at="2025-01-01T00:00:00Z", body=body7)]])
+    set_branch_history(ctx, "agent/issue-5", [], fail=True)
+    ctx.gh.answers["pr view"] = {"headRefName": "cursor/issue-5", "body": body7}
+    ctx.gh.answers["issue view"] = lambda args: "OPEN\n" if "--jq" in args else {"title": "T", "body": "B", "comments": []}
+    ctx.gh.answers["issue list"] = []
+
+    assert ctx.make().run() == 0
+    assert ctx.path("task-settle-pr-7.json").exists()
+    assert not ctx.path("task-merged-pr-7").exists()
+    assert wt_cursor.is_dir()
+    assert not ctx.gh.ran("issue", "edit")
+
+
+@pytest.mark.parametrize("head_branch", ["agent/issue-300", "cursor/issue-300"])
+def test_settlement_removes_only_merged_branches_worktree(ctx, monkeypatch, head_branch):
+    monkeypatch.setattr(merge, "remove_worktree", REAL_REMOVE_WORKTREE)
+    monkeypatch.setattr(merge.after_merge, "follow_ups", lambda *a: None)
+    monkeypatch.setattr(merge.after_merge, "owner_actions", lambda *a: None)
+    wt_root = Path(ctx.env["WT_ROOT"])
+    wt_root.mkdir(exist_ok=True)
+    wt_agent = wt_root / "agent-300"
+    wt_cursor = wt_root / "cursor-300"
+    sh(ctx.repo, "git", "worktree", "add", "-q", "-b", "agent/issue-300", str(wt_agent), "origin/main")
+    sh(ctx.repo, "git", "worktree", "add", "-q", "-b", "cursor/issue-300", str(wt_cursor), "origin/main")
+    merged_wt, other_wt = (wt_agent, wt_cursor) if head_branch.startswith("agent/") else (wt_cursor, wt_agent)
+    (other_wt / "dirty.txt").write_text("keep me\n")
+
+    body = "<!-- baton-task issue=300 completion=partial -->\n\nRefs #300\n"
+    ctx.path("task-settle-pr-7.json").write_text(json.dumps({"pr": "7", "issue": "300"}) + "\n")
+    set_branch_history(ctx, head_branch, [[rest_pr(7, head_branch, merged_at="2025-01-01T00:00:00Z", body=body)]])
+    other_branch = "cursor/issue-300" if head_branch.startswith("agent/") else "agent/issue-300"
+    set_branch_history(ctx, other_branch, [[]])
+    ctx.gh.answers["pr view"] = {"headRefName": head_branch, "body": body}
+    ctx.gh.answers["issue view"] = lambda args: "OPEN\n" if "--jq" in args else {"title": "T", "body": "B", "comments": []}
+    ctx.gh.answers["issue list"] = []
+
+    assert ctx.make().run() == 0
+    assert ctx.path("task-merged-pr-7").exists()
+    assert not merged_wt.exists()
+    assert other_wt.is_dir() and (other_wt / "dirty.txt").read_text() == "keep me\n"
+
+
+def test_open_pr_on_other_branch_prevents_settlement(ctx, monkeypatch):
+    monkeypatch.setattr(merge, "remove_worktree", REAL_REMOVE_WORKTREE)
+    monkeypatch.setattr(merge.after_merge, "follow_ups", lambda *a: None)
+    monkeypatch.setattr(merge.after_merge, "owner_actions", lambda *a: None)
+    wt_root = Path(ctx.env["WT_ROOT"])
+    wt_root.mkdir(exist_ok=True)
+    wt_agent = wt_root / "agent-300"
+    wt_cursor = wt_root / "cursor-300"
+    sh(ctx.repo, "git", "worktree", "add", "-q", "-b", "agent/issue-300", str(wt_agent), "origin/main")
+    sh(ctx.repo, "git", "worktree", "add", "-q", "-b", "cursor/issue-300", str(wt_cursor), "origin/main")
+
+    body = "<!-- baton-task issue=300 completion=partial -->\n\nRefs #300\n"
+    ctx.path("task-settle-pr-7.json").write_text(json.dumps({"pr": "7", "issue": "300"}) + "\n")
+    set_branch_history(ctx, "cursor/issue-300", [[rest_pr(7, "cursor/issue-300", merged_at="2025-01-01T00:00:00Z", body=body)]])
+    set_branch_history(ctx, "agent/issue-300", [[rest_pr(10, "agent/issue-300", state="open", merged_at=None, body=body)]])
+    ctx.gh.answers["pr view"] = {"headRefName": "cursor/issue-300", "body": body}
+    ctx.gh.answers["issue view"] = lambda args: "OPEN\n" if "--jq" in args else {"title": "T", "body": "B", "comments": []}
+    ctx.gh.answers["issue list"] = []
+
+    assert ctx.make().run() == 0
+    assert wt_agent.is_dir() and wt_cursor.is_dir()
+    assert not ctx.gh.ran("issue", "edit")
+
+
+def test_numberless_intent_closed_pr_retires_and_picker_runs(ctx, monkeypatch):
+    started = []
+    monkeypatch.setattr(dev, "run", lambda t, n: started.append(n) or 80)
+    monkeypatch.setattr(spec, "verdict_plan", lambda env, n, listed=None: "plan")
+    head, base = "a" * 40, "b" * 40
+    wt = Path(ctx.env["WT_ROOT"]) / "agent-5"
+    intent_path = dev.opening_path(ctx.make(), "5")
+    dev.save_opening(intent_path, {"issue": "5", "branch": "agent/issue-5", "wt": str(wt),
+                                   "vendor": "codex", "model": "gpt-x", "head": head, "base": base})
+    wip(ctx, n=5, ready=[issue(12)])
+    ctx.gh.answers["pr list"] = []
+    set_branch_history(ctx, "agent/issue-5", [[rest_pr(146, "agent/issue-5", sha=head, body="Refs #5")]])
+    set_branch_history(ctx, "cursor/issue-5", [[]])
+
+    assert ctx.make().run() == 0
+    assert not intent_path.exists()
+    assert released(ctx, 5)
+    assert started == ["12"]
+
+
+@pytest.mark.parametrize("reason", ["lookup_failed", "mismatched_head", "mismatched_author",
+                                    "ambiguous_second_page", "malformed_second_page"])
+def test_numberless_intent_retained_on_failed_mismatched_or_ambiguous_history(ctx, reason):
+    head, base = "a" * 40, "b" * 40
+    wt = Path(ctx.env["WT_ROOT"]) / "agent-5"
+    intent_path = dev.opening_path(ctx.make(), "5")
+    dev.save_opening(intent_path, {"issue": "5", "branch": "agent/issue-5", "wt": str(wt),
+                                   "vendor": "codex", "model": "gpt-x", "head": head, "base": base})
+    ctx.gh.answers["pr list"] = []
+    page1 = [rest_pr(100 + i, "agent/issue-5", sha="f" * 40, body="Refs #5") for i in range(99)]
+    if reason == "lookup_failed":
+        set_branch_history(ctx, "agent/issue-5", [], fail=True)
+    elif reason == "mismatched_head":
+        set_branch_history(ctx, "agent/issue-5", [[rest_pr(146, "agent/issue-5", sha="0" * 40, body="Refs #5")]])
+    elif reason == "mismatched_author":
+        set_branch_history(ctx, "agent/issue-5", [[rest_pr(146, "agent/issue-5", sha=head, login="stranger", body="Refs #5")]])
+    elif reason == "ambiguous_second_page":
+        set_branch_history(ctx, "agent/issue-5", [
+            page1 + [rest_pr(200, "agent/issue-5", sha=head, body="Refs #5")],
+            [rest_pr(201, "agent/issue-5", sha=head, body="Refs #5")],
+        ])
+    else:
+        set_branch_history(ctx, "agent/issue-5", [
+            page1 + [rest_pr(200, "agent/issue-5", sha=head, body="Refs #5")],
+            "not-a-page",
+        ])
+
+    assert ctx.make().run() == 1
+    assert intent_path.exists()
+
+
+def test_malformed_second_page_does_not_release_label(ctx, monkeypatch):
+    started = []
+    monkeypatch.setattr(dev, "run", lambda t, n: started.append(n) or 80)
+    monkeypatch.setattr(spec, "verdict_plan", lambda env, n, listed=None: "plan")
+    wip(ctx, n=5, ready=[issue(12)])
+    page1 = [rest_pr(100 + i, "agent/issue-5", body="Refs #5") for i in range(100)]
+    set_branch_history(ctx, "agent/issue-5", [page1, [{"bad": "entry"}]])
+    set_branch_history(ctx, "cursor/issue-5", [[]])
+
+    assert ctx.make().run() == 0
+    assert not released(ctx, 5)
+    assert started == ["12"]
+
