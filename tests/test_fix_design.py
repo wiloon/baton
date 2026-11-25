@@ -104,6 +104,16 @@ def test_a_design_section_over_the_cap_posts_nothing_and_hands_off(run, design, 
     assert any("design answers exceed the reply cap" in line for line in run.runner_log())
 
 
+@pytest.mark.parametrize("extra", [0, 1, 2, 3])
+def test_capped_reply_never_exceeds_the_cap_when_the_section_nearly_fills_it(monkeypatch, extra):
+    monkeypatch.setattr(fix, "REPLY_CAP", 100)
+    head = "## Design findings\nD1.1. rejected — "
+    section = head + "z" * (100 - extra - len(head)) + "\n"
+    out = fix.Runner.capped_reply(None, "x" * 500 + "\n\n" + section)
+    assert out is not None and len(out) <= 100 and section.rstrip("\n") in out
+    assert not out.startswith("\n")
+
+
 def deferred_then_resumed_without_change(run, monkeypatch, *, drop_saved=False):
     """First pass defers the description (rc 75); the resumed call runs no agent and its description
     update succeeds with no change."""

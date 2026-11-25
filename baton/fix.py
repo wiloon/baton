@@ -1302,7 +1302,8 @@ class Runner:
             return reply[:REPLY_CAP]
         if len(section) > REPLY_CAP:
             return None
-        return rest.rstrip("\n")[:REPLY_CAP - len(section) - 2].rstrip("\n") + "\n\n" + section
+        head = rest.rstrip("\n")[:max(0, REPLY_CAP - len(section) - 2)].rstrip("\n")
+        return f"{head}\n\n{section}" if head else section
 
     def reply_rejection_only(self, pr, fixer):
         """rejection_only for a reply-protocol fix; a resume that ran no agent reads the answers saved
