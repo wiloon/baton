@@ -91,6 +91,7 @@ The config remains valid and normal cross-vendor selection applies.
   be repeated per role, and round-specific effort needs yet another key family per vendor.
 - **Aliases + routes (chosen):** two small tables. A generation change is one line per alias, and
   effort becomes a per-round decision.
+- **Also route by task tier:** adopted later by ADR 0009 (`ROLE_light`, `ROLE_heavy`).
 - **Also route by area (ui/api/chrome):** deferred. Visual checking will be a role of its own
   rather than an area override, and areas already rank vendors through `[preferences]`.
 
@@ -139,3 +140,5 @@ The config remains valid and normal cross-vendor selection applies.
   rule (`Gemini 4 Neon (High)` → `gemini-4-neon-high`) before the Gemini and
   requested-model checks. If the real CLI offers neither `init.model` nor a run-tied
   `cli.log` entry, agy is not enabled.
+- ADR 0009 (owner, 2026-11-24): routes gain a tier dimension chosen by the task profile;
+  an absent tier entry inherits the standard entry, and follow-up rounds keep `ROLE_followup`.
