@@ -447,3 +447,36 @@ def test_why_withholds_stderr_when_secret_lookup_raises(gh, child_token, monkeyp
     got = pr.why(subprocess.CompletedProcess([], 1, "", f"denied {child_token}\n"))
     assert got == " (gh: [stderr withheld: redaction failed])"
     assert pr.why(subprocess.CompletedProcess([], 1, "", "")) == ""
+
+
+@pytest.mark.parametrize("state", ["", "null", "CLOSED", "weird"])
+def test_a_merge_whose_state_is_not_open_or_merged_is_not_sent_again(scripted, state):
+    fake = scripted((1, "", "HTTP 503: Service Unavailable"), (0, state + "\n", ""))
+    assert pr.gh("pr", "merge", "5", "-R", "o/r", "--squash").returncode == 1
+    assert [c[:2] for c in fake.calls] == [("pr", "merge"), ("pr", "view")]
+
+
+def test_an_issue_create_whose_lookup_is_unreadable_is_not_sent_again(scripted):
+    fake = scripted((1, "", "read: connection reset by peer"), (1, "", "HTTP 404: Not Found"))
+    assert pr.gh("issue", "create", "-R", "o/r", "--title", "t", "--body", "b").returncode == 1
+    assert [c[:2] for c in fake.calls] == [("issue", "create"), ("issue", "list")]
+
+
+@pytest.mark.parametrize("listing", ["{}", "[1]", '[{"title": "t", "url": 5}]', "[{}]"])
+def test_an_issue_create_with_a_malformed_lookup_is_not_sent_again(scripted, listing):
+    fake = scripted((1, "", "read: connection reset by peer"), (0, listing, ""))
+    assert pr.gh("issue", "create", "-R", "o/r", "--title", "t", "--body", "b").returncode == 1
+    assert [c[:2] for c in fake.calls] == [("issue", "create"), ("issue", "list")]
+
+
+@pytest.mark.parametrize("view", ['{"comments": [{"body": null}]}', '{"comments": {}}', '{"comments": [1]}', "[]"])
+def test_a_comment_with_a_malformed_history_is_not_posted_again(scripted, view):
+    fake = scripted((1, "", "TLS handshake timeout"), (0, view, ""))
+    assert pr.gh("pr", "comment", "5", "-R", "o/r", "--body", "hi").returncode == 1
+    assert [c[:2] for c in fake.calls] == [("pr", "comment"), ("pr", "view")]
+
+
+def test_a_comment_with_an_unreadable_body_file_is_not_posted_again(scripted):
+    fake = scripted((1, "", "TLS handshake timeout"))
+    assert pr.gh("pr", "comment", "5", "-R", "o/r", "--body-file", "/nonexistent/x").returncode == 1
+    assert [c[:2] for c in fake.calls] == [("pr", "comment")]

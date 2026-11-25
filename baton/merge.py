@@ -584,6 +584,9 @@ class Merger:
                 if pinned is not None:
                     self.merge_head = match_sha
                 return {"ok": True}
+            if pinned is not None and pr_helpers.transient(merged):
+                # a lost answer on the pinned ADR path goes to the saved retry budget, not a re-poll
+                return {"ok": False, "reason": "merge_failed", "detail": pr_helpers.why(merged), "transient": True}
             data = self.pr_merge_state()   # carried into the next iteration, never re-read
             if (data or {}).get("mergeStateStatus") != "BEHIND":
                 return {"ok": False, "reason": "merge_failed", "detail": pr_helpers.why(merged),

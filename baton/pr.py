@@ -149,15 +149,17 @@ def _landed(args, input):
             try:
                 text = input if source == "-" else Path(source).read_text()
             except OSError:
-                return None
+                return UNKNOWN
         if text is None:
             return None
         seen = gh(args[0], "view", args[2], *scope, "--json", "comments")
-        try:
-            bodies = [c.get("body", "") for c in json.loads(seen.stdout)["comments"][-20:]]
-        except (ValueError, KeyError, TypeError):
+        if seen.returncode != 0:
             return UNKNOWN
-        if text.strip() in (b.strip() for b in bodies):
+        try:
+            bodies = [c["body"].strip() for c in json.loads(seen.stdout)["comments"][-20:]]
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return UNKNOWN
+        if text.strip() in bodies:
             return subprocess.CompletedProcess(["gh", *args], 0, "", "")
         return None
     if args[:2] == ("pr", "create") and (head := _option(args, "--head")):
@@ -168,17 +170,26 @@ def _landed(args, input):
         return subprocess.CompletedProcess(["gh", *args], 0, url + "\n", "") if url else None
     if args[:2] == ("issue", "create") and (title := _option(args, "--title")):
         found = gh("issue", "list", *scope, "--state", "open", "--limit", "30", "--json", "title,url")
+        if found.returncode != 0:
+            return UNKNOWN
         try:
-            url = next((i["url"] for i in json.loads(found.stdout) if i.get("title") == title), "")
+            issues = json.loads(found.stdout)
+            if not isinstance(issues, list):
+                return UNKNOWN
+            url = next((i["url"] for i in issues if i["title"] == title), "")
         except (ValueError, KeyError, TypeError):
+            return UNKNOWN
+        if not isinstance(url, str):
             return UNKNOWN
         return subprocess.CompletedProcess(["gh", *args], 0, url + "\n", "") if url else None
     if args[:2] == ("pr", "merge") and len(args) > 2:
         state = gh("pr", "view", args[2], *scope, "--json", "state", "--jq", ".state")
         if state.returncode != 0:
             return UNKNOWN
-        if state.stdout.strip() == "MERGED":
+        answer = state.stdout.strip()
+        if answer == "MERGED":
             return subprocess.CompletedProcess(["gh", *args], 0, "", "")
+        return None if answer == "OPEN" else UNKNOWN
     return None
 
 

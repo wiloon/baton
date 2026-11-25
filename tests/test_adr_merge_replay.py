@@ -8,6 +8,7 @@ from test_adr_update import SAVED, UPDATED, pin, record_handoffs
 from test_spec import ACCEPTED, N, _spec_clock, merges, resume_pending, updates
 from test_spec import loop as loop  # noqa: PLC0414
 
+from baton import pr as pr_helpers
 from baton import tick
 from baton.common import Deferred
 
@@ -214,3 +215,24 @@ def test_an_acceptance_completed_another_way_publishes_nothing_and_clears_the_re
     assert loop.run() is True
     assert len(merges(loop)) == 4 and owner_handoffs(loop) == 0
     assert not retry_files(loop) and not update_file(loop).exists()
+
+
+def test_a_lost_adr_merge_answer_with_an_unreadable_lookup_is_left_to_the_next_tick(loop, monkeypatch):
+    clock = _spec_clock(monkeypatch)
+    resume_pending(loop, monkeypatch)
+    loop.gh.flaky["pr merge"] = [("HTTP 502 Bad Gateway", False)]   # the answer was lost
+    seen = []
+
+    def backoff(pause):   # the lookup inside pr.gh's backoff fails once; a re-poll would then see BEHIND
+        if merges(loop) and not seen:
+            seen.append(pause)
+            loop.gh.flaky["pr view"] = [("HTTP 404: Not Found", False)]
+            loop.gh.merge_state = "BEHIND"
+    monkeypatch.setattr(pr_helpers, "sleep", backoff)
+    with pytest.raises(Deferred, match=REASON):
+        loop.run()
+    assert len(merges(loop)) == 1 and not updates(loop) and retry_files(loop)
+    loop.gh.merge_state = "CLEAN"
+    clock["now"] = 1_060
+    assert loop.run() is True
+    assert len(merges(loop)) == 2 and len(loop.gh.posted(ACCEPTED)) == 1
