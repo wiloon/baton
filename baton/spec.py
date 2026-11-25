@@ -471,8 +471,10 @@ class Spec:
             lambda text: self.handoff(text, reason), role=role,
             **self.retry_picker(role, other_model, spec_followup))
 
-    def retry_read(self, read, why, reason, *, continuation=None):
-        """Consume a waiting attempt before reading; return the value or hand off."""
+    def retry_read(self, read, why, reason, *, continuation=None, keep=False):
+        """Consume a waiting attempt before reading; return the value or hand off.
+
+        KEEP leaves a recovered operation's record in place: its caller clears it when the operation ends."""
         try:
             pending = owner_handoff.load_retry(self.env, self.issue, reason)
         except owner_handoff.RetryUnreadable as exc:
@@ -490,7 +492,7 @@ class Spec:
             result = self.handoff(why, reason, transient=transient, continuation=continuation)
             if result.action == owner_handoff.DEFER:
                 raise Deferred("handoff-retry", reason, lends_slot=False)
-        else:
+        elif not keep:
             owner_handoff.clear_retry(self.env, self.issue, reason)
         return value
 
@@ -1464,6 +1466,7 @@ class Spec:
     def publish_accept(self, binding):
         """Carry the reviewed inputs into the durable verdict and label operation."""
         verdict = binding["verdict"]
+        owner_handoff.clear_retry(self.env, self.issue, owner_handoff.SPEC_ADR_MERGE)
         publication = {**binding, "body": verdict, "digest": owner_handoff.body_digest(verdict),
                        "next": "transition"}
         return self.post_accept(owner_handoff.SPEC_ACCEPT_POST, publication, initial=True)
@@ -1475,17 +1478,27 @@ class Spec:
         merger = merge.Merger(self.env, self.hooks, pr, n)
         ci_message = f"{who} accepted, but CI on the ADR PR #{pr} is not green."
 
-        def stop(why, reason, *, observe=True, **status):
+        def stop(why, reason, *, observe=True, continuation=None, **status):
             observation = merger.observation(reason, acceptance=verdict, **status) if observe else {}
-            self.handoff(why, reason, **observation)
+            result = self.handoff(why, reason, transient=continuation is not None, continuation=continuation,
+                                  **observation)
             owner_handoff.clear_retry(self.env, n, owner_handoff.SPEC_PENDING_ACCEPT_POST)
+            if result.action == owner_handoff.DEFER:
+                # The saved merge owns the continuation now; the branch update record stays with it.
+                raise Deferred("handoff-retry", reason, lends_slot=False)
             merger.clear_update()
             return "stop"
 
         def merge_failed(result):
             failure = result["reason"]
+            # A classified transport failure of the merge itself replays under the saved budget (#151, section 6).
+            replay = None
+            if failure == "merge_failed" and result.get("transient") and binding["adr_head"]:
+                replay = {"step": "merge", "pr": str(pr), "verdict": verdict, "issue_body": binding["issue_body"],
+                          "feedback": binding["feedback"], "adr_head": binding["adr_head"]}
             return stop(f"{who} accepted, but merging the ADR PR #{pr} failed.{result.get('detail') or ''}",
-                        "spec_adr_merge_failed", failure=failure, observe=not failure.startswith("update_"))
+                        "spec_adr_merge_failed", failure=failure, observe=not failure.startswith("update_"),
+                        continuation=replay)
 
         # An update saved by an earlier run settles first, and its deadline before any PR read.
         accepted = binding["adr_head"]
@@ -1517,11 +1530,13 @@ class Spec:
         notify.notify(f"#{n}: ADR PR #{pr} merged", f"https://github.com/{self.repo}/pull/{pr}")
         return self.publish_accept({**binding, "adr_head": merger.merge_head})
 
-    def resume_pending_accept(self, binding, payload=None):
-        """Resume acceptance against the original inputs and one authoritative PR revision."""
+    def resume_pending_accept(self, binding, payload=None, *, merge_replay=False):
+        """Resume acceptance against the original inputs and one authoritative PR revision.
+
+        MERGE_REPLAY: the saved record is a transport-failed ADR merge, kept until the operation ends (#151)."""
         pr, verdict = binding["pr"], binding["verdict"]
         self.pr = pr
-        reason = "spec_pending_adr_read_failed"
+        reason = owner_handoff.SPEC_ADR_MERGE if merge_replay else "spec_pending_adr_read_failed"
         why = f"Could not read inputs to resume acceptance of ADR PR #{pr}."
 
         inputs = None
@@ -1534,13 +1549,18 @@ class Spec:
                 data, transient = read_issue(self.env, self.issue)
                 if data is None:
                     return None, transient
+            if merge_replay and data["state"] == "CLOSED":
+                return "SUPERSEDED", False
             current = accept_pending(self.env, self.issue, listed=data["comments"])
             if not current:
                 if plan_from(data["comments"], self.env.owner, self.env.config.scheduling.cursor_login_re) == verdict:
                     return "PUBLISHED", False
                 return "CHANGED", False
+            body = self.body_key(data["body"]) if merge_replay else data["body"]
             if (current["pr"] != pr or current["verdict"] != verdict or current["head"] != binding["adr_head"]
-                    or data["body"] != binding["issue_body"]):
+                    or body != binding["issue_body"]):
+                return "CHANGED", False
+            if merge_replay and self.owner_feedback_digest(data["comments"]) != binding["feedback"]:
                 return "CHANGED", False
             if not binding["adr_head"]:
                 return "CHANGED", False
@@ -1555,10 +1575,17 @@ class Spec:
                 return "CHANGED", False
             return state, False
 
-        state = self.retry_read(read, why, reason, continuation=binding)
+        state = self.retry_read(read, why, reason, continuation=binding, keep=merge_replay)
+        if merge_replay and state not in ("OPEN", "MERGED", saved_update):
+            # Every terminal exit of the replay takes its branch update record with it (#151, section 1).
+            merge.Merger(self.env, self.hooks, pr, self.issue).clear_update()
         if state is None:
             return False
+        if state == "SUPERSEDED":
+            owner_handoff.clear_retry(self.env, self.issue, reason)
+            return False
         if state == "PUBLISHED":
+            owner_handoff.clear_retry(self.env, self.issue, reason)
             return True
         if state == "CHANGED":
             self.handoff(f"Issue body, verdict, or ADR head changed or could not be verified for PR #{pr}.", reason)
@@ -2361,6 +2388,21 @@ class Spec:
             outcome = self.complete_answer_post(answer_intent)
             if outcome != "answered":
                 return False
+        try:
+            merge_wait = owner_handoff.load_retry(env, n, owner_handoff.SPEC_ADR_MERGE)
+        except owner_handoff.RetryUnreadable as exc:
+            notify.log(f"#{n}: {owner_handoff.SPEC_ADR_MERGE} retry unreadable: {exc}")
+            self.handoff("Could not read the saved ADR merge.", owner_handoff.SPEC_ADR_MERGE)
+            # The damaged record no longer names the PR; the pending acceptance comment still does.
+            data = issue_payload if issue_payload is not None else read_issue(env, n, once=True)[0]
+            pending = accept_pending(env, n, listed=data["comments"]) if data else None
+            if pending:
+                merge.Merger(env, self.hooks, pending["pr"], n).clear_update()
+            return False
+        if merge_wait is not None:
+            # The saved merge owns the continuation: no reviewer, no worker, no vendor.
+            owner_handoff.clear_retry(env, n, owner_handoff.SPEC_PENDING_ACCEPT_POST)
+            return self.resume_pending_accept(merge_wait["continuation"], issue_payload, merge_replay=True)
         resume_post = self.waiting_comment_post() if answer_intent is None else None
         if resume_post == "unreadable":
             return False

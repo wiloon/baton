@@ -487,8 +487,11 @@ def test_every_category_1_reason_is_rule_mode_with_retry_budget():
         "spec_body_edit_failed", "spec_adr_open_failed",
         "fix_push_failed", "dev_push_failed", "spec_adr_push_failed",
         "fix_description_write_failed", "fix_checks_refresh_failed", "fix_task_write_failed",
+        "spec_adr_merge_failed",
     }
-    for reason in handoff.RETRY_REASONS:
+    # The ADR merge replays a transport failure, then keeps its category-3 observation (#151, section 6).
+    assert handoff.REASONS["spec_adr_merge_failed"] == handoff.Reason(3, "observe", ("retry_step",))
+    for reason in handoff.RETRY_REASONS - {"spec_adr_merge_failed"}:
         entry = handoff.REASONS[reason]
         assert (entry.category, entry.mode, entry.actions) == (1, "rule", ())
 
