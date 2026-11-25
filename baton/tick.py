@@ -950,6 +950,39 @@ class Tick:
             return None
         return [item for page in pages for item in page]
 
+    def pr_history(self, issue):
+        """Every PR of the issue's agent branches (same repository, base main), any state, or None
+        when any lookup fails: a partial history is never used."""
+        owner = self.gh_repo.split("/")[0]
+        found = []
+        for branch in names.branches(issue):
+            pulls = self.admission_items(f"pulls?state=all&head={owner}:{branch}")
+            if pulls is None:
+                return None
+            try:
+                found += [pr for pr in pulls if pr["head"]["ref"] == branch and pr["base"]["ref"] == "main"
+                          and pr["head"]["repo"]["full_name"] == self.gh_repo]
+                {int(pr["number"]) for pr in found}
+            except (KeyError, TypeError, ValueError):
+                return None
+        return found
+
+    def release_stale(self, issue):
+        """An agent-wip issue with no open PR: remove the label unless its newest PR is a merge
+        nobody settled yet (merged work must not be developed again). A failure leaves the label."""
+        history = self.pr_history(issue)
+        if history is None:
+            self.log(f"#{issue}: PR history unreadable; agent-wip not released, retrying next tick")
+            return
+        newest = max(history, key=lambda pr: int(pr["number"]), default=None)
+        if newest and newest.get("merged_at") and not (self.state / f"task-merged-pr-{newest['number']}").exists():
+            self.log(f"#{issue}: merged PR #{newest['number']} is not settled; agent-wip kept")
+            return
+        if self.gh("issue", "edit", issue, "-R", self.gh_repo, "--remove-label", "agent-wip") is None:
+            self.log(f"#{issue}: agent-wip not released (label removal failed), retrying next tick")
+            return
+        self.log(f"#{issue}: released agent-wip (no open PR)")
+
     def next_issue(self):
         listed = self.gh_json("issue", "list", "-R", self.gh_repo, "--state", "open", "--label", "agent-wip", "--limit", "100",
                               "--json", "number")
@@ -970,6 +1003,11 @@ class Tick:
             self.log("could not list open PRs; not starting new work")
             return ""
         branches = {p["headRefName"] for p in prs}
+        # An agent-wip issue without an open PR holds no slot: release it, or leave it uncounted.
+        for p in listed:
+            if not branches.intersection(names.branches(str(p["number"]))):
+                self.release_stale(str(p["number"]))
+        listed = [p for p in listed if branches.intersection(names.branches(str(p["number"])))]
         # A PR waiting for the owner uses no agent capacity; it must not hold up the queue.
         with_owner = {names.issue_of(p["headRefName"]) for p in prs
                       if any(label.get("name") == "ready-for-human" for label in p.get("labels") or [])}
@@ -985,9 +1023,7 @@ class Tick:
             why = []
             for p in pending:
                 n = str(p["number"])
-                if not held[n]:
-                    why.append(f"#{n}: no open PR")
-                elif n in deferred:
+                if n in deferred:
                     why.append(f"#{n}: PR #{held[n]} deferred ({markers[held[n]]})")
                 else:
                     why.append(f"#{n}: PR #{held[n]} in review")
