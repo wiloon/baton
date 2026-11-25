@@ -82,9 +82,7 @@ def agy_runner(tmp_path, monkeypatch):
     (fake / "agy").chmod(0o755)
     (fake / "timeout").write_text('#!/bin/sh\nshift 2\nexec "$@"\n')
     (fake / "timeout").chmod(0o755)
-    token = home / ".gemini/antigravity-cli/antigravity-oauth-token"
-    token.parent.mkdir(parents=True)
-    token.write_text("t")
+    (home / ".gemini/antigravity-cli").mkdir(parents=True)   # cli.log lives here; no token file (#247)
     for name, value in (("PATH", f"{fake}{os.pathsep}{os.environ['PATH']}"), ("FAKE_DIR", str(fake)),
                         ("HOME", str(home))):
         monkeypatch.setenv(name, value)
@@ -262,11 +260,23 @@ def test_untrusted_denied_action_text_is_not_a_quota_signal(agy_runner):
     assert out["status"] == "failure"
 
 
-def test_missing_login_is_an_auth_failure(agy_runner):
-    (agy_runner.home_dir / ".gemini/antigravity-cli/antigravity-oauth-token").unlink()
+def test_no_token_file_still_runs(agy_runner):
+    """The SSH-session token file is not the login: agy runs from the keyring without it."""
+    assert not (agy_runner.home_dir / ".gemini/antigravity-cli/antigravity-oauth-token").exists()
+    agy_runner.plan(stream=stream())
+    out = agy_runner.run()
+    assert out["status"] == "success"
+    assert agy_runner.calls()
+
+
+def test_logged_out_result_is_an_auth_failure(agy_runner):
+    """A real logout is the result error the CLI reports, read as auth with a cooldown."""
+    agy_runner.plan(stream=(json.dumps({"event": "result", "result": {
+        "conversation_id": "", "status": "ERROR", "response": "",
+        "error": "authentication failed or timed out", "num_turns": 0}}) + "\n"))
     out = agy_runner.run()
     assert (out["rc"], out["status"]) == (75, "auth")
-    assert agy_runner.calls() == []
+    assert (agy_runner.state_dir / "agy-cooldown-until").read_text().strip().isdigit()
 
 
 def test_quota_source_none_runs_no_agent_and_records_no_quota(agy_runner):
