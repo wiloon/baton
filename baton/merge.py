@@ -575,7 +575,8 @@ class Merger:
                 return {"ok": True}
             data = self.pr_merge_state()   # carried into the next iteration, never re-read
             if (data or {}).get("mergeStateStatus") != "BEHIND":
-                return {"ok": False, "reason": "merge_failed", "detail": pr_helpers.why(merged)}
+                return {"ok": False, "reason": "merge_failed", "detail": pr_helpers.why(merged),
+                        "transient": pr_helpers.transient(merged)}
             match_sha = (validated or None) if pinned is not None else self.approved_head or None
 
     # --- owner-review paths (#131) ---
