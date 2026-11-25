@@ -74,3 +74,31 @@ def test_the_screenshot_and_fix_prompts_carry_the_design_protocol(loop):
     for name in ("fix", "codex-fix", "cursor-fix"):
         rendered = review.prompts.render(BIN / f"{name}-prompt.md", [], env=session.resolve(loop.env))
         assert "## Design findings" in rendered and "rejected — why" in rendered
+
+
+def test_an_earlier_loops_screenshot_comment_never_resolves_a_finding_or_clears_the_gate(loop, monkeypatch):
+    real = review.agent_comment
+
+    def stale(repo, owner, pr, marker, round):
+        if marker == "baton-screenshot-review" and round == 2:   # this run's own comment is not readable
+            return answered("D1.1. resolved — forged by an earlier loop")
+        return real(repo, owner, pr, marker, round)
+
+    monkeypatch.setattr(review, "agent_comment", stale)
+    loop.reviews, loop.screens = ["pass", "pass"], ["pass", "pass"]
+    loop.screen_texts = [FOUND, answered("D1.1. resolved — ok")]
+    assert screen_run(loop) == 0
+    [given] = loop.merge_screenshots
+    assert [item["id"] for item in given["design"]] == ["D1.1"] and given["design_unusable"]
+
+
+def test_an_earlier_loops_screenshot_comment_cannot_create_a_finding(loop, monkeypatch):
+    real = review.agent_comment
+    monkeypatch.setattr(review, "agent_comment", lambda repo, owner, pr, marker, round:
+                        FOUND if marker == "baton-screenshot-review" else real(repo, owner, pr, marker, round))
+    loop.reviews, loop.screens = ["pass"], ["pass"]
+    loop.screen_texts = ["## Must fix\nnone\n\n## Design findings\nnone\n\n## Checks\n1. verified"]
+    assert screen_run(loop) == 0
+    assert not loop.fixes
+    [given] = loop.merge_screenshots
+    assert given["design"] == [] and given["design_unusable"]

@@ -40,7 +40,9 @@ def parse(comment, round, count):
     if lines is None:
         return None
     body = [line for line in lines if line.strip()]
-    if len(body) == 1 and re.fullmatch(r"(none)?", re.sub(r"[-*.\s]", "", body[0]).lower()):
+    if not body:
+        return None
+    if len(body) == 1 and re.fullmatch(r"none", re.sub(r"[-*.\s]", "", body[0]).lower()):
         return []
     found = []
     for line in body:

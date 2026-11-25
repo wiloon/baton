@@ -325,11 +325,16 @@ class Merger:
         else every current check (of every checks section when the body is not well-formed)."""
         return left if left is not None else checks.recovery_items(body or "")
 
-    def left_text(self, left, owed):
+    def left_text(self, left, owed, design=()):
+        """The hand-off list; a check an open design finding blocks carries the finding's text."""
         if not owed:
             return ""
         lead = "The screenshot review left these checks for you" if left is not None else "Checks for you"
-        return f"{lead}:" + "".join(f"\n- {item}" for item in owed)
+
+        def line(item):
+            texts = [f["text"] for f in design if item in f["checks"]]
+            return f"\n- {item}" + "".join(f" — design finding {f}" for f in texts)
+        return f"{lead}:" + "".join(line(item) for item in owed)
 
     # --- update a behind branch, then merge (#122) ---
     def pr_merge_state(self):
@@ -631,7 +636,7 @@ class Merger:
             body = pr_helpers.body(pr)
             left = self.left_for_owner(screenshot, body)
             owed = self.owed(left, body)
-            listed = self.left_text(left, owed)
+            listed = self.left_text(left, owed, (screenshot or {}).get("design") or ())
             self.handoff("auto_merge_off", f"PR #{pr} review passed",
                          f"Auto-merge is off{where}; ready for you." + (f" {listed}\n{url}" if listed else f" {url}"))
             if body is None or not pr_helpers.checks_none(body):
@@ -680,7 +685,7 @@ class Merger:
             live_body = gate.get("body")
             left = self.left_for_owner(screenshot, live_body)
             owed = self.owed(left, live_body if live_body is not None else body)
-            listed = self.left_text(left, owed)
+            listed = self.left_text(left, owed, (screenshot or {}).get("design") or ())
             self.handoff("manual_checks", f"PR #{pr} needs a manual check",
                          "Review and CI passed." + (f" {listed}\n{url}" if listed else f" {url}"))
             notify.send_shots(pr, note="Checks for you" if left is None else "", left=owed)
@@ -714,7 +719,7 @@ class Merger:
                 live_body = gate.get("body")
                 left = self.left_for_owner(screenshot, live_body)
                 owed = self.owed(left, live_body if live_body is not None else body)
-                listed = self.left_text(left, owed)
+                listed = self.left_text(left, owed, (screenshot or {}).get("design") or ())
                 self.handoff("manual_checks", f"PR #{pr} needs a manual check",
                              "Review and CI passed." + (f" {listed}\n{url}" if listed else f" {url}"))
                 notify.send_shots(pr, note="Checks for you" if left is None else "", left=owed)

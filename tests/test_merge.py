@@ -410,7 +410,7 @@ def test_a_check_an_open_design_finding_blocks_is_never_cleared_by_its_verified_
     run.go(screenshot={"checks": TWO, "comment": verdicts("1. verified", "2. verified"), "design": [FINDING]})
     assert run.labelled("ready-for-human") and not run.merged()
     text = run.texts["PR #335 needs a manual check"]
-    assert ONE in text and SIGNUP not in text
+    assert ONE in text and SIGNUP not in text and FINDING["text"] in text
 
 
 def test_design_findings_with_unusable_verdicts_send_every_check_to_the_owner(run):
