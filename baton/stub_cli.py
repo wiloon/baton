@@ -87,7 +87,8 @@ def end_line_identity(model):
 
 
 def end_line_model(fields):
-    return ""
+    """The model the Stub's runner.log end line records (its summary ends in model=...)."""
+    return next((field.split("=", 1)[1] for field in fields if field.startswith("model=")), "")
 
 
 def work_started(log_text):

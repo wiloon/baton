@@ -4233,3 +4233,9 @@ def test_the_spec_policy_comes_from_the_adapter_constant_not_the_vendor_name(loo
         "Revision mode: same-vendor-different-model (stub")
     assert s.unverified("stub", "stub", "same", "same") is True
     assert s.unverified("stub", "stub", "other", "same") is False
+
+
+def test_stub_end_line_model_reads_the_logged_model_field():
+    from baton import stub_cli
+    assert stub_cli.end_line_model(["revised", "model=stub-model-1"]) == "stub-model-1"
+    assert stub_cli.end_line_model(["revised"]) == ""
