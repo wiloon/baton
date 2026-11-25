@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from baton import agents, config, dispatch, pick, quota, session, settle
+from baton import agents, config, cursor_cli, dispatch, pick, quota, session, settle
 from baton.common import Deferred
 from conftest import full_text
 from test_agents import FAKE_CLI, lines
@@ -235,7 +235,7 @@ def test_raw_refresh_cursor_still_propagates_errors(tmp_path):
     auth = tmp_path / "auth.json"
     auth.write_text('{"accessToken": "tok"}')
     with pytest.raises(OSError, match="boom"):
-        quota.refresh_cursor(str(tmp_path), time.time(), auth=auth,
+        cursor_cli.refresh_quota(str(tmp_path), time.time(), auth=auth,
                              fetch=lambda token: (_ for _ in ()).throw(OSError("boom")))
 
 

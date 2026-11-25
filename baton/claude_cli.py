@@ -130,8 +130,19 @@ def probe_command(model, directory):
 
 
 def parse_quota_log(lines):
-    from . import quota
-    return quota.parse_claude(lines)
+    """Windows from the last rate_limit_event: {name: {used, resets_at}}."""
+    from .quota import json_lines
+    windows = {}
+    for event in json_lines(lines):
+        if not isinstance(event, dict) or event.get("type") != "rate_limit_event":
+            continue
+        info = event.get("rate_limit_info") or {}
+        for name, window in (info.get("unifiedWindows") or {}).items():
+            if "utilization" in window:
+                windows[name] = {"used": float(window["utilization"]), "resets_at": int(window["resetsAt"])}
+        if info.get("status") == "rejected" and info.get("rateLimitType"):
+            windows[info["rateLimitType"]] = {"used": 1.0, "resets_at": int(info.get("resetsAt") or 0)}
+    return windows
 
 
 def distinct_models(first, second):
@@ -259,5 +270,4 @@ def analyst_response(text):
 
 
 def analyst_quota(lines, home):
-    from . import quota
-    return quota.parse_claude(lines)
+    return parse_quota_log(lines)
