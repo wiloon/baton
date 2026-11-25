@@ -19,9 +19,12 @@ close. Code still enforces review independence, owner authorization, quota limit
 grants (ADR 0007), retry limits and actual CI results. An advisor cannot widen its own action set
 or declare a failed check passed.
 
-The **routine advisor** makes one stateless call to an API model outside the worker
-subscriptions, DeepSeek by default. Scheduling judgement keeps working when a worker vendor's
-five-hour window is full. Before a task handoff, the runner classifies the reason in code.
+The **routine advisor** makes one stateless call per decision. Its first backend is Claude Code
+in print mode (`claude -p`), run on the owner's subscription with no tools, given the same
+bounded snapshot and allowed actions. When Claude cannot take the call (its cap or five-hour
+window is reached, it is cooling down, or the call fails or times out), the same call goes to
+the **fallback backend**: an API model outside the worker subscriptions, DeepSeek by default,
+paid per use. Scheduling judgement so keeps working when every worker vendor is out of quota. Before a task handoff, the runner classifies the reason in code.
 Rules handle known waits and safe retries. Owner-only reasons go directly to the owner.
 For judgement calls, the routine advisor can choose among the applicable bounded recovery
 actions. For a problem that needs investigation, it may recommend one retry of the failed
@@ -80,12 +83,17 @@ advisor action per reason and task episode, and a recurrence after that action g
   a crash or upgrade is unclear, and its decisions are hard to replay or test.
 - **One resumed session per task episode:** keeps context across a task, but hits context
   compaction and restart problems. An episode summary kept in state gives most of the benefit.
+- **DeepSeek as the only routine backend** (the first version): independent of every worker
+  subscription and fast, but weaker than Claude on judgement and paid per call, while the
+  Claude subscription has quota to spare.
 - **Advisory decision points (chosen):** keep the deterministic loop, and replace rule branches
   with model judgement one decision point at a time, each with a rule fallback.
 
 ## Consequences
 
-- Advisor usage is recorded separately from workload usage.
+- Advisor usage is recorded separately from workload usage, and every decision record names the
+  backend that answered. Claude advisor calls count against Claude's quota like any other run,
+  so the existing caps decide when the fallback backend takes over.
 - The routine advisor sends bounded issue and PR content to an external provider. Baseline
   context can include diff size and CI check status. Each repository must opt in separately
   to raw diff excerpts, CI log excerpts and local repository documents used as citation
@@ -131,3 +139,8 @@ advisor action per reason and task episode, and a recurrence after that action g
   response, because a queued update leaves the old head visible and absence can't be confirmed.
 - Issue #151 (spec round 5): give each ADR branch update one saved deadline that also bounds its
   calls, because a stalled call or a restart could otherwise postpone the handoff without limit.
+- Owner, 2026-11-24 (Claude moved to the Max subscription): the routine advisor calls Claude
+  Code first and DeepSeek only as the fallback backend, because Claude judges better and its
+  subscription quota is spare, while DeepSeek is paid per call. The fallback keeps the
+  pipeline's judgement available when Claude is out of quota. Both backends get the same
+  snapshot and action set; a backend with read-only tools stays a separate follow-up.

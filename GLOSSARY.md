@@ -26,6 +26,19 @@ _Avoid_: AI scheduler, supervisor
 The stored account of one advisor recommendation: what it saw, what it could choose, what it
 chose and why, and later what happened.
 
+**Task profile**:
+An assessment of a task made when it is picked up and refreshed when its spec is accepted:
+its size, kind, risk and whether it should be split, each with a reason.
+
+**Route tier**:
+One of three owner-configured levels (light, standard, heavy) of model and effort for a step;
+the task profile chooses the tier, never the model.
+_Avoid_: Model selection by the advisor
+
+**Fallback backend**:
+The advisor backend used when the primary one (Claude Code) cannot take a call, so judgement
+keeps working when worker quota runs out.
+
 **Observation mode**:
 A decision point whose advisor recommendations are recorded but do not change the work.
 
