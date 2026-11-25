@@ -81,7 +81,9 @@ TOKEN_FILE = ".gemini/antigravity-cli/antigravity-oauth-token"
 CLI_LOG = ".gemini/antigravity-cli/cli.log"
 # Read-only commands every role needs, and what dev/fix add on top. The repository's CI command
 # and verify hook are appended per run (permissions_settings).
-READ_COMMANDS = ("git", "rg", "ls", "cat")
+# Read-only inspection commands. A headless agy run stops with an empty reply at the first denied
+# command, so a reviewer exploring with `find ... | sort` failed the whole review (PR #244).
+READ_COMMANDS = ("git", "rg", "grep", "ls", "cat", "head", "tail", "wc", "find", "sort", "uniq", "diff")
 WRITE_COMMANDS = READ_COMMANDS + ("python3", "mkdir")
 EFFORT = re.compile(r"-(?:low|medium|high|xhigh)$")
 
