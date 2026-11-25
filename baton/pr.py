@@ -133,9 +133,13 @@ def _option(args, name):
     return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else None
 
 
+UNKNOWN = "unknown"
+
+
 def _landed(args, input):
     """For a write that may have reached GitHub before its answer was lost: the result it
-    would have given, or None when it did not land. Idempotent calls return None: retry them."""
+    would have given, None when it confirmably did not land, or UNKNOWN when the lookup was
+    unreadable (the write is then not repeated, #151 section 3). Idempotent calls return None."""
     repo = _option(args, "-R")
     scope = ["-R", repo] if repo else []
     if args[1:2] == ("comment",) and args[0] in ("issue", "pr") and len(args) > 2:
@@ -145,32 +149,47 @@ def _landed(args, input):
             try:
                 text = input if source == "-" else Path(source).read_text()
             except OSError:
-                return None
+                return UNKNOWN
         if text is None:
             return None
         seen = gh(args[0], "view", args[2], *scope, "--json", "comments")
+        if seen.returncode != 0:
+            return UNKNOWN
         try:
-            bodies = [c.get("body", "") for c in json.loads(seen.stdout)["comments"][-20:]]
-        except (ValueError, KeyError, TypeError):
-            return None
-        if text.strip() in (b.strip() for b in bodies):
+            bodies = [c["body"].strip() for c in json.loads(seen.stdout)["comments"][-20:]]
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return UNKNOWN
+        if text.strip() in bodies:
             return subprocess.CompletedProcess(["gh", *args], 0, "", "")
         return None
     if args[:2] == ("pr", "create") and (head := _option(args, "--head")):
         found = gh("pr", "list", *scope, "--state", "open", "--head", head, "--json", "url", "--jq", ".[0].url // empty")
-        url = found.stdout.strip() if found.returncode == 0 else ""
+        if found.returncode != 0:
+            return UNKNOWN
+        url = found.stdout.strip()
         return subprocess.CompletedProcess(["gh", *args], 0, url + "\n", "") if url else None
     if args[:2] == ("issue", "create") and (title := _option(args, "--title")):
         found = gh("issue", "list", *scope, "--state", "open", "--limit", "30", "--json", "title,url")
+        if found.returncode != 0:
+            return UNKNOWN
         try:
-            url = next((i["url"] for i in json.loads(found.stdout) if i.get("title") == title), "")
+            issues = json.loads(found.stdout)
+            if not isinstance(issues, list):
+                return UNKNOWN
+            url = next((i["url"] for i in issues if i["title"] == title), "")
         except (ValueError, KeyError, TypeError):
-            return None
+            return UNKNOWN
+        if not isinstance(url, str):
+            return UNKNOWN
         return subprocess.CompletedProcess(["gh", *args], 0, url + "\n", "") if url else None
     if args[:2] == ("pr", "merge") and len(args) > 2:
         state = gh("pr", "view", args[2], *scope, "--json", "state", "--jq", ".state")
-        if state.returncode == 0 and state.stdout.strip() == "MERGED":
+        if state.returncode != 0:
+            return UNKNOWN
+        answer = state.stdout.strip()
+        if answer == "MERGED":
             return subprocess.CompletedProcess(["gh", *args], 0, "", "")
+        return None if answer == "OPEN" else UNKNOWN
     return None
 
 
@@ -210,7 +229,7 @@ def gh(*args, input=None, limit=None, reconcile=None, repeat=None, until=None):
             if state != "absent":
                 return result
         elif (done := _landed(args, input)) is not None:
-            return done
+            return result if done == UNKNOWN else done
         result = attempt()
     if result.returncode != 0 and retryable(result):
         if reconcile is not None and reconcile() == "landed":

@@ -387,6 +387,32 @@ def test_a_comment_that_did_not_land_is_posted_again(scripted):
     assert [c[:2] for c in fake.calls] == [("pr", "comment"), ("pr", "view"), ("pr", "comment")]
 
 
+def test_a_merge_whose_state_lookup_is_unreadable_is_not_sent_again(scripted):
+    fake = scripted((1, "", "HTTP 503: Service Unavailable"), (1, "", "HTTP 404: Not Found"))
+    result = pr.gh("pr", "merge", "5", "-R", "o/r", "--squash")
+    assert result.returncode == 1 and "503" in result.stderr
+    assert [c[:2] for c in fake.calls] == [("pr", "merge"), ("pr", "view")]
+
+
+def test_a_comment_whose_history_is_unreadable_is_not_posted_again(scripted):
+    fake = scripted((1, "", "TLS handshake timeout"), (0, "not json", ""))
+    assert pr.gh("pr", "comment", "5", "-R", "o/r", "--body", "hi").returncode == 1
+    assert [c[:2] for c in fake.calls] == [("pr", "comment"), ("pr", "view")]
+
+
+def test_a_pr_create_whose_lookup_is_unreadable_is_not_sent_again(scripted):
+    fake = scripted((1, "", "read: connection reset by peer"), (1, "", "HTTP 404: Not Found"))
+    result = pr.gh("pr", "create", "-R", "o/r", "--head", "docs/x", "--base", "main", "--title", "t", "--body", "b")
+    assert result.returncode == 1
+    assert [c[:2] for c in fake.calls] == [("pr", "create"), ("pr", "list")]
+
+
+def test_a_merge_confirmed_still_open_is_sent_again(scripted):
+    fake = scripted((1, "", "HTTP 503: Service Unavailable"), (0, "OPEN\n", ""), (0, "", ""))
+    assert pr.gh("pr", "merge", "5", "-R", "o/r", "--squash").returncode == 0
+    assert [c[:2] for c in fake.calls] == [("pr", "merge"), ("pr", "view"), ("pr", "merge")]
+
+
 def test_why_is_the_last_stderr_lines():
     import subprocess
     result = subprocess.CompletedProcess([], 1, "", "a\n\nb\nc\nHTTP 502: Bad Gateway\n")
@@ -421,3 +447,36 @@ def test_why_withholds_stderr_when_secret_lookup_raises(gh, child_token, monkeyp
     got = pr.why(subprocess.CompletedProcess([], 1, "", f"denied {child_token}\n"))
     assert got == " (gh: [stderr withheld: redaction failed])"
     assert pr.why(subprocess.CompletedProcess([], 1, "", "")) == ""
+
+
+@pytest.mark.parametrize("state", ["", "null", "CLOSED", "weird"])
+def test_a_merge_whose_state_is_not_open_or_merged_is_not_sent_again(scripted, state):
+    fake = scripted((1, "", "HTTP 503: Service Unavailable"), (0, state + "\n", ""))
+    assert pr.gh("pr", "merge", "5", "-R", "o/r", "--squash").returncode == 1
+    assert [c[:2] for c in fake.calls] == [("pr", "merge"), ("pr", "view")]
+
+
+def test_an_issue_create_whose_lookup_is_unreadable_is_not_sent_again(scripted):
+    fake = scripted((1, "", "read: connection reset by peer"), (1, "", "HTTP 404: Not Found"))
+    assert pr.gh("issue", "create", "-R", "o/r", "--title", "t", "--body", "b").returncode == 1
+    assert [c[:2] for c in fake.calls] == [("issue", "create"), ("issue", "list")]
+
+
+@pytest.mark.parametrize("listing", ["{}", "[1]", '[{"title": "t", "url": 5}]', "[{}]"])
+def test_an_issue_create_with_a_malformed_lookup_is_not_sent_again(scripted, listing):
+    fake = scripted((1, "", "read: connection reset by peer"), (0, listing, ""))
+    assert pr.gh("issue", "create", "-R", "o/r", "--title", "t", "--body", "b").returncode == 1
+    assert [c[:2] for c in fake.calls] == [("issue", "create"), ("issue", "list")]
+
+
+@pytest.mark.parametrize("view", ['{"comments": [{"body": null}]}', '{"comments": {}}', '{"comments": [1]}', "[]"])
+def test_a_comment_with_a_malformed_history_is_not_posted_again(scripted, view):
+    fake = scripted((1, "", "TLS handshake timeout"), (0, view, ""))
+    assert pr.gh("pr", "comment", "5", "-R", "o/r", "--body", "hi").returncode == 1
+    assert [c[:2] for c in fake.calls] == [("pr", "comment"), ("pr", "view")]
+
+
+def test_a_comment_with_an_unreadable_body_file_is_not_posted_again(scripted):
+    fake = scripted((1, "", "TLS handshake timeout"))
+    assert pr.gh("pr", "comment", "5", "-R", "o/r", "--body-file", "/nonexistent/x").returncode == 1
+    assert [c[:2] for c in fake.calls] == [("pr", "comment")]
