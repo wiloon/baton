@@ -442,3 +442,15 @@ def child_token(monkeypatch):
     current.tools["GH_TOKEN"] = opaque
     monkeypatch.setattr(session, "resolve", lambda value=None: current)
     return opaque
+
+
+def watch_retirement(monkeypatch, state, pr):
+    """For each removal of an existing review-pending-PR: was ready-label-pending-PR already there? (#265)"""
+    seen, real = [], Path.unlink
+
+    def unlink(path, *args, **kwargs):
+        if path.name == f"review-pending-{pr}" and path.exists():
+            seen.append(path.with_name(f"ready-label-pending-{pr}").exists())
+        return real(path, *args, **kwargs)
+    monkeypatch.setattr(Path, "unlink", unlink)
+    return seen

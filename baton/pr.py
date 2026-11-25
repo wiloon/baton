@@ -31,7 +31,7 @@ def task_wanted(reply):
 # A gh failure worth another try: the network or GitHub's edge, not the request (#46).
 TRANSIENT = re.compile(r"TLS handshake timeout|connection reset|connection refused|i/o timeout|unexpected EOF"
                        r"|timeout awaiting response headers|Client\.Timeout exceeded|error connecting to"
-                       r"|HTTP 50[234]|secondary rate limit", re.IGNORECASE)
+                       r"|HTTP 50[0234]|Something went wrong while executing your query|secondary rate limit", re.IGNORECASE)
 # Pauses before each retry, in seconds: three retries over about 20 s.
 BACKOFF = (2, 5, 15)
 sleep = time.sleep

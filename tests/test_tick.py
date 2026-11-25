@@ -595,6 +595,7 @@ def test_an_issue_with_a_pr_is_skipped(ctx, monkeypatch, branch):
 def test_new_work_waits_while_an_issue_awaits_review(ctx):
     issues(ctx, ready=[issue(12)], pending=1)
     ctx.gh.answers["pr list"] = [{"number": 30, "headRefName": "agent/issue-0", "labels": []}]
+    ctx.path("review-pending-30").write_text("x")
     assert ctx.make().next_issue() == ""
     assert "1 issue(s) still waiting on review (agent-wip), cap 1, 0 deferred, 1 not deferred" in ctx.log()
     assert "#0: PR #30 in review" in ctx.log()
@@ -605,7 +606,7 @@ ORIGINAL_REVIEW_LOOP = tick.Tick.review_loop
 QUOTA = "quota claude=blocked(5h 94% >= 90%)"
 
 
-def flight(ctx, wip, ready=(), prs=None, labels=None, cap=None):
+def flight(ctx, wip, ready=(), prs=None, labels=None, cap=None, in_review=True):
     """WIP issues are in flight; PRS maps an issue to its open PR number, LABELS a PR to its labels."""
     prs, labels = prs or {}, labels or {}
     ctx.gh.answers["issue list"] = lambda args: [{"number": n} for n in wip] if "agent-wip" in args else \
@@ -616,6 +617,9 @@ def flight(ctx, wip, ready=(), prs=None, labels=None, cap=None):
     for item in ready:
         label_history(ctx, item["number"], [label_event(1, "owner")])
     ctx.cap = cap
+    for n, pr in prs.items():   # a PR in review has saved state (#265); without it the tick calls it stalled
+        if in_review:
+            ctx.path(f"recovery-{n}-{pr}.json").write_text("{}")
 
 
 def pr_state(ctx, state="OPEN", branch="agent/issue-5"):
@@ -843,7 +847,7 @@ def test_wip_issues_beyond_the_first_page_count_toward_the_cap(ctx, monkeypatch)
 
 def test_an_agent_fix_deferred_in_vendor_selection_lends_its_slot(ctx, monkeypatch):
     pr_state(ctx)
-    flight(ctx, wip=[5], ready=[issue(12)], prs={5: 11})
+    flight(ctx, wip=[5], ready=[issue(12)], prs={5: 11}, in_review=False)
     ctx.gh.answers["pr list"] = lambda args: [{"number": 11, "headRefName": "agent/issue-5", "labels": []}]
     Path(ctx.env["WT_ROOT"], "agent-5").mkdir(parents=True)
     monkeypatch.setattr(tick.session, "run_process", lambda *a, **k: subprocess.CompletedProcess(a, 0, "", ""))
@@ -1189,7 +1193,8 @@ def test_a_pr_waiting_for_the_owner_does_not_hold_up_new_work(ctx, monkeypatch):
 
 def test_a_pr_still_in_review_holds_up_new_work(ctx):
     issues(ctx, ready=[issue(12)], pending=1)
-    ctx.gh.answers["pr list"] = [{"headRefName": "agent/issue-0", "labels": []}]
+    ctx.gh.answers["pr list"] = [{"number": 30, "headRefName": "agent/issue-0", "labels": []}]
+    ctx.path("review-pending-30").write_text("x")
     assert ctx.make().next_issue() == ""
 
 
@@ -3063,4 +3068,65 @@ def test_malformed_second_page_does_not_release_label(ctx, monkeypatch):
     assert ctx.make().run() == 0
     assert not released(ctx, 5)
     assert started == ["12"]
+
+
+# --- a stalled PR and a ready label that could not be written (#265) -----------------------------------------
+STATES = {
+    "review-pending": lambda ctx: checkpoint(ctx, pr="11"),
+    "fix-push-waiting": lambda ctx: ctx.path("fix-push-waiting-11").write_text("5"),
+    "slot-deferred": lambda ctx: ctx.path("slot-deferred-11").write_text("{}"),
+    "ready-label-pending": lambda ctx: ctx.path("ready-label-pending-11").write_text('{"attempts": 0}'),
+    "retry-record": lambda ctx: ctx.path("handoff-retry-5-11-fix_push_failed.json").write_text("{}"),
+    "recovery-record": lambda ctx: ctx.path("recovery-5-11.json").write_text("{}"),
+}
+
+
+def ready_edits(ctx):
+    return [c for c in ctx.gh.ran("pr", "edit") if "ready-for-human" in c]
+
+
+def test_an_unlabelled_pr_with_no_saved_state_is_handed_off_not_logged_in_review(ctx):
+    flight(ctx, wip=[5], ready=[issue(12)], prs={5: 11}, in_review=False)
+    assert ctx.make().next_issue() == "12"   # the handed-off PR holds no slot
+    assert [c[2] for c in ready_edits(ctx)] == ["11"]
+    assert "in review" not in ctx.log()
+    assert "handoff pr_stalled category=3" in ctx.log()
+    assert not [c for c in ctx.gh.ran("issue", "edit") if "ready-for-human" in c]
+
+
+@pytest.mark.parametrize("saved", sorted(STATES))
+def test_a_pr_with_saved_state_is_not_handed_off(ctx, saved):
+    flight(ctx, wip=[5], ready=[issue(12)], prs={5: 11}, in_review=False)
+    STATES[saved](ctx)
+    ctx.make().next_issue()
+    assert not ready_edits(ctx)
+    assert "pr_stalled" not in ctx.log()
+
+
+@pytest.mark.parametrize("label", ["agent-review", "agent-fix", "ready-for-human"])
+def test_a_pr_with_a_pipeline_label_is_not_handed_off(ctx, label):
+    flight(ctx, wip=[5], ready=[issue(12)], prs={5: 11}, labels={11: [label]}, in_review=False)
+    ctx.make().next_issue()
+    assert not ready_edits(ctx)
+
+
+def test_a_following_tick_applies_a_pending_ready_label_and_removes_the_record(ctx):
+    ctx.path("ready-label-pending-11").write_text('{"attempts": 0}')
+    handoff.retry_ready_labels(ctx.make().env)
+    assert [c[2] for c in ready_edits(ctx)] == ["11"]
+    assert not ctx.path("ready-label-pending-11").exists()
+
+
+def test_a_pending_ready_label_is_given_up_after_five_ticks_and_the_owner_is_told(ctx, monkeypatch):
+    told = []
+    monkeypatch.setattr(handoff.notify, "notify", lambda title, text="": told.append(title))
+    ctx.gh.fails.add("pr edit")
+    ctx.path("ready-label-pending-11").write_text('{"attempts": 0}')
+    runner = ctx.make().env
+    for _ in range(4):
+        handoff.retry_ready_labels(runner)
+    assert ctx.path("ready-label-pending-11").exists() and not told
+    handoff.retry_ready_labels(runner)
+    assert not ctx.path("ready-label-pending-11").exists()
+    assert told == ["PR #11 needs you"]
 

@@ -10,7 +10,7 @@ import pytest
 
 from baton import advisor, ci, merge, notify, pick, pr as pr_helpers
 from baton.config import Advisor
-from conftest import sh
+from conftest import sh, watch_retirement
 from test_notify import PNG, Telegram
 
 BIN = Path(__file__).resolve().parents[1] / "bin"
@@ -1183,3 +1183,77 @@ def test_ci_log_excerpt_is_sent_only_with_its_flag_and_for_the_failed_check(run,
     assert "CI log excerpt:\ntests (run 222):" in snapshot and "assert boom" in snapshot
     assert [a[:3] for a in runs] == [("run", "view", "222")] and "--log-failed" in runs[0]
     assert len(snapshot.split("CI log excerpt:")[1]) < 3200
+
+
+# --- GitHub's transient errors on the merge and the ready label (#265) ----------------------------
+GRAPHQL = ("gh: GraphQL: Something went wrong while executing your query on 2026-11-25T15:49:08Z. "
+           "Please include `ED6C:19235B:CCC3FE:DABFAB:6B070372` when reporting this issue.")
+
+
+def github_errors(run, monkeypatch, errors, landed=False):
+    """The first len(ERRORS) `gh pr merge` tries fail with these stderr texts; LANDED: the failed try merged."""
+    import subprocess
+    queue, real_call = list(errors), pr_helpers.call
+    run.tries = 0
+    monkeypatch.setattr(pr_helpers, "sleep", lambda s: None)
+
+    def call(*args, **kw):
+        run.tries += args[:2] == ("pr", "merge")
+        if args[:2] == ("pr", "merge") and queue:
+            if landed:
+                run.gh.set(state="MERGED")
+            return subprocess.CompletedProcess(["gh", *args], 1, "", queue.pop(0))
+        return real_call(*args, **kw)
+    monkeypatch.setattr(pr_helpers, "call", call)
+
+
+@pytest.mark.parametrize("error", [GRAPHQL, "HTTP 500: Internal Server Error"])
+def test_a_merge_that_fails_once_with_a_github_side_error_still_merges(run, monkeypatch, error):
+    github_errors(run, monkeypatch, [error])
+    run.go()
+    assert run.merged() and not run.labelled("ready-for-human")
+    assert "after_merge" in run.events and "notify PR #335 merge failed" not in run.events
+    assert run.tries == 2
+
+
+def test_a_merge_that_keeps_failing_with_the_github_error_hands_off_after_the_bound(run, monkeypatch):
+    github_errors(run, monkeypatch, [GRAPHQL] * 10)
+    run.go()
+    assert run.labelled("ready-for-human") and run.gh.pr.get("state") != "MERGED"
+    assert run.tries == len(pr_helpers.BACKOFF) + 1
+    assert "notify PR #335 merge failed" in run.events
+
+
+def test_a_merge_the_github_error_hid_is_recorded_as_merged(run, monkeypatch):
+    github_errors(run, monkeypatch, [GRAPHQL], landed=True)
+    run.go()
+    assert not run.labelled("ready-for-human") and "after_merge" in run.events
+    assert run.tries == 1
+
+
+def label_outage(run):
+    run.gh.set(mergeStateStatus="DIRTY", headRefOid=OLD, merge_results=[1], merge_fail_status=["DIRTY"])
+    Path(run.env["STATE"], f"review-pending-{PR}").write_text("x")
+    run.gh.fail("label")
+    run.go()
+
+
+def test_a_label_outage_leaves_a_pending_record(run, monkeypatch):
+    retired = watch_retirement(monkeypatch, run.env["STATE"], PR)
+    label_outage(run)
+    assert retired and all(retired)   # the record was there before the continuation went
+    assert not Path(run.env["STATE"], f"review-pending-{PR}").exists()
+    assert Path(run.env["STATE"], f"ready-label-pending-{PR}").exists()
+
+
+def test_a_label_that_lands_leaves_no_pending_record(run):
+    run.gh.set(mergeStateStatus="DIRTY", headRefOid=OLD, merge_results=[1], merge_fail_status=["DIRTY"])
+    run.go()
+    assert run.labelled("ready-for-human")
+    assert not Path(run.env["STATE"], f"ready-label-pending-{PR}").exists()
+
+
+def test_a_pr_handoff_does_not_label_the_issue(run):
+    run.gh.set(mergeStateStatus="DIRTY", headRefOid=OLD, merge_results=[1], merge_fail_status=["DIRTY"])
+    run.go()
+    assert not any(c[:2] == ["issue", "edit"] and "ready-for-human" in c for c in run.gh.calls())

@@ -16,7 +16,7 @@ from baton.config import load
 from baton.dispatch import dispatch as dispatch_run
 from baton.fix import fix_pr as fix_pr_run
 from baton.common import Deferred, changed
-from conftest import full_text, sh
+from conftest import full_text, sh, watch_retirement
 from test_adapter_capabilities import with_stub
 
 REAL_MERGE = merge.Merger.merge_or_handoff
@@ -2782,6 +2782,26 @@ def test_an_unrelated_head_after_saving_the_merge_checkpoint_hands_off(loop, mon
     assert loop.run(fixer="cursor", reviewer="codex") == 0
     assert not loop.merged and loop.labelled("ready-for-human")
     assert not loop.checkpoint()
+
+
+def test_a_label_outage_on_an_unconfirmed_head_keeps_a_pending_record(loop, monkeypatch):
+    loop.reviews[:] = ["pass"]
+
+    def interrupt(*args, **kwargs):
+        raise InterruptedError("stopped after saving the merge checkpoint")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(merge.Merger, "merge_or_handoff", interrupt)
+        with pytest.raises(InterruptedError, match="after saving"):
+            loop.run(fixer="cursor", reviewer="codex")
+    loop.gh.set(headRefOid="f" * 40)
+    loop.gh.fail("label")
+    retired = watch_retirement(monkeypatch, loop.env["STATE"], PR)
+    assert loop.run(fixer="cursor", reviewer="codex") == 0
+    assert loop.labelled("ready-for-human") and not loop.merged   # the write was tried, and failed
+    assert retired and all(retired)   # the record was there before the continuation went
+    assert not loop.checkpoint()
+    assert Path(loop.env["STATE"], f"ready-label-pending-{PR}").exists()
 
 
 def test_a_landed_ci_repair_advances_the_approved_head_across_restart(loop, monkeypatch):
