@@ -413,6 +413,23 @@ def test_a_check_an_open_design_finding_blocks_is_never_cleared_by_its_verified_
     assert ONE in text and SIGNUP not in text and FINDING["text"] in text
 
 
+def test_a_design_disagreement_hand_off_quotes_both_positions(run):
+    run.gh.set(body=CLEAN.replace("none", TWO))
+    disputed = {**FINDING, "disagree": {"reviewer": "still 24 px at 390 px", "fixer": "24 px is the brand spacing"},
+                "answer": {"kind": "rejected", "why": "24 px is the brand spacing", "earlier": True}}
+    run.go(screenshot={"checks": TWO, "comment": verdicts("1. verified", "2. verified"), "design": [disputed]})
+    text = run.texts["PR #335 needs a manual check"]
+    assert "design disagreement" in text and "reviewer: still 24 px at 390 px" in text
+    assert "fixer: 24 px is the brand spacing" in text
+
+
+def test_an_answered_design_finding_hand_off_shows_the_fixer_answer(run):
+    run.gh.set(body=CLEAN.replace("none", TWO))
+    answered = {**FINDING, "answer": {"kind": "adopted", "why": "now 18 px", "earlier": False}}
+    run.go(screenshot={"checks": TWO, "comment": verdicts("1. verified", "2. verified"), "design": [answered]})
+    assert "fixer answer: adopted — now 18 px" in run.texts["PR #335 needs a manual check"]
+
+
 def test_design_findings_with_unusable_verdicts_send_every_check_to_the_owner(run):
     run.gh.set(body=CLEAN.replace("none", TWO))
     run.go(screenshot={"checks": TWO, "comment": verdicts("1. verified", "2. verified"), "design_unusable": True})

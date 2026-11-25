@@ -47,6 +47,7 @@ def loop(gh, worktree, tmp_path, monkeypatch):
     state.env, state.gh, state.wt, state.repo = env, gh, worktree.wt, worktree.repo
     state.agents, state.fixes, state.merged = [], [], []
     state.reviews, state.fix_plans = ["changes", "pass"], []
+    state.fix_replies = []   # (reply text, loop id or None for this loop's) per fix run
     state.screens, state.after, state.artifacts = [], {}, []
     state.screen_texts = []   # one comment text per screenshot run, before screen_text
     # A marker the runner must strip, kept in two pieces: the agent guard refuses writes naming a vendor marker.
@@ -84,9 +85,16 @@ def loop(gh, worktree, tmp_path, monkeypatch):
 
     def fix_pr(runner, pr, wt, fixer, source, feedback, head=""):
         plan = state.fix_plans.pop(0) if state.fix_plans else 0
-        state.fixes.append({"fixer": fixer, "source": source, "feedback": feedback, "head": head, "round": runner.round})
+        state.fixes.append({"fixer": fixer, "source": source, "feedback": feedback, "head": head, "round": runner.round,
+                            "loop_id": runner.loop_id, "design_ids": list(runner.design_ids),
+                            "design_only": runner.design_only})
         if plan == 75:
             raise Deferred(fixer, "quota exhausted")
+        if state.fix_replies:   # the fix comment the real fixer posts, with its marker
+            reply, loop_id = state.fix_replies.pop(0)
+            gh.set(comments=[*gh.pr["comments"], {
+                "author": {"login": "owner"}, "createdAt": "2026-10-27T11:00:00Z",
+                "body": f"<!-- baton-fix by={fixer} loop={loop_id or runner.loop_id} round={runner.round} -->\n{reply}"}])
         (Path(wt) / f"fix-{time.monotonic_ns()}.txt").write_text("x\n")
         sh(wt, "git", "add", "-A")
         sh(wt, "git", "commit", "-q", "-m", "fix")

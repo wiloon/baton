@@ -332,8 +332,11 @@ class Merger:
         lead = "The screenshot review left these checks for you" if left is not None else "Checks for you"
 
         def line(item):
-            texts = [f["text"] for f in design if item in f["checks"]]
-            return f"\n- {item}" + "".join(f" — design finding {f}" for f in texts)
+            found = [f for f in design if item in f["checks"]]
+            return f"\n- {item}" + "".join(f" — design finding {f['text']}{design_findings.answer_text(f)}"
+                                            + (f" — owner — design disagreement: reviewer: {f['disagree']['reviewer']}; "
+                                               f"fixer: {f['disagree']['fixer']}" if f.get("disagree") else "")
+                                            for f in found)
         return f"{lead}:" + "".join(line(item) for item in owed)
 
     # --- update a behind branch, then merge (#122) ---

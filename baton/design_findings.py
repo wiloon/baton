@@ -16,7 +16,8 @@ HEADING = re.compile(r"^#{1,6}\s")
 SECTION = re.compile(r"^#{2,3}\s+design findings\s*:?\s*$", re.IGNORECASE)
 ANSWERS = re.compile(r"^#{2,3}\s+design answers\s*:?\s*$", re.IGNORECASE)
 FINDING = re.compile(r"^\s{0,3}(?:[-*+]\s+)?(\d+)\s*[.):]\s+checks?\s+([\d\s,]+?)\s*[—–-]+\s*(\S.*)$", re.IGNORECASE)
-ANSWER = re.compile(r"^\s*(?:[-*+]\s+)?(D\d+\.\d+)\s*[.):]?\s*(resolved|held)\b", re.IGNORECASE)
+ANSWER = re.compile(r"^\s*(?:[-*+]\s+)?(D\d+\.\d+)\s*[.):]?\s*(resolved|held)\b[\s—–:-]*(.*)$", re.IGNORECASE)
+REPLY = re.compile(r"^\s*(?:[-*+]\s+)?(D\d+\.\d+)\s*[.):]?\s*(adopted|rejected)\b[\s—–:-]*(.*)$", re.IGNORECASE)
 
 
 def section(comment, heading):
@@ -62,19 +63,92 @@ def parse(comment, round, count):
     return found
 
 
+def lines_of(lines, pattern):
+    """(id, kind, why) of every line of LINES that PATTERN matches."""
+    found = []
+    for line in lines or ():
+        match = pattern.match(re.sub(r"[*`_]", "", line))
+        if match:
+            found.append((match.group(1).upper(), match.group(2).lower(), match.group(3).strip()))
+    return found
+
+
+def unique(found):
+    """{id: (kind, why)} of the ids FOUND names exactly once (a repeated id counts as unanswered)."""
+    count = {}
+    for key, _, _ in found:
+        count[key] = count.get(key, 0) + 1
+    return {key: (kind, why) for key, kind, why in found if count[key] == 1}
+
+
+def judgments(comment):
+    """{id: (resolved | held, why)} from `## Design answers`."""
+    return unique(lines_of(section(comment, ANSWERS), ANSWER))
+
+
 def answers(comment):
-    """{id: "resolved" | "held"} from `## Design answers`; an id given twice is dropped (it
-    counts as unanswered)."""
-    given, twice = {}, set()
-    for line in section(comment, ANSWERS) or ():
-        match = ANSWER.match(re.sub(r"[*`_]", "", line))
-        if not match:
+    """{id: "resolved" | "held"}; an id given twice is dropped."""
+    return {key: kind for key, (kind, _) in judgments(comment).items()}
+
+
+def replies(text):
+    """The fixer's `## Design findings` lines of one reply: [(id, adopted | rejected, why)]."""
+    return lines_of(section(text, SECTION), REPLY)
+
+
+def current_answers(texts):
+    """The fixer's current answers from the replies TEXTS of one window: {id: (kind, why)}. An id
+    answered twice (in one reply or across replies, even identically) counts as unanswered."""
+    return unique([line for text in texts for line in replies(text)])
+
+
+def apply_answers(items, current):
+    """ITEMS with each id's current answer from CURRENT; an item with none keeps its previous
+    answer, marked earlier (history: it never makes a disagreement)."""
+    out = []
+    for item in items:
+        item = dict(item)
+        if item["id"] in current:
+            kind, why = current[item["id"]]
+            item["answer"] = {"kind": kind, "why": why, "earlier": False}
+        elif item.get("answer"):
+            item["answer"] = {**item["answer"], "earlier": True}
+        out.append(item)
+    return out
+
+
+def judge(items, comment):
+    """ITEMS after a screenshot review's judgments: `resolved` closes an item that has no
+    disagreement; `held` against a current `rejected` answer makes it one (both positions kept);
+    every kept answer then becomes history for the next exchange."""
+    given, kept = judgments(comment), []
+    for item in items:
+        verdict, why = given.get(item["id"], ("", ""))
+        if verdict == "resolved" and not item.get("disagree"):
             continue
-        key = match.group(1).upper()
-        if key in given:
-            twice.add(key)
-        given[key] = match.group(2).lower()
-    return {key: value for key, value in given.items() if key not in twice}
+        answer = item.get("answer")
+        if (verdict == "held" and answer and answer["kind"] == "rejected" and not answer["earlier"]
+                and not item.get("disagree")):
+            item = {**item, "disagree": {"reviewer": why or "held", "fixer": answer["why"] or "rejected"}}
+        if answer:
+            item = {**item, "answer": {**answer, "earlier": True}}
+        kept.append(item)
+    return kept
+
+
+def rejects_all(ids, text):
+    """True when the reply TEXT answers every id of IDS exactly once, all `rejected`."""
+    given = current_answers([text])
+    return bool(ids) and all(given.get(key, ("", ""))[0] == "rejected" for key in ids)
+
+
+def answer_text(item):
+    """The fixer's answer to ITEM for a block or hand-off line; "" when it gave none."""
+    answer = item.get("answer")
+    if not answer:
+        return ""
+    label = "earlier fixer answer" if answer.get("earlier") else "fixer answer"
+    return f" [{label}: {answer['kind']} — {answer['why']}]" if answer["why"] else f" [{label}: {answer['kind']}]"
 
 
 def settle(open_items, comment):
@@ -93,7 +167,7 @@ def block(open_items):
     if not open_items:
         return "none"
     return "\n".join(f"{item['id']}. checks {'; '.join(c.replace(chr(10), ' ') for c in item['checks'])}"
-                     f" — {item['text']}" for item in open_items)
+                     f" — {item['text']}{answer_text(item)}" for item in open_items)
 
 
 def blocked(open_items):

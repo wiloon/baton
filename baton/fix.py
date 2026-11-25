@@ -23,7 +23,7 @@ import sys
 import tempfile
 import time
 
-from . import agents, dispatch, e2e_gate, hooks as telemetry, notify, pick, pr as pr_helpers, pr_contract, prompts, recovery, vendors
+from . import agents, design_findings, dispatch, e2e_gate, hooks as telemetry, notify, pick, pr as pr_helpers, pr_contract, prompts, recovery, vendors
 from .common import Deferred, Exhausted, child_env, git, push, strip_markers
 
 REPLY_CAP = 60000
@@ -41,6 +41,12 @@ def failure_excerpt(failure):
 
 
 class Runner:
+    # Design findings (#96): the review loop sets these on the runner it hands to fix_pr.
+    loop_id = ""        # the review loop's id, carried by every fix comment it posts
+    design_ids = ()     # the open design findings the fixer must answer
+    design_only = False  # no Must fix in the feedback: only design findings
+    design_reply = ()   # the reply's `## Design findings` lines, read by fix_pr
+
     @session.scoped
     def __init__(self, env=None, hooks=None, pr=0, round=""):
         env = session.resolve(env)
@@ -1219,9 +1225,11 @@ class Runner:
                     rest = pr_helpers.split_checks(pr, strip_markers(fix_file.read_text()), self.ctx)
                 except Exception:
                     rest = strip_markers(fix_file.read_text())
-                marker = (f"<!-- baton-fix by={fixer} outcome=needs-info -->"
+                self.design_reply = rest
+                loop = f" loop={self.loop_id} round={self.round}" if self.loop_id and str(self.round).isdecimal() else ""
+                marker = (f"<!-- baton-fix by={fixer}{loop} outcome=needs-info -->"
                           if outcome.startswith("RESULT: needs-info")
-                          else f"<!-- baton-fix by={fixer} -->")
+                          else f"<!-- baton-fix by={fixer}{loop} -->")
                 if any(line.strip() and not line.startswith("RESULT: ") for line in rest.split("\n")):   # a checks-only reply has nothing to post; a bare marker would move the cutoff
                     self.comment(pr, f"{marker}\n{rest.rstrip(chr(10))}")
             self.hooks.fix(fixer, self.round or 0, out["reply"], str(fix_file))
@@ -1279,6 +1287,11 @@ class Runner:
                                description_rc=description_rc, description_changed=description_changed,
                                description_reason=description_reason)
 
+    def rejection_only(self):
+        """A no-commit fix is no hand-off when the feedback had only design findings (no Must fix)
+        and the reply answers every one of them `rejected`: the next screenshot review judges it."""
+        return bool(self.design_only and design_findings.rejects_all(self.design_ids, self.design_reply or ""))
+
     def finish_fix(self, pr, wt, fixer, source, feedback, head, *, agent_head, model, cursor_base,
                    task_changed, description_rc, description_changed, description_reason):
         """The steps after a fixed run's description and TASK: writes: checks, verify, push (#151)."""
@@ -1290,7 +1303,8 @@ class Runner:
                 description_rc=description_rc, description_reason=description_reason)
             if rc != 0:
                 return rc
-            if not task_changed and not checks_changed and not description_changed:
+            if (not task_changed and not checks_changed and not description_changed
+                    and not self.rejection_only()):
                 action, fixer, _ = self.recover(pr, "fix_no_commit", f"PR #{pr} needs you",
                                                 f"The fix run made no commit; stopping the loop. {url}", fixer, wt=wt, head=head)
                 if action == "handoff":
