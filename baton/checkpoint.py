@@ -14,7 +14,8 @@ FIELDS = ("pr", "wt", "note", "fixer", "reviewer", "round", "step", "fix_head", 
 OPTIONAL = ("code_verdict", "screenshot", "screenshot_checks", "screenshot_comment",
             "reviewed_head", "base_branch", "reviewed_issue", "verdict_digest", "verdict_round",
             "screenshot_digest", "feedback_waiting", "post_waiting", "post_outcome", "extra",
-            "merge_head", "push_completed", "design_open", "design_unusable")
+            "merge_head", "push_completed", "design_open", "design_unusable",
+            "design_shot_round", "design_only", "loop_id")
 SAFE = re.compile(r"[A-Za-z0-9_@%+=:,./-]*")   # bash leaves these unquoted
 NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 # $'...' escapes that stand for one byte

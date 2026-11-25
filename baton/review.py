@@ -19,6 +19,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import sys
 import time
 from typing import NamedTuple
@@ -198,6 +199,23 @@ def marked_comment(comments, owner, marker, round):
     bodies = [c.get("body") or "" for c in comments
               if (c.get("author") or {}).get("login") == owner and (c.get("body") or "").startswith(prefix)]
     return bodies[-1].rstrip("\n") if bodies else ""
+
+
+FIX_MARKER = re.compile(r"^<!-- baton-fix\b[^>]*\bloop=(\S+)\s+round=(\d+)\b[^>]*-->[ \t]*\n?")
+
+
+def fix_replies(comments, owner, loop_id, low, high):
+    """The bodies (marker stripped) of this loop's fix comments with LOW <= round < HIGH: the
+    fixer's answers since the previous screenshot review. A comment of another loop, or with no
+    loop id, is never an answer."""
+    found = []
+    for comment in comments or ():
+        body = comment.get("body") or ""
+        match = FIX_MARKER.match(body)
+        if (match and loop_id and match.group(1) == loop_id and (comment.get("author") or {}).get("login") == owner
+                and low <= int(match.group(2)) < high):
+            found.append(body[match.end():])
+    return found
 
 
 def agent_review(repo, owner, pr, round):
@@ -758,7 +776,25 @@ class Review:
 
     def design_fields(self):
         return {"design_open": design_findings.dump(self.design),
-                "design_unusable": "1" if self.design_unusable else ""}
+                "design_unusable": "1" if self.design_unusable else "",
+                "design_shot_round": str(self.shot_round), "loop_id": self.loop_id,
+                "design_only": "1" if self.design_only else ""}
+
+    @staticmethod
+    def new_loop_id():
+        """A loop id unique per PR: the start time in seconds and a short random suffix."""
+        return f"{int(time.time())}-{secrets.token_hex(3)}"
+
+    def design_answers(self, round):
+        """The fixer's current answers to the open findings for the review of ROUND: this loop's fix
+        comments since the previous screenshot review."""
+        result = pr_helpers.gh("pr", "view", str(self.pr), "-R", self.repo, "--json", "comments")
+        try:
+            comments = json.loads(result.stdout).get("comments") if result.returncode == 0 else []
+        except (AttributeError, ValueError, TypeError):
+            comments = []
+        return design_findings.current_answers(
+            fix_replies(comments, self.owner, self.loop_id, self.shot_round, round))
 
     def current_screenshot(self, round):
         """The screenshot review comment this run posted for ROUND, bound by its digest; "" when
@@ -778,8 +814,9 @@ class Review:
         self.design_unusable = found is None
         if found is None:
             return
-        self.design = (design_findings.settle(self.design, body)
-                       + design_findings.with_check_text(found, listed))
+        carried = design_findings.apply_answers(self.design, self.design_answers(round))
+        self.design = design_findings.judge(carried, body) + design_findings.with_check_text(found, listed)
+        self.shot_round = round
 
     def render(self, template, **pairs):
         return prompts.render(self.self_dir / template, list(pairs.items()), env=self.env)
@@ -973,7 +1010,8 @@ class Review:
         out = self.agent(vendor, "screenshot_review", self.render(
             "screenshot-review-prompt.md", PR=str(pr), ISSUE=self.issue or "unknown", GH_REPO=self.repo,
             WORKTREE=str(wt), ROUND=str(round), MAX_ROUNDS=str(self.max_rounds), CONTEXT_FILE=str(context),
-            OPEN_DESIGN=design_findings.block(getattr(self, "design", [])) if round > 1 else "none",
+            OPEN_DESIGN=(design_findings.block(design_findings.apply_answers(self.design, self.design_answers(round)))
+                         if round > 1 else "none"),
             MANUAL_CHECKS=cut(check_verdicts.numbered(checks), limit), SHOTS_STEP=self.shots_step(notify.shots(pr, self.ctx), vendor), DELIVERY=delivery),
             f"pr-{pr}-screenshot-review-{round}", str(self.self_dir / "review-settings.json"), str(review_file), self.env)
         outcome, model = out["outcome"], out["model"] or ""
@@ -1094,6 +1132,9 @@ class Review:
             extra = 1 if saved.get("extra") == "1" else 0
             self.design = design_findings.load(saved.get("design_open", ""))
             self.design_unusable = saved.get("design_unusable") == "1"
+            self.shot_round = int(saved["design_shot_round"]) if saved.get("design_shot_round", "").isdecimal() else 0
+            self.loop_id = saved.get("loop_id") or self.new_loop_id()
+            self.design_only = saved.get("design_only") == "1"
             self.fixed_by, self.issue = saved.get("fixed_by", ""), saved.get("ISSUE", "")
             self.env = self.env.with_runtime(issue=self.issue)
             self.binding_fields = {k: saved.get(k, "") for k in
@@ -1103,6 +1144,7 @@ class Review:
         else:
             self.binding_fields = {}
             self.design, self.design_unusable = [], False
+            self.shot_round, self.design_only, self.loop_id = 0, False, self.new_loop_id()
         pending_post = self.post_pending()
         screenshot_post = self.screenshot_post_pending()
         cfg = self.env.config
@@ -1306,11 +1348,18 @@ class Review:
                     self.design_round(round, checks)
                     self.values.update(self.design_fields())
                     self.save()
-                if verdict == "pass" and not self.design:
+                self.design_only = False
+                self.values["design_only"] = ""
+                # A disagreement the pipeline can't settle waits for the owner at the merge; only
+                # the other open findings keep the loop going.
+                if verdict == "pass" and not [item for item in self.design if not item.get("disagree")]:
                     break
                 if verdict == "pass":
                     # Only design findings are open: they go to the fixer, but never as review_limit.
                     verdict = "changes"
+                    self.design_only = True
+                    self.values["design_only"] = "1"
+                    self.save()
                     if round >= self.max_rounds + extra:
                         break
                 if round >= self.max_rounds + extra:
@@ -1333,6 +1382,9 @@ class Review:
                                screenshot_checks="")
             self.save()
             runner = fix.Runner(self.env.with_runtime(fix_followup=round > 1), self.hooks, pr, str(round))
+            runner.loop_id = self.loop_id
+            runner.design_ids = [item["id"] for item in self.design if not item.get("disagree")]
+            runner.design_only = self.design_only and bool(self.design)
             # The next round's reviewer must stay free: a continuity-pinned reviewer, or a sole pool vendor.
             pool = self.env.config.quota.vendor_pool
             exclude = reviewer if continuity_pin(reviewer) else ("" if len(pool) > 1 else pool[0])
