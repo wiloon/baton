@@ -2,6 +2,7 @@
 credentials are invalid. Codex writes artifacts into a scratch directory inside the
 worktree; only the runner copies them out (markers stripped) to the path the caller
 named, so only the runner publishes artifacts and markers."""
+import glob
 import json
 import os
 import re
@@ -10,11 +11,20 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from .common import Run, changed, child_env, events, git, read, restore, run_cli, strip_markers
+from .common import (MODEL_CODE, Run, analyst_rows, analyst_tool_use, changed, child_env, events, git, read,
+                     restore, run_cli, strip_markers)
 
 ID = "codex"
 DISPLAY_NAME = "Codex"
 ANALYST_ALIAS = "codex_fast"
+# Retrospective analyst: approved models, its environment and how its budget is enforced.
+ANALYST_FAMILY = r"gpt-6(?:\.[12])?-sol"
+ANALYST_REQUEST_FAMILY = ANALYST_FAMILY
+ANALYST_MIXED_MODELS = False
+ANALYST_BUDGET = "deadline_and_call_caps"
+ANALYST_ENV_KEEP = ("CODEX_HOME",)
+ANALYST_ENV_STRIP = ()
+ANALYST_ENV_SET = {}
 SUPPORTED_ROLES = frozenset({
     "dev", "fixer", "reviewer", "screenshot_reviewer", "spec_reviewer", "reviser",
     "retrospective",
@@ -133,9 +143,44 @@ def probe_command(model, directory):
         "GH_TOKEN": "invalid", "GITHUB_TOKEN": "invalid", "GIT_SSH_COMMAND": "/bin/false"}
 
 
+def _find_rate_limits(value):
+    if isinstance(value, dict):
+        if isinstance(value.get("rate_limits"), dict):
+            return value["rate_limits"]
+        for child in value.values():
+            found = _find_rate_limits(child)
+            if found:
+                return found
+    return None
+
+
+def parse_quota_in(lines, home):
+    """Windows from the last rate_limits in the run's session file under HOME (or in the log itself)."""
+    from .quota import json_lines
+    lines = list(lines)
+    sources = [lines]
+    for event in json_lines(lines):
+        if isinstance(event, dict) and event.get("type") == "thread.started" and event.get("thread_id"):
+            for path in glob.glob(os.path.join(home, "sessions", "**", f"rollout-*-{event['thread_id']}.jsonl"),
+                                  recursive=True):
+                sources.append(Path(path).read_text(errors="replace").splitlines())
+    windows = {}
+    for source in sources:
+        for event in json_lines(source):
+            limits = _find_rate_limits(event)
+            if not limits:
+                continue
+            for key in ("primary", "secondary"):
+                window = limits.get(key)
+                if not window or window.get("used_percent") is None:
+                    continue
+                name = "five_hour" if (window.get("window_minutes") or 0) <= 24 * 60 else "seven_day"
+                windows[name] = {"used": float(window["used_percent"]) / 100, "resets_at": int(window["resets_at"])}
+    return windows
+
+
 def parse_quota_log(lines):
-    from . import quota
-    return quota.parse_codex(lines, os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"))
+    return parse_quota_in(lines, os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"))
 
 
 # The terminal verdict each role may end with (its final message's last line).
@@ -338,3 +383,43 @@ def log_model(row, codex_home=None):
     if row.get("type") == "thread.started" and row.get("thread_id"):
         return True, codex_model(str(row["thread_id"]), codex_home)
     return False, None
+
+
+def analyst_effort(model, default):
+    return default
+
+
+def analyst_command(settings, analyst, workspace, env):
+    disabled = ("shell_tool", "unified_exec", "view_image", "multi_agent", "hooks", "memories",
+                "skill_mcp_dependency_install", "skill_search", "tool_suggest", "goals", "sleep_tool")
+    command = ["codex", "exec", "--ignore-user-config", "--ignore-rules", "--ephemeral",
+               "--skip-git-repo-check", "-s", "read-only", "-m", analyst.model,
+               "-c", 'approval_policy="never"', "-c", 'web_search="disabled"',
+               "-c", "features.code_mode.enabled=false", "-c", "project_doc_max_bytes=0",
+               "-c", "skills.bundled.enabled=false", "-c", "mcp_servers={}",
+               "-c", "skills.include_instructions=false",
+               "-c", f'model_reasoning_effort="{analyst.effort}"', "--json"]
+    for setting in UNUSED:
+        command += ["-c", setting]
+    for feature in disabled:
+        command += ["--disable", feature]
+    return [*command, "-"]
+
+
+def analyst_response(text):
+    """(rows, reply, valid, actual model, models, tool_use) of the analyst's output."""
+    rows = analyst_rows(text)
+    contexts = [r["payload"] for r in rows if r.get("type") == "turn_context" and isinstance(r.get("payload"), dict)]
+    actual = "unknown"
+    if contexts and MODEL_CODE.fullmatch(str(contexts[-1].get("model", ""))):
+        actual = contexts[-1]["model"]
+    messages = [r.get("item", {}).get("text", "") for r in rows
+                if r.get("type") == "item.completed" and isinstance(r.get("item"), dict)
+                and r["item"].get("type") == "agent_message"]
+    valid = any(r.get("type") == "turn.completed" for r in rows) and not any(
+        r.get("type") in ("error", "turn.failed") for r in rows)
+    return rows, messages[-1] if messages else "", valid, actual, [], analyst_tool_use(rows)
+
+
+def analyst_quota(lines, home):
+    return parse_quota_in(lines, home)

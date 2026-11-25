@@ -11,7 +11,7 @@ import time
 
 import pytest
 
-from baton import settle
+from baton import cursor_cli, settle
 
 PROBE_CLI = f"""#!{sys.executable}
 import os, pathlib, sys
@@ -166,7 +166,7 @@ def test_a_probe_classifies_the_login(gh, tmp_path, probe_cli, monkeypatch, out,
 
 def test_a_cursor_probe_refreshes_from_the_usage_api_without_running_an_agent(gh, tmp_path, monkeypatch):
     state = tmp_path / "state"
-    monkeypatch.setattr(settle.quota, "refresh_cursor", lambda state, now: {"seven_day": {"used": 0.4, "resets_at": 1999999999}})
+    monkeypatch.setattr(cursor_cli, "refresh_quota", lambda state, now: {"seven_day": {"used": 0.4, "resets_at": 1999999999}})
     settle.probe(str(state), str(tmp_path / "logs"), "cursor", "haiku")
     assert "quota cursor: week 40%" in (tmp_path / "logs" / "runner.log").read_text()
     assert json.loads((state / "quota-cursor.json").read_text())["probed_at"] > 0
@@ -176,13 +176,13 @@ def test_a_cursor_probe_refreshes_from_the_usage_api_without_running_an_agent(gh
 def test_a_cursor_run_refreshes_its_quota_and_a_failure_is_only_logged(gh, tmp_path, monkeypatch):
     state = tmp_path / "state"
     calls = []
-    monkeypatch.setattr(settle.quota, "refresh_cursor", lambda s, now: calls.append(s) or {})
+    monkeypatch.setattr(cursor_cli, "refresh_quota", lambda s, now: calls.append(s) or {})
     settle.settle(str(state), "cursor", "success", 0, "", "t")
     assert calls == [str(state)]
 
     def down(s, now):
         raise OSError("api down")
-    monkeypatch.setattr(settle.quota, "refresh_cursor", down)
+    monkeypatch.setattr(cursor_cli, "refresh_quota", down)
     assert settle.settle(str(state), "cursor", "success", 0, "", "t")[0] == 0
     assert "quota: refreshing cursor failed: api down" in (tmp_path / "logs" / "runner.log").read_text()
 

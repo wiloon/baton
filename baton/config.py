@@ -305,6 +305,14 @@ class Config:
     telegram: Telegram | None = None
     retrospectives: Retrospectives = Retrospectives()
     advisor: Advisor = Advisor(env_file=None)
+    # Resolved ANALYST_ALIAS of each retrospective-capable adapter without a model_<id> setting.
+    analyst_models: Pairs = ()
+
+    def analyst_model(self, vendor_id):
+        """The model a vendor's retrospective analyst requests: its fixed model_<id> setting when
+        the config has one, else its adapter's ANALYST_ALIAS resolved through the alias catalog."""
+        fixed = getattr(self.retrospectives, f"model_{vendor_id}", None)
+        return fixed if fixed is not None else dict(self.analyst_models)[vendor_id]
 
     def repo(self, gh_repo):
         """The configured repository named owner/name; ConfigError for any other."""
@@ -660,7 +668,8 @@ def load(path: str | Path, *, home: Path | None = None) -> Config:
     if not isinstance(raw_retro, dict):
         raise ConfigError("retrospectives: expected a table")
     analyst_vendors = {v.id for v in vendors if "retrospective" in v.roles}
-    retro_models = {}
+    retro_models, alias_models = {}, []
+    fixed = {f.name for f in fields(Retrospectives)}
     for vendor, adapter in agents.ADAPTERS.items():
         key = f"model_{vendor}"
         if key in raw_retro and vendor not in declared:
@@ -668,8 +677,12 @@ def load(path: str | Path, *, home: Path | None = None) -> Config:
         if key in raw_retro and vendor not in analyst_vendors:
             raise ConfigError(f"retrospectives.{key}: vendor cannot run retrospective")
         if vendor in analyst_vendors:
-            retro_models[key] = _model_alias(raw_retro.get(key, adapter.ANALYST_ALIAS), aliases,
-                                            f"retrospectives.{key}")
+            if key in fixed:
+                retro_models[key] = _model_alias(raw_retro.get(key, adapter.ANALYST_ALIAS), aliases,
+                                                f"retrospectives.{key}")
+            else:
+                alias_models.append((vendor, _model_alias(adapter.ANALYST_ALIAS, aliases,
+                                                          f"retrospectives.{key}")))
     sections["retrospectives"] = replace(sections.get("retrospectives", Retrospectives()), **retro_models)
     pool, extra = tuple(v.id for v in vendors if v.quota == "pool"), tuple(v.id for v in vendors if v.quota == "extra")
     caps = tuple((v.id, v.cap) for v in vendors)
@@ -710,7 +723,8 @@ def load(path: str | Path, *, home: Path | None = None) -> Config:
             if role not in vendor_roles[vendor]:
                 raise ConfigError(f"preferences.{key}: vendor {vendor} cannot run {role}")
     config = Config(**sections, vendors=vendors, repos=repos,
-                    preferences=tuple((k, tuple(v)) for k, v in sorted(preferences.items())), source=source)
+                    preferences=tuple((k, tuple(v)) for k, v in sorted(preferences.items())), source=source,
+                    analyst_models=tuple(alias_models))
     adv = config.advisor
     if adv.mode not in ('off', 'observe', 'live'):
         raise ConfigError('advisor.mode: expected "off", "observe" or "live"')
@@ -725,7 +739,7 @@ def load(path: str | Path, *, home: Path | None = None) -> Config:
         raise ConfigError('retrospectives.model: expected a model identifier')
     for vendor in config.declared():
         if "retrospective" in config.vendor(vendor).roles:
-            model = getattr(retro, f"model_{vendor}", "")
+            model = config.analyst_model(vendor)
             if model and not approved_model(vendor, model, requested=True):
                 raise ConfigError(f'retrospectives.model_{vendor}: requires the approved Opus/Sol/Grok 4.7 family')
     if retro.effort not in ('high', 'xhigh'):

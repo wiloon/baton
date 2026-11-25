@@ -18,6 +18,14 @@ from .common import Run, changed, child_env, events, git, outcome_line, read, re
 ID = "agy"
 DISPLAY_NAME = "Antigravity"
 ANALYST_ALIAS = "agy_analyst"
+# Not retrospective-capable (SUPPORTED_ROLES): the analyst constants only keep registry iteration total.
+ANALYST_FAMILY = r"(?!)"
+ANALYST_REQUEST_FAMILY = ANALYST_FAMILY
+ANALYST_MIXED_MODELS = False
+ANALYST_BUDGET = "deadline_and_call_caps"
+ANALYST_ENV_KEEP = ()
+ANALYST_ENV_STRIP = ()
+ANALYST_ENV_SET = {}
 SUPPORTED_ROLES = frozenset({"dev", "fixer", "reviewer", "spec_reviewer"})
 QUOTA_SOURCE = "none"
 QUOTA_WINDOWS = frozenset()
@@ -69,11 +77,12 @@ SPEC_SAME_VENDOR = "known-distinct-model"
 SPEC_TEMPLATE = "spec-prompt.md"
 SPEC_UNMARKED_REVIEWER = False
 
-TOKEN_FILE = ".gemini/antigravity-cli/antigravity-oauth-token"
 CLI_LOG = ".gemini/antigravity-cli/cli.log"
 # Read-only commands every role needs, and what dev/fix add on top. The repository's CI command
 # and verify hook are appended per run (permissions_settings).
-READ_COMMANDS = ("git", "rg", "ls", "cat")
+# Read-only inspection commands. A headless agy run stops with an empty reply at the first denied
+# command, so a reviewer exploring with `find ... | sort` failed the whole review (PR #244).
+READ_COMMANDS = ("git", "rg", "grep", "ls", "cat", "head", "tail", "wc", "find", "sort", "uniq", "diff")
 WRITE_COMMANDS = READ_COMMANDS + ("python3", "mkdir")
 EFFORT = re.compile(r"-(?:low|medium|high|xhigh)$")
 
@@ -145,11 +154,12 @@ def refresh_quota(state, now, **kwargs):
     return {}
 
 
-def preflight():
-    """None when the runner user is logged in, else the failed outcome (status auth)."""
-    if (Path.home() / TOKEN_FILE).exists():
-        return None
-    return "RESULT: failed Antigravity login required; run agy on the runner host and log in"
+# No preflight: agy keeps its login in the keyring when it runs outside an SSH session (the runner's
+# systemd units: "ChainedAuth: authenticated via keyring"), and writes
+# ~/.gemini/antigravity-cli/antigravity-oauth-token only for SSH sessions, a file that later
+# disappears while the keyring login stays valid. Checking that file put a logged-in agy into a
+# 4-hour auth cooldown (PR #247). A real logout shows as the run's result error
+# ("authentication failed or timed out"), which classify() reads as auth through error_text().
 
 
 def simple_commands(command):

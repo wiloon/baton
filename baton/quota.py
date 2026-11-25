@@ -2,13 +2,11 @@
 """Quota snapshots of the pool vendors, read from what each run reports, and the pick.
 
 Neither subscription has a public quota API. Each run's own output carries it:
-Claude Code's stream-json emits rate_limit_event, and Codex writes rate_limits
-into its session file (~/.codex/sessions/.../rollout-*-<thread id>.jsonl).
-Cursor's output carries none: refresh_cursor asks the dashboard API its IDE uses
-(undocumented; a change only leaves the snapshot unknown), which costs no usage.
+Each adapter parses its own run output (parse_quota_log) or, when its QUOTA_SOURCE is
+"api", asks its own API (refresh_quota); this module stores and compares the snapshots.
   python -m baton.quota record VENDOR LOG   merge LOG into $STATE/quota-VENDOR.json
   python -m baton.quota probed VENDOR       note a probe attempt
-  python -m baton.quota refresh cursor      read Cursor's usage now and print it
+  python -m baton.quota refresh VENDOR      read the API-sourced vendor's usage now and print it
   python -m baton.quota credential VENDOR RESULT  record credential health
   python -m baton.quota stale VENDOR        exit 0 for a stale snapshot
   python -m baton.quota pick [--current V] [--prefer "V ..."] VENDOR...
@@ -16,158 +14,25 @@ Cursor's output carries none: refresh_cursor asks the dashboard API its IDE uses
 """
 
 from . import agents, session
-import glob
 import json
 from contextlib import contextmanager
 import fcntl
 import math
-import os
 from pathlib import Path
-import subprocess
 import sys
 import time
 import tempfile
-import urllib.request
 
 WINDOW_SECONDS = {"five_hour": 5 * 3600, "seven_day": 7 * 24 * 3600}
 TIE = 0.05   # scores this close count as equal: preference, then pool order decides
-CURSOR_USAGE = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage"
-# Where cursor-agent >= 2026.11.19 keeps its login on Linux (secret-tool attributes).
-CURSOR_SECRET = ("service", "cursor-credentials", "account", "cursor-user")
 
 
-def _json_lines(lines):
+def json_lines(lines):
     for line in lines:
         try:
             yield json.loads(line)
         except (ValueError, TypeError):
             continue
-
-
-def parse_claude(lines):
-    """Windows from the last rate_limit_event: {name: {used, resets_at}}."""
-    windows = {}
-    for event in _json_lines(lines):
-        if not isinstance(event, dict) or event.get("type") != "rate_limit_event":
-            continue
-        info = event.get("rate_limit_info") or {}
-        for name, window in (info.get("unifiedWindows") or {}).items():
-            if "utilization" in window:
-                windows[name] = {"used": float(window["utilization"]), "resets_at": int(window["resetsAt"])}
-        if info.get("status") == "rejected" and info.get("rateLimitType"):
-            windows[info["rateLimitType"]] = {"used": 1.0, "resets_at": int(info.get("resetsAt") or 0)}
-    return windows
-
-
-def _find_rate_limits(value):
-    if isinstance(value, dict):
-        if isinstance(value.get("rate_limits"), dict):
-            return value["rate_limits"]
-        for child in value.values():
-            found = _find_rate_limits(child)
-            if found:
-                return found
-    return None
-
-
-def parse_codex(lines, codex_home):
-    """Windows from the last rate_limits in the run's session file (or in the log itself)."""
-    lines = list(lines)
-    sources = [lines]
-    for event in _json_lines(lines):
-        if isinstance(event, dict) and event.get("type") == "thread.started" and event.get("thread_id"):
-            for path in glob.glob(os.path.join(codex_home, "sessions", "**", f"rollout-*-{event['thread_id']}.jsonl"),
-                                  recursive=True):
-                sources.append(Path(path).read_text(errors="replace").splitlines())
-    windows = {}
-    for source in sources:
-        for event in _json_lines(source):
-            limits = _find_rate_limits(event)
-            if not limits:
-                continue
-            for key in ("primary", "secondary"):
-                window = limits.get(key)
-                if not window or window.get("used_percent") is None:
-                    continue
-                name = "five_hour" if (window.get("window_minutes") or 0) <= 24 * 60 else "seven_day"
-                windows[name] = {"used": float(window["used_percent"]) / 100, "resets_at": int(window["resets_at"])}
-    return windows
-
-
-def parse_cursor(payload):
-    """The weekly window of a GetCurrentPeriodUsage answer: {name: {used, resets_at}}."""
-    try:
-        used = float(payload["planUsage"]["totalPercentUsed"]) / 100
-        return {"seven_day": {"used": used, "resets_at": int(payload["billingCycleEnd"]) // 1000}}
-    except (KeyError, TypeError, ValueError):
-        return {}
-
-
-def _fetch_cursor(token):
-    request = urllib.request.Request(CURSOR_USAGE, data=b"{}", headers={
-        "Authorization": f"Bearer {token}", "Content-Type": "application/json", "Connect-Protocol-Version": "1"})
-    with urllib.request.urlopen(request, timeout=20) as response:
-        return json.load(response)
-
-
-class CursorLoginUnreadable(ValueError):
-    """auth.json records a Cursor login, but its access token can't be read."""
-
-
-def _secret_lookup():
-    """The credential cursor-agent keeps in the Secret Service (Linux), or None."""
-    try:
-        found = subprocess.run(["secret-tool", "lookup", *CURSOR_SECRET], capture_output=True, text=True,
-                               timeout=30, check=False)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return found.stdout if found.returncode == 0 else None
-
-
-def cursor_token(auth, lookup=_secret_lookup):
-    """Cursor's access token; None when this machine has no Cursor login.
-
-    cursor-agent 2026.11.19 moved the login into the OS secret store and left only
-    {"storedIn": "os-secret-store"} in auth.json; older versions keep accessToken there.
-    Raises CursorLoginUnreadable when a login is recorded but no token comes back, so the
-    snapshot can't silently freeze at its last value."""
-    try:
-        stored = json.loads(Path(auth).read_text())
-    except OSError:
-        return None
-    except ValueError as error:
-        raise CursorLoginUnreadable(f"cursor auth.json is not JSON: {error}") from None
-    if not isinstance(stored, dict) or stored.get("signedOut") is True:
-        return None
-    if token := stored.get("accessToken"):
-        return token
-    if stored.get("storedIn") == "os-secret-store":
-        try:
-            token = json.loads(lookup() or "")["accessToken"]
-        except (ValueError, TypeError, KeyError):
-            token = None
-        if not token:
-            raise CursorLoginUnreadable("cursor login is in the OS secret store, but secret-tool returned no "
-                                        f"access token ({' '.join(CURSOR_SECRET)})")
-        return token
-    raise CursorLoginUnreadable("cursor auth.json has neither accessToken nor storedIn")
-
-
-def refresh_cursor(state, now, auth=None, fetch=_fetch_cursor, lookup=_secret_lookup):
-    """Record Cursor's usage; {} when it isn't logged in here. Raises when the login can't be
-    read (recording probe_failed) or the API fails."""
-    try:
-        token = cursor_token(auth or Path.home() / ".config/cursor/auth.json", lookup)
-    except CursorLoginUnreadable:
-        credential(state, 'cursor', 'probe_failed', now)
-        raise
-    if token is None:
-        return {}
-    windows = parse_cursor(fetch(token))
-    if windows:
-        record(state, "cursor", windows, now)
-        credential(state, 'cursor', 'authenticated', now)
-    return windows
 
 
 def _path(state, vendor):
@@ -367,12 +232,13 @@ def main(argv):
         mark_probed(state, args[0], now)
         return 0
     if command == "refresh":
-        # Documented CLI form keeps the `cursor` argument; admission and the adapter hook
-        # are still Cursor's. The vendor argument is ignored (refresh with no args matches).
-        if reason := cfg.admission_error("cursor"):
+        # Documented CLI form takes a vendor argument that is ignored (refresh with no args matches):
+        # the vendor refreshed is the adapter whose quota comes from an API.
+        vendor = next(v for v, adapter in agents.ADAPTERS.items() if adapter.QUOTA_SOURCE == "api")
+        if reason := cfg.admission_error(vendor):
             print(reason, file=sys.stderr)
             return 1
-        print(json.dumps(agents.ADAPTERS["cursor"].refresh_quota(state, now)))
+        print(json.dumps(agents.ADAPTERS[vendor].refresh_quota(state, now)))
         return 0
     if command == "credential":
         credential(state, args[0], args[1], now)

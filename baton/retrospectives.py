@@ -17,7 +17,7 @@ import tempfile
 import time
 import uuid
 
-from . import analyst_pool, maintenance, vendor_policy, quota
+from . import agents, analyst_pool, maintenance, vendor_policy, quota
 from .config import ConfigError, load
 from .retrospective_analyst import ANALYZER_VERSION, analyze, prompt_for
 from .retrospective_evidence import (EvidenceError, Ledger, VERSION, VOLATILE_POSTMERGE, digest, encoded, eligible,
@@ -287,8 +287,9 @@ def run(config, state, root, output, repo='', pipeline='', retry=False, held=Fal
                             windows = result.pop('quota_windows', {})
                             try:
                                 observed = time.time()
-                                if analyst.vendor == 'cursor':
-                                    quota.refresh_cursor(state, observed)
+                                adapter = agents.ADAPTERS[analyst.vendor]
+                                if adapter.QUOTA_SOURCE == 'api':
+                                    adapter.refresh_quota(state, observed)
                                 elif windows:
                                     quota.record(state, analyst.vendor, windows, observed)
                                 if result.get('rc') == 0:

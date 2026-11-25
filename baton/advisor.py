@@ -629,17 +629,17 @@ def digest(env, now=None):
     now = int(now if now is not None else time.time())
     stamp = Path(str(env.config.paths.state), "advisor", "digest-last")
     try:
-        last, *cursor = map(int, stamp.read_text().split(maxsplit=1))
+        last, *offset = map(int, stamp.read_text().split(maxsplit=1))
     except (OSError, ValueError):
-        last, cursor = 0, []
+        last, offset = 0, []
     if now - last < DIGEST_SECONDS:
         return ""
     try:
         records = read_records(env, strict=True)
     except OSError:
         return ""
-    if cursor:
-        consumed = cursor[0]
+    if offset:
+        consumed = offset[0]
         previous, recent = records[:consumed], records[consumed:]
     else:
         # Migrate the timestamp-only stamp. Its cutoff second may contain unreported records.
