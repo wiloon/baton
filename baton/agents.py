@@ -29,6 +29,8 @@ from .common import Request, events, read
 
 ADAPTERS = {mod.ID: mod for mod in (claude_cli, cursor_cli, codex_cli, agy_cli, stub_cli)}
 CATALOG = frozenset(ADAPTERS)
+# The adapter that owns reply state saved before owner records existed (legacy state names).
+LEGACY_REPLY_VENDOR = next((name for name, mod in ADAPTERS.items() if getattr(mod, "LEGACY_REPLY_RESUME", False)), "")
 
 
 STATUSES = ("success", "failure", "timeout", "quota", "busy", "auth")

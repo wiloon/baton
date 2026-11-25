@@ -282,3 +282,8 @@ def test_claude_cursor_codex_configure_unchanged(stub_runner):
     assert (model, suffix, options) == ("auto", "", {})
     model, minutes, suffix, options = dispatch.configure("codex", "review", env)
     assert suffix == "-codex" and "effort" in options and "add_dirs" in options
+
+
+def test_the_legacy_reply_state_belongs_to_the_adapter_that_declares_it():
+    assert agents.LEGACY_REPLY_VENDOR == "cursor"
+    assert [n for n, m in agents.ADAPTERS.items() if getattr(m, "LEGACY_REPLY_RESUME", False)] == ["cursor"]
