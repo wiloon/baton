@@ -68,6 +68,49 @@ our assessment and open questions, not claims that features are absent.
   demonstrates a bounded LLM classifier with JSON output and deterministic fallback. That pattern
   is useful; its example models and maintenance status should not be carried into a new deployment.
 
+## Scheduling, priority and tracker references
+
+Research date: 2026-11-25. Question: what can BATON borrow for running several tasks at once on
+one host, ordering the queue by priority, and using Linear next to GitHub Issues? Sources are
+READMEs, specifications and vendor documentation; no candidate below was installed or run.
+
+| Project | Documented behavior | What BATON can borrow | Replacement? |
+| --- | --- | --- | --- |
+| [Symphony](https://github.com/openai/symphony) ([SPEC](https://github.com/openai/symphony/blob/main/SPEC.md)) | Polls a tracker on a fixed cadence and dispatches with bounded concurrency. Dispatch order is "priority then oldest creation time", identifier as the tie-break. Eligible: active state, required labels present, not already running or claimed, a free slot. `max_concurrent_agents` (default 10) plus `max_concurrent_agents_by_state`. The spec is tracker-agnostic (adapters); the demo uses Linear. `blocked_by` is best-effort metadata. | The queue order (priority, then age); per-stage concurrency caps; claim/reconcile of running work. The main reference for a parallel scheduler. | No: no cross-vendor review loop, subscription quota pacing or merge gates. |
+| [Cyrus](https://github.com/cyrusagents/cyrus) (Apache-2.0) | Watches issues assigned to it in Linear, GitHub, GitLab or Slack; one git worktree per issue; runs Claude Code, Codex, Cursor, Gemini or OpenCode; a validation loop re-runs checks after each change up to an iteration limit. | Per-issue worktrees under concurrent sessions (BATON already has them); repository routing from one host. | No: assignment-driven runs, no documented writer/reviewer independence, quota or vendor scheduling. |
+| [Stoneforge](https://stoneforge.ai/) ([org](https://github.com/stoneforge-ai), Apache-2.0) | Web dashboard and runtime for parallel agents. Its orchestrator spawns agents, dispatches tasks with dependencies, isolates worktrees and runs merge review; syncs with GitHub, Linear and Notion; priorities and kanban views. | Dependency-aware dispatch and merge review/ordering: the closest match to "serialize tasks that touch the same files". Read its merge path before designing BATON's. | No: replacing BATON would drop quota pacing, review independence, owner-review paths, the advisor and retrospectives. |
+
+### Linear as a priority source
+
+- Linear priority is a native field (urgent, high, medium, low, none); views filter, group and
+  order by it. GitHub Issues has no priority field; labels filter but cannot order a search.
+- [Linear's GitHub Issues sync](https://linear.app/docs/github) lists title, description, status,
+  assignee, labels, sub-issues, comments and priority, without saying what priority becomes on the
+  GitHub side. Only one repository per Linear team can sync two-way; others sync GitHub → Linear
+  only. Only issues created after the sync is set up are synced; older ones need an import.
+- Linear has no public, unauthenticated view of a team's issues. "Public" teams are public to
+  workspace members; outsiders need guest accounts (Business plan, invited). Third-party tools
+  ([Helium Rooms](https://heliumrooms.com/blog/linear-public-roadmap-guide),
+  [Feedvote](https://feedvote.app/)) or a one-way mirror to GitHub Issues fill the gap.
+
+Consequence for BATON: an open-source repository keeps GitHub Issues as the source of truth for
+tasks, specs and reviews. Priority comes from labels in the target repository
+([#194](https://github.com/wiloon/baton/issues/194)), ordered like Symphony: priority, then the
+lower issue number. Linear stays optional ([#195](https://github.com/wiloon/baton/issues/195)):
+an owner who plans in Linear can sync its priority onto those labels outside BATON, so BATON does
+not depend on Linear.
+
+### Concurrency on one host
+
+BATON already isolates most per-task state: one worktree per issue or PR, per-repository clones,
+state, logs and context, and nonblocking per-vendor leases shared across repositories
+([Parallel work and pause](../retrospectives.md#parallel-work-and-pause)). The single global
+runner lock is what keeps a host to one task. The smallest step is one task per repository at a
+time, with repositories running concurrently: tasks in different repositories cannot conflict on
+files or merges. [#266](https://github.com/wiloon/baton/issues/266) tracks that step. Several tasks inside one repository need a scheduler that serializes tasks whose
+file sets overlap; Symphony's ordering and per-stage caps and Stoneforge's dependency-aware dispatch
+are the references for that later step.
+
 ## Can BATON itself become a coordinating agent?
 
 Yes, selectively. The current runner already coordinates model-powered workers through a
