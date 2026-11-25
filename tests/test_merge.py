@@ -10,7 +10,7 @@ import pytest
 
 from baton import advisor, ci, merge, notify, pick, pr as pr_helpers
 from baton.config import Advisor
-from conftest import sh
+from conftest import sh, watch_retirement
 from test_notify import PNG, Telegram
 
 BIN = Path(__file__).resolve().parents[1] / "bin"
@@ -1238,8 +1238,11 @@ def label_outage(run):
     run.go()
 
 
-def test_a_label_outage_leaves_a_pending_record(run):
+def test_a_label_outage_leaves_a_pending_record(run, monkeypatch):
+    retired = watch_retirement(monkeypatch, run.env["STATE"], PR)
     label_outage(run)
+    assert retired and all(retired)   # the record was there before the continuation went
+    assert not Path(run.env["STATE"], f"review-pending-{PR}").exists()
     assert Path(run.env["STATE"], f"ready-label-pending-{PR}").exists()
 
 
