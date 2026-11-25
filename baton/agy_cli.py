@@ -295,7 +295,12 @@ def run(req):
     settings = permissions_settings(req.role, repo.ci_command, repo.verify_hook)
     mode = "plan" if req.readonly else "accept-edits"
     seconds = max(req.minutes * 60 - 60, 60)
-    dirs = [d for d in dict.fromkeys([*req.add_dirs, req.shots_dir, os.path.dirname(req.output) if req.output else ""]) if d]
+    dirs = [req.shots_dir, os.path.dirname(req.output) if req.output else ""]
+    if not req.readonly:
+        # A linked worktree keeps its objects and refs outside the checkout; commits need both.
+        dirs = [git(req.cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"),
+                git(req.cwd, "rev-parse", "--absolute-git-dir"), *dirs]
+    dirs = [d for d in dict.fromkeys([*req.add_dirs, *dirs]) if d]
     env = child_env(**req.env, GH_TOKEN="no-github-for-agy", GITHUB_TOKEN="", GIT_SSH_COMMAND="/bin/false",
                     GIT_TERMINAL_PROMPT="0")
     # -p takes the prompt and must be last.
@@ -309,7 +314,7 @@ def run(req):
     model, _ = reported(text)
     used = usage(result) if result else ""
     outcome = outcome_line(reply, KINDS)
-    why = failure(req, result, model) if result and rc == 0 else ""
+    why = failure(req, result, model) if rc == 0 else ""
     if why:
         outcome = f"RESULT: failed {why}"
         if head and not req.readonly:
@@ -319,5 +324,5 @@ def run(req):
     if req.readonly and head and changed(req.cwd, head):
         restore(req.cwd, head)
         outcome = f"RESULT: failed Agy changed files in a read-only {req.role}"
-    verified = "" if why or not result else model
+    verified = model if rc == 0 and not why and result else ""
     return Run(rc, outcome, reply, used, f"{outcome} {used} model={verified or req.model}", model=verified)

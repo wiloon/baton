@@ -16,7 +16,6 @@ from pathlib import Path
 import pytest
 
 from baton import agents, config, dispatch, quota, session, settle, vendors
-from baton.common import Request
 from conftest import full_text
 from test_agents import lines
 
@@ -191,7 +190,12 @@ def test_dev_run_reports_the_init_model_and_builds_the_command(agy_runner):
     assert "--effort" not in args and "--dangerously-skip-permissions" not in args
     allow = json.loads(args[args.index("--settings") + 1])["permissions"]["allow"]
     assert "command(git)" in allow and "command(task ci:changed)" in allow
-    assert "/tmp" in [args[i + 1] for i, a in enumerate(args) if a == "--add-dir"]
+    added = [args[i + 1] for i, a in enumerate(args) if a == "--add-dir"]
+    assert "/tmp" in added
+    git_dirs = [subprocess.run(["git", "-C", str(agy_runner.worktree), "rev-parse", *flag], capture_output=True,
+                               text=True).stdout.strip()
+                for flag in (["--path-format=absolute", "--git-common-dir"], ["--absolute-git-dir"])]
+    assert all(git_dirs) and all(d in added for d in git_dirs)
     assert out["log"].endswith("-agy.jsonl")
 
 
@@ -221,6 +225,7 @@ def test_label_conversion(label, model):
     ("no-evidence", dict(stream=stream(model="")), "no model"),
     ("non-gemini", dict(stream=stream(model="claude-opus-5-5-high")), "non-Gemini"),
     ("mismatch", dict(stream=stream(model="gemini-4-neon-high")), "requested"),
+    ("no-result", dict(stream=lines({"event": "init", "model": MODEL, "conversation_id": "c1"})), "status missing"),
 ])
 def test_unproven_runs_fail_and_leave_no_commit(agy_runner, name, kwargs, why):
     start = agy_runner.head()
@@ -280,6 +285,27 @@ def test_usage_of_a_recorded_result(agy_runner):
     assert agy_cli.usage_of(row) == {"input_tokens": 100, "output_tokens": 7}
 
 
+def bin_telemetry():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("bin_telemetry", ROOT / "bin/telemetry.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_telemetry_reads_usage_from_a_recorded_agy_stream(tmp_path):
+    log = tmp_path / "agy.jsonl"
+    log.write_text(stream())
+    got = bin_telemetry().usage("agy", log, "success")
+    assert (got["usage_state"], got["input_tokens"], got["output_tokens"]) == ("complete", 100, 7)
+
+
+def test_telemetry_usage_is_unavailable_with_two_result_events(tmp_path):
+    log = tmp_path / "agy.jsonl"
+    log.write_text(stream() + stream())
+    assert bin_telemetry().usage("agy", log, "success")["usage_state"] == "unavailable"
+
+
 # --- allowlist ---------------------------------------------------------------------------------
 
 def test_allowlist_is_derived_from_the_ci_command():
@@ -314,9 +340,67 @@ def test_agy_reviews_another_vendors_pr_and_others_review_agy(tmp_path):
     assert vendors.review_allowed(state, 9, "claude") is True
 
 
-def test_agy_commits_are_attributed_by_record_contrib_not_a_marker():
-    assert not any(marker for marker in agents.ADAPTERS["agy"].COMMIT_MARKERS)
-    assert Request  # the request type the adapter reads
+def pick_review(agy_runner, pr):
+    state = str(agy_runner.state_dir)
+    for vendor in ("claude", "codex", "cursor"):
+        Path(state, f"{vendor}-cooldown-until").write_text(str(int(time.time()) + 2 * 86400))
+    return vendors.pick(state, ["claude", "codex"], "review", ["claude", "codex", "cursor", "agy"],
+                        pr=pr, by="contrib", review=True)
+
+
+def test_agy_reviews_its_own_pr_on_a_distinct_model_when_every_other_reviewer_is_blocked(agy_runner):
+    state = str(agy_runner.state_dir)
+    vendors.record_author(state, "20", "agy")
+    vendors.record_author_model(state, "20", "agy", MODEL)
+    result, rc = pick_review(agy_runner, "20")
+    assert (result["vendor"], rc, result["review_mode"]) == ("agy", 0, "same-vendor-different-model")
+
+
+def test_agy_is_not_picked_to_review_its_own_pr_on_the_writers_model(agy_runner):
+    state = str(agy_runner.state_dir)
+    vendors.record_author(state, "21", "agy")
+    vendors.record_author_model(state, "21", "agy", REVIEW_MODEL)   # the review route model wrote it
+    result, rc = pick_review(agy_runner, "21")
+    assert result["vendor"] != "agy" and rc == 75
+
+
+def test_dev_opening_attributes_the_pr_to_agy_with_the_verified_model(agy_runner):
+    from types import SimpleNamespace
+    from baton import dev
+    state = agy_runner.state_dir
+    (state / "review-pending-30").touch()
+    ctx = agy_runner.root / "ctx"
+    ctx.mkdir()
+    base = agy_runner.head()
+    agy_runner.plan(stream=stream(), commit=True)
+    out = agy_runner.run()
+    assert out["model"] == MODEL
+    tick = SimpleNamespace(ctx=ctx, state=state, active={"issue": "9"}, gh_repo="o/r", log=lambda *a: None,
+                           notify=lambda *a: None)
+    intent = {"issue": "9", "pr": "30", "vendor": "agy", "model": out["model"], "wt": str(agy_runner.worktree),
+              "base": base}
+    path = ctx / "opening.json"
+    path.write_text("{}")
+    assert dev.finish_opening(tick, intent, path) == 0
+    assert (state / "pr-30-authors").read_text().split() == ["agy"]
+    assert (state / "pr-30-author-models").read_text().strip() == f"agy {MODEL}"
+    assert vendors.contrib_of(str(state), "30", "agy") > 0
+
+
+def test_a_fix_commit_is_attributed_to_agy(agy_runner):
+    from baton import fix
+    state = str(agy_runner.state_dir)
+    head = agy_runner.head()
+    agy_runner.plan(stream=stream(), commit=True)
+    out = agy_runner.run("fix")
+    assert out["status"] == "success" and agy_runner.head() != head
+    runner = fix.Runner(env=agy_runner.env, pr=31)
+    state = runner.state
+    assert runner.record("31", "agy", agy_runner.worktree, head, out["model"], "") is True
+    assert Path(state, "pr-31-authors").read_text().split() == ["agy"]
+    assert Path(state, "pr-31-author-models").read_text().strip() == f"agy {MODEL}"
+    assert vendors.contrib_of(state, "31", "agy") > 0
+    assert runner.attempt_authors == ["agy"]
 
 
 # --- guard.sh, Alloy, docs ---------------------------------------------------------------------
@@ -327,8 +411,10 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_guard_and_alloy_vendor_lists_equal_the_adapter_sets():
     import re
     expected_alloy = set(agents.ADAPTERS) - {"stub"}
-    for match in re.findall(r'IsMatch\(attributes\["agent"\], "\^\(([^)]*)\)\$"\)',
-                            (ROOT / "telemetry/runner.alloy").read_text()):
+    matches = re.findall(r'IsMatch\(attributes\["agent"\], "\^\(([^)]*)\)\$"\)',
+                         (ROOT / "telemetry/runner.alloy").read_text())
+    assert len(matches) == 2
+    for match in matches:
         assert set(match.split("|")) == expected_alloy
     expected_guard = set(agents.ADAPTERS) - {"stub", "claude"}
     found = re.findall(r"by=\(([^)]*)\)", (ROOT / "bin/guard.sh").read_text())
