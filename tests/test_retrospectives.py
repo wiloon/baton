@@ -975,7 +975,7 @@ def test_cursor_analyst_sandbox_is_pinned(host, monkeypatch, tmp_path):
     login.mkdir()
     (login / 'auth.json').write_text('{}')
     monkeypatch.setenv('CURSOR_CONFIG_DIR', str(login))
-    monkeypatch.setattr('baton.quota.refresh_cursor', lambda *a, **k: {})
+    monkeypatch.setattr('baton.cursor_cli.refresh_quota', lambda *a, **k: {})
     assert host.run()[0]['state'] == 'success'
     call = host.calls()[0]
     assert call['vendor'] == 'cursor' and call['args'] == CURSOR_ARGV

@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
-from baton import agents, analyst_pool, config, dispatch, pick, quota, review, scan, session, tick, vendors
+from baton import agents, analyst_pool, config, cursor_cli, dispatch, pick, quota, review, scan, session, tick, vendors
 from conftest import full_text, sh
 
 
@@ -83,7 +83,7 @@ def test_admission_rejects_before_vendor_calls_or_state_changes(pool_env, monkey
         pytest.fail("rejected request reached a vendor or acquired capacity")
 
     for module, symbol in ((dispatch.capacity, "lease"), (agents, "run"), (agents, "preflight"),
-                           (quota, "refresh_cursor")):
+                           (cursor_cli, "refresh_quota")):
         monkeypatch.setattr(module, symbol, unexpected)
     before = sorted(cfg.paths.state.glob("**/*"))
     result = dispatch.dispatch(vendor, role, "prompt", "test", ".", env=sess)

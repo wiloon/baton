@@ -4,6 +4,8 @@ and comments for it. A read-only run that changed anything is reset here, before
 quota deferral could leave the change behind."""
 import json
 import os
+import subprocess
+import urllib.request
 from pathlib import Path
 
 from .common import (MODEL_CODE, Run, analyst_result, analyst_rows, analyst_tool_use, changed, child_env, events,
@@ -116,9 +118,86 @@ def parse_quota_log(lines):
     return {}
 
 
-def refresh_quota(state, now, **kwargs):
+USAGE_URL = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage"
+# Where cursor-agent >= 2026.11.19 keeps its login on Linux (secret-tool attributes).
+SECRET_ATTRIBUTES = ("service", "cursor-credentials", "account", "cursor-user")
+
+
+def parse_usage(payload):
+    """The weekly window of a GetCurrentPeriodUsage answer: {name: {used, resets_at}}."""
+    try:
+        used = float(payload["planUsage"]["totalPercentUsed"]) / 100
+        return {"seven_day": {"used": used, "resets_at": int(payload["billingCycleEnd"]) // 1000}}
+    except (KeyError, TypeError, ValueError):
+        return {}
+
+
+def _fetch_usage(token):
+    request = urllib.request.Request(USAGE_URL, data=b"{}", headers={
+        "Authorization": f"Bearer {token}", "Content-Type": "application/json", "Connect-Protocol-Version": "1"})
+    with urllib.request.urlopen(request, timeout=20) as response:
+        return json.load(response)
+
+
+class LoginUnreadable(ValueError):
+    """auth.json records a Cursor login, but its access token can't be read."""
+
+
+def _secret_lookup():
+    """The credential cursor-agent keeps in the Secret Service (Linux), or None."""
+    try:
+        found = subprocess.run(["secret-tool", "lookup", *SECRET_ATTRIBUTES], capture_output=True, text=True,
+                               timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return found.stdout if found.returncode == 0 else None
+
+
+def access_token(auth, lookup=_secret_lookup):
+    """Cursor's access token; None when this machine has no Cursor login.
+
+    cursor-agent 2026.11.19 moved the login into the OS secret store and left only
+    {"storedIn": "os-secret-store"} in auth.json; older versions keep accessToken there.
+    Raises LoginUnreadable when a login is recorded but no token comes back, so the
+    snapshot can't silently freeze at its last value."""
+    try:
+        stored = json.loads(Path(auth).read_text())
+    except OSError:
+        return None
+    except ValueError as error:
+        raise LoginUnreadable(f"cursor auth.json is not JSON: {error}") from None
+    if not isinstance(stored, dict) or stored.get("signedOut") is True:
+        return None
+    if token := stored.get("accessToken"):
+        return token
+    if stored.get("storedIn") == "os-secret-store":
+        try:
+            token = json.loads(lookup() or "")["accessToken"]
+        except (ValueError, TypeError, KeyError):
+            token = None
+        if not token:
+            raise LoginUnreadable("cursor login is in the OS secret store, but secret-tool returned no "
+                                  f"access token ({' '.join(SECRET_ATTRIBUTES)})")
+        return token
+    raise LoginUnreadable("cursor auth.json has neither accessToken nor storedIn")
+
+
+def refresh_quota(state, now, auth=None, fetch=_fetch_usage, lookup=_secret_lookup):
+    """Record Cursor's usage; {} when it isn't logged in here. Raises when the login can't be
+    read (recording probe_failed) or the API fails."""
     from . import quota
-    return quota.refresh_cursor(state, now, **kwargs)
+    try:
+        token = access_token(auth or Path.home() / ".config/cursor/auth.json", lookup)
+    except LoginUnreadable:
+        quota.credential(state, ID, "probe_failed", now)
+        raise
+    if token is None:
+        return {}
+    windows = parse_usage(fetch(token))
+    if windows:
+        quota.record(state, ID, windows, now)
+        quota.credential(state, ID, "authenticated", now)
+    return windows
 
 
 def final_message(text):
