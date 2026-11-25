@@ -156,7 +156,7 @@ class Tick:
                 (state / f"spec-paused-{a['spec']}").unlink(missing_ok=True)
             if a["cursor_fix"] and not push_pending:
                 n = a["cursor_fix"]
-                producers = {"cursor"}   # legacy names, plus whoever the owner record names
+                producers = {agents.LEGACY_REPLY_VENDOR}   # legacy names, plus whoever the owner record names
                 try:
                     recorded = json.loads((state / f"pr-{n}-fix-owner").read_text())["fixer"]
                     if recorded in agents.ADAPTERS:

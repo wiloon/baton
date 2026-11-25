@@ -581,7 +581,7 @@ class Runner:
     def record(self, pr, fixer, wt, agent_head, model, cursor_base):
         """Who wrote what (author, author model, lines); False when the records failed."""
         try:
-            prior = self.prior_author or "cursor"   # a saved legacy base is Cursor's
+            prior = self.prior_author or agents.LEGACY_REPLY_VENDOR   # a saved legacy base is Cursor's
             if cursor_base and cursor_base != agent_head and prior not in self.attempt_authors:
                 self.add_author(prior)
                 vendors.record_author(self.state, pr, prior)
@@ -746,7 +746,7 @@ class Runner:
                     self.description_discarded(pr, fixer or self.last_fixer or "fixer",
                                                description_reason or "")
                 if clear_cursor:
-                    self.clear_reply_request(pr, fixer or self.last_fixer or "cursor")
+                    self.clear_reply_request(pr, fixer or self.last_fixer or agents.LEGACY_REPLY_VENDOR)
                 recovery.clear(self.env, episode, pr)
                 return 0
             if self.push_feedback is None:
@@ -1374,10 +1374,10 @@ class Runner:
         if owner:
             producer, base = owner["fixer"], owner["base"]
         elif pair:   # a request from before owner records is Cursor's
-            producer = "cursor"
-            base = self.read_base(pr, "cursor") or (agent_head if fixer == "cursor" else head or agent_head)
+            producer = agents.LEGACY_REPLY_VENDOR
+            base = self.read_base(pr, agents.LEGACY_REPLY_VENDOR) or (agent_head if fixer == agents.LEGACY_REPLY_VENDOR else head or agent_head)
         if not base:
-            base = self.read_base(pr, fixer) or self.read_base(pr, "cursor") or head or agent_head
+            base = self.read_base(pr, fixer) or self.read_base(pr, agents.LEGACY_REPLY_VENDOR) or head or agent_head
         self.prior_author = ""
         if producer and producer != fixer:
             for name, adapter in agents.ADAPTERS.items():
@@ -1386,8 +1386,8 @@ class Runner:
             Path(self.ctx, f"pr-{pr}-fix-checks.json").unlink(missing_ok=True)
             if agents.ADAPTERS[producer].FIX_RESUMABLE_VIA_REPLY:
                 self.prior_author = producer
-        elif not producer and self.read_base(pr, "cursor"):
-            self.prior_author = "cursor"
+        elif not producer and self.read_base(pr, agents.LEGACY_REPLY_VENDOR):
+            self.prior_author = agents.LEGACY_REPLY_VENDOR
         self.write_owner(pr, fixer, base)
         return base
 
@@ -1413,7 +1413,7 @@ class Runner:
         if task_file.is_file():
             want, _, feedback_digest = task_file.read_text().partition("\n")
             self.push_feedback = feedback_digest.strip() or self.capture_push_feedback(pr)
-        elif baseline_file.is_file() and request.is_file() and fixer == "cursor":
+        elif baseline_file.is_file() and request.is_file() and fixer == agents.LEGACY_REPLY_VENDOR:
             # Legacy pending body requests have no saved TASK intent (Cursor only).
             want = ""
             self.push_feedback = self.capture_push_feedback(pr)
@@ -1425,9 +1425,9 @@ class Runner:
             shots = Path(self.ctx, f"pr-{pr}-shots")
             session.run_process(["rm", "-rf", str(shots)])
             shots.mkdir(parents=True)
-            if fixer != "cursor":
+            if fixer != agents.LEGACY_REPLY_VENDOR:
                 # A later Cursor round must not resume the request this run supersedes.
-                Path(self.state, f"cursor-fix-task-{pr}").unlink(missing_ok=True)
+                Path(self.state, f"{agents.LEGACY_REPLY_VENDOR}-fix-task-{pr}").unlink(missing_ok=True)
             self.clear_reply_request(pr, fixer, keep_base=True)
             Path(self.ctx, f"pr-{pr}-fix-checks.json").unlink(missing_ok=True)
             out = self.agent(fixer, "fix", self.render(
@@ -1591,7 +1591,7 @@ class Runner:
     def finish_cursor_fix(self, pr, wt, branch, url, source, feedback, head, *, agent_head,
                           body_changed, task_changed, discarded, description_reason):
         return self.finish_reply_fix(
-            pr, wt, "cursor", branch, url, source, feedback, head, agent_head=agent_head,
+            pr, wt, agents.LEGACY_REPLY_VENDOR, branch, url, source, feedback, head, agent_head=agent_head,
             body_changed=body_changed, task_changed=task_changed, discarded=discarded,
             description_reason=description_reason)
 
