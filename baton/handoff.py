@@ -133,6 +133,7 @@ REASONS = {
     "fix_verify_failed": Reason(3, "live", ("retry_step",)),
     "fix_worktree_diverged": Reason(3, "live", ("retry_step",)),
     "merge_failed": Reason(3, "observe", ("retry_step",)),
+    "pr_stalled": Reason(3, "rule"),
     "spec_adr_merge_failed": Reason(3, "observe", ("retry_step",)),
     "spec_adr_merge_unconfirmed": Reason(3, "observe", ("retry_step",)),
     "spec_adr_state_invalid": Reason(3, "observe", ("retry_step",)),
@@ -755,11 +756,56 @@ def label_ready(env, kind, number, remove=()):
     return pr_helpers.gh(cmd, "edit", str(number), "-R", env.repo.gh_repo, *opts)
 
 
+READY_PENDING = "ready-label-pending-"
+READY_TICKS = 5   # ticks that re-apply a label gh could not write before the owner is told
+
+
+def ready_pending_path(env, number):
+    return Path(env.dirs.state, f"{READY_PENDING}{number}")
+
+
+def _write_ready_pending(env, number, attempts=0):
+    try:
+        atomic_json(ready_pending_path(env, number), {"attempts": attempts})
+    except OSError as exc:
+        notify.log(f"could not save {READY_PENDING}{number}: {exc}")
+
+
+def retry_ready_labels(env):
+    """Each tick: re-apply ready-for-human on PRs whose label write failed (#265). Success removes the
+    record; after READY_TICKS failed ticks the owner is told and the record is dropped."""
+    for path in sorted(Path(env.dirs.state).glob(f"{READY_PENDING}*")):
+        number = path.name.removeprefix(READY_PENDING)
+        if not number.isdecimal():
+            continue
+        try:
+            attempts = int(json.loads(path.read_text())["attempts"])
+        except (OSError, ValueError, KeyError, TypeError):
+            attempts = 0
+        result = label_ready(env, "pr", number)
+        if result.returncode == 0:
+            path.unlink(missing_ok=True)
+            notify.log(f"PR #{number}: ready-for-human applied after an earlier failure")
+            continue
+        attempts += 1
+        if attempts >= READY_TICKS:
+            notify.log(f"PR #{number}: ready-for-human could not be applied after {attempts} ticks{pr_helpers.why(result)}")
+            notify.notify(f"PR #{number} needs you",
+                          f"baton handed this PR off but could not add {READY} after {attempts} ticks. "
+                          "Label it by hand.")
+            path.unlink(missing_ok=True)
+        else:
+            _write_ready_pending(env, number, attempts)
+
+
 def _finish(env, reason, entry, *, kind, number, title, text, hooks, remove, item, episode,
             after_labels, decision=None, before_labels=None):
     """The one terminal handoff: outcomes, labels, telemetry, notify, log."""
     finishing_push = (kind == "pr" and reason in ("fix_run_failed", "fix_needs_info", "fix_checks_refresh_failed")
                       and Path(env.dirs.state, f"fix-push-waiting-{number}").exists())
+    if kind == "pr":
+        # Written before the continuation goes: the PR is never both unlabelled and checkpoint-free (#265).
+        _write_ready_pending(env, number)
     if not finishing_push:
         if kind == "pr":
             # Retire the continuation before publishing the handoff or releasing its grant.
@@ -770,6 +816,8 @@ def _finish(env, reason, entry, *, kind, number, title, text, hooks, remove, ite
     if before_labels:
         before_labels()   # the comment that explains the failure goes up before the label
     result = label_ready(env, kind, number, remove=remove)
+    if kind == "pr" and result.returncode == 0:
+        ready_pending_path(env, number).unlink(missing_ok=True)
     if after_labels:
         after_labels(result)
     advisor.finish_episode(env, kind, number, "handoff")

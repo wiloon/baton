@@ -353,7 +353,10 @@ def scripted(monkeypatch):
 
 
 @pytest.mark.parametrize("stderr", ["net/http: TLS handshake timeout", "HTTP 503: Service Unavailable",
-                                    "HTTP 403: You have exceeded a secondary rate limit"])
+                                    "HTTP 403: You have exceeded a secondary rate limit",
+                                    "HTTP 500: Internal Server Error",
+                                    "gh: GraphQL: Something went wrong while executing your query on 2026-11-25T15:49:08Z. "
+                                    "Please include `ED6C:19235B` when reporting this issue."])
 def test_a_transient_failure_is_retried_with_backoff(scripted, stderr):
     fake = scripted((1, "", stderr), (1, "", stderr), (0, "ok\n", ""))
     assert pr.gh("issue", "view", "6", "-R", "o/r").stdout == "ok\n"

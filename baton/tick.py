@@ -311,6 +311,7 @@ class Tick:
             self.fetch_failed = True
             return None
         self.cleanup()
+        owner_handoff.retry_ready_labels(self.env)
         if self.scan_cmd:
             return self.scan_command()
         self.file_merged_follow_ups()
@@ -1088,6 +1089,7 @@ class Tick:
         # A PR waiting for the owner uses no agent capacity; it must not hold up the queue.
         with_owner = {names.issue_of(p["headRefName"]) for p in prs
                       if any(label.get("name") == "ready-for-human" for label in p.get("labels") or [])}
+        with_owner |= self.hand_off_stalled({str(p["number"]) for p in listed}, prs, with_owner)
         pending = [p for p in listed if str(p["number"]) not in with_owner]
         pr_of = {names.issue_of(p["headRefName"]): str(p.get("number", "")) for p in prs
                  if names.issue_of(p["headRefName"]) not in with_owner}
@@ -1140,6 +1142,45 @@ class Tick:
             self.recovered_issues[issue] = payload
             return issue
         return ""
+
+    PIPELINE_LABELS = frozenset({"ready-for-human", "agent-review", "agent-fix"})
+
+    def has_saved_state(self, pr, issue):
+        """Whether any saved state says the pipeline still holds this PR."""
+        from . import recovery
+        state = self.state
+        if any((state / f"{name}-{pr}").exists()
+               for name in ("review-pending", "fix-push-waiting", "slot-deferred", "ready-label-pending")):
+            return True
+        if pr in owner_handoff.operation_episodes(self.env, owner_handoff.RETRY_REASONS):
+            return True
+        return recovery.path(self.env, issue, issue).exists() or any(state.glob(f"recovery-*-{pr}.json"))
+
+    def hand_off_stalled(self, wip, prs, with_owner):
+        """An agent-wip issue whose only open PR carries no pipeline label and no saved state is stuck
+        (#265): hand the PR off so the owner sees it. Returns the issues handed off."""
+        by_issue = {}
+        for p in prs:
+            issue = names.issue_of(p["headRefName"])
+            if issue in wip:
+                by_issue.setdefault(issue, []).append(p)
+        stalled = set()
+        for issue, found in sorted(by_issue.items()):
+            if len(found) != 1 or issue in with_owner:
+                continue
+            p, pr = found[0], str(found[0]["number"])
+            if self.PIPELINE_LABELS & {label.get("name") for label in p.get("labels") or []}:
+                continue
+            if self.has_saved_state(pr, issue):
+                continue
+            self.log(f"#{issue}: PR #{pr} has no pipeline label and no saved state; handing it off")
+            owner_handoff.perform(
+                self.env, "pr_stalled", kind="pr", number=pr, item=pr, episode=issue,
+                title=f"PR #{pr} stalled",
+                text=f"PR #{pr} for #{issue} has no pipeline label and nothing saved to resume it.",
+                hooks=self.hooks(issue, pr))
+            stalled.add(issue)
+        return stalled
 
     def candidates(self):
         """ready-for-agent says "specified", AGENT_MILESTONE says "wanted now" ("" for any
