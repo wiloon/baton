@@ -21,7 +21,7 @@ import subprocess
 import sys
 import time
 
-from . import agents, claude_cli, pr as pr_helpers, quota, vendor_policy
+from . import agents, pr as pr_helpers, quota, vendor_policy
 from .config import ROLES, ROUTE_ROLE
 
 
@@ -284,6 +284,28 @@ def same_vendor_review(vendor):
     return bool(adapter and adapter.SAME_VENDOR_REVIEW)
 
 
+def models_distinct(vendor, first, second):
+    """Two model identities of VENDOR differ: by the adapter's distinct_models(a, b) when it has
+    one (Claude's aliases and IDs), else both are known and unequal."""
+    distinct = getattr(agents.ADAPTERS[vendor], "distinct_models", None)
+    if distinct is not None:
+        return bool(distinct(first, second))
+    return all(value and value != "unknown" for value in (first, second)) and first != second
+
+
+def spec_same_vendor(vendor):
+    """VENDOR's policy for a spec round after its own (ADR 0004): "known-distinct-model" (review
+    and revision, on two known models, the base review route kept), "alternating-phase" (the other
+    phase's route, models compared by models_distinct) or "" (never)."""
+    adapter = agents.ADAPTERS.get(vendor)
+    return getattr(adapter, "SPEC_SAME_VENDOR", "") if adapter else ""
+
+
+def alternating_spec_vendor():
+    """The first adapter whose spec rounds alternate phase after its own, or ''."""
+    return next((vendor for vendor in agents.ADAPTERS if spec_same_vendor(vendor) == "alternating-phase"), "")
+
+
 def same_vendor_review_mode(state, pr, vendor, model):
     """How a same-vendor reviewer may audit its own code: with a different model, or, as the last
     resort, with the same model in a fresh session (every review run starts one). "" when the
@@ -297,12 +319,7 @@ def same_vendor_review_mode(state, pr, vendor, model):
     if not (model and model != "unknown" and written and "unknown" not in written):
         return ""
     adapter = agents.ADAPTERS[vendor]
-    distinct = getattr(adapter, "distinct_models", None)
-    if distinct is None:
-        different = model not in written
-    else:
-        different = all(distinct(model, author_model) for author_model in written)
-    if different:
+    if all(models_distinct(vendor, model, author_model) for author_model in written):
         return "same-vendor-different-model"
     return "same-model-fresh-context" if getattr(adapter, "SAME_VENDOR_SAME_MODEL", False) else ""
 
@@ -413,21 +430,18 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
         if review_pool and all(v in excluded for v in review_pool) and not fallbacks:
             return {"vendor": "", "reason": "all eligible reviewers excluded by authorship",
                     "probe": [], "blocked": {}, "exhausted": True}, 0
-    if role in ("reviser", "spec_reviewer") and "codex" in excluded and "codex" in candidates:
+    if role in ("reviser", "spec_reviewer"):
         route_role = "spec" if role == "reviser" else "spec_review"
-        model = session.resolve().config.models.route(route_role, "codex").model
-        if other_model and other_model != "unknown" and model and model != other_model:
-            fallbacks = {"codex": "same-vendor-different-model"}
-    if role == "spec_reviewer" and "claude" in excluded and "claude" in candidates:
-        # Owner rule (2026-11-24): never stall on independence; Claude reviews Claude's revision
-        # on a distinct model (the caller picks the route that differs from OTHER_MODEL).
-        model = session.resolve().config.models.route("spec_review", "claude", followup=spec_followup).model
-        if claude_cli.distinct_models(model, other_model):
-            fallbacks["claude"] = "same-vendor-different-model"
-    if role == "reviser" and "claude" in excluded and "claude" in candidates:
-        model = session.resolve().config.models.route("spec", "claude", followup=spec_followup).model
-        if claude_cli.distinct_models(model, other_model):
-            fallbacks = {"claude": "same-vendor-different-model"}
+        for same in candidates:
+            policy = spec_same_vendor(same)
+            if same not in excluded or not policy:
+                continue
+            # "alternating-phase": the caller picks the route that differs from OTHER_MODEL (owner rule
+            # 2026-11-24: never stall on independence); "known-distinct-model": the base route.
+            followup = spec_followup if policy == "alternating-phase" else False
+            model = session.resolve().config.models.route(route_role, same, followup=followup).model
+            if models_distinct(same, model, other_model):
+                fallbacks[same] = "same-vendor-different-model"
     ordered = ([current, *candidates] if by == "pool" else candidates)
     ready, blocked, probe = [], {}, []
     horizons = {}   # blocked vendor -> vendor_policy.SHORT or LONG

@@ -124,6 +124,16 @@ def test_adapters_declare_same_vendor_review():
         "claude": False, "codex": True, "cursor": False, "stub": False}
 
 
+def test_adapters_declare_the_spec_same_vendor_policy():
+    assert {name: a.SPEC_SAME_VENDOR for name, a in agents.ADAPTERS.items()} == {
+        "claude": "alternating-phase", "codex": "known-distinct-model", "cursor": "", "stub": ""}
+    assert {name: a.SPEC_TEMPLATE for name, a in agents.ADAPTERS.items()} == {
+        "claude": "spec-prompt.md", "codex": "codex-spec-prompt.md", "cursor": "spec-prompt.md",
+        "stub": "spec-prompt.md"}
+    assert {name: a.SPEC_UNMARKED_REVIEWER for name, a in agents.ADAPTERS.items()} == {
+        "claude": True, "codex": False, "cursor": False, "stub": False}
+
+
 def test_config_load_admits_stub_and_rejects_unsupported_role(tmp_path):
     path = tmp_path / "config.toml"
     path.write_text(with_stub(full_text()))

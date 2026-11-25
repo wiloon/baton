@@ -17,7 +17,7 @@ from baton import capacity, dev, fix, handoff, merge, notify, pick, review, scan
 from baton.common import Deferred
 from conftest import issue_snapshot_pages, sh
 
-REAL_CURSOR_PLAN = spec.cursor_plan   # the devrun fixture stubs it
+REAL_VERDICT_PLAN = spec.verdict_plan   # the devrun fixture stubs it
 
 BIN = Path(__file__).resolve().parents[1] / "bin"
 LOGIN = r"^cursor$"
@@ -522,13 +522,13 @@ def test_the_lowest_eligible_issue_is_picked(ctx, monkeypatch):
                        issue(13, milestone="Later"), issue(14, login="stranger"), issue(15, labels=["agent-wip"]),
                        issue(16, labels=["needs-info"])],
            found=[issue(40, milestone=None, labels=["claude-found"])])
-    monkeypatch.setattr(spec, "cursor_plan", lambda env, n, listed=None: "plan")
+    monkeypatch.setattr(spec, "verdict_plan", lambda env, n, listed=None: "plan")
     assert ctx.make().next_issue() == "12"
 
 
 def test_a_maintainer_label_admits_an_external_issue(ctx, monkeypatch):
     issues(ctx, ready=[issue(7, login="contributor", labels=["ready-for-agent"])])
-    monkeypatch.setattr(spec, "cursor_plan", lambda env, n, listed=None: "plan")
+    monkeypatch.setattr(spec, "verdict_plan", lambda env, n, listed=None: "plan")
     assert ctx.make().next_issue() == "7"
 
 
@@ -588,7 +588,7 @@ def test_an_external_issue_still_obeys_handoff_labels(ctx, label):
 @pytest.mark.parametrize("branch", ["agent/issue-12", "cursor/issue-12"])
 def test_an_issue_with_a_pr_is_skipped(ctx, monkeypatch, branch):
     issues(ctx, ready=[issue(12), issue(13)], open_prs=[branch])
-    monkeypatch.setattr(spec, "cursor_plan", lambda env, n, listed=None: "plan")
+    monkeypatch.setattr(spec, "verdict_plan", lambda env, n, listed=None: "plan")
     assert ctx.make().next_issue() == "13"
 
 
@@ -638,7 +638,7 @@ def deferred_review(ctx, prs, **extra):
 
 
 def no_vendor_blocked(monkeypatch, seen=None):
-    monkeypatch.setattr(spec, "cursor_plan", lambda env, n, listed=None: "plan")
+    monkeypatch.setattr(spec, "verdict_plan", lambda env, n, listed=None: "plan")
     monkeypatch.setattr(tick.Tick, "pick_vendor", lambda self, *a, **k: "codex")
 
 
@@ -691,7 +691,7 @@ def test_a_lent_slot_starts_nothing_when_every_vendor_is_blocked(ctx, monkeypatc
     flight(ctx, wip=[5], ready=[issue(12)], prs={5: 11})
     defer_loop(monkeypatch)
     deferred_review(ctx, [11])
-    monkeypatch.setattr(spec, "cursor_plan", lambda env, n, listed=None: "plan")
+    monkeypatch.setattr(spec, "verdict_plan", lambda env, n, listed=None: "plan")
     monkeypatch.setattr(tick.Tick, "pick_vendor", lambda self, *a, **k: (_ for _ in ()).throw(Deferred("pool", QUOTA)))
     assert ctx.make().next_issue() == ""
     assert not ctx.path("slot-deferred-12").exists()   # the candidate's own deferral records nothing
@@ -906,7 +906,7 @@ def test_other_deferrals_leave_no_marker(ctx, monkeypatch, how):
         ctx.make().pending_reviews()
     elif how == "candidate":
         flight(ctx, wip=[], ready=[issue(12)])
-        monkeypatch.setattr(spec, "cursor_plan", lambda env, n, listed=None: "plan")
+        monkeypatch.setattr(spec, "verdict_plan", lambda env, n, listed=None: "plan")
         monkeypatch.setattr(tick.Tick, "pick_vendor", lambda self, *a, **k: (_ for _ in ()).throw(Deferred("pool", QUOTA)))
         assert t.next_issue() == ""
     elif how == "closed":
@@ -1181,7 +1181,7 @@ def test_a_closed_issue_with_agent_wip_cannot_lend_a_slot(ctx, monkeypatch):
 def test_a_pr_waiting_for_the_owner_does_not_hold_up_new_work(ctx, monkeypatch):
     issues(ctx, ready=[issue(12)], pending=1)
     ctx.gh.answers["pr list"] = [{"headRefName": "agent/issue-0", "labels": [{"name": "ready-for-human"}]}]
-    monkeypatch.setattr(spec, "cursor_plan", lambda env, n, listed=None: "plan")
+    monkeypatch.setattr(spec, "verdict_plan", lambda env, n, listed=None: "plan")
     assert ctx.make().next_issue() == "12"
 
 
@@ -1193,7 +1193,7 @@ def test_a_pr_still_in_review_holds_up_new_work(ctx):
 
 def test_an_issue_no_vendor_can_run_is_skipped_for_the_next(ctx, monkeypatch):
     issues(ctx, ready=[issue(12), issue(13)])
-    monkeypatch.setattr(spec, "cursor_plan", lambda env, n, listed=None: "plan")
+    monkeypatch.setattr(spec, "verdict_plan", lambda env, n, listed=None: "plan")
     calls = iter([Deferred("pool", "no vendor can run now"), None])
 
     def pick_vendor(self, *a, **k):
@@ -1464,7 +1464,7 @@ def devrun(ctx, worktree, monkeypatch):
     state.issue, state.runs, state.verify, state.script = issue, [], (0, "", 0), []
     state.gh.answers["issue view"] = {"title": "A title", "body": "A body", "comments": []}
     state.gh.answers["pr create"] = "https://github.com/owner/app/pull/301\n"
-    monkeypatch.setattr(spec, "cursor_plan", lambda env, n, listed=None: "the plan")
+    monkeypatch.setattr(spec, "verdict_plan", lambda env, n, listed=None: "the plan")
     monkeypatch.setattr(tick.Tick, "pick_vendor", lambda self, role, mode, cands, **k: "codex")
     verify = fix.Runner.verify
     monkeypatch.setattr(fix.Runner, "verify", lambda self, *a: state.verify if state.verify else verify(self, *a))
@@ -1675,7 +1675,7 @@ def test_a_legacy_cursor_worktree_keeps_its_branch(devrun):
 
 def test_the_spec_runs_first_when_there_is_no_plan(devrun, monkeypatch):
     plans = iter(["", "the plan"])
-    monkeypatch.setattr(spec, "cursor_plan", lambda env, n, listed=None: next(plans))
+    monkeypatch.setattr(spec, "verdict_plan", lambda env, n, listed=None: next(plans))
     called = []
     monkeypatch.setattr(tick.Tick, "spec_loop", lambda self, n: called.append(n) or False)
     t, rc = devrun.go()
@@ -1683,7 +1683,7 @@ def test_the_spec_runs_first_when_there_is_no_plan(devrun, monkeypatch):
 
 
 def test_an_accepted_spec_without_a_plan_comment_is_an_error(devrun, monkeypatch):
-    monkeypatch.setattr(spec, "cursor_plan", lambda env, n, listed=None: "")
+    monkeypatch.setattr(spec, "verdict_plan", lambda env, n, listed=None: "")
     monkeypatch.setattr(tick.Tick, "spec_loop", lambda self, n: True)
     t, rc = devrun.go()
     assert rc == 1 and "spec accepted but no plan comment found" in devrun.log()
@@ -1874,7 +1874,7 @@ def test_dev_blocked_after_a_granted_retry_hands_off_once(advised_dev, monkeypat
 
 
 def test_dev_verification_retry_resumes_after_deferral(advised_dev, monkeypatch):
-    monkeypatch.setattr(spec, "cursor_plan", lambda *a, **k: "<!-- baton-verdict: accept by=claude -->\nPlan")
+    monkeypatch.setattr(spec, "verdict_plan", lambda *a, **k: "<!-- baton-verdict: accept by=claude -->\nPlan")
     advised_dev.action = "retry_step"
     advised_dev.script = [implements()]
     calls = []
@@ -2173,7 +2173,7 @@ def test_queue_admits_a_pending_accept_issue_when_only_dev_can_run(ctx, monkeypa
     issues(ctx, ready=[issue(12)])
     monkeypatch.setattr(spec, "accept_pending",
                         lambda env, n, listed=None: {"pr": "77", "verdict": "x", "index": 0} if n == "12" else None)
-    monkeypatch.setattr(spec, "cursor_plan", lambda env, n, listed=None: "")
+    monkeypatch.setattr(spec, "verdict_plan", lambda env, n, listed=None: "")
     monkeypatch.setattr(spec, "spec_state", lambda env, n: ("", 0))
     t = ctx.make()
     config = t.env.config
@@ -2193,9 +2193,9 @@ def test_queue_admits_a_pending_accept_issue_when_only_dev_can_run(ctx, monkeypa
 
 
 def test_dev_run_does_not_dispatch_while_pending_accept_leaves_no_plan(devrun, monkeypatch):
-    """While acceptance is pending, cursor_plan is empty so the tick resumes via spec_loop (#122)."""
+    """While acceptance is pending, verdict_plan is empty so the tick resumes via spec_loop (#122)."""
     called = []
-    monkeypatch.setattr(spec, "cursor_plan", lambda env, n, listed=None: "")
+    monkeypatch.setattr(spec, "verdict_plan", lambda env, n, listed=None: "")
     monkeypatch.setattr(tick.Tick, "spec_loop", lambda self, n: called.append(n) or False)
     monkeypatch.setattr(tick.Tick, "pick_vendor", lambda *a, **k: pytest.fail("implementation vendor picked"))
     t = devrun.make()
@@ -2207,9 +2207,9 @@ def test_dev_implements_the_saved_verdict_once_the_pending_accept_resumes(devrun
     """spec_loop publishes the verdict (superseding the pending marker); dev then gets that plan (#122)."""
     verdict = "<!-- baton-verdict: accept by=codex -->\n## Spec review (codex), round 1: accept\n\nsaved plan"
     listed = [{"author": {"login": "owner"}, "body": f"<!-- baton-spec-accept-pending pr=77 -->\n{verdict}"}]
-    monkeypatch.setattr(spec, "cursor_plan", REAL_CURSOR_PLAN)
+    monkeypatch.setattr(spec, "verdict_plan", REAL_VERDICT_PLAN)
     devrun.gh.answers["issue view"] = {"title": "A title", "body": "A body", "comments": listed}
-    assert spec.cursor_plan(devrun.make().env, "300") == ""   # pending: no plan yet
+    assert spec.verdict_plan(devrun.make().env, "300") == ""   # pending: no plan yet
     called = []
 
     def resume(self, n):
