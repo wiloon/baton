@@ -43,7 +43,8 @@ eligibility policy (ADRs 0004 and 0005).
   spec review and spec revision.
 - The wait applies to the deferred item. An agent PR waiting on quota or cooldown can lend its
   `max_pending_prs` slot to another issue in the same repository. The repository can admit at
-  most one extra issue above the cap. Existing PR work keeps priority over new issues.
+  most one extra issue above the cap. Existing PR work keeps priority over new issues. `P0`
+  issues are the exception to both of these last two rules (ADR 0010).
 
 ## Revision record
 
@@ -61,3 +62,5 @@ eligibility policy (ADRs 0004 and 0005).
   `SAME_VENDOR_SAME_MODEL = False` (owner rule #221). Its `distinct_models` strips the effort
   suffix, and config requires agy's `review` route model to be distinct from its `dev`, `fix`
   and `fix_followup` route models, so the never-stall fallback exists.
+- Issue #194: exempt `P0` issues from the one-extra-issue bound and from PR work going first, so an
+  urgent bug starts at the next pick (ADR 0010).
