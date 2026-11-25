@@ -676,7 +676,8 @@ class Merger:
                              + "".join(f"\n- {item['id']}: {item['text']}" for item in orphans) + f"\n{url}")
                 return
             left = self.left_for_owner(screenshot, body)
-            gate = pr_helpers.gate(pr, cleared=screenshot["checks"] if left == [] else None)
+            gate = pr_helpers.gate(pr, cleared=screenshot["checks"] if left == [] else None,
+                                   carried=(screenshot or {}).get("design"))
         except Exception:
             gate = {"action": "manual_checks"}
         if gate.get("action") == "queue_review":
@@ -689,6 +690,8 @@ class Merger:
             left = self.left_for_owner(screenshot, live_body)
             owed = self.owed(left, live_body if live_body is not None else body)
             listed = self.left_text(left, owed, (screenshot or {}).get("design") or ())
+            listed += "".join(f"\n- open design finding {item['id']}: {item['text']}"
+                              for item in self.orphaned_design(screenshot, live_body))
             self.handoff("manual_checks", f"PR #{pr} needs a manual check",
                          "Review and CI passed." + (f" {listed}\n{url}" if listed else f" {url}"))
             notify.send_shots(pr, note="Checks for you" if left is None else "", left=owed)
@@ -700,7 +703,8 @@ class Merger:
             try:
                 body = pr_helpers.body(pr)
                 left = self.left_for_owner(screenshot, body)
-                return pr_helpers.gate(pr, cleared=screenshot["checks"] if left == [] else None)
+                return pr_helpers.gate(pr, cleared=screenshot["checks"] if left == [] else None,
+                                       carried=(screenshot or {}).get("design"))
             except Exception:
                 return {"action": "manual_checks"}
 

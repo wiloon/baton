@@ -194,6 +194,20 @@ def test_a_passing_split_review_files_the_owners_screenshot_nit(gh):
     assert gh.created()[0]["body"].endswith("## Review nits\n\n- library.png: align the two labels")
 
 
+def test_design_findings_and_the_fixers_design_answers_are_never_filed(gh):
+    shot = ("<!-- baton-screenshot-review round=1 by=claude -->\n## Must fix\nnone\n"
+            "## Nits\n- library.png: align the two labels\n"
+            "## Design findings\n1. checks 1 — a.css: bottom 24 px vs top 18 px; unequal gap; cut to 18 px\n"
+            "## Design answers\nD1.1. held — still 24 px\n## Checks\n1. verified")
+    fix = ("<!-- baton-fix by=claude loop=1-ab round=1 -->\n## Must fix\nnone\n## Nits\nnone\n"
+           "## Design findings\nD1.1. rejected — brand spacing")
+    gh.set(title="t", body="", comments=comments(REVIEW + "## Must fix\nnone\n## Nits\nnone", shot, fix))
+    after_merge.follow_ups(1, "2")
+    [issue] = gh.created()
+    assert issue["body"].endswith("## Review nits\n\n- library.png: align the two labels")
+    assert "24 px" not in issue["body"] and "brand spacing" not in issue["body"]
+
+
 def test_a_follow_up_issue_files_no_further_follow_ups(gh, tmp_path):
     gh.set(body="## Follow-ups\n- [nit] rename helper\n- [bug] Real bug — x", issue_labels={"2": ["follow-up"]},
            comments=comments(REVIEW + "## Nits\n- a nit"))

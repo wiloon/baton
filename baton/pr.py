@@ -523,16 +523,20 @@ def checks_none(text):
     return checks.is_none(text)
 
 
-def gate(pr, cleared=None):
+def gate(pr, cleared=None, carried=None):
     """After green CI: merge, hand off for a manual check, or queue a metadata review
     when the live description would close the wrong issue (preflight).
     CLEARED: the manual checks the screenshot review verified, all of them (#92); they
     clear the gate only while the live description still lists exactly those checks.
+    CARRIED: open design findings (#96); one whose check this read of the body no longer lists
+    never merges, so a body change after the caller's read cannot slip past.
     A checks handoff includes the body that caused it, when it could be read."""
     current = body(pr)
     if current is None:
         return {"action": "manual_checks"}
     listed = checks.items(current)   # none unless the body has exactly one checks section
+    if any(check not in listed for item in carried or () for check in item["checks"]):
+        return {"action": "manual_checks", "body": current}
     verified = cleared is not None and bool(listed) and listed == check_verdicts.items(cleared)
     if not (verified or checks_none(current)):
         return {"action": "manual_checks", "body": current}

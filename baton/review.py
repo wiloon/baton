@@ -237,10 +237,38 @@ def must_fix_first(text):
     return "\n".join([head, *section]), "".join(f"\n{line}" for line in kept), findings
 
 
-def combined_feedback(code, screenshot, limit):
+class DesignOverflow(Exception):
+    """The design records alone do not fit review_context_max_chars (#96)."""
+
+
+def combined_feedback(code, screenshot, limit, open_block=""):
     """The code review comment, a blank line, then the screenshot review comment, within LIMIT
     characters. When it overflows each comment gets half of the room, an unused share goes to the
-    longer one, and a cut comment keeps its Must fix section first."""
+    longer one, and a cut comment keeps its Must fix section first.
+
+    The screenshot comment's `## Design findings` section and OPEN_BLOCK (the open design findings
+    block, with its heading) are complete records (#96): never cut, kept whole ahead of the rest,
+    which takes the remaining room. DesignOverflow when they alone exceed LIMIT."""
+    joined = f"{code}\n\n{screenshot}" if screenshot or not open_block else code
+    if open_block:
+        joined += f"\n\n{open_block}"
+    if len(joined) <= limit:
+        return joined
+    shot_rest, design = design_findings.split_section(screenshot)
+    if design.partition("\n")[2].strip().lower() in ("", "none", "none."):   # nothing to keep whole
+        shot_rest, design = screenshot, ""
+    tail = "\n\n".join(part for part in (design, open_block) if part)
+    if not tail:
+        return plain_feedback(code, screenshot, limit)
+    if len(tail) > limit:
+        raise DesignOverflow
+    room = limit - len(tail) - 2
+    if room <= 0:
+        return tail
+    return f"{plain_feedback(code, shot_rest, room).rstrip()}\n\n{tail}"
+
+
+def plain_feedback(code, screenshot, limit):
     joined = f"{code}\n\n{screenshot}"
     if len(joined) <= limit:
         return joined
@@ -765,7 +793,15 @@ class Review:
                 owner_handoff.clear_retry(self.env, episode, reason, pr)
                 self.save_binding(feedback_waiting="")
                 cap = int(self.env.config.scheduling.review_context_max_chars or 20000)
-                return (combined_feedback(code, shots, cap) if screenshot else code), None
+                open_block = f"## Open design findings\n{design_findings.block(self.design)}" if self.design else ""
+                try:
+                    if screenshot or open_block:
+                        return combined_feedback(code, shots, cap, open_block), None
+                except DesignOverflow:
+                    self.handoff("review_run_failed", f"PR #{pr} review failed",
+                                 f"design findings exceed review_context_max_chars. {self.url}")
+                    return "", 0
+                return code, None
             retryable = True
 
         if binding is None or not retryable:
@@ -1007,11 +1043,14 @@ class Review:
             delivery = "Include the full review in your final message, above the verdict line."
         else:
             delivery = f"Write the comment to `{review_file}` with the Write tool."
+        open_design = (design_findings.block(design_findings.apply_answers(self.design, self.design_answers(round)))
+                       if round > 1 else "none")
+        if open_design != "none" and len(open_design) > limit:   # a complete record, never cut (#96)
+            raise DesignOverflow
         out = self.agent(vendor, "screenshot_review", self.render(
             "screenshot-review-prompt.md", PR=str(pr), ISSUE=self.issue or "unknown", GH_REPO=self.repo,
             WORKTREE=str(wt), ROUND=str(round), MAX_ROUNDS=str(self.max_rounds), CONTEXT_FILE=str(context),
-            OPEN_DESIGN=(design_findings.block(design_findings.apply_answers(self.design, self.design_answers(round)))
-                         if round > 1 else "none"),
+            OPEN_DESIGN=open_design,
             MANUAL_CHECKS=cut(check_verdicts.numbered(checks), limit), SHOTS_STEP=self.shots_step(notify.shots(pr, self.ctx), vendor), DELIVERY=delivery),
             f"pr-{pr}-screenshot-review-{round}", str(self.self_dir / "review-settings.json"), str(review_file), self.env)
         outcome, model = out["outcome"], out["model"] or ""
@@ -1318,6 +1357,11 @@ class Review:
                             self.fail_reason = ""
                             try:
                                 outcome = self.run_screenshot_review(round, data, checks, selected)
+                            except DesignOverflow:
+                                self.handoff("review_run_failed", f"PR #{pr} review failed",
+                                             f"design findings exceed review_context_max_chars. {self.url}")
+                                self.drop()
+                                return 0
                             except Exhausted as exhausted:
                                 outcome = self.failed("screenshot_reviewer_unavailable",
                                                       exhausted.reason or "No screenshot reviewer available.")
@@ -1418,8 +1462,6 @@ class Review:
                                         exclude=exclude, issue=self.issue)
                 self.values["fixer"] = fixer
                 self.save()
-                if self.design:
-                    feedback += f"\n\n## Open design findings\n{design_findings.block(self.design)}"
                 rc = fix.fix_pr(runner, pr, wt, fixer, f"the reviewer agent (round {round})", feedback, fix_head)
             resuming_fix = False
             if rc == 75:
