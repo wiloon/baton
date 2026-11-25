@@ -155,6 +155,18 @@ elif args[:1] == ["api"] and "--slurp" in args and args[1].endswith(("/comments"
     comments = [{**row, "id": row.get("id", i + 1), "user": row.get("user", row.get("author"))}
                 for i, row in enumerate(rows)]
     print(json.dumps([comments[i:i+100] for i in range(0, len(comments), 100)] or [[]]))
+elif args[:1] == ["api"] and "--slurp" in args and "/pulls?" in args[1]:
+    if fails("pulls"):
+        sys.exit(1)
+    branch = args[1].split("head=", 1)[1].split("&", 1)[0].split(":", 1)[-1]
+    pulls = pr.get("pulls_api")
+    if pulls is None:
+        pulls = [{"number": p["number"], "state": p.get("state", "open"), "merged_at": p.get("merged_at"),
+                  "base": {"ref": "main"}, "head": {"ref": p.get("headRefName", pr.get("headRefName", branch)),
+                                                    "repo": {"full_name": os.environ["GH_REPO"]}}}
+                 for p in pr.get("open_prs", [])]
+    matched = [p for p in pulls if (p.get("head") or {}).get("ref") == branch]
+    print(json.dumps([matched[i:i + 100] for i in range(0, len(matched), 100)] or [[]]))
 elif args[:1] == ["api"]:
     print(json.dumps(pr.get("inline", [])))
 elif args[:2] == ["issue", "list"]:

@@ -23,7 +23,7 @@ import subprocess
 import sys
 import time
 
-from . import advisor, after_merge, check_verdicts, checkpoint, checks, ci, fix, hooks as telemetry, names, notify, pick, pr as pr_helpers
+from . import advisor, after_merge, check_verdicts, checkpoint, checks, ci, fix, hooks as telemetry, names, notify, pick, pr as pr_helpers, pr_contract
 from .common import Deferred, git
 
 
@@ -233,24 +233,35 @@ class Merger:
         advisor.finish_episode(self.env, "pr", pr, "merged")
         if Path(state_dir, f"task-merged-pr-{pr}").exists():
             return True
+        data = pr_helpers.view(pr, "headRefName,body")
+        if data is None:
+            return False
         try:
-            issue = pr_helpers.relation(pr)
+            issue, completion = pr_contract.relation(data)
         except ValueError:
             return True
-        completion, issue = issue["completion"], issue["issue"]
+        head_branch = data.get("headRefName") or ""
         if not re.fullmatch(r"\d+", issue):
+            return True
+        history = pr_helpers.issue_history(self.repo, issue)
+        if history is None:
+            return False
+        newer = [item["number"] for item in history if item["number"] > int(pr)]
+        if newer:
+            notify.log(f"PR #{pr}: superseded by PR #{max(newer)}; task left alone")
+            Path(state_dir, f"task-merged-pr-{pr}").touch()
             return True
         gh = lambda *args: pr_helpers.gh(*args, "-R", self.repo)
         state = gh("issue", "view", issue, "--json", "state", "--jq", ".state")
         if state.returncode != 0:
             return False
         if completion == "partial" and state.stdout.strip() == "OPEN":
-            branch, wt = names.for_issue(str(self.env.dirs.worktrees), issue)
-            open_prs = gh("pr", "list", "--state", "open", "--head", branch, "--json", "number", "--jq", "length")
-            if open_prs.returncode != 0:
-                return False
-            if open_prs.stdout.strip() != "0":
-                return True   # A later slice already owns the task.
+            if any((item.get("state") or "").lower() == "open" and item["number"] != int(pr) for item in history):
+                return True   # An open PR on the issue's agent branches still owns the task.
+            if names.issue_of(head_branch):
+                wt = names.worktree_for(str(self.env.dirs.worktrees), head_branch)
+            else:
+                _, wt = names.for_issue(str(self.env.dirs.worktrees), issue)
             if wt.is_dir():
                 if git(wt, "status", "--porcelain") or session.run_process(
                         ["git", "-C", str(wt), "merge-base", "--is-ancestor", "HEAD", "origin/main"]).returncode != 0:

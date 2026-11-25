@@ -463,6 +463,76 @@ class Tick:
             if not merger.finish_merged_task():
                 self.log(f"PR #{n}: task recovery will retry")
             merger.after_merge()
+        self.retry_merged_settlements()
+
+    def record_merged_settlement(self, pr, issue):
+        """Record a merged PR for task settlement atomically; False when the write fails."""
+        path = self.state / f"task-settle-pr-{pr}.json"
+        temp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        try:
+            temp.write_text(json.dumps({"pr": str(pr), "issue": str(issue)}, sort_keys=True) + "\n")
+            temp.replace(path)
+        except OSError as exc:
+            temp.unlink(missing_ok=True)
+            self.log(f"PR #{pr}: could not write settlement record: {exc}")
+            return False
+        return True
+
+    def settle_recorded_merge(self, pr, issue, path=None):
+        """Run finish_merged_task and after_merge for a recorded PR; delete the record only
+        once task-merged-pr-<pr> exists."""
+        pr, issue = str(pr), str(issue)
+        path = path or (self.state / f"task-settle-pr-{pr}.json")
+        recorded = self.state / f"merged-event-pr-{pr}"
+        if not recorded.exists() and self.hooks(issue, pr).owner_merged():
+            recorded.touch()
+        merger = merge.Merger(self.env, self.hooks(issue, pr), pr, issue)
+        if not merger.finish_merged_task():
+            self.log(f"PR #{pr}: task recovery will retry")
+        merger.after_merge()
+        if (self.state / f"task-merged-pr-{pr}").exists():
+            path.unlink(missing_ok=True)
+            return True
+        return False
+
+    def record_and_settle_merge(self, pr, issue):
+        """Record PR for settlement and run it now; True when task-merged-pr-<pr> exists."""
+        if not self.record_merged_settlement(pr, issue):
+            return False
+        return self.settle_recorded_merge(pr, issue)
+
+    def retry_merged_settlements(self):
+        """Retry every pending settlement record, independent of open-issue state or labels."""
+        for path in sorted(self.state.glob("task-settle-pr-*.json")):
+            try:
+                data = json.loads(path.read_text())
+                pr = str(data["pr"])
+                issue = str(data["issue"])
+                if not pr.isdecimal() or not issue.isdecimal():
+                    raise ValueError("invalid pr or issue")
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                self.log(f"{path.name}: unreadable settlement record: {exc}")
+                continue
+            self.settle_recorded_merge(pr, issue, path)
+
+    def matches_merged_issue(self, pr_data, issue):
+        """True when a PR dict (REST or gh pr view) is authored by the owner on main in this
+        repository and its task relation names ISSUE."""
+        if "baseRefName" in pr_data:
+            if pr_data.get("baseRefName") != "main" or pr_data.get("isCrossRepository") is not False:
+                return False
+            login = (pr_data.get("author") or {}).get("login") or ""
+            branch = pr_data.get("headRefName") or ""
+        else:
+            login = (pr_data.get("user") or {}).get("login") or ""
+            branch = (pr_data.get("head") or {}).get("ref") or ""
+        if login != self.owner:
+            return False
+        try:
+            related_issue, _ = pr_contract.relation({"body": pr_data.get("body") or "", "headRefName": branch})
+        except ValueError:
+            return False
+        return related_issue == str(issue)
 
     def is_agent_branch(self, pr):
         out = self.gh("pr", "view", str(pr), "-R", self.gh_repo, "--json", "headRefName", "--jq", ".headRefName")
@@ -540,6 +610,17 @@ class Tick:
             if state not in ("OPEN", "MERGED", "CLOSED"):
                 return 0
             if state != "OPEN":
+                if state == "MERGED":
+                    issue = str(saved.get("ISSUE") or "")
+                    if issue.isdecimal() and not (self.state / f"task-merged-pr-{pr}").exists():
+                        remote = self.gh_json("pr", "view", pr, "-R", self.gh_repo, "--json",
+                                              "state,headRefName,baseRefName,isCrossRepository,author,body")
+                        if not isinstance(remote, dict):
+                            return 0
+                        if remote.get("state") == "MERGED" and self.matches_merged_issue(remote, issue):
+                            if not self.record_merged_settlement(pr, issue):
+                                return 0
+                            self.settle_recorded_merge(pr, issue)
                 self.active["pr"] = str(pr)
                 advisor.finish_episode(self.env, "pr", pr, state.lower())
                 path.unlink(missing_ok=True)
@@ -956,19 +1037,7 @@ class Tick:
     def pr_history(self, issue):
         """Every PR of the issue's agent branches (same repository, base main), any state, or None
         when any lookup fails: a partial history is never used."""
-        owner = self.gh_repo.split("/")[0]
-        found = []
-        for branch in names.branches(issue):
-            pulls = self.admission_items(f"pulls?state=all&head={owner}:{branch}")
-            if pulls is None:
-                return None
-            try:
-                found += [pr for pr in pulls if pr["head"]["ref"] == branch and pr["base"]["ref"] == "main"
-                          and pr["head"]["repo"]["full_name"] == self.gh_repo]
-                {int(pr["number"]) for pr in found}
-            except (KeyError, TypeError, ValueError):
-                return None
-        return found
+        return pr_helpers.issue_history(self.gh_repo, issue)
 
     def release_stale(self, issue):
         """An agent-wip issue with no open PR: remove the label unless its newest PR is a merge
@@ -979,7 +1048,12 @@ class Tick:
             return
         newest = max(history, key=lambda pr: int(pr["number"]), default=None)
         if newest and newest.get("merged_at") and not (self.state / f"task-merged-pr-{newest['number']}").exists():
-            self.log(f"#{issue}: merged PR #{newest['number']} is not settled; agent-wip kept")
+            pr = str(newest["number"])
+            if not self.matches_merged_issue(newest, issue):
+                self.log(f"#{issue}: merged PR #{pr} is not settled (identity mismatch); agent-wip kept")
+                return
+            if not self.record_and_settle_merge(pr, issue):
+                self.log(f"#{issue}: merged PR #{pr} is not settled; agent-wip kept")
             return
         if self.gh("issue", "edit", issue, "-R", self.gh_repo, "--remove-label", "agent-wip") is None:
             self.log(f"#{issue}: agent-wip not released (label removal failed), retrying next tick")

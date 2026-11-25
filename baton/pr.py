@@ -5,7 +5,7 @@ calls the bash helpers made, and keeps their exit codes. Commands that change th
 print JSON: `changed`, and `log` for a runner.log line that bash writes.
 """
 
-from . import check_verdicts, checks, session
+from . import check_verdicts, checks, names, session
 import argparse
 import json
 import os
@@ -280,6 +280,53 @@ def relation(pr):
         raise ValueError(f"cannot read PR #{pr}")
     issue, completion = pr_contract.relation(data)
     return {"issue": issue, "completion": completion}
+
+
+def branch_history(repo, branch):
+    """Every same-repository PR on BRANCH with base main (any state), deduplicated by PR
+    number, or None when any call, page or entry fails or is malformed."""
+    owner = repo.split("/")[0]
+    result = gh("api", f"repos/{repo}/pulls?state=all&head={owner}:{branch}&per_page=100", "--paginate", "--slurp")
+    if result.returncode != 0:
+        return None
+    try:
+        pages = json.loads(result.stdout)
+    except ValueError:
+        return None
+    if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+        return None
+    by_number = {}
+    for page in pages:
+        for item in page:
+            if not isinstance(item, dict):
+                return None
+            number = item.get("number")
+            head = item.get("head")
+            base = item.get("base")
+            if (type(number) is not int or number <= 0
+                    or not isinstance(head, dict) or not isinstance(base, dict)
+                    or not isinstance(head.get("ref"), str) or not isinstance(base.get("ref"), str)):
+                return None
+            head_repo = head.get("repo")
+            if head_repo is not None and not isinstance(head_repo, dict):
+                return None
+            if (head["ref"] == branch and base["ref"] == "main"
+                    and isinstance(head_repo, dict) and head_repo.get("full_name") == repo):
+                by_number[number] = item
+    return list(by_number.values())
+
+
+def issue_history(repo, issue):
+    """Every same-repository PR of ISSUE's agent branches (base main, any state), deduplicated
+    by PR number, or None when any lookup fails: a partial history is never used."""
+    by_number = {}
+    for branch in names.branches(issue):
+        pulls = branch_history(repo, branch)
+        if pulls is None:
+            return None
+        for item in pulls:
+            by_number[item["number"]] = item
+    return list(by_number.values())
 
 
 def preflight(pr):
