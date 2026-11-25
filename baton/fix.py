@@ -1292,6 +1292,30 @@ class Runner:
         and the reply answers every one of them `rejected`: the next screenshot review judges it."""
         return bool(self.design_only and design_findings.rejects_all(self.design_ids, self.design_reply or ""))
 
+    def capped_reply(self, reply):
+        """REPLY under REPLY_CAP with its `## Design findings` section whole and only the rest cut;
+        None when that section alone exceeds the cap."""
+        if len(reply) <= REPLY_CAP:
+            return reply
+        rest, section = design_findings.split_section(reply)
+        if not section:
+            return reply[:REPLY_CAP]
+        if len(section) > REPLY_CAP:
+            return None
+        return rest.rstrip("\n")[:REPLY_CAP - len(section) - 2].rstrip("\n") + "\n\n" + section
+
+    def reply_rejection_only(self, pr, fixer):
+        """rejection_only for a reply-protocol fix; a resume that ran no agent reads the answers saved
+        before the description was applied."""
+        if self.design_reply:
+            return self.rejection_only()
+        try:
+            saved = json.loads(Path(self.state, f"{fixer}-fix-design-{pr}").read_text())
+            return bool(self.design_only and set(saved["ids"]) == set(self.design_ids)
+                        and design_findings.rejects_all(saved["ids"], saved["reply"]))
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
+
     def finish_fix(self, pr, wt, fixer, source, feedback, head, *, agent_head, model, cursor_base,
                    task_changed, description_rc, description_changed, description_reason):
         """The steps after a fixed run's description and TASK: writes: checks, verify, push (#151)."""
@@ -1345,6 +1369,7 @@ class Runner:
         """Drop the shared body request and the producer's saved task and fix base."""
         Path(self.state, f"pr-body-base-{pr}").unlink(missing_ok=True)
         Path(self.state, f"{fixer}-fix-task-{pr}").unlink(missing_ok=True)
+        Path(self.state, f"{fixer}-fix-design-{pr}").unlink(missing_ok=True)
         if not keep_base:
             Path(self.state, f"{fixer}-fix-base-{pr}").unlink(missing_ok=True)
         pr_helpers.remove_body_request(Path(self.ctx, f"pr-{pr}-body.md"))
@@ -1421,6 +1446,7 @@ class Runner:
         base_file = Path(self.state, f"{fixer}-fix-base-{pr}")
         baseline_file = Path(self.state, f"pr-body-base-{pr}")
         task_file = Path(self.state, f"{fixer}-fix-task-{pr}")
+        design_file = Path(self.state, f"{fixer}-fix-design-{pr}")
         head = self.claim_fix(pr, fixer, head, agent_head)
         base_file.write_text(head + "\n")
         request = Path(self.ctx, f"pr-{pr}-body.md")
@@ -1455,11 +1481,22 @@ class Runner:
             reply = "\n".join(line for line in strip_markers(reply_raw).split("\n") if not line.startswith("RESULT: ")).rstrip("\n")
             if reply_raw:
                 reply = pr_helpers.split_checks(pr, reply, self.ctx).rstrip("\n")
+            self.design_reply = reply
             if reply.strip():
-                marker = (f"<!-- baton-fix by={fixer} outcome=needs-info -->"
+                loop = f" loop={self.loop_id} round={self.round}" if self.loop_id and str(self.round).isdecimal() else ""
+                marker = (f"<!-- baton-fix by={fixer}{loop} outcome=needs-info -->"
                           if outcome.startswith("RESULT: needs-info")
-                          else f"<!-- baton-fix by={fixer} -->")
-                self.comment(pr, f"{marker}\n{reply[:REPLY_CAP]}", f"PR #{pr}: posting {name}'s reply failed")
+                          else f"<!-- baton-fix by={fixer}{loop} -->")
+                posted = self.capped_reply(reply)
+                if posted is None:   # the design answers alone do not fit: post nothing that parses as a partial answer
+                    if not self.record(pr, fixer, wt, agent_head, "", ""):
+                        return 1
+                    action, alt, _ = self.recover(pr, "fix_run_failed", f"{name} PR #{pr} fix failed",
+                                                  f"design answers exceed the reply cap. {url}", fixer, wt=wt, head=head)
+                    if action == "handoff":
+                        return 1
+                    return self.dispatch_fixer(pr, wt, alt, source, feedback, head)
+                self.comment(pr, f"{marker}\n{posted}", f"PR #{pr}: posting {name}'s reply failed")
             if not outcome.startswith("RESULT: fixed"):
                 if self.head(wt) != head:
                     if not self.record(pr, fixer, wt, head, out["model"] or "unknown", ""):
@@ -1475,6 +1512,9 @@ class Runner:
                     return 1
                 return self.dispatch_fixer(pr, wt, alt, source, feedback, head)
             if request.exists() or request.is_symlink() or want:
+                # Keep the validated design answers for a resume that runs no agent.
+                if self.design_only and self.design_ids:
+                    design_file.write_text(json.dumps({"ids": list(self.design_ids), "reply": reply}))
                 # Publish the fixed attempt after saving its checks, before any GitHub edit.
                 temp = task_file.with_suffix(".tmp")
                 temp.write_text(f"{want}\n{self.push_feedback or ''}\n")
@@ -1621,7 +1661,7 @@ class Runner:
                 description_rc=2 if discarded else 0, description_reason=description_reason)
             if rc != 0:
                 return rc
-            if not (body_changed or task_changed or checks_changed):
+            if not (body_changed or task_changed or checks_changed or self.reply_rejection_only(pr, fixer)):
                 action, alt, _ = self.recover(pr, "fix_no_commit", f"{name} PR #{pr} needs you",
                                                 f"{name}'s fix run made no commit. {url}", fixer, wt=wt, head=head)
                 if action == "handoff":

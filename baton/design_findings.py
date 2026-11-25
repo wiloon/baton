@@ -33,6 +33,17 @@ def section(comment, heading):
     return lines if found else None
 
 
+def split_section(text):
+    """TEXT as (the rest, the `## Design findings` section whole with its heading); the section is
+    "" when TEXT has none."""
+    rest, kept, on = [], [], False
+    for line in (text or "").split("\n"):
+        if HEADING.match(line):
+            on = bool(SECTION.match(line.strip()))
+        (kept if on else rest).append(line)
+    return "\n".join(rest), "\n".join(kept).rstrip("\n")
+
+
 def parse(comment, round, count):
     """The new findings of the comment as `{id, checks, text}` (checks: 1-based numbers), `[]`
     for `none`; None when the section is missing or any finding has no valid check number
