@@ -24,10 +24,10 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from . import claude_cli, codex_cli, cursor_cli, stub_cli
+from . import agy_cli, claude_cli, codex_cli, cursor_cli, stub_cli
 from .common import Request, events, read
 
-ADAPTERS = {mod.ID: mod for mod in (claude_cli, cursor_cli, codex_cli, stub_cli)}
+ADAPTERS = {mod.ID: mod for mod in (claude_cli, cursor_cli, codex_cli, agy_cli, stub_cli)}
 CATALOG = frozenset(ADAPTERS)
 
 
@@ -138,6 +138,8 @@ def deadline(text, cooldown_hours=COOLDOWN_HOURS, now=None):
 def classify(vendor, rc, log_text, outcome="", cooldown_hours=COOLDOWN_HOURS):
     """(status, cooldown_until): timeout, then auth, quota, busy, failure."""
     found = errors(log_text)
+    if extract := getattr(ADAPTERS[vendor], "error_text", None):
+        found = "\n".join(part for part in (found, extract(log_text)) if part)
     if rc in (124, 137):
         return "timeout", None
     if re.search(AUTH, found, re.I):

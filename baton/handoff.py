@@ -363,7 +363,7 @@ def _fix_push_binding_valid(item, binding):
 def _dev_push_binding_valid(item, binding):
     attempts = binding.get("attempts")
     return (binding.get("issue") == item
-            and binding.get("vendor") in ("claude", "codex", "cursor")
+            and binding.get("vendor") in agents.ADAPTERS
             and isinstance(binding.get("title"), str) and bool(binding["title"])
             and isinstance(binding.get("body_text"), str)
             and isinstance(binding.get("base"), str) and bool(re.fullmatch(r"[0-9a-f]{40}", binding["base"]))

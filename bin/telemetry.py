@@ -93,14 +93,16 @@ def usage(vendor, log, status):
                     continue
                 if isinstance(row, dict) and adapter.reconnect_row(row):
                     reconnected = True
-                if isinstance(row, dict) and row.get('type') == adapter.USAGE_EVENT:
+                if isinstance(row, dict) and row.get(getattr(adapter, 'USAGE_EVENT_KEY', 'type')) == adapter.USAGE_EVENT:
                     events.append(row)
     except OSError:
         pass
     result = {'usage_state': 'unavailable', 'cost_state': 'unavailable'}
-    if len(events) != 1 or not isinstance(events[0].get('usage'), dict):
+    raw = events[0].get('usage') if len(events) == 1 else None
+    if hasattr(adapter, 'usage_of') and len(events) == 1:
+        raw = adapter.usage_of(events[0])
+    if not isinstance(raw, dict):
         return result
-    raw = events[0]['usage']
     fields = adapter.USAGE_FIELDS
     for target, source in fields.items():
         value = raw.get(source)
