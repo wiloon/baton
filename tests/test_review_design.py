@@ -137,6 +137,22 @@ def test_a_block_over_the_limit_is_an_overflow_even_without_a_screenshot_comment
         review.combined_feedback("code", "", 20, BLOCK)
 
 
+def test_a_block_without_a_screenshot_comment_fits_exactly_and_overflows_one_below():
+    code = "code " * 10
+    whole = f"{code}\n\n{BLOCK}"
+    assert review.combined_feedback(code, "", len(whole), BLOCK) == whole
+    assert review.combined_feedback(code, "", len(BLOCK), BLOCK).endswith(BLOCK)
+    with pytest.raises(review.DesignOverflow):
+        review.combined_feedback(code, "", len(BLOCK) - 1, BLOCK)
+
+
+def test_a_bulleted_empty_design_section_reserves_no_room():
+    code, _ = pieces()
+    shot = "shot\n\n## Design findings\n- none.\n\n## Checks\n1. verified"
+    out = review.combined_feedback(code, shot, 50)
+    assert len(out) <= 50   # no DesignOverflow, plain cut
+
+
 def test_a_design_section_over_the_limit_hands_off_and_sends_no_partial_item(loop):
     loop.reviews, loop.screens = ["pass", "pass"], ["pass", "pass"]
     loop.screen_texts = [FOUND, answered("D1.1. resolved — ok")]

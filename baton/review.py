@@ -255,7 +255,7 @@ def combined_feedback(code, screenshot, limit, open_block=""):
     if len(joined) <= limit:
         return joined
     shot_rest, design = design_findings.split_section(screenshot)
-    if design.partition("\n")[2].strip().lower() in ("", "none", "none."):   # nothing to keep whole
+    if re.sub(r"[-*.\s]", "", design.partition("\n")[2]).lower() in ("", "none"):   # nothing to keep whole
         shot_rest, design = screenshot, ""
     tail = "\n\n".join(part for part in (design, open_block) if part)
     if not tail:
