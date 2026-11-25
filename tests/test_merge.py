@@ -445,6 +445,22 @@ def test_a_carried_finding_whose_check_is_gone_hands_the_pr_to_the_owner(run, bo
     assert "D1.1: a.css: bottom 24 px" in run.texts["PR #335 needs a manual check"]
 
 
+def test_gate_own_read_drops_the_check_of_a_carried_finding_after_the_first_read(run, monkeypatch):
+    # merge_or_handoff's read still lists the check; only pr.gate's later read has turned the section none.
+    reads = iter([CLEAN.replace("none", TWO)])
+    monkeypatch.setattr(pr_helpers, "body", lambda pr: next(reads, CLEAN))
+    run.go(screenshot={"checks": TWO, "comment": verdicts("1. verified", "2. verified"), "design": [FINDING]})
+    assert run.labelled("ready-for-human") and not run.merged()
+    assert "D1.1: a.css: bottom 24 px" in run.texts["PR #335 needs a manual check"]
+
+
+def test_gate_takes_carried_findings_and_never_merges_when_their_check_is_gone(monkeypatch):
+    monkeypatch.setattr(pr_helpers, "body", lambda pr: CLEAN)
+    assert pr_helpers.gate("335", carried=[FINDING])["action"] == "manual_checks"
+    monkeypatch.setattr(pr_helpers, "preflight", lambda pr: None)
+    assert pr_helpers.gate("335", carried=[])["action"] == "merge"
+
+
 def test_checks_the_owner_wrote_into_the_issue_merge_once_verified(run):
     run.gh.set(body=CLEAN.replace("none", TWO),
                issues={"297": {"state": "OPEN", "body": "## Checks to verify\n- Sign up and land back on Welcome."}})

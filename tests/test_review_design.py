@@ -102,3 +102,59 @@ def test_an_earlier_loops_screenshot_comment_cannot_create_a_finding(loop, monke
     assert not loop.fixes
     [given] = loop.merge_screenshots
     assert given["design"] == [] and given["design_unusable"]
+
+
+DESIGN = ("## Design findings\n1. checks 1 — a.css: bottom 24 px vs top 18 px; unequal optical gap; "
+          "cut bottom padding to 18 px")
+BLOCK = "## Open design findings\nD1.1. checks The library. — a.css: bottom 24 px"
+
+
+def pieces():
+    code = "code review\n## Must fix\nnone\n" + "pad " * 300
+    shot = "shot review\n## Must fix\nnone\n\n" + DESIGN + "\n\n## Checks\n1. verified"
+    return code, shot
+
+
+def test_combined_feedback_keeps_every_design_item_whole_at_the_boundary():
+    code, shot = pieces()
+    whole = f"{code}\n\n{shot}\n\n{BLOCK}"
+    assert review.combined_feedback(code, shot, len(whole), BLOCK) == whole
+    cut = review.combined_feedback(code, shot, len(whole) - 1, BLOCK)
+    assert len(cut) <= len(whole) - 1 and DESIGN in cut and BLOCK in cut
+    assert cut.count("pad ") < code.count("pad ")   # only the other text is cut
+
+
+def test_combined_feedback_with_the_design_records_alone_filling_the_limit():
+    code, shot = pieces()
+    tail = f"{DESIGN}\n\n{BLOCK}"
+    assert review.combined_feedback(code, shot, len(tail), BLOCK) == tail
+    with pytest.raises(review.DesignOverflow):
+        review.combined_feedback(code, shot, len(tail) - 1, BLOCK)
+
+
+def test_a_block_over_the_limit_is_an_overflow_even_without_a_screenshot_comment():
+    with pytest.raises(review.DesignOverflow):
+        review.combined_feedback("code", "", 20, BLOCK)
+
+
+def test_a_block_without_a_screenshot_comment_fits_exactly_and_overflows_one_below():
+    code = "code " * 10
+    whole = f"{code}\n\n{BLOCK}"
+    assert review.combined_feedback(code, "", len(whole), BLOCK) == whole
+    assert review.combined_feedback(code, "", len(BLOCK), BLOCK).endswith(BLOCK)
+    with pytest.raises(review.DesignOverflow):
+        review.combined_feedback(code, "", len(BLOCK) - 1, BLOCK)
+
+
+def test_a_bulleted_empty_design_section_reserves_no_room():
+    code, _ = pieces()
+    shot = "shot\n\n## Design findings\n- none.\n\n## Checks\n1. verified"
+    out = review.combined_feedback(code, shot, 50)
+    assert len(out) <= 50   # no DesignOverflow, plain cut
+
+
+def test_a_design_section_over_the_limit_hands_off_and_sends_no_partial_item(loop):
+    loop.reviews, loop.screens = ["pass", "pass"], ["pass", "pass"]
+    loop.screen_texts = [FOUND, answered("D1.1. resolved — ok")]
+    assert screen_run(loop, REVIEW_CONTEXT_MAX_CHARS="100") == 0
+    assert not loop.fixes and not loop.merged and loop.labelled("ready-for-human")
