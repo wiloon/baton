@@ -2,7 +2,7 @@
 from contextlib import contextmanager
 from dataclasses import dataclass
 
-from . import capacity, vendor_policy
+from . import agents, capacity, vendor_policy
 
 
 @dataclass(frozen=True)
@@ -18,8 +18,8 @@ def candidates(config):
     for vendor in (*config.pool(), *config.extra()):
         if not config.allows(vendor, "retrospective"):
             continue
-        model = getattr(settings, f'model_{vendor}')
-        effort = ('xhigh' if '-xhigh' in model else 'high') if vendor == 'cursor' else settings.effort
+        model = config.analyst_model(vendor)
+        effort = agents.ADAPTERS[vendor].analyst_effort(model, settings.effort)
         result.append(Analyst(vendor, model, effort))
     return result
 

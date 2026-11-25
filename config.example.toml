@@ -318,6 +318,10 @@ enable_claudeai_mcp_servers = false
 
 # Optional evidence analysis: share review quota/preference policy, restricted to Opus/Sol/Grok 4.7.
 # Declared [vendors.*] tables determine which CLI vendors are enabled and which roles they run.
+# An adapter declares what a role can use (its supported roles, analyst command, approved model
+# family, environment and budget enforcement); a vendor's `roles` grant picks which of them run.
+# model_claude, model_codex and model_cursor are the only model settings: an adapter without
+# one uses its built-in alias, resolved through the alias table (an unknown alias is an error).
 # preferences.retrospective overrides preferences.reviewer for this role (otherwise reused).
 [retrospectives]
 enabled = false

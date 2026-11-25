@@ -566,6 +566,16 @@ def test_an_issue_push_record_accepts_landed_but_never_finished(env, monkeypatch
         handoff.load_retry(env, "1", reason)
 
 
+def test_a_dev_push_record_for_a_non_built_in_vendor_is_resumed(env, monkeypatch):
+    from types import SimpleNamespace
+    from baton import dev
+    monkeypatch.setattr(handoff, "clock", lambda: 1_000)
+    binding = {**issue_push_binding("1"), "vendor": "stub", "attempts": [["stub", "stub-1", "c" * 40, "a" * 40]]}
+    assert handoff.prepare_retry(env, "1", "dev_push_failed", "1", binding) is not None
+    found = dev.waiting_dev_push(SimpleNamespace(env=env), env, "1")
+    assert found is not None and found["continuation"]["vendor"] == "stub"
+
+
 def test_a_damaged_retry_record_hands_off_without_replaying(env, monkeypatch):
     """An unreadable retry must fail closed: no fresh budget, no lookup replay."""
     labelled = []

@@ -116,6 +116,26 @@ def last_result(text):
     return found
 
 
+MODEL_CODE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,127}')
+
+
+def analyst_rows(text):
+    """The JSON objects of an analyst CLI's output."""
+    return [obj for _, obj in events(text) if isinstance(obj, dict)]
+
+
+def analyst_result(rows):
+    return next((r for r in reversed(rows) if r.get('type') == 'result'), {})
+
+
+def analyst_tool_use(rows):
+    """Any event showing the tool-free analyst used a tool."""
+    return any(r.get('type') in ('tool_call', 'tool_use') or
+               (isinstance(r.get('item'), dict) and r['item'].get('type') in
+                ('command_execution', 'file_change', 'mcp_tool_call', 'web_search'))
+               for r in rows)
+
+
 def permission_denials(log):
     """The commands Claude's permission mode denied in that run, from its result event (#53)."""
     denied = last_result(read(log)).get("permission_denials") if log else None

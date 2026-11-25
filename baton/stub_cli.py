@@ -6,12 +6,20 @@ reset and no image support. Production hosts leave it undeclared; tests admit it
 """
 import json
 
+from .common import MODEL_CODE, analyst_result, analyst_rows, analyst_tool_use
 from .common import Run, changed, child_env, events, git, last_result, outcome_line, read, restore, run_cli
 
 ID = "stub"
 DISPLAY_NAME = "Stub"
 ANALYST_ALIAS = "stub_fast"
-SUPPORTED_ROLES = frozenset({"dev", "fixer", "reviewer", "spec_reviewer"})
+ANALYST_FAMILY = r"stub-\d+"
+ANALYST_REQUEST_FAMILY = ANALYST_FAMILY
+ANALYST_MIXED_MODELS = False
+ANALYST_BUDGET = "deadline_and_call_caps"
+ANALYST_ENV_KEEP = ()
+ANALYST_ENV_STRIP = ()
+ANALYST_ENV_SET = {}
+SUPPORTED_ROLES = frozenset({"dev", "fixer", "reviewer", "spec_reviewer", "retrospective"})
 QUOTA_SOURCE = "probe-run"
 QUOTA_WINDOWS = frozenset({"seven_day"})
 QUOTA_ERROR = r"stub quota exhausted|stub_usage_limit"
@@ -161,6 +169,30 @@ def run(req):
 
 def reconnect_row(row):
     return False
+
+
+def analyst_effort(model, default):
+    return default
+
+
+def analyst_command(settings, analyst, workspace, env):
+    return ["stub-agent", "-p", "--model", analyst.model, "--effort", analyst.effort,
+            "--output-format", "stream-json"]
+
+
+def analyst_response(text):
+    """(rows, reply, valid, actual model, models, tool_use) of the analyst's output."""
+    rows = analyst_rows(text)
+    result = analyst_result(rows)
+    model = main_model(text)
+    actual = model if MODEL_CODE.fullmatch(model) else "unknown"
+    reply = final_message(text) or result.get("result", "")
+    valid = bool(result) and not result.get("is_error") and result.get("subtype") == "success"
+    return rows, reply, valid, actual, [], analyst_tool_use(rows)
+
+
+def analyst_quota(lines, home):
+    return parse_quota_log(lines)
 
 
 def log_model(row, codex_home=None):

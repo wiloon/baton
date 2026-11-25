@@ -119,6 +119,16 @@ existing alternatives, replacement criteria and the proposed boundary for model-
 - whatever the watched repository's own checks need (its toolchain; `mise.toml` here pins one
   for everything under `~/baton`, edit it to suit)
 
+Each CLI is an adapter registered in `baton/agents.py` (`ADAPTERS`). An adapter module declares
+the capabilities and policies of its CLI as constants: the roles it can run, its quota source,
+its review and fix protocol, and, for retrospectives, its analyst command, approved model family,
+environment and budget enforcement. Config only enables a vendor (`[vendors.<id>]`) and grants it
+roles from the adapter's supported set; a grant for a role the adapter lacks is a config error.
+Preferences order the vendors that are eligible for a role and never widen the grant. The
+retrospective model comes from `retrospectives.model_<id>` for Claude, Codex and Cursor; any other
+adapter uses its built-in alias, resolved through `[models.aliases]`. Adding an adapter means adding
+its module and one `ADAPTERS` entry, with no new config fields.
+
 The watched repository explains its conventions (tests, CI command, commit style) in its own
 `AGENTS.md`; the agents read it like any other agent would.
 

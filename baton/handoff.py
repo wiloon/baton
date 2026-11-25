@@ -486,8 +486,8 @@ def _fix_meta_write_binding_valid(item, binding, *, reason):
                     or not isinstance(context["fix_source"], str)):
                 return False
         resume = binding.get("resume")
-        if binding["fixer"] == "cursor" and resume is None:
-            return True    # Legacy Cursor records predate the stored resume base.
+        if getattr(agents.ADAPTERS.get(binding["fixer"]), "LEGACY_REPLY_RESUME", False) and resume is None:
+            return True    # Legacy reply-protocol records predate the stored resume base.
         return _description_resume_valid(resume)
     return False
 
