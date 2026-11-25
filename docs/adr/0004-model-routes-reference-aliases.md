@@ -131,3 +131,11 @@ The config remains valid and normal cross-vendor selection applies.
   so selection, validation and dispatch use the screenshot model consistently.
 - Issue #103: require routes only for declared, allowed roles and express phase and model
   evidence rules through adapter policies to keep existing assignments and safeguards.
+- Issue #109, round 1: agy (Gemini only) follows the writer-model policy with effort-stripped
+  model comparison. The actual model must come from the run (`init.model`, or a `cli.log`
+  entry tied to the run's conversation id), never the requested alias. A run without it
+  fails; there is no exception to this ADR.
+- Issue #109, round 2: a `cli.log` display label is mapped to a model ID by a stated
+  rule (`Gemini 4 Neon (High)` → `gemini-4-neon-high`) before the Gemini and
+  requested-model checks. If the real CLI offers neither `init.model` nor a run-tied
+  `cli.log` entry, agy is not enabled.

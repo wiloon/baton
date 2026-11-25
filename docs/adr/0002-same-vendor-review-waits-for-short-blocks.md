@@ -57,3 +57,7 @@ eligibility policy (ADRs 0004 and 0005).
   review Claude-written code too, on a distinct model only (Opus after Sonnet). Claude records
   the writer's model; `SAME_VENDOR_SAME_MODEL` keeps the same-model fresh-session fallback to
   Codex. Revert by setting Claude's `SAME_VENDOR_REVIEW` back to `False`.
+- Issue #109, round 1: agy declares `SAME_VENDOR_REVIEW = True`, `RECORDS_AUTHOR_MODEL = True`,
+  `SAME_VENDOR_SAME_MODEL = False` (owner rule #221). Its `distinct_models` strips the effort
+  suffix, and config requires agy's `review` route model to be distinct from its `dev`, `fix`
+  and `fix_followup` route models, so the never-stall fallback exists.
