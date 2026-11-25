@@ -251,7 +251,7 @@ def test_storage_lock_serializes_processes_and_preserves_merged_windows(tmp_path
     state = str(tmp_path)
     marker = tmp_path/'writer-started'
     script = '''
-from baton import claude_cli, codex_cli, cursor_cli, quota
+from baton import quota
 from pathlib import Path
 import sys
 Path(sys.argv[2]).touch()
