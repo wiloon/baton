@@ -23,7 +23,7 @@ import subprocess
 import sys
 import time
 
-from . import advisor, after_merge, check_verdicts, checkpoint, checks, ci, fix, hooks as telemetry, names, notify, pick, pr as pr_helpers, pr_contract
+from . import advisor, after_merge, check_verdicts, checkpoint, checks, ci, design_findings, fix, hooks as telemetry, names, notify, pick, pr as pr_helpers, pr_contract
 from .common import Deferred, git
 
 
@@ -304,10 +304,21 @@ class Merger:
         listed = checks.items(body)
         if not listed or listed != check_verdicts.items(screenshot.get("checks") or ""):
             return None
+        if screenshot.get("design_unusable"):
+            return None
         verdicts = check_verdicts.parse(screenshot.get("comment") or "", len(listed))
         if verdicts is None:
             return None
-        return [item for item, verdict in zip(listed, verdicts) if verdict != "verified"]
+        # A check an open design finding blocks is never verified, whatever its line says (#96).
+        held = design_findings.blocked(screenshot.get("design") or ())
+        return [item for item, verdict in zip(listed, verdicts) if verdict != "verified" or item in held]
+
+    def orphaned_design(self, screenshot, body):
+        """The open design findings whose check no current check carries (the checks changed after
+        the review that raised them, or the section is now none): the owner decides."""
+        listed = checks.items(body or "")
+        return [item for item in (screenshot or {}).get("design") or ()
+                if any(check not in listed for check in item["checks"])]
 
     def owed(self, left, body):
         """What a hand-off shows the owner: the checks left after a usable screenshot review,
@@ -650,6 +661,12 @@ class Merger:
         body, left = None, None
         try:
             body = pr_helpers.body(pr)
+            orphans = self.orphaned_design(screenshot, body)
+            if orphans:
+                self.handoff("manual_checks", f"PR #{pr} needs a manual check",
+                             "Review and CI passed, but open design findings no longer match the PR's checks:"
+                             + "".join(f"\n- {item['id']}: {item['text']}" for item in orphans) + f"\n{url}")
+                return
             left = self.left_for_owner(screenshot, body)
             gate = pr_helpers.gate(pr, cleared=screenshot["checks"] if left == [] else None)
         except Exception:

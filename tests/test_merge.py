@@ -402,6 +402,32 @@ def test_anything_short_of_verified_checks_goes_to_the_owner(run, case):
     assert caption.startswith("PR #335: Checks for you\n") and caption.splitlines()[3:] == lines
 
 
+FINDING = {"id": "D1.1", "checks": [ONE], "text": "a.css: bottom 24 px vs top 18 px; add 6 px"}
+
+
+def test_a_check_an_open_design_finding_blocks_is_never_cleared_by_its_verified_line(run):
+    run.gh.set(body=CLEAN.replace("none", TWO))
+    run.go(screenshot={"checks": TWO, "comment": verdicts("1. verified", "2. verified"), "design": [FINDING]})
+    assert run.labelled("ready-for-human") and not run.merged()
+    text = run.texts["PR #335 needs a manual check"]
+    assert ONE in text and SIGNUP not in text
+
+
+def test_design_findings_with_unusable_verdicts_send_every_check_to_the_owner(run):
+    run.gh.set(body=CLEAN.replace("none", TWO))
+    run.go(screenshot={"checks": TWO, "comment": verdicts("1. verified", "2. verified"), "design_unusable": True})
+    assert run.labelled("ready-for-human") and not run.merged()
+    assert ONE in run.texts["PR #335 needs a manual check"] and SIGNUP in run.texts["PR #335 needs a manual check"]
+
+
+@pytest.mark.parametrize("body", ["none", "- Another check."])
+def test_a_carried_finding_whose_check_is_gone_hands_the_pr_to_the_owner(run, body):
+    run.gh.set(body=CLEAN.replace("none", body))
+    run.go(screenshot={"checks": TWO, "comment": verdicts("1. verified", "2. verified"), "design": [FINDING]})
+    assert run.labelled("ready-for-human") and not run.merged()
+    assert "D1.1: a.css: bottom 24 px" in run.texts["PR #335 needs a manual check"]
+
+
 def test_checks_the_owner_wrote_into_the_issue_merge_once_verified(run):
     run.gh.set(body=CLEAN.replace("none", TWO),
                issues={"297": {"state": "OPEN", "body": "## Checks to verify\n- Sign up and land back on Welcome."}})
