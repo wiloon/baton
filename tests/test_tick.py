@@ -2672,3 +2672,29 @@ def test_a_failed_release_leaves_the_label_and_does_not_block_another_issue(ctx,
     monkeypatch.setattr(spec, "verdict_plan", lambda env, n, listed=None: "plan")
     assert ctx.make().next_issue() == "12"
     assert "#5:" in ctx.log() and "not released" in ctx.log()
+
+
+def test_run_releases_a_closed_pr_issue_and_dispatches_dev_for_the_next(ctx, monkeypatch):
+    started = []
+    monkeypatch.setattr(dev, "run", lambda t, n: started.append(n) or 80)
+    monkeypatch.setattr(spec, "verdict_plan", lambda env, n, listed=None: "plan")
+    wip(ctx, ready=[issue(12)])
+    history(ctx, 5, closed=[146])
+    assert ctx.make().run() == 0
+    assert released(ctx, 5) and "#5: released agent-wip (no open PR)" in ctx.log()
+    assert started == ["12"]
+
+
+@pytest.mark.parametrize("failure", ["unsettled", "lookup"])
+def test_run_keeps_an_unreleasable_label_uncounted_and_starts_another(ctx, monkeypatch, failure):
+    started = []
+    monkeypatch.setattr(dev, "run", lambda t, n: started.append(n) or 80)
+    monkeypatch.setattr(spec, "verdict_plan", lambda env, n, listed=None: "plan")
+    wip(ctx, ready=[issue(12)])
+    if failure == "unsettled":
+        history(ctx, 5, merged=[7])
+    else:
+        history(ctx, 5, closed=[146], fail=True)
+    assert ctx.make().run() == 0
+    assert not released(ctx, 5)
+    assert started == ["12"]

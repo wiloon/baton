@@ -48,10 +48,10 @@ may be in flight before baton starts a new one. A PR waiting for the owner (`rea
 not counted. A PR whose next agent step was deferred for vendor quota or cooldown lends its slot
 until that step runs again without a deferral, so another vendor can start the next issue. At most
 `max_pending_prs + 1` counted issues are in flight through normal scheduling. An `agent-wip` issue
-with no open PR holds no slot: when its newest PR on either agent branch was closed without merging
-(or its merge is already settled), baton removes `agent-wip` and logs `released agent-wip (no open
-PR)`; an unsettled merge keeps the label but is not counted, and a failed lookup leaves the label and
-retries next tick. When the cap blocks a start, the log lists each in-flight issue, its PR, and the
+with no open PR holds no slot: unless its newest PR on either agent branch is a merge not yet
+settled, baton removes `agent-wip` (also when the issue has no PR at all, such as an interrupted or
+deferred dev run) and logs `released agent-wip (no open PR)`; an unsettled merge keeps the label but
+is not counted, and a failed lookup leaves the label and retries next tick. When the cap blocks a start, the log lists each in-flight issue, its PR, and the
 saved deferral reason.
 
 **Picking a vendor.** For each run, baton drops the vendors that are resting after a limit or an
