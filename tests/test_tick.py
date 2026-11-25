@@ -594,9 +594,10 @@ def test_an_issue_with_a_pr_is_skipped(ctx, monkeypatch, branch):
 
 def test_new_work_waits_while_an_issue_awaits_review(ctx):
     issues(ctx, ready=[issue(12)], pending=1)
+    ctx.gh.answers["pr list"] = [{"number": 30, "headRefName": "agent/issue-0", "labels": []}]
     assert ctx.make().next_issue() == ""
     assert "1 issue(s) still waiting on review (agent-wip), cap 1, 0 deferred, 1 not deferred" in ctx.log()
-    assert "#0: no open PR" in ctx.log()
+    assert "#0: PR #30 in review" in ctx.log()
 
 
 # --- a PR deferred on quota lends its slot (#99) --------------------------------------------------------------
@@ -739,13 +740,13 @@ def test_the_slots_lent_are_bounded(ctx, monkeypatch, cap, wip, deferred, starte
 
 def test_the_cap_log_names_issues_prs_states_and_reasons(ctx, monkeypatch):
     pr_state(ctx)
-    flight(ctx, wip=[5, 6], ready=[issue(12)], prs={5: 11})
+    flight(ctx, wip=[5, 6], ready=[issue(12)], prs={5: 11, 6: 12})
     defer_loop(monkeypatch)
     deferred_review(ctx, [11])
     assert ctx.make().next_issue() == ""
     log = ctx.log()
     assert "2 issue(s) still waiting on review (agent-wip), cap 1, 1 deferred, total limit 2 reached" in log
-    assert f"#5: PR #11 deferred (pool {QUOTA})" in log and "#6: no open PR" in log
+    assert f"#5: PR #11 deferred (pool {QUOTA})" in log and "#6: PR #12 in review" in log
 
 
 def test_a_resumed_review_that_completes_returns_the_slot(ctx, monkeypatch):
@@ -833,7 +834,7 @@ def test_a_live_pr_beyond_the_first_page_keeps_its_loan(ctx, monkeypatch):
 
 def test_wip_issues_beyond_the_first_page_count_toward_the_cap(ctx, monkeypatch):
     numbers = list(range(100, 201))
-    flight(ctx, wip=numbers[:100], ready=[issue(12)])
+    flight(ctx, wip=numbers[:100], ready=[issue(12)], prs={n: n + 1000 for n in numbers})
     no_vendor_blocked(monkeypatch)
     ctx.gh.answers["api repos/owner/app/issues?state=open&labels=agent-wip&per_page=100"] = [
         [{"number": n} for n in numbers[:100]], [{"number": numbers[-1]}]]
@@ -858,9 +859,10 @@ def test_an_agent_fix_deferred_in_vendor_selection_lends_its_slot(ctx, monkeypat
     assert ctx.path("slot-deferred-11").exists()
     no_vendor_blocked(monkeypatch)
     assert ctx.make().next_issue() == "12"
-    # closure of the PR with no review checkpoint: the next admission discards the marker
+    # closure of the PR with no review checkpoint: the next admission discards the marker and releases the issue
     flight(ctx, wip=[5], ready=[issue(12)], prs={})
-    assert ctx.make().next_issue() == ""
+    history(ctx, 5, closed=[11])
+    assert ctx.make().next_issue() == "12"
     assert not ctx.path("slot-deferred-11").exists()
 
 
@@ -2598,3 +2600,101 @@ def test_item_finalization_clears_the_recorded_reply_owner_files(ctx):
     tick_run.finish_item(1)
     for name in names:
         assert not ctx.path(name).exists(), name
+
+
+# --- an agent-wip issue without an open PR releases its slot (#155) ----------------------------------------------
+def history(ctx, n, closed=(), merged=(), fail=False):
+    """PR history of issue N on its agent branch; the legacy branch has none."""
+    def pr(number, merged_at):
+        return {"number": number, "state": "closed", "merged_at": merged_at, "base": {"ref": "main"},
+                "head": {"ref": f"agent/issue-{n}", "repo": {"full_name": "owner/app"}}}
+    key = f"api repos/owner/app/pulls?state=all&head=owner:agent/issue-{n}&per_page=100"
+    if not fail:
+        ctx.gh.answers[key] = [[pr(x, None) for x in closed] + [pr(x, "2026-01-01T00:00:00Z") for x in merged]]
+    ctx.gh.answers[f"api repos/owner/app/pulls?state=all&head=owner:cursor/issue-{n}&per_page=100"] = [[]]
+
+
+def wip(ctx, n=5, ready=()):
+    ctx.gh.answers["issue list"] = lambda args: [{"number": n}] if "agent-wip" in args else (
+        [] if "claude-found" in args else list(ready))
+    for item in ready:
+        label_history(ctx, item["number"], [label_event(1, "owner")])
+
+
+def released(ctx, n):
+    return [c for c in ctx.gh.calls if c[:3] == ["issue", "edit", str(n)] and "agent-wip" in c]
+
+
+def test_an_issue_whose_only_pr_was_closed_is_released_and_the_next_one_starts(ctx, monkeypatch):
+    wip(ctx, ready=[issue(12)])
+    history(ctx, 5, closed=[146])
+    monkeypatch.setattr(spec, "verdict_plan", lambda env, n, listed=None: "plan")
+    assert ctx.make().next_issue() == "12"
+    assert released(ctx, 5) and "#5: released agent-wip (no open PR)" in ctx.log()
+
+
+def test_a_released_issue_that_is_not_eligible_is_not_started(ctx):
+    wip(ctx, ready=[issue(12, labels=["ready-for-agent", "needs-info"])])
+    history(ctx, 5, closed=[146])
+    assert ctx.make().next_issue() == ""
+    assert released(ctx, 5)
+
+
+def test_the_newest_pr_decides_not_an_older_merged_one(ctx):
+    wip(ctx)
+    history(ctx, 5, closed=[9], merged=[7])
+    ctx.make().next_issue()
+    assert released(ctx, 5)
+
+
+def test_an_unsettled_merge_keeps_the_label_without_holding_a_slot(ctx, monkeypatch):
+    wip(ctx, ready=[issue(12)])
+    history(ctx, 5, merged=[7])
+    monkeypatch.setattr(spec, "verdict_plan", lambda env, n, listed=None: "plan")
+    assert ctx.make().next_issue() == "12"
+    assert not released(ctx, 5) and "#5: merged PR #7 is not settled" in ctx.log()
+
+
+def test_a_settled_merge_releases_the_label(ctx):
+    wip(ctx)
+    history(ctx, 5, merged=[7])
+    ctx.path("task-merged-pr-7").touch()
+    ctx.make().next_issue()
+    assert released(ctx, 5)
+
+
+@pytest.mark.parametrize("failure", ["lookup", "label"])
+def test_a_failed_release_leaves_the_label_and_does_not_block_another_issue(ctx, monkeypatch, failure):
+    wip(ctx, ready=[issue(12)])
+    history(ctx, 5, closed=[146], fail=failure == "lookup")
+    if failure == "label":
+        ctx.gh.fails.add("issue edit")
+    monkeypatch.setattr(spec, "verdict_plan", lambda env, n, listed=None: "plan")
+    assert ctx.make().next_issue() == "12"
+    assert "#5:" in ctx.log() and "not released" in ctx.log()
+
+
+def test_run_releases_a_closed_pr_issue_and_dispatches_dev_for_the_next(ctx, monkeypatch):
+    started = []
+    monkeypatch.setattr(dev, "run", lambda t, n: started.append(n) or 80)
+    monkeypatch.setattr(spec, "verdict_plan", lambda env, n, listed=None: "plan")
+    wip(ctx, ready=[issue(12)])
+    history(ctx, 5, closed=[146])
+    assert ctx.make().run() == 0
+    assert released(ctx, 5) and "#5: released agent-wip (no open PR)" in ctx.log()
+    assert started == ["12"]
+
+
+@pytest.mark.parametrize("failure", ["unsettled", "lookup"])
+def test_run_keeps_an_unreleasable_label_uncounted_and_starts_another(ctx, monkeypatch, failure):
+    started = []
+    monkeypatch.setattr(dev, "run", lambda t, n: started.append(n) or 80)
+    monkeypatch.setattr(spec, "verdict_plan", lambda env, n, listed=None: "plan")
+    wip(ctx, ready=[issue(12)])
+    if failure == "unsettled":
+        history(ctx, 5, merged=[7])
+    else:
+        history(ctx, 5, closed=[146], fail=True)
+    assert ctx.make().run() == 0
+    assert not released(ctx, 5)
+    assert started == ["12"]
