@@ -94,3 +94,27 @@ def test_the_answer_window_takes_this_loops_replies_since_the_previous_screensho
     assert review.fix_replies(comments, "o", "L", 1, 3) == [reply, second]
     assert review.fix_replies(comments, "o", "L", 2, 3) == [second]
     assert review.fix_replies(comments, "o", "L", 1, 2) == [reply]
+
+
+WHY = ("24 px is the brand spacing, " + "set by the design system and shared by every page, " * 4).strip()
+LONG_REJECT = f"## Must fix\nnone\n\n## Design findings\nD1.1. rejected — {WHY}\n"
+OPEN = ("D1.1. checks The library at 390 px and 1280 px. — a.css: bottom 24 px vs top 18 px; unequal optical gap; cut bottom padding to 18 px"
+        f" [fixer answer: rejected — {WHY}]")
+
+
+def boundary_run(loop, limit):
+    loop.reviews, loop.screens = ["pass", "pass"], ["pass", "pass"]
+    loop.screen_texts = [FOUND, answered("D1.1. held — still 24 px")]
+    loop.fix_replies = [(LONG_REJECT, None)]
+    return screen_run(loop, REVIEW_CONTEXT_MAX_CHARS=str(limit))
+
+
+def test_the_round_two_open_design_record_fits_exactly_at_the_limit(loop):
+    assert boundary_run(loop, len(OPEN)) == 0
+    assert len(loop.fixes) == 1 and OPEN in loop.agents[3]["prompt"]
+
+
+def test_the_round_two_open_design_record_one_char_over_hands_off_without_the_agent(loop):
+    assert boundary_run(loop, len(OPEN) - 1) == 0
+    assert len(loop.fixes) == 1 and len(loop.agents) == 3   # no round-2 screenshot agent
+    assert loop.labelled("ready-for-human")
