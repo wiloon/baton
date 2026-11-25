@@ -567,6 +567,16 @@ def test_a_merged_partial_pr_releases_its_task_once(run):
     assert Path(run.env["STATE"], "last-slice-297").read_text() == f"{PR}\n"
 
 
+def test_a_failed_pr_read_returns_false_and_changes_nothing(run):
+    run.gh.set(open_prs=[], body=PARTIAL)
+    sh(run.wt, "git", "push", "-q", "origin", "HEAD:main")
+    sh(run.repo, "git", "fetch", "-q", "origin")
+    run.gh.fail("view")
+    assert not run.merger().finish_merged_task()
+    assert not Path(run.env["STATE"], f"task-merged-pr-{PR}").exists()
+    assert not [c for c in run.gh.calls() if c[:2] == ["issue", "edit"]]
+
+
 def test_a_merged_slice_closes_its_dev_grants_but_not_the_next_slices_on_reentry(run):
     from baton import session
     env = session.resolve(run.env)
