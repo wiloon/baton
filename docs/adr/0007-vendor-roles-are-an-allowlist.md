@@ -42,8 +42,22 @@ of adapters supplies validation and dispatch. Adding an adapter requires a catal
   keeps the original fix base for verifying local commits. Existing unmarked pending requests
   can be resumed by the adapter that provided the legacy reply protocol (Cursor).
 
+- Retrospective analysis takes its model from the fixed `model_<id>` setting when the
+  config has one (claude, codex, cursor). An adapter without such a field uses
+  `ANALYST_ALIAS` resolved through the merged alias catalog (`BUILTIN_ALIASES` plus the host's
+  `[models.aliases]`, as today), with no override; an unknown alias is a `ConfigError`. A
+  `retrospectives.model_<id>` key for an adapter without that field is a `ConfigError`, not a
+  `TypeError`. The adapter's own model-family check applies.
+  Every registered adapter, the stub included, defines the analyst constants, so code that
+  iterates `agents.ADAPTERS` never hits a missing attribute. Each adapter also contributes its
+  analyst environment keep/strip/set constants; the runner applies their union.
+
 ## Revision record
 
+- Issue #115: define the analyst model source for adapters without a `model_<id>` field,
+  because no new config fields are allowed.
+- Issue #115 (round 2): the alias resolves through the merged catalog, not `BUILTIN_ALIASES`
+  alone, because the stub's `stub_fast` is not a built-in alias.
 - Issue #103: record the hard role allowlist and its effect on selection, waiting and handoff.
 - Issue #106: route behaviour through registered adapter capabilities so another adapter can
   use existing workflow roles without adding vendor branches or new configuration fields.
