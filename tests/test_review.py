@@ -2862,6 +2862,7 @@ def test_adapters_declare_review_capabilities():
         "claude": ("review-prompt.md", "artifact", "diff_size", "write", False),
         "codex": ("codex-review-prompt.md", "artifact", "direct", "final_message", False),
         "cursor": ("cursor-review-prompt.md", "reply", "none", "", True),
+        "agy": ("agy-review-prompt.md", "reply", "none", "", True),
         "stub": ("stub-review-prompt.md", "reply", "none", "", True),
     }
     for vendor, (template, delivery, skill, shots, pin) in expected.items():

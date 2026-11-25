@@ -119,19 +119,20 @@ def test_stub_is_registered_with_declared_capabilities():
 
 def test_adapters_declare_same_vendor_review():
     assert {name: a.SAME_VENDOR_REVIEW for name, a in agents.ADAPTERS.items()} == {
-        "claude": True, "codex": True, "cursor": False, "stub": False}
+        "claude": True, "codex": True, "cursor": False, "agy": True, "stub": False}
     assert {name: a.SAME_VENDOR_SAME_MODEL for name, a in agents.ADAPTERS.items()} == {
-        "claude": False, "codex": True, "cursor": False, "stub": False}
+        "claude": False, "codex": True, "cursor": False, "agy": False, "stub": False}
 
 
 def test_adapters_declare_the_spec_same_vendor_policy():
     assert {name: a.SPEC_SAME_VENDOR for name, a in agents.ADAPTERS.items()} == {
-        "claude": "alternating-phase", "codex": "known-distinct-model", "cursor": "", "stub": ""}
+        "claude": "alternating-phase", "codex": "known-distinct-model", "cursor": "",
+        "agy": "known-distinct-model", "stub": ""}
     assert {name: a.SPEC_TEMPLATE for name, a in agents.ADAPTERS.items()} == {
         "claude": "spec-prompt.md", "codex": "codex-spec-prompt.md", "cursor": "spec-prompt.md",
-        "stub": "spec-prompt.md"}
+        "agy": "spec-prompt.md", "stub": "spec-prompt.md"}
     assert {name: a.SPEC_UNMARKED_REVIEWER for name, a in agents.ADAPTERS.items()} == {
-        "claude": True, "codex": False, "cursor": False, "stub": False}
+        "claude": True, "codex": False, "cursor": False, "agy": False, "stub": False}
 
 
 def test_config_load_admits_stub_and_rejects_unsupported_role(tmp_path):

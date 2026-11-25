@@ -520,7 +520,7 @@ def _load_vendors(raw, directory, home, aliases):
             raise ConfigError(f"{label}.cache_dirs: expected an array of strings")
         cache = tuple(_path(v, directory, home) for v in cache)
         probe = entry.get("quota_probe_model", "")
-        if cli.PROBE_SENDS_MODEL:
+        if cli.PROBE_SENDS_MODEL or probe:
             probe = _model_alias(probe, aliases, f"{label}.quota_probe_model")
         vendors.append(Vendor(vendor_id, adapter, tuple(roles), quota, float(cap), max_minutes,
                               five_hour_max, fallback, cache, probe))
@@ -573,6 +573,31 @@ def _model_routes(raw, aliases, vendors):
     return tuple(routes)
 
 
+def _check_adapter_models(vendors, routes):
+    """An adapter's valid_model(id) judges every resolved model of its routes (follow-ups too), its
+    fallback models and its probe model; aliases are global, so the check is on the resolved ID. An
+    adapter with DISTINCT_REVIEW_MODEL needs its review routes' models to differ from its write routes'."""
+    for vendor in vendors:
+        adapter = agents.ADAPTERS[vendor.adapter]
+        valid = getattr(adapter, "valid_model", None)
+        if valid is None:
+            continue
+        own = [(f"models.routes.{name}.{vendor.id}.model", route.model)
+               for name, provider, route in routes if provider == vendor.id]
+        own += [(f"vendors.{vendor.id}.fallback_models", model) for model in vendor.fallback_models]
+        own += [(f"vendors.{vendor.id}.quota_probe_model", vendor.quota_probe_model)] if vendor.quota_probe_model else []
+        for field, model in own:
+            if not valid(model):
+                raise ConfigError(f"{field}: {vendor.id} does not accept model {model}")
+        if getattr(adapter, "DISTINCT_REVIEW_MODEL", False) and "reviewer" in vendor.roles:
+            by_name = {name: route.model for name, provider, route in routes if provider == vendor.id}
+            for review in ("review", "review_followup"):
+                for write in ("dev", "fix", "fix_followup"):
+                    if review in by_name and write in by_name and not adapter.distinct_models(by_name[review], by_name[write]):
+                        raise ConfigError(f"models.routes.{review}.{vendor.id}: model {by_name[review]} must be "
+                                          f"distinct from the {write} route's {by_name[write]} (effort alone is not distinct)")
+
+
 def _validate_coverage(config):
     if not config.pool():
         raise ConfigError("vendors: at least one vendor with quota = pool is required")
@@ -621,6 +646,7 @@ def load(path: str | Path, *, home: Path | None = None) -> Config:
     home = home or Path.home()
     vendors = _load_vendors(data["vendors"], source.parent, home, aliases)
     routes = _model_routes(models.pop("routes", None), aliases, vendors)
+    _check_adapter_models(vendors, routes)
     sections = {name: _section(name, cls, data[name], source.parent, home)
                 for name, cls in SECTIONS.items()}
     sections.update({name: _section(name, cls, data[name], source.parent, home)

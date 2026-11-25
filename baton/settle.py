@@ -131,6 +131,10 @@ def _probe(state, logs, vendor, model):
     if adapter.QUOTA_SOURCE == "api":
         refresh_api(state, vendor)
         return
+    if adapter.QUOTA_SOURCE == "none":
+        # No quota data to read and no agent to run: the probe only checks the login is there.
+        record_credential(state, vendor, "auth_expired" if agents.preflight(vendor) else "authenticated")
+        return
     log = Path(logs, f"{time.strftime('%F-%H%M%S')}-quota-probe-{vendor}.jsonl")
     hooks = telemetry.from_env()  # Global overhead, never charged to an issue's task totals.
     probe_run = hooks.begin(vendor, "probe", 2, requested_model=model if adapter.PROBE_SENDS_MODEL else "")

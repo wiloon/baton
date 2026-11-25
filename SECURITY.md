@@ -22,6 +22,7 @@ can contain prompt injection.
 | Claude Code | CLI permissions and `bin/guard.sh` reject known operations | Shell command filters do not constrain everything an allowed interpreter, test or build can do. |
 | Codex | CLI read-only or workspace-write sandbox; network configured by role | Reads and child processes follow the installed CLI's sandbox policy; dev/fix can use the network and configured cache directories. |
 | Cursor | GitHub credential overrides; changes checked after read-only runs | `--force --trust` is not host isolation. Restoring tracked files after a run cannot undo arbitrary side effects. |
+| Antigravity (`agy`) | `--sandbox`, an exact `command(...)` allowlist from the repository's CI command, GitHub credential overrides; a failed write run is reset to its start commit and changes after a read-only run are reverted | The allowlist admits whole programs (an allowed interpreter or test runner can do more than its name suggests). Gemini models only; the model each run reports is checked against the one requested. |
 
 Setting invalid GitHub tokens in a child process does not isolate credential files, SSH agents,
 other ambient credentials, or the runner's home directory. The runner itself needs GitHub write

@@ -5,7 +5,7 @@
 baton is an unattended coding-agent runner for GitHub repositories. A systemd timer wakes it every
 ten minutes. Each time, it takes one step on an issue or pull request: review an issue's spec,
 implement it, review the PR, fix what the review or CI found, and merge. Each step hands the work
-to Claude Code, Codex or Cursor's CLI, whichever has the most of its subscription quota to spare.
+to Claude Code, Codex, Cursor or Antigravity (`agy`, Gemini models) CLI, whichever has the most of its subscription quota to spare.
 
 ## Why it exists
 
@@ -61,7 +61,8 @@ from the vendors' CLIs, refreshed by a one-turn probe run when older than `quota
 
 **Guard rails.** Claude Code uses a PreToolUse hook (`bin/guard.sh`) and permission settings
 (`bin/*settings.json`) to reject known dangerous operations. Codex uses its CLI sandbox;
-Cursor runs with `--force --trust` and checks for changes after a read-only run. These controls
+Cursor runs with `--force --trust` and checks for changes after a read-only run. Antigravity (`agy`) runs
+in `--sandbox` with an exact command allowlist and is reset after a failed or read-only run. These controls
 have different coverage. Shell filters and post-run checks do not provide host isolation:
 an allowed program or a repository's tests can perform other operations with the runner's access.
 Run baton under a dedicated account on a disposable host or VM, with credentials scoped to the
@@ -112,6 +113,9 @@ existing alternatives, replacement criteria and the proposed boundary for model-
   - Claude Code (`claude`)
   - Codex (`codex`)
   - Cursor (`cursor-agent`) as an optional extra vendor (`[vendors.cursor]` with `quota = "extra"`)
+  - Antigravity (`agy`) as an optional extra vendor (`[vendors.agy]` with `quota = "extra"`), Gemini models
+    only: a model that is not `gemini-*` is a config error, and its review route needs a model
+    distinct from its dev and fix routes (an effort suffix alone is not distinct)
 - whatever the watched repository's own checks need (its toolchain; `mise.toml` here pins one
   for everything under `~/baton`, edit it to suit)
 

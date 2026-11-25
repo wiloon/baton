@@ -37,7 +37,7 @@ case "$tool" in
     }
     if ! is_test_file; then
       jq -e '[.tool_input.content, .tool_input.new_string, .tool_input.new_source, (.tool_input.edits // [] | .[].new_string)]
-        | map(strings) | any(test("by=(cursor|codex)"))' <<<"$input" >/dev/null && deny "vendor markers are reserved for the runner"
+        | map(strings) | any(test("by=(cursor|codex|agy)"))' <<<"$input" >/dev/null && deny "vendor markers are reserved for the runner"
     fi
     # The owner's principles change only when the owner asks for it, in an interactive session.
     [[ "$p" == */docs/agents/principles.md ]] && deny "docs/agents/principles.md changes only when the owner asks for it; don't draft entries"
@@ -59,7 +59,7 @@ case "$tool" in
     has() { printf '%s\n' "$c" | grep -qE -- "$1"; }
 
     has '\.config/baton|telegram\.env|\.config/gh|\.ssh/|TELEGRAM_' && deny "secrets are off limits"
-    has 'by=(cursor|codex)' && deny "vendor markers are reserved for the runner"
+    has 'by=(cursor|codex|agy)' && deny "vendor markers are reserved for the runner"
     has "${S}(env|printenv|export)([[:space:]]|$)" && ! has "${S}env[[:space:]]+[A-Z_]+=" && deny "no dumping the environment"
 
     has "${S}git([[:space:]]+-C[[:space:]]+[^[:space:]]+)?[[:space:]]+tag\b" && deny "no git tags (v* deploys production)"
