@@ -11,6 +11,7 @@ import re
 import uuid
 
 from . import audit, timing
+from .common import MODEL_CODE
 
 VERSION = 1
 TERMINAL = {'merged', 'planned_handoff', 'abnormal_handoff'}
@@ -25,7 +26,7 @@ ATTR_FIELDS = ('verdict', 'reason', 'ci_result', 'head_sha', 'run_id', 'agent', 
 COUNTS = {*TOKENS, 'issue', 'pr', 'sequence', 'spec_rounds', 'review_rounds', 'round',
           'result', 'must_fix', 'adopted', 'rejected', 'duration_ms', 'reverts', 'issues'}
 MEASURES = {'started', 'ended', 'updated', 'timestamp', 'checked_at', 'cost_usd'}
-CODE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,127}')
+CODE = MODEL_CODE
 REPO = re.compile(r'(?!\.{1,2}/)[A-Za-z0-9_.-]+/(?!\.{1,2}$)[A-Za-z0-9_.-]+')
 
 

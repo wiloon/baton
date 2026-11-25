@@ -2,11 +2,25 @@
 access at all: it edits and commits in its worktree; the runner pushes, opens the PR
 and comments for it. A read-only run that changed anything is reset here, before a
 quota deferral could leave the change behind."""
-from .common import Run, changed, child_env, events, git, last_result, outcome_line, read, restore, run_cli
+import json
+import os
+from pathlib import Path
+
+from .common import (MODEL_CODE, Run, analyst_result, analyst_rows, analyst_tool_use, changed, child_env, events,
+                     git, last_result, outcome_line, read, restore, run_cli)
 
 ID = "cursor"
 DISPLAY_NAME = "Cursor"
 ANALYST_ALIAS = "cursor_analyst"
+# Retrospective analyst: approved models, its environment and how its budget is enforced.
+ANALYST_FAMILY = r"grok-4\.7(?:-(?:high|xhigh)(?:-fast)?)?"
+# A request must never use Auto or an implicit level; only a returned identity may be the base name.
+ANALYST_REQUEST_FAMILY = r"grok-4\.7-(?:high|xhigh)(?:-fast)?"
+ANALYST_MIXED_MODELS = False
+ANALYST_BUDGET = "deadline_and_call_caps"
+ANALYST_ENV_KEEP = ()
+ANALYST_ENV_STRIP = ()
+ANALYST_ENV_SET = {}
 SUPPORTED_ROLES = frozenset({
     "dev", "fixer", "reviewer", "spec_reviewer", "retrospective",
 })
@@ -34,6 +48,7 @@ REQUIRES_CACHE_DIRS = False
 COMMIT_MARKERS = ("cursoragent@cursor.com",)
 LEGACY_SEED_WITH_OWNER = False
 UNMARKED_AUTHOR_INFERENCE = False
+LEGACY_REPLY_RESUME = True
 GITHUB_ACCESS = "runner"
 FIX_RESUMABLE_VIA_REPLY = True
 FIX_TEMPLATE = "cursor-fix-prompt.md"
@@ -169,3 +184,42 @@ def log_model(row, codex_home=None):
         model = row.get("model")
         return True, None if str(model).lower() == "auto" else model
     return False, None
+
+
+def analyst_effort(model, default):
+    # Cursor advertises explicit reasoning-level model IDs.
+    return "xhigh" if "-xhigh" in model else "high"
+
+
+def analyst_command(settings, analyst, workspace, env):
+    # Cursor's existing subscription supplies Grok. Never use Auto or --force.
+    directory = workspace / "cursor-config"
+    directory.mkdir(mode=0o700)
+    denied = ["Shell(*)", "Read(**)", "Read(/**)", "Write(**)", "Write(/**)", "WebFetch(*)", "Mcp(*:*)"]
+    (directory / "cli-config.json").write_text(json.dumps(dict(
+        version=1, editor={"vimMode": False}, permissions={"allow": [], "deny": denied})))
+    (directory / "mcp.json").write_text('{"mcpServers":{}}')
+    auth = Path(os.environ.get("CURSOR_CONFIG_DIR") or Path.home() / ".config/cursor") / "auth.json"
+    if auth.is_file():
+        (directory / "auth.json").symlink_to(auth)
+    env["CURSOR_CONFIG_DIR"] = str(directory)
+    # Project permissions are an additional deny layer even on older config resolvers.
+    project = workspace / ".cursor"
+    project.mkdir(mode=0o700)
+    (project / "cli.json").write_text(json.dumps({"permissions": {"allow": [], "deny": denied}}))
+    return ["cursor-agent", "-p", "--mode", "ask", "--trust", "--model", analyst.model,
+            "--output-format", "stream-json"]
+
+
+def analyst_response(text):
+    """(rows, reply, valid, actual model, models, tool_use) of the analyst's output."""
+    rows = analyst_rows(text)
+    result = analyst_result(rows)
+    actual = result["actual_model"] if MODEL_CODE.fullmatch(str(result.get("actual_model", ""))) else "unknown"
+    reply = final_message(text) or result.get("result", "")
+    valid = bool(result) and not result.get("is_error") and result.get("subtype") == "success"
+    return rows, reply, valid, actual, [], analyst_tool_use(rows)
+
+
+def analyst_quota(lines, home):
+    return {}

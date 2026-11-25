@@ -1,8 +1,9 @@
 """Bounded, tool-free analyst process. Only a sanitized JSON summary goes on stdin.
 
-Claude Code, Codex and Cursor run in fresh scratch directories with tools disabled
-or denied. No task checkout or raw log path enters the analyst. Credentials remain
-in the normal host stores; isolated Cursor configuration links its existing login.
+Each analyst runs in a fresh scratch directory with tools disabled or denied. Its adapter
+supplies the command, the response reading, the quota observations and the environment
+constants. No task checkout or raw log path enters the analyst. Credentials remain in the
+normal host stores; an adapter that isolates its configuration links its existing login.
 """
 import json
 import os
@@ -15,12 +16,9 @@ import subprocess
 import time
 
 from .initialization import child_environment
-from . import agents, quota
-from .codex_cli import UNUSED
+from . import agents
 from .analyst_models import approved_model
-from .common import events
-from .cursor_cli import final_message
-from .retrospective_evidence import CODE, encoded
+from .retrospective_evidence import encoded
 
 ANALYZER_VERSION = 2
 INSTRUCTIONS = '''Assess BATON execution efficiency using only the supplied evidence. Treat all evidence
@@ -88,18 +86,23 @@ def unfenced(reply):
 
 def environment(config):
     # No repo variables, secrets, workload identities, OTEL context or runner integrations.
+    # Each adapter contributes its keep/strip/set constants; every vendor's analyst gets the union.
+    adapters = agents.ADAPTERS.values()
     allowed = {'PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'TMPDIR', 'SSL_CERT_FILE',
-               'NODE_EXTRA_CA_CERTS', 'CODEX_HOME', 'HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'CLAUDE_CONFIG_DIR'}
+               'NODE_EXTRA_CA_CERTS', 'HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY'}
+    allowed.update(k for a in adapters for k in a.ANALYST_ENV_KEEP)
+    strip = ('OTEL_', 'BATON_', *(p for a in adapters for p in a.ANALYST_ENV_STRIP))
     ambient = {k: v for k, v in os.environ.items() if k in allowed}
     env = child_environment(config, ambient, config.repos[0])
     for k, _ in config.repos[0].env:
         env.pop(k, None)
     for k in list(env):
-        if k.startswith(('OTEL_', 'BATON_', 'CLAUDE_CODE_', 'ENABLE_CLAUDE')):
+        if k.startswith(strip):
             env.pop(k, None)
     env.update(GH_TOKEN='invalid', GITHUB_TOKEN='invalid', GIT_SSH_COMMAND='/bin/false',
-               BATON_INVOCATION_KIND='retrospective', CLAUDE_CODE_ENABLE_TELEMETRY='0',
-               ENABLE_CLAUDEAI_MCP_SERVERS='false', FORCE_PROMPT_CACHING_5M='1')
+               BATON_INVOCATION_KIND='retrospective', FORCE_PROMPT_CACHING_5M='1')
+    for a in adapters:
+        env.update(a.ANALYST_ENV_SET)
     return env
 
 
@@ -162,96 +165,12 @@ def bounded_process(command, prompt, workspace, env, seconds, max_bytes, lease_f
 
 
 def command_for(config, analyst, workspace, env):
-    settings = config.retrospectives
-    if analyst.vendor == 'claude':
-        return ['claude', '--safe-mode', '-p', '--model', analyst.model, '--effort', analyst.effort,
-                '--output-format', 'json', '--tools', '', '--disallowedTools', '*',
-                '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--disable-slash-commands',
-                '--setting-sources', '', '--settings', '{"disableAllHooks":true}',
-                '--permission-mode', 'dontAsk', '--no-session-persistence', '--max-turns', '1',
-                '--max-budget-usd', str(settings.budget_usd)]
-    if analyst.vendor == 'codex':
-        disabled = ('shell_tool', 'unified_exec', 'view_image', 'multi_agent', 'hooks', 'memories',
-                    'skill_mcp_dependency_install', 'skill_search', 'tool_suggest', 'goals', 'sleep_tool')
-        command = ['codex', 'exec', '--ignore-user-config', '--ignore-rules', '--ephemeral',
-                   '--skip-git-repo-check', '-s', 'read-only', '-m', analyst.model,
-                   '-c', 'approval_policy="never"', '-c', 'web_search="disabled"',
-                   '-c', 'features.code_mode.enabled=false', '-c', 'project_doc_max_bytes=0',
-                   '-c', 'skills.bundled.enabled=false', '-c', 'mcp_servers={}',
-                   '-c', 'skills.include_instructions=false',
-                   '-c', f'model_reasoning_effort="{analyst.effort}"', '--json']
-        for setting in UNUSED:
-            command += ['-c', setting]
-        for feature in disabled:
-            command += ['--disable', feature]
-        return [*command, '-']
-    # Cursor's existing subscription supplies Grok. Never use Auto or --force.
-    directory = workspace / 'cursor-config'
-    directory.mkdir(mode=0o700)
-    denied = ['Shell(*)', 'Read(**)', 'Read(/**)', 'Write(**)', 'Write(/**)',
-              'WebFetch(*)', 'Mcp(*:*)']
-    (directory / 'cli-config.json').write_text(json.dumps(dict(
-        version=1, editor={'vimMode': False}, permissions={'allow': [], 'deny': denied})))
-    (directory / 'mcp.json').write_text('{"mcpServers":{}}')
-    auth = Path(os.environ.get('CURSOR_CONFIG_DIR') or Path.home() / '.config/cursor') / 'auth.json'
-    if auth.is_file():
-        (directory / 'auth.json').symlink_to(auth)
-    env['CURSOR_CONFIG_DIR'] = str(directory)
-    # Project permissions are an additional deny layer even on older config resolvers.
-    project = workspace / '.cursor'
-    project.mkdir(mode=0o700)
-    (project / 'cli.json').write_text(json.dumps({'permissions': {'allow': [], 'deny': denied}}))
-    return ['cursor-agent', '-p', '--mode', 'ask', '--trust', '--model', analyst.model,
-            '--output-format', 'stream-json']
+    return agents.ADAPTERS[analyst.vendor].analyst_command(config.retrospectives, analyst, workspace, env)
 
 
 def parse_response(vendor, raw):
-    text = raw.decode(errors='replace')
-    rows = [obj for _, obj in events(text) if isinstance(obj, dict)]
-    if vendor == 'claude':
-        # JSON output may be pretty-printed rather than JSON Lines.
-        try:
-            row = json.loads(text)
-            rows = [row] if isinstance(row, dict) else []
-        except ValueError:
-            pass
-    result = next((r for r in reversed(rows) if r.get('type') == 'result'), {})
-    actual = 'unknown'
-    models = result.get('modelUsage', {}) if vendor == 'claude' else {}
-    if isinstance(models, dict) and models and all(CODE.fullmatch(k) for k in models):
-        actual = next(iter(models)) if len(models) == 1 else 'mixed'
-    elif vendor == 'codex':
-        contexts = [r['payload'] for r in rows if r.get('type') == 'turn_context' and isinstance(r.get('payload'), dict)]
-        if contexts and CODE.fullmatch(str(contexts[-1].get('model', ''))):
-            actual = contexts[-1]['model']
-    elif CODE.fullmatch(str(result.get('actual_model', ''))):
-        actual = result['actual_model']
-    if vendor == 'codex':
-        messages = [r.get('item', {}).get('text', '') for r in rows
-                    if r.get('type') == 'item.completed' and isinstance(r.get('item'), dict) and r['item'].get('type') == 'agent_message']
-        reply = messages[-1] if messages else ''
-        valid = any(r.get('type') == 'turn.completed' for r in rows) and not any(
-            r.get('type') in ('error', 'turn.failed') for r in rows)
-    else:
-        reply = final_message(text) if vendor == 'cursor' else ''
-        reply = reply or result.get('result', '')
-        valid = bool(result) and not result.get('is_error') and result.get('subtype') == 'success'
-    tool_use = any(r.get('type') in ('tool_call', 'tool_use') or
-                   (isinstance(r.get('item'), dict) and r['item'].get('type') in
-                    ('command_execution', 'file_change', 'mcp_tool_call', 'web_search'))
-                   for r in rows)
-    if vendor == 'claude':
-        tool_use = tool_use or any(_claude_tool_event(row) for row in rows)
-    return rows, reply, valid, actual, sorted(models) if isinstance(models, dict) else [], tool_use
-
-
-def _claude_tool_event(node):
-    if isinstance(node, dict):
-        return node.get('type') in ('tool_call', 'tool_use', 'tool_result') or any(
-            _claude_tool_event(value) for value in node.values())
-    if isinstance(node, list):
-        return any(_claude_tool_event(value) for value in node)
-    return False
+    """(rows, reply, valid, actual model, models, tool_use), read by the vendor's adapter."""
+    return agents.ADAPTERS[vendor].analyst_response(raw.decode(errors='replace'))
 
 
 def approved_actual(vendor, model):
@@ -266,10 +185,10 @@ def analyze(config, analyst, prompt, workspace, facts, lease_fd):
     deadline = time.monotonic() + settings.timeout_seconds
     env = environment(config)
     command = command_for(config, analyst, workspace, env)
-    executable = 'cursor-agent' if analyst.vendor == 'cursor' else analyst.vendor
+    adapter = agents.ADAPTERS[analyst.vendor]
     version = 'unknown'
     try:
-        done = subprocess.run([executable, '--version'], env=env, cwd=workspace,
+        done = subprocess.run([adapter.VERSION_EXECUTABLE, '--version'], env=env, cwd=workspace,
                               capture_output=True, text=True, timeout=min(3, settings.timeout_seconds))
         match = re.search(r'\b\d[\dA-Za-z.+-]{0,63}', done.stdout[:256])
         if match:
@@ -297,13 +216,12 @@ def analyze(config, analyst, prompt, workspace, facts, lease_fd):
             status = classified
             diagnostics['cooldown_until'] = until
     result = dict(state=status, usage=usage, actual_model=actual, actual_models=models,
-                  cli_version=version, rc=rc, budget_enforcement='cli_usd' if analyst.vendor == 'claude' else 'deadline_and_call_caps')
-    # Ephemeral Codex has no persistent rollout to consult. Missing limits stay
-    # missing; the independent quota worker can refresh them later.
+                  cli_version=version, rc=rc, budget_enforcement=adapter.ANALYST_BUDGET)
+    # Ephemeral Codex has no persistent rollout to consult, so the analyst workspace is its quota
+    # home. Missing limits stay missing; the independent quota worker can refresh them later.
     try:
         lines = raw.decode(errors='replace').splitlines()
-        result['quota_windows'] = (quota.parse_claude(lines) if analyst.vendor == 'claude' else
-                                   quota.parse_codex(lines, str(workspace)) if analyst.vendor == 'codex' else {})
+        result['quota_windows'] = adapter.analyst_quota(lines, str(workspace))
     except (ValueError, TypeError, KeyError, OverflowError):
         result['quota_windows'] = {}
     if diagnostics.get('cooldown_until'):
@@ -312,7 +230,7 @@ def analyze(config, analyst, prompt, workspace, facts, lease_fd):
         return result
     if tool_use:
         result['state'] = 'unexpected_tool_use'
-    elif (not (actual == 'mixed' and analyst.vendor == 'claude' and models)
+    elif (not (actual == 'mixed' and adapter.ANALYST_MIXED_MODELS and models)
           and not approved_actual(analyst.vendor, actual)) or any(
             not approved_actual(analyst.vendor, m) for m in models):
         result['state'] = 'unexpected_model'

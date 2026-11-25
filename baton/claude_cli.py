@@ -1,8 +1,10 @@
 """Claude Code (`claude -p`). Read-only and GitHub access come from the settings file
 and guard.sh (a PreToolUse hook that reads BATON_AGENT_*), not from this adapter."""
+import json
 import re
 
-from .common import Run, child_env, events, last_result, outcome_line, read, run_cli
+from .common import (MODEL_CODE, Run, analyst_result, analyst_rows, analyst_tool_use, child_env, events,
+                     last_result, outcome_line, read, run_cli)
 
 ID = "claude"
 DISPLAY_NAME = "Claude"
@@ -59,6 +61,14 @@ SPEC_SAME_VENDOR = "alternating-phase"
 SPEC_TEMPLATE = "spec-prompt.md"
 SPEC_UNMARKED_REVIEWER = True
 PROBE_PROMPT = "Reply with the word ok."
+# Retrospective analyst: approved models, its environment and how its budget is enforced.
+ANALYST_FAMILY = r"(?:opus|claude-opus-[A-Za-z0-9._:-]+)"
+ANALYST_REQUEST_FAMILY = ANALYST_FAMILY
+ANALYST_MIXED_MODELS = True
+ANALYST_BUDGET = "cli_usd"
+ANALYST_ENV_KEEP = ("CLAUDE_CONFIG_DIR",)
+ANALYST_ENV_STRIP = ("CLAUDE_CODE_", "ENABLE_CLAUDE")
+ANALYST_ENV_SET = {"CLAUDE_CODE_ENABLE_TELEMETRY": "0", "ENABLE_CLAUDEAI_MCP_SERVERS": "false"}
 MODEL = re.compile(
     r"(?P<prefix>claude-)?(?P<family>opus|sonnet|haiku)(?P<version>(?:-[0-9]+)*?)(?:-(?P<snapshot>[0-9]{8}))?"
 )
@@ -203,3 +213,51 @@ def log_model(row, codex_home=None):
     if row.get("type") == "system" and row.get("subtype") == "init":
         return True, row.get("model")
     return False, None
+
+
+def analyst_effort(model, default):
+    return default
+
+
+def analyst_command(settings, analyst, workspace, env):
+    return ["claude", "--safe-mode", "-p", "--model", analyst.model, "--effort", analyst.effort,
+            "--output-format", "json", "--tools", "", "--disallowedTools", "*",
+            "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--disable-slash-commands",
+            "--setting-sources", "", "--settings", '{"disableAllHooks":true}',
+            "--permission-mode", "dontAsk", "--no-session-persistence", "--max-turns", "1",
+            "--max-budget-usd", str(settings.budget_usd)]
+
+
+def _tool_event(node):
+    if isinstance(node, dict):
+        return node.get("type") in ("tool_call", "tool_use", "tool_result") or any(
+            _tool_event(value) for value in node.values())
+    if isinstance(node, list):
+        return any(_tool_event(value) for value in node)
+    return False
+
+
+def analyst_response(text):
+    """(rows, reply, valid, actual model, models, tool_use) of the analyst's output."""
+    rows = analyst_rows(text)
+    # JSON output may be pretty-printed rather than JSON Lines.
+    try:
+        row = json.loads(text)
+        rows = [row] if isinstance(row, dict) else []
+    except ValueError:
+        pass
+    result = analyst_result(rows)
+    models = result.get("modelUsage", {})
+    actual = "unknown"
+    if isinstance(models, dict) and models and all(MODEL_CODE.fullmatch(k) for k in models):
+        actual = next(iter(models)) if len(models) == 1 else "mixed"
+    elif MODEL_CODE.fullmatch(str(result.get("actual_model", ""))):
+        actual = result["actual_model"]
+    valid = bool(result) and not result.get("is_error") and result.get("subtype") == "success"
+    tool_use = analyst_tool_use(rows) or any(_tool_event(row) for row in rows)
+    return rows, result.get("result", ""), valid, actual, sorted(models) if isinstance(models, dict) else [], tool_use
+
+
+def analyst_quota(lines, home):
+    from . import quota
+    return quota.parse_claude(lines)

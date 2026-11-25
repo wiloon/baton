@@ -18,6 +18,14 @@ from .common import Run, changed, child_env, events, git, outcome_line, read, re
 ID = "agy"
 DISPLAY_NAME = "Antigravity"
 ANALYST_ALIAS = "agy_analyst"
+# Not retrospective-capable (SUPPORTED_ROLES): the analyst constants only keep registry iteration total.
+ANALYST_FAMILY = r"(?!)"
+ANALYST_REQUEST_FAMILY = ANALYST_FAMILY
+ANALYST_MIXED_MODELS = False
+ANALYST_BUDGET = "deadline_and_call_caps"
+ANALYST_ENV_KEEP = ()
+ANALYST_ENV_STRIP = ()
+ANALYST_ENV_SET = {}
 SUPPORTED_ROLES = frozenset({"dev", "fixer", "reviewer", "spec_reviewer"})
 QUOTA_SOURCE = "none"
 QUOTA_WINDOWS = frozenset()

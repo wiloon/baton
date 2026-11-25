@@ -367,12 +367,13 @@ def main(argv):
         mark_probed(state, args[0], now)
         return 0
     if command == "refresh":
-        # Documented CLI form keeps the `cursor` argument; admission and the adapter hook
-        # are still Cursor's. The vendor argument is ignored (refresh with no args matches).
-        if reason := cfg.admission_error("cursor"):
+        # Documented CLI form takes a vendor argument that is ignored (refresh with no args matches):
+        # the vendor refreshed is the adapter whose quota comes from an API.
+        vendor = next(v for v, adapter in agents.ADAPTERS.items() if adapter.QUOTA_SOURCE == "api")
+        if reason := cfg.admission_error(vendor):
             print(reason, file=sys.stderr)
             return 1
-        print(json.dumps(agents.ADAPTERS["cursor"].refresh_quota(state, now)))
+        print(json.dumps(agents.ADAPTERS[vendor].refresh_quota(state, now)))
         return 0
     if command == "credential":
         credential(state, args[0], args[1], now)

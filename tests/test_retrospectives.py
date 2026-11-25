@@ -50,8 +50,12 @@ if '--version' in sys.argv:
     print('2.1.100 (Claude Code)')
     sys.exit(0)
 prompt = sys.stdin.read()
+files = {}
+for path in pathlib.Path.cwd().rglob('*'):
+    rel = str(path.relative_to(os.getcwd()))
+    files[rel] = ['link', os.readlink(path)] if path.is_symlink() else ['dir'] if path.is_dir() else ['file', path.read_text()]
 with (root/'calls').open('a') as f:
-    f.write(json.dumps(dict(vendor=vendor, args=sys.argv[1:], prompt=prompt, cwd=os.getcwd(), env=dict(os.environ)))+'\\n')
+    f.write(json.dumps(dict(vendor=vendor, args=sys.argv[1:], prompt=prompt, cwd=os.getcwd(), env=dict(os.environ), files=files))+'\\n')
 plan = json.loads((root/'plan.json').read_text()) if (root/'plan.json').exists() else {}
 if plan.get('stderr'):
     print(plan['stderr'],file=sys.stderr)
@@ -76,10 +80,11 @@ if vendor == 'codex':
     print(json.dumps(dict(type='turn.completed', usage={'input_tokens':24,'cached_input_tokens':20,'output_tokens':3})))
 else:
     usage = (dict(input_tokens=4, cache_read_input_tokens=20, cache_creation_input_tokens=0, output_tokens=3)
-             if vendor == 'claude' else dict(inputTokens=4, cacheReadTokens=20, cacheWriteTokens=0, outputTokens=3))
+             if vendor in ('claude', 'stub-agent') else dict(inputTokens=4, cacheReadTokens=20, cacheWriteTokens=0, outputTokens=3))
     print(json.dumps(dict(type='result', subtype='success', result=reply, usage=usage,
         modelUsage={plan.get('actual','claude-opus-test'): {}} if vendor=='claude' else {},
-        actual_model=plan.get('actual','grok-4.7') if vendor=='cursor' else 'unknown', total_cost_usd=0.01)))
+        actual_model=plan.get('actual','grok-4.7') if vendor=='cursor' else 'unknown', total_cost_usd=0.01,
+        **({'model': plan.get('actual','stub-1')} if vendor=='stub-agent' else {}))))
 sys.exit(plan.get('rc',0))
 '''
 
@@ -90,7 +95,7 @@ def host(tmp_path, monkeypatch):
     state.mkdir()
     cli = tmp_path / 'bin'
     cli.mkdir()
-    for executable in ('claude', 'codex', 'cursor-agent'):
+    for executable in ('claude', 'codex', 'cursor-agent', 'stub-agent'):
         (cli/executable).write_text(FAKE_CLAUDE.replace('PYTHON', sys.executable))
         (cli/executable).chmod(0o755)
     (cli/'timeout').write_text('#!/bin/sh\nshift 2\nexec "$@"\n')
@@ -839,3 +844,149 @@ def test_nested_claude_tool_events_invalidate_analysis(event):
 
     raw = json.dumps({"type": "assistant", "message": {"content": [{"type": event}]}}).encode()
     assert retrospective_analyst.parse_response("claude", raw)[-1] is True
+
+
+# --- The stub analyst runs the public path through adapter capabilities only ---
+
+def stub_config(tmp_path, *, aliases=True, retro=''):
+    from test_adapter_capabilities import with_stub
+    text = with_stub((ROOT / 'config.example.toml').read_text())
+    text = text.replace('adapter = "stub"\nroles = ["dev", "fixer", "reviewer", "spec_reviewer"]',
+                        'adapter = "stub"\nroles = ["dev", "fixer", "reviewer", "spec_reviewer", "retrospective"]')
+    if not aliases:
+        # Routes, fallbacks and the probe model move to another alias; only the analyst alias is gone.
+        text = text.replace('stub_fast', 'stub_other')
+    text = text.replace('enabled = false\n# Deprecated', f'enabled = true\n{retro}# Deprecated', 1)
+    path = tmp_path / 'stub-config.toml'
+    path.write_text(text)
+    return path
+
+
+def test_stub_analyst_runs_through_adapter_capabilities(host, tmp_path):
+    pipe = seed(host.state)
+    loaded = config.load(stub_config(tmp_path))
+    stub = tuple(v for v in loaded.vendors if v.id == 'stub')
+    host.config = replace(host.config, vendors=stub, retrospectives=loaded.retrospectives,
+                          analyst_models=loaded.analyst_models,
+                          quota=replace(loaded.quota, vendor_pool=(), vendor_extra=('stub',), caps=(('stub', stub[0].cap),)))
+    now = time.time()
+    (host.state/'credential-stub.json').write_text(json.dumps(dict(result='authenticated', observed_at=now)))
+    (host.state/'quota-stub.json').write_text(json.dumps(dict(observed_at=now, windows={
+        'seven_day': dict(used=0.1, observed_at=now, resets_at=now+10000)})))
+    assert host.run()[0]['state'] == 'success'
+    calls = host.calls()
+    assert [c['vendor'] for c in calls] == ['stub-agent']
+    attempt = host.report(pipe)['analysis_attempts'][0]
+    assert attempt['state'] == 'success' and attempt['vendor'] == 'stub'
+    assert attempt['requested_model'] == 'stub-1' and attempt['actual_model'] == 'stub-1'
+    assert attempt['budget_enforcement'] == 'deadline_and_call_caps'
+    assert attempt['cli_version'] == '2.1.100'
+
+
+def test_an_unknown_analyst_alias_is_a_config_error(tmp_path):
+    with pytest.raises(config.ConfigError, match=r'retrospectives\.model_stub: expected a known model alias'):
+        config.load(stub_config(tmp_path, aliases=False))
+
+
+def test_a_model_key_for_an_adapter_without_the_field_is_a_config_error(tmp_path):
+    with pytest.raises(config.ConfigError, match='unknown fields: model_stub'):
+        config.load(stub_config(tmp_path, retro='model_stub = "stub_fast"\n'))
+
+
+# --- Characterization of each built-in analyst sandbox (pinned before the adapter move) ---
+
+CLAUDE_ARGV = ['--safe-mode', '-p', '--model', 'opus', '--effort', 'high', '--output-format', 'json',
+               '--tools', '', '--disallowedTools', '*', '--strict-mcp-config', '--mcp-config',
+               '{"mcpServers":{}}', '--disable-slash-commands', '--setting-sources', '',
+               '--settings', '{"disableAllHooks":true}', '--permission-mode', 'dontAsk',
+               '--no-session-persistence', '--max-turns', '1', '--max-budget-usd', '1.0']
+CODEX_ARGV = ['exec', '--ignore-user-config', '--ignore-rules', '--ephemeral', '--skip-git-repo-check',
+              '-s', 'read-only', '-m', 'gpt-6.2-sol', '-c', 'approval_policy="never"',
+              '-c', 'web_search="disabled"', '-c', 'features.code_mode.enabled=false',
+              '-c', 'project_doc_max_bytes=0', '-c', 'skills.bundled.enabled=false',
+              '-c', 'mcp_servers={}', '-c', 'skills.include_instructions=false',
+              '-c', 'model_reasoning_effort="high"', '--json']
+CODEX_FEATURE_ARGV = [
+    '-c', 'skills.include_instructions=false', '-c', 'features.plugins=false', '-c', 'features.apps=false',
+    '-c', 'features.image_generation=false', '-c', 'features.browser_use=false',
+    '-c', 'features.browser_use_external=false', '-c', 'features.computer_use=false',
+    '-c', 'features.in_app_browser=false',
+    '--disable', 'shell_tool', '--disable', 'unified_exec', '--disable', 'view_image',
+    '--disable', 'multi_agent', '--disable', 'hooks', '--disable', 'memories',
+    '--disable', 'skill_mcp_dependency_install', '--disable', 'skill_search',
+    '--disable', 'tool_suggest', '--disable', 'goals', '--disable', 'sleep_tool', '-']
+CURSOR_ARGV = ['-p', '--mode', 'ask', '--trust', '--model', 'grok-4.7-high', '--output-format', 'stream-json']
+DENIED = ['Shell(*)', 'Read(**)', 'Read(/**)', 'Write(**)', 'Write(/**)', 'WebFetch(*)', 'Mcp(*:*)']
+
+
+def analyst_environment(monkeypatch, tmp_path):
+    monkeypatch.setenv('CODEX_HOME', str(tmp_path / 'codex-home'))
+    monkeypatch.setenv('CLAUDE_CONFIG_DIR', str(tmp_path / 'claude-dir'))
+    monkeypatch.setenv('CLAUDE_CODE_SECRET', 'x')
+    monkeypatch.setenv('ENABLE_CLAUDE_OTHER', 'x')
+    monkeypatch.setenv('CLAUDE_CODE_ENABLE_TELEMETRY', '1')
+    monkeypatch.setenv('ENABLE_CLAUDEAI_MCP_SERVERS', 'true')
+    monkeypatch.setenv('CURSOR_API_KEY', 'PRIVATE_CURSOR')
+
+
+def check_environment(env, tmp_path):
+    assert env['CODEX_HOME'] == str(tmp_path / 'codex-home')
+    assert env['CLAUDE_CONFIG_DIR'] == str(tmp_path / 'claude-dir')
+    assert env['CLAUDE_CODE_ENABLE_TELEMETRY'] == '0' and env['ENABLE_CLAUDEAI_MCP_SERVERS'] == 'false'
+    assert env['FORCE_PROMPT_CACHING_5M'] == '1' and env['BATON_INVOCATION_KIND'] == 'retrospective'
+    assert env['GH_TOKEN'] == 'invalid' and env['GITHUB_TOKEN'] == 'invalid'
+    assert env['GIT_SSH_COMMAND'] == '/bin/false'
+    assert not {'CLAUDE_CODE_SECRET', 'ENABLE_CLAUDE_OTHER', 'OTEL_RESOURCE_ATTRIBUTES',
+                'BATON_TELEMETRY_ITEM', 'CURSOR_API_KEY'} & set(env)
+
+
+def test_claude_analyst_sandbox_is_pinned(host, monkeypatch, tmp_path):
+    pipe = seed(host.state)
+    analyst_environment(monkeypatch, tmp_path)
+    assert host.run()[0]['state'] == 'success'
+    call = host.calls()[0]
+    assert call['vendor'] == 'claude' and call['args'] == CLAUDE_ARGV
+    check_environment(call['env'], tmp_path)
+    assert not any(name.startswith(('cursor-config', '.cursor')) for name in call['files'])
+    attempt = host.report(pipe)['analysis_attempts'][0]
+    assert attempt['budget_enforcement'] == 'cli_usd' and attempt['cli_version'] == '2.1.100'
+    assert attempt['actual_model'] == 'claude-opus-test' and attempt['state'] == 'success'
+
+
+def test_codex_analyst_sandbox_is_pinned(host, monkeypatch, tmp_path):
+    pipe = seed(host.state)
+    enable_vendors(host, ('codex',))
+    analyst_environment(monkeypatch, tmp_path)
+    assert host.run()[0]['state'] == 'success'
+    call = host.calls()[0]
+    args = call['args']
+    assert call['vendor'] == 'codex' and args == CODEX_ARGV + CODEX_FEATURE_ARGV
+    check_environment(call['env'], tmp_path)
+    attempt = host.report(pipe)['analysis_attempts'][0]
+    assert attempt['budget_enforcement'] == 'deadline_and_call_caps' and attempt['cli_version'] == '2.1.100'
+    assert attempt['actual_model'] == 'gpt-6.1-sol'
+
+
+def test_cursor_analyst_sandbox_is_pinned(host, monkeypatch, tmp_path):
+    pipe = seed(host.state)
+    enable_vendors(host, ('cursor',))
+    analyst_environment(monkeypatch, tmp_path)
+    login = tmp_path / 'login'
+    login.mkdir()
+    (login / 'auth.json').write_text('{}')
+    monkeypatch.setenv('CURSOR_CONFIG_DIR', str(login))
+    monkeypatch.setattr('baton.quota.refresh_cursor', lambda *a, **k: {})
+    assert host.run()[0]['state'] == 'success'
+    call = host.calls()[0]
+    assert call['vendor'] == 'cursor' and call['args'] == CURSOR_ARGV
+    files = call['files']
+    assert json.loads(files['cursor-config/cli-config.json'][1]) == dict(
+        version=1, editor={'vimMode': False}, permissions={'allow': [], 'deny': DENIED})
+    assert json.loads(files['.cursor/cli.json'][1]) == {'permissions': {'allow': [], 'deny': DENIED}}
+    assert json.loads(files['cursor-config/mcp.json'][1]) == {'mcpServers': {}}
+    assert files['cursor-config/auth.json'] == ['link', str(login / 'auth.json')]
+    assert call['env']['CURSOR_CONFIG_DIR'] == str(Path(call['cwd']) / 'cursor-config')
+    check_environment(call['env'], tmp_path)
+    attempt = host.report(pipe)['analysis_attempts'][0]
+    assert attempt['budget_enforcement'] == 'deadline_and_call_caps' and attempt['cli_version'] == '2.1.100'
+    assert attempt['effort'] == 'high' and attempt['actual_model'] == 'grok-4.7'
