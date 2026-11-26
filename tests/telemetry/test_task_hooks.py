@@ -72,6 +72,16 @@ class OwnerMergeHookTests(unittest.TestCase):
         self.assertTrue(self.hooks().owner_merged())
         self.assertFalse((self.root / 'telemetry/events').exists() and self.events())
 
+    def test_spec_review_verdict_records_author_agent_without_model(self):
+        self.hooks().verdict('spec_review', 'codex', 'a' * 40, 1, 'SPEC: accept', 'ok', author_agent='claude')
+        self.hooks().verdict('spec_review', 'codex', 'b' * 40, 2, 'SPEC: changes', 'fix')
+        spec_events = sorted((e for e in self.events() if e['event_kind'] == 'spec_review'),
+                             key=lambda e: e['attrs']['round'])
+        self.assertEqual(len(spec_events), 2)
+        self.assertEqual(spec_events[0]['attrs']['author_agent'], 'claude')
+        self.assertEqual(spec_events[1]['attrs']['author_agent'], 'unknown')
+        self.assertNotIn('author_model', spec_events[0]['attrs'])
+
 
 class TaskHookTests(unittest.TestCase):
     def test_ci_wrapper_pass_failure_timeout_no_checks_and_head_change(self):

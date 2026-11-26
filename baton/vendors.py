@@ -399,7 +399,7 @@ def selection_details(state, pool, candidates, chosen, role, *, area="", now=Non
 
 def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool",
          now=None, probe_only=False, review=False, fixed_by="", area="", other_model="", pr_state=None,
-         spec_followup=False, pinned=False):
+         spec_followup=False, pinned=False, avoid_author=""):
     """STATE: the machine's cooldowns and quota; PR_STATE (default STATE): the repository's PR
     records (authors, contributions)."""
     now = int(time.time()) if now is None else now
@@ -442,6 +442,10 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
             model = session.resolve().config.models.route(route_role, same, followup=followup).model
             if models_distinct(same, model, other_model):
                 fallbacks[same] = "same-vendor-different-model"
+        if role == "spec_reviewer" and avoid_author and avoid_author in candidates and avoid_author not in excluded:
+            # ADR 0002 (#274): the issue's author vendor is a preference, never a hard exclusion.
+            excluded.add(avoid_author)
+            fallbacks[avoid_author] = "author-vendor"
     ordered = ([current, *candidates] if by == "pool" else candidates)
     ready, blocked, probe = [], {}, []
     horizons = {}   # blocked vendor -> vendor_policy.SHORT or LONG

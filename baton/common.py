@@ -83,6 +83,52 @@ class Run:
     model: str = ""
 
 
+AUTHOR_MODEL = re.compile(r"[A-Za-z0-9._:/-]{1,80}")
+AUTHOR_MARKER = re.compile(
+    r"^<!-- baton-author: vendor=(?P<vendor>[A-Za-z0-9_-]+) model=(?P<model>[A-Za-z0-9._:/-]{1,80}) -->$"
+)
+AUTHOR_MARKER_LINE = re.compile(r"^\s*<!-- baton-author\b.*-->\s*$")
+
+
+def is_author_marker_line(line):
+    """True for a standalone HTML comment line carrying a baton-author marker."""
+    return bool(AUTHOR_MARKER_LINE.match(line.rstrip("\r")))
+
+
+def strip_author_markers(text):
+    """Drop standalone baton-author lines so section parsers ignore them anywhere in a body."""
+    return "\n".join(line for line in (text or "").split("\n") if not is_author_marker_line(line))
+
+
+def parse_author_marker(text, configured_vendors):
+    """Parse the single `<!-- baton-author: vendor=V model=M -->` line in TEXT.
+    Returns (vendor, model) when exactly one baton-author line exists and is valid
+    with vendor in configured_vendors, else ("", "")."""
+    found = [line.rstrip("\r") for line in (text or "").split("\n") if "<!-- baton-author" in line]
+    if len(found) != 1:
+        return "", ""
+    match = AUTHOR_MARKER.fullmatch(found[0])
+    if not match or match["vendor"] not in configured_vendors:
+        return "", ""
+    return match["vendor"], match["model"]
+
+
+def format_author_marker(vendor, model=""):
+    """Format a valid baton-author marker line; invalid or missing models become 'unknown'."""
+    value = model if model and AUTHOR_MODEL.fullmatch(model) else "unknown"
+    return f"<!-- baton-author: vendor={vendor} model={value} -->"
+
+
+def prepend_author_marker(body, marker):
+    """Put MARKER at the top of BODY, after a leading baton-scan line when present."""
+    if not marker:
+        return body
+    lines = (body or "").split("\n")
+    if lines and lines[0].startswith("<!-- baton-scan "):
+        return "\n".join([lines[0], marker, *lines[1:]])
+    return f"{marker}\n{body}" if body else f"{marker}\n"
+
+
 def strip_markers(text):
     """Drop every line carrying an baton marker; only the runner adds trusted ones."""
     return "\n".join(line for line in text.split("\n") if "<!-- baton-" not in line)

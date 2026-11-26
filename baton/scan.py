@@ -20,7 +20,7 @@ import sys
 import time
 
 from . import agents, dispatch, fix, notify, pr as pr_helpers, prompts, vendors
-from .common import Deferred, strip_markers
+from .common import Deferred, format_author_marker, prepend_author_marker, strip_markers
 
 
 def refresh_worktree(repo_dir, wt):
@@ -72,6 +72,8 @@ def scan_area(env, index, area):
             title.replace(f"{draft}.title")
             body.replace(f"{draft}.md")
             Path(f"{draft}.area").write_text(f"{area}\n")
+            model = run.get("model") or "unknown"
+            Path(f"{draft}.author").write_text(f"{vendor} {model}\n")
             notify.log(f"scan of {area} found a defect (draft {draft})")
         else:
             notify.notify("Scan failed", f"SCAN: found but no {out}.title / {out}.md")
@@ -92,7 +94,16 @@ def file_scan(env, draft):
     title_file = Path(f"{draft}.title")
     title_file.write_text(strip_markers(title_file.read_text()).rstrip("\n") + "\n")
     text = strip_markers(Path(f"{draft}.md").read_text()).rstrip("\n")
-    Path(f"{draft}.body").write_text(f'<!-- baton-scan area="{area}" -->\n{text}\n')
+    author_file = Path(f"{draft}.author")
+    marker = ""
+    if author_file.is_file():
+        parts = author_file.read_text().strip().split(None, 1)
+        if parts and parts[0] in env.config.declared():
+            marker = format_author_marker(parts[0], parts[1] if len(parts) > 1 else "unknown")
+    body_text = f'<!-- baton-scan area="{area}" -->\n{text}\n'
+    if marker:
+        body_text = prepend_author_marker(body_text, marker)
+    Path(f"{draft}.body").write_text(body_text)
     title = title_file.read_text().split("\n", 1)[0]
     created, _applied = pr_helpers.create_issue(
         env.repo.gh_repo, title=title, body_file=f"{draft}.body",
@@ -105,7 +116,7 @@ def file_scan(env, draft):
     url = created.stdout.rstrip("\n")
     notify.log(f"scan of {area} filed {url}")
     notify.notify("Scan filed an issue for Cursor", url)
-    for suffix in ("title", "md", "area", "body"):
+    for suffix in ("title", "md", "area", "body", "author"):
         Path(f"{draft}.{suffix}").unlink(missing_ok=True)
     return True
 

@@ -119,6 +119,26 @@ def test_a_failed_filing_keeps_the_draft(env, monkeypatch):
     assert Path(f"{base}.md").exists() and "gh issue create failed" in Path(env["LOGS"], "runner.log").read_text()
 
 
+def test_scan_saves_author_file_and_file_scan_writes_author_marker(env, monkeypatch):
+    def run(vendor, role, prompt, tag, cwd, settings="", output="", env=None, hooks=None):
+        base = re.search(r"/tmp/baton-scan-\d{8}-\d{6}", prompt).group(0)
+        Path(f"{base}.title").write_text("billing: double charge\n")
+        Path(f"{base}.md").write_text("<!-- baton-author: vendor=codex model=fake -->\n## Problem\nx\n")
+        return {"rc": 0, "outcome": "SCAN: found", "reply": "SCAN: found", "model": "claude-opus-5-5", "defer": ""}
+    monkeypatch.setattr(scan.dispatch, "dispatch", run)
+    outcome, saved = scan.scan_area(env, "3", AREA)
+    assert outcome == "SCAN: found"
+    assert Path(f"{saved}.author").read_text() == "claude claude-opus-5-5\n"
+    calls = fake_gh(monkeypatch)
+    assert scan.file_scan(env, saved) is True
+    assert calls[0][-1] == (
+        f'<!-- baton-scan area="{AREA}" -->\n'
+        "<!-- baton-author: vendor=claude model=claude-opus-5-5 -->\n"
+        "## Problem\nx\n"
+    )
+    assert not Path(f"{saved}.author").exists()
+
+
 def test_file_scan_creates_both_missing_labels_then_files(gh, tmp_path):
     gh.set_labels()
     base = draft({"STATE": str(tmp_path / "state")})
