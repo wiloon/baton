@@ -9,6 +9,7 @@ import fcntl
 import os
 from pathlib import Path
 import secrets
+import stat
 
 
 @contextmanager
@@ -19,6 +20,18 @@ def locked(state):
     with path.open('a') as file:   # closing it releases the lock
         fcntl.flock(file, fcntl.LOCK_EX)
         yield
+
+
+def unlink_unless_directory(path):
+    """Unlink PATH if it exists, a symlink as a link. True: a real directory is there, left to the
+    caller. Linux refuses that unlink with EISDIR, macOS with EPERM (#281)."""
+    try:
+        path.unlink(missing_ok=True)
+    except (IsADirectoryError, PermissionError):
+        if not stat.S_ISDIR(path.lstat().st_mode):
+            raise
+        return True
+    return False
 
 
 def sync_directory(path):

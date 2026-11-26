@@ -5,7 +5,7 @@ calls the bash helpers made, and keeps their exit codes. Commands that change th
 print JSON: `changed`, and `log` for a runner.log line that bash writes.
 """
 
-from . import check_verdicts, checks, names, session
+from . import check_verdicts, checks, names, session, statefile
 import argparse
 import json
 import os
@@ -374,9 +374,7 @@ def _prepare_request(text, issue, live, wanted):
 
 def remove_body_request(path):
     """Discard even a rejected directory at the agent's request path."""
-    try:
-        path.unlink(missing_ok=True)
-    except IsADirectoryError:
+    if statefile.unlink_unless_directory(path):
         shutil.rmtree(path)
 
 

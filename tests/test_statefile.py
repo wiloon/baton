@@ -14,7 +14,7 @@ import time
 
 import pytest
 
-from baton import migrate, notify, quota, retrospectives, settle
+from baton import migrate, notify, quota, retrospectives, settle, statefile
 from baton.config import load
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -297,7 +297,6 @@ def test_the_migration_gate_accepts_every_runner_wide_file(runner):
 
 
 def test_the_older_atomic_writers_are_aliases_of_the_shared_helper(tmp_path, monkeypatch):
-    from baton import statefile
     calls = []
     monkeypatch.setattr(statefile, "replace", lambda path, text, **modes: calls.append((path, text, modes)))
     quota.atomic_json(tmp_path / "a.json", {"x": float("nan")})
@@ -328,3 +327,25 @@ def test_each_state_file_keeps_its_permissions(runner):
     assert mode(runner.state / "quota-codex.json") == 0o600
     assert mode(runner.state / "retrospectives" / "new" / "row.json") == 0o600
     assert mode(runner.state / "retrospectives" / "new") == 0o700
+
+
+@pytest.mark.parametrize("platform", ["native", "macos_unlink"])
+def test_unlink_unless_directory_leaves_only_a_real_directory(tmp_path, request, platform):
+    if platform != "native":
+        request.getfixturevalue(platform)
+    directory, file, link = tmp_path / "directory", tmp_path / "file", tmp_path / "link"
+    directory.mkdir()
+    (directory / "child").touch()
+    file.touch()
+    link.symlink_to(directory)
+    assert statefile.unlink_unless_directory(directory) is True
+    for path in (file, link, tmp_path / "missing"):
+        assert statefile.unlink_unless_directory(path) is False
+    assert not file.exists() and not link.is_symlink() and (directory / "child").is_file()
+
+
+def test_unlink_unless_directory_does_not_swallow_a_refused_file(tmp_path, denied_unlink):
+    file = tmp_path / "file"
+    file.touch()
+    with pytest.raises(PermissionError):
+        statefile.unlink_unless_directory(file)
