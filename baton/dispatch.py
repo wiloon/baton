@@ -21,7 +21,7 @@ from pathlib import Path
 import sys
 import time
 
-from . import agents, capacity, hooks as telemetry, notify, settle, vendors
+from . import agents, capacity, gitcontrol, hooks as telemetry, notify, settle, vendors
 from .common import LEASE_REASON, Request
 
 
@@ -107,14 +107,24 @@ def _dispatch(vendor, role, prompt, tag, cwd, settings, output, env, hooks):
     child_overrides.update(secret_overrides(env, role))
     request = Request(vendor=vendor, role=role, prompt=prompt, cwd=Path(cwd), log=run_log, minutes=minutes,
                       model=model, otel=adapter.request_otel(run), env=child_overrides, **options)
+    # No run may change what git executes for the runner afterwards (config, hooks).
+    git_control = gitcontrol.snapshot(cwd)
     try:
         ran = agents.run(request, cooldown_hours)
     except Exception as error:
+        if tampered := gitcontrol.restore(git_control):
+            notify.log(f"{tag}: {vendor} changed git control files; restored: {', '.join(tampered)}")
         notify.log(f"end {tag} adapter rc=1, no result")
         outcome = f"RESULT: failed baton rc=1 (log {run_log})"
         rc, outcome, defer = settle.settle(state, vendor, "failure", 1, str(run_log), tag, "", outcome)
         hooks.end(run, "failure", str(run_log))
         return result(rc, "failure", outcome, "", defer=defer, log=str(run_log))
+    if tampered := gitcontrol.restore(git_control):
+        notify.log(f"{tag}: {vendor} changed git control files; restored: {', '.join(tampered)}")
+        if ran.status == "success":
+            # Its work can't be trusted either: fail the run, whatever it reported.
+            ran.status, ran.rc, ran.reply = "failure", 1, ""
+            ran.outcome = "RESULT: failed changed the repository's git configuration or hooks (restored)"
     if ran.status == "busy":
         ran.cooldown_until = int(time.time()) + env.config.models.busy_minutes * 60
     if ran.killed:

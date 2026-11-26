@@ -339,3 +339,78 @@ def test_a_codex_screenshot_review_without_its_artifact_fails(runner, monkeypatc
     runner.plan(stream=CODEX_STREAM, last="REVIEW: pass\n")
     out = runner.run("codex", "screenshot_review", output=str(runner.root / "shots.md"))
     assert out["outcome"].startswith("RESULT: failed") and "no Codex review artifact" in out["outcome"]
+
+
+# --- git control files (config, hooks) ---------------------------------------------------
+
+TAMPER = f"""#!{sys.executable}
+import json, os, pathlib, subprocess, sys
+fake = pathlib.Path(os.environ["FAKE_DIR"])
+plan = json.loads((fake / "tamper.json").read_text())
+git_dir = pathlib.Path.cwd() / ".git"
+for name, content in plan.get("write", {{}}).items():
+    path = git_dir / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+    path.chmod(0o755)
+for name in plan.get("remove", []):
+    (git_dir / name).unlink()
+os.execv(str(fake / "claude-real"), [str(fake / "claude-real"), *sys.argv[1:]])
+"""
+
+
+def tamper(runner, **plan):
+    fake = runner.root / "fake"
+    (fake / "claude").rename(fake / "claude-real")
+    (fake / "claude").write_text(TAMPER)
+    (fake / "claude").chmod(0o755)
+    (fake / "tamper.json").write_text(json.dumps(plan))
+
+
+def test_a_run_that_adds_a_hook_fails_and_the_hook_is_removed(runner):
+    runner.plan(stream=claude_stream("fine\nREVIEW: pass"))
+    tamper(runner, write={"hooks/pre-push": "#!/bin/sh\ntouch /tmp/ran\n"})
+    out = runner.run()
+    assert (out["rc"], out["status"]) == (1, "failure")
+    assert "git configuration or hooks" in out["outcome"] and out["reply"] == ""
+    assert not (runner.worktree / ".git" / "hooks" / "pre-push").exists()
+    assert any("changed git control files; restored: hooks/pre-push" in line for line in runner.runner_log())
+
+
+def test_a_run_that_edits_git_config_fails_and_the_config_is_restored(runner):
+    config = runner.worktree / ".git" / "config"
+    before = config.read_bytes()
+    runner.plan(stream=claude_stream("fine\nREVIEW: pass"))
+    tamper(runner, write={"config": before.decode() + "[core]\n\tfsmonitor = /tmp/x\n"})
+    out = runner.run()
+    assert out["status"] == "failure" and config.read_bytes() == before
+    assert config.stat().st_mode & 0o777 != 0o755   # the mode is restored too
+
+
+def test_a_changed_or_removed_existing_hook_is_put_back(runner):
+    hook = runner.worktree / ".git" / "hooks" / "pre-commit"
+    hook.parent.mkdir(exist_ok=True)
+    hook.write_text("#!/bin/sh\nexit 0\n")
+    hook.chmod(0o755)
+    runner.plan(stream=claude_stream("fine\nREVIEW: pass"))
+    tamper(runner, remove=["hooks/pre-commit"], write={"info/attributes": "* filter=x\n"})
+    out = runner.run()
+    assert out["status"] == "failure"
+    assert hook.read_text() == "#!/bin/sh\nexit 0\n" and hook.stat().st_mode & 0o777 == 0o755
+    assert not (runner.worktree / ".git" / "info" / "attributes").exists()
+
+
+def test_a_run_that_leaves_git_control_files_alone_is_unaffected(runner):
+    runner.plan(stream=claude_stream("fine\nREVIEW: pass"))
+    tamper(runner)
+    out = runner.run()
+    assert (out["rc"], out["status"], out["outcome"]) == (0, "success", "REVIEW: pass")
+    assert not any("git control files" in line for line in runner.runner_log())
+
+
+def test_a_deferred_run_keeps_its_status_but_the_files_are_still_restored(runner):
+    runner.plan(stream="You've hit your limit \u00b7 resets 3am\n", rc=1)
+    tamper(runner, write={"hooks/post-checkout": "#!/bin/sh\n"})
+    out = runner.run()
+    assert out["status"] == "quota" and out["rc"] == 75
+    assert not (runner.worktree / ".git" / "hooks" / "post-checkout").exists()
