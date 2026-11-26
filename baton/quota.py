@@ -13,7 +13,7 @@ Each adapter parses its own run output (parse_quota_log) or, when its QUOTA_SOUR
                                print the vendor to use and a one-line summary; exit 1 if none
 """
 
-from . import agents, session
+from . import agents, session, statefile
 import json
 from contextlib import contextmanager
 import fcntl
@@ -21,7 +21,6 @@ import math
 from pathlib import Path
 import sys
 import time
-import tempfile
 
 WINDOW_SECONDS = {"five_hour": 5 * 3600, "seven_day": 7 * 24 * 3600}
 TIE = 0.05   # scores this close count as equal: preference, then pool order decides
@@ -52,16 +51,7 @@ def _save(state, vendor, snap):
 
 def atomic_json(path, value):
     """Readers see a complete generation; writers never share a temporary file."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(mode='w', dir=path.parent, prefix=path.name + '.', delete=False) as out:
-        temporary = Path(out.name)
-        try:
-            json.dump(value, out)
-            out.close()
-            temporary.replace(path)
-        finally:
-            temporary.unlink(missing_ok=True)
+    statefile.replace(path, json.dumps(value), mode=0o600)
 
 
 @contextmanager

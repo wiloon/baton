@@ -39,7 +39,7 @@ import sys
 import tempfile
 import time
 
-from . import advisor, after_merge, agents, checkpoint, dev, fix, handoff as owner_handoff, hooks as telemetry, maintenance, merge, names, notify, pick, pr as pr_helpers, pr_contract, review, scan, spec, tmp_sweep, vendors
+from . import advisor, after_merge, agents, checkpoint, dev, fix, handoff as owner_handoff, hooks as telemetry, maintenance, merge, names, notify, pick, pr as pr_helpers, pr_contract, review, scan, spec, statefile, tmp_sweep, vendors
 from .common import Deferred, git
 
 AGENT_REVIEW_NOTE = ("The PR description{issue} give the problem, its cause and the fix. Check the diagnosis first: does the "
@@ -142,7 +142,7 @@ class Tick:
     def begin_item(self):
         self.active = {"review": "", "spec": "", "issue": "", "cursor_fix": "", "pr": ""}
         if not self.manual:   # the next tick starts with the repository after this one
-            (self.runner_state / "last-repo").write_text(f"{self.gh_repo}\n")
+            statefile.replace(self.runner_state / "last-repo", f"{self.gh_repo}\n")
         fd, path = tempfile.mkstemp(prefix="baton-telemetry-item.", dir=self.env.tools.get("TMPDIR", "/tmp") or "/tmp")
         os.close(fd)
         self.env.runtime.telemetry_item = path
@@ -1425,8 +1425,9 @@ def run(ticks):
     (runner_state / "chain-next").unlink(missing_ok=True)
     # Upgrade the old global cooldown as Claude-only; retain today's Claude counter.
     old, new = runner_state / "cooldown-until", runner_state / "claude-cooldown-until"
-    if old.is_file() and not new.exists():
-        old.rename(new)
+    with statefile.locked(runner_state):   # a cooldown written in between would be overwritten
+        if old.is_file() and not new.exists():
+            old.rename(new)
     if len(ticks) == 1:
         try:
             return first.pass_()
