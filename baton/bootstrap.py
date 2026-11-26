@@ -14,17 +14,25 @@ def main(argv=None):
     parser.add_argument('--validate', action='store_true')
     parser.add_argument('--preflight', action='store_true', help='Check local dependencies without starting tasks')
     parser.add_argument('--chain', type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument('--serve-child', action='store_true', help=argparse.SUPPRESS)   # `serve`'s tick
     parser.add_argument('--repo', default='', metavar='OWNER/NAME',
                         help='The repository a command is for; needed when several are configured')
-    parser.add_argument('command', nargs='*', help='ISSUE | pr N | review N | scan [N|list] | file-scan DRAFT')
+    parser.add_argument('command', nargs='*', help='serve | ISSUE | pr N | review N | scan [N|list] | file-scan DRAFT')
     args = parser.parse_args(argv)
+    serving = args.command[:1] == ['serve']
+    if serving and (len(args.command) > 1 or args.repo or args.serve_child):
+        print('usage: python -m baton serve (no --repo, no further arguments)', file=sys.stderr)
+        return 2
+    if args.serve_child and (not args.repo or args.command):
+        print('usage: python -m baton --repo OWNER/NAME --serve-child (no command)', file=sys.stderr)
+        return 2
     try:
         config = load(args.config)
         if args.chain < 0 or args.chain > config.scheduling.chain_max:
             raise ConfigError('chain count outside configured bounds')
         if args.repo:
             config.repo(args.repo)
-        elif args.command and len(config.repos) > 1:
+        elif args.command and not serving and len(config.repos) > 1:
             raise ConfigError('repos: several repositories are configured; pass --repo OWNER/NAME')
     except ConfigError as error:
         print(f'Invalid configuration: {error}', file=sys.stderr)
@@ -62,13 +70,19 @@ def main(argv=None):
     if legacy := migrate.pending(config):
         print(f'Single-repository state found ({legacy}); run python -m baton.migrate OWNER/NAME first', file=sys.stderr)
         return 2
-    # By hand: the named (or only) repository. The timer: every configured repository, in turn.
-    repos = [config.repo(args.repo) if args.repo else config.repos[0]] if args.command else list(config.repos)
+    if serving:
+        from . import serve
+        return serve.main(config)
+    # By hand and for `serve`'s child: the named (or only) repository. The timer: every configured
+    # repository, in turn.
+    one = args.command or args.serve_child
+    repos = [config.repo(args.repo) if args.repo else config.repos[0]] if one else list(config.repos)
     invocations = []
     for repo in repos:
         invocation = session.create(config, repo=repo)
         invocation.runtime.chain = args.chain
         invocation.runtime.manual = bool(args.command)
+        invocation.runtime.serve_child = args.serve_child
         invocations.append(invocation)
     session.bind(invocations[0])
     if args.command == ['scan', 'list']:

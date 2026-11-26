@@ -20,7 +20,11 @@ currently allowed actions with a rule-based default.
 **Advisor**:
 A model that recommends one allowed action at a decision point. It does not change anything
 itself.
-_Avoid_: AI scheduler, supervisor
+_Avoid_: AI scheduler
+
+**Supervisor**:
+The resident `baton serve` process that schedules tick children, one per repository. It makes no
+judgement.
 
 **Decision record**:
 The stored account of one advisor recommendation: what it saw, what it could choose, what it

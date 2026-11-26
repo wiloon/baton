@@ -1,14 +1,16 @@
 """Native typed entry tests: no legacy fixture adaptation or real agent calls."""
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 import os
 import subprocess
 import sys
 
 import pytest
-from baton import bootstrap, quota, session, vendors, tick
+from baton import bootstrap, hooks, quota, session, vendors, tick
 from baton.config import load
 from conftest import full_text
+from test_repos import TWO
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -64,6 +66,52 @@ def test_chain_preserves_config_and_bound_and_closes_lock(tmp_path, monkeypatch)
     assert invocation.lock_file.closed
     assert calls[0][1][-4:] == ['--config',str(config.source),'--chain','1']
     assert explicit.runtime.chain == 1
+
+
+@pytest.fixture
+def walked(tmp_path, monkeypatch):
+    """bootstrap.main over two configured repositories, each tick's item a merged partial slice."""
+    source = tmp_path/'config.toml'
+    source.write_text(TWO.replace('~/', f'{tmp_path}/home/'))
+    seen = SimpleNamespace(source=source, worked=[], events=[], execs=[], flag=True)
+    def work(self):
+        seen.worked.append((self.gh_repo, bool(self.manual)))
+        if not seen.flag:
+            return None
+        (self.state/'chain-next').touch()
+        return self.after_item(80)
+    monkeypatch.setattr(tick.Tick, 'work', work)
+    monkeypatch.setattr(tick.Tick, 'scan_fallback', lambda self: None)
+    monkeypatch.setattr(hooks.Telemetry, 'tick', lambda self, manual=False: seen.events.append(bool(manual)))
+    monkeypatch.setattr(tick.os, 'execv', lambda executable, argv: seen.execs.append(argv))
+    seen.run = lambda *argv: bootstrap.main(['--config', str(source), *argv])
+    seen.flags = lambda: list((tmp_path/'home').rglob('chain-next'))
+    return seen
+
+
+def test_a_serve_child_ticks_only_its_repository_and_exits_80_instead_of_chaining(walked):
+    assert walked.run('--repo', 'acme/shop', '--serve-child') == 80
+    assert walked.worked == [('acme/shop', False)]
+    assert walked.events == [False]
+    assert not walked.execs and not walked.flags()
+
+
+def test_a_serve_child_without_a_merged_slice_exits_0(walked):
+    walked.flag = False
+    assert walked.run('--repo', 'acme/shop', '--serve-child') == 0
+    assert walked.worked == [('acme/shop', False)]
+
+
+def test_a_serve_child_honours_paused(walked):
+    walked.source.write_text(walked.source.read_text().replace('paused = false', 'paused = true'))
+    assert walked.run('--repo', 'acme/shop', '--serve-child') == 0
+    assert not walked.worked
+
+
+def test_the_timer_path_still_chains_by_re_exec(walked):
+    assert walked.run('--repo', 'acme/shop') == 0
+    assert walked.worked == [('acme/app', False)]
+    assert walked.execs and walked.execs[0][-2:] == ['--chain', '1']
 
 
 def test_service_style_minimal_environment_ignores_legacy_overrides(tmp_path):

@@ -30,7 +30,7 @@ from .config import ConfigError, load, repo_dirs
 # old files that stay on disk), vendor cooldowns and run counts,
 # quota and credential snapshots, telemetry/retrospectives, vendor leases, advisor decisions, and old
 # deploy backups.
-GLOBAL_STATE = re.compile(r"lock|housekeeping\.lock|scan\.lock|maintenance(?:\.lock)?|last-repo|chain-next|telemetry|retrospectives|vendor-leases|quota-locks|quota-probes|deploy-backups|advisor|repos|"
+GLOBAL_STATE = re.compile(r"lock|housekeeping\.lock|scan\.lock|maintenance(?:\.lock)?|last-repo|chain-next|telemetry|retrospectives|vendor-leases|quota-locks|quota-probes|deploy-backups|advisor|repos|serve\.json|"
                           r"(?:[a-z]+-)?cooldown-until|(?:[a-z]+-)?runs-\d{4}-\d\d-\d\d|"
                           r"(?:quota|credential)-[a-z]+\.json")
 LABELLED = re.compile(r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d \[[^\]\s]+/[^\]\s]+\] ")

@@ -48,8 +48,12 @@ review_skill_min_lines = 800
 chain_max = 5
 # The most characters of PR comments and reviews given to a reviewer or fixer as context.
 review_context_max_chars = 20000
-# true: the timer's ticks do nothing; runs by hand still work.
+# true: the timer's ticks do nothing and `serve` starts nothing; runs by hand still work.
 paused = false
+# `python -m baton serve` only: tick children it runs at once across all repositories, never two for
+# one repository. Optional, at least 1. Raise it only when the repositories' CI and e2e commands do
+# not collide on ports or container names. Lowering it never stops a running child.
+max_parallel = 1
 # Cursor triages claude-found issues (its verdicts advance them), and code scans may run.
 cross_review = true
 # Who Cursor is on GitHub: PR author logins and branch names that mark a Cursor PR.
@@ -64,6 +68,13 @@ scan = false
 scan_interval_hours = 6
 # No new scan while this many claude-found issues still wait for triage.
 scan_max_waiting = 2
+
+# Optional: the resident supervisor, `python -m baton serve`, which replaces baton.timer. It reads
+# this whole file again on every loop; while the file is invalid it starts nothing.
+[serve]
+# Seconds between its loops, and how long a finished or idle repository waits before its next tick.
+# A failing one waits twice as long each time, up to an hour. At least 10.
+poll_seconds = 60
 
 [[repos]]
 # A repository the runner works on, one [[repos]] entry each; the runner takes them in turn.
