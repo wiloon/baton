@@ -6,6 +6,7 @@ response, and the model appears in `cli.log` as a display label when `init` has 
 `cli.log` line shape and the usage keys are modelled on those notes, not copied from a real file.
 """
 import json
+import math
 import os
 import subprocess
 import sys
@@ -19,12 +20,33 @@ from baton import agents, agy_cli, config, dispatch, quota, session, settle, ven
 from conftest import full_text
 from test_agents import lines
 
+# `agy -p /quota --output-format json`, agy 1.5.17 on SER8 (#252), trimmed as recorded in the issue.
+QUOTA_FIXTURE = json.dumps({
+    "status": "SUCCESS", "num_turns": 0,
+    "response": "Gemini Models\tWeekly Limit Remaining\t42%\t2026-12-01T03:23:36Z\n",
+    "command": {"name": "usage", "data": {"groups": [
+        {"name": "Gemini Models", "buckets": [
+            {"id": "gemini-weekly", "window": "weekly", "remaining_fraction": 0.42058518528938293,
+             "reset_time": "2026-12-01T03:23:36Z"},
+            {"id": "gemini-5h", "window": "5h", "remaining_fraction": 0.956117570400238,
+             "reset_time": "2026-11-26T03:06:19Z"}]},
+        {"name": "Claude and GPT models", "buckets": [
+            {"id": "3p-weekly", "window": "weekly", "remaining_fraction": 1, "reset_time": "1970-01-01T00:00:00Z"},
+            {"id": "3p-5h", "window": "5h", "remaining_fraction": 1, "reset_time": "1970-01-01T00:00:00Z"}]}]}}})
+
 FAKE_AGY = f"""#!{sys.executable}
 import json, os, pathlib, subprocess, sys
 fake = pathlib.Path(os.environ["FAKE_DIR"])
 args = sys.argv[1:]
 if args == ["--version"]:
     sys.exit(0)
+if args[:2] == ["-p", "/quota"]:
+    # Every agy run ends with a quota refresh (#252): answer it without counting as an agent run.
+    (fake / "quota-calls").open("a").write(json.dumps({{"args": args, "cwd": os.getcwd()}}) + "\\n")
+    answer = json.loads((fake / "quota.json").read_text()) if (fake / "quota.json").exists() else {{}}
+    sys.stdout.write(answer.get("stdout", {QUOTA_FIXTURE!r}))
+    sys.stderr.write(answer.get("stderr", ""))
+    sys.exit(answer.get("rc", 0))
 (fake / "calls").open("a").write("agy\\n")
 (fake / "args.json").write_text(json.dumps(args))
 plan = json.loads((fake / "plan.json").read_text())
@@ -118,6 +140,17 @@ def agy_runner(tmp_path, monkeypatch):
             path = fake / "calls"
             return path.read_text().split() if path.exists() else []
 
+        def quota(self, **answer):
+            """What the fake answers to `agy -p /quota`: stdout, stderr, rc."""
+            (fake / "quota.json").write_text(json.dumps(answer))
+
+        def quota_calls(self):
+            path = fake / "quota-calls"
+            return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+        def runner_log(self):
+            return "".join(path.read_text() for path in logs.rglob("runner.log"))
+
     return Runner()
 
 
@@ -129,7 +162,8 @@ def test_agy_is_registered_with_gemini_only_review_policy():
     assert agy.SAME_VENDOR_SAME_MODEL is False
     assert agy.ROUTE_FIELDS == frozenset({"model"})
     assert agy.COMMIT_MARKERS == ()
-    assert agy.QUOTA_SOURCE == "none"
+    assert agy.QUOTA_SOURCE == "api"
+    assert agy.QUOTA_WINDOWS == {"five_hour", "seven_day"}
     assert agy.SUPPORTED_ROLES == {"dev", "fixer", "reviewer", "spec_reviewer"}
     assert agy.valid_model("gemini-4-neon-medium")
     assert not agy.valid_model("claude-opus-5-5-medium")
@@ -279,14 +313,237 @@ def test_logged_out_result_is_an_auth_failure(agy_runner):
     assert (agy_runner.state_dir / "agy-cooldown-until").read_text().strip().isdigit()
 
 
-def test_quota_source_none_runs_no_agent_and_records_no_quota(agy_runner):
+def test_quota_source_none_runs_no_agent_and_records_no_quota(agy_runner, monkeypatch):
+    """The `none` seam in settle._probe stays, though no registered adapter uses it (#252)."""
+    monkeypatch.setattr(agy_cli, "QUOTA_SOURCE", "none")
+    monkeypatch.setattr(agy_cli, "QUOTA_WINDOWS", frozenset())
     assert settle.probe(str(agy_runner.state_dir), str(agy_runner.logs_dir), "agy", "") is True
-    assert agy_runner.calls() == []
+    assert agy_runner.calls() == [] and agy_runner.quota_calls() == []
     assert not list(agy_runner.logs_dir.glob("*quota-probe-agy*"))
     snap = quota.load(agy_runner.state_dir, "agy")
     assert snap.get("probed_at") and not snap.get("windows")
     assert quota.fresh(agy_runner.state_dir, "agy", time.time(), 60)
     assert quota.credential_current(agy_runner.state_dir, "agy", time.time())
+
+
+# --- quota from `agy -p /quota` (#252) ---------------------------------------------------------
+
+def epoch(text):
+    from datetime import datetime
+    return int(datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp())
+
+
+NOW = epoch("2026-11-25T12:00:00Z")
+
+
+def gemini(five=0.956117570400238, week=0.42058518528938293, five_reset="2026-11-26T03:06:19Z",
+           week_reset="2026-12-01T03:23:36Z", status="SUCCESS", drop=(), extra=None, **fields):
+    buckets = [{"id": "gemini-weekly", "window": "weekly", "remaining_fraction": week, "reset_time": week_reset},
+               {"id": "gemini-5h", "window": "5h", "remaining_fraction": five, "reset_time": five_reset}]
+    for bucket in buckets:
+        bucket.update(extra or {})
+    buckets = [b for b in buckets if b["window"] not in drop]
+    return json.dumps({"status": status, "num_turns": 0, **fields,
+                       "command": {"name": "usage", "data": {"groups": [
+                           {"name": "Gemini Models", "buckets": buckets}]}}})
+
+
+def answering(stdout=QUOTA_FIXTURE, stderr="", rc=0, calls=None):
+    def run(command, *, cwd, env, timeout):
+        if calls is not None:
+            calls.append({"command": command, "cwd": cwd, "env": env, "timeout": timeout,
+                          "cwd_exists": Path(cwd).is_dir()})
+        return subprocess.CompletedProcess(command, rc, stdout, stderr)
+    return run
+
+
+def raising(error):
+    def run(command, *, cwd, env, timeout):
+        raise error
+    return run
+
+
+def metrics(agy_runner):
+    values = {}
+    t = bin_telemetry()
+    t.quota_metrics(agy_runner.state_dir, t._runner_config(agy_runner.root / "config.toml"),
+                    lambda name, value, labels: values.__setitem__((name, labels), value), NOW)
+    return {(name, labels.split('window="')[1].rstrip('"}')): value
+            for (name, labels), value in values.items() if 'agent="agy"' in labels and "window=" in labels}
+
+
+def test_refresh_records_the_gemini_group_only(agy_runner):
+    state = str(agy_runner.state_dir)
+    calls = []
+    windows = agy_cli.refresh_quota(state, NOW, run=answering(calls=calls))
+    assert set(windows) == {"five_hour", "seven_day"}
+    assert windows["five_hour"]["used"] == pytest.approx(1 - 0.956117570400238)
+    assert windows["five_hour"]["resets_at"] == epoch("2026-11-26T03:06:19Z")
+    assert windows["seven_day"]["used"] == pytest.approx(1 - 0.42058518528938293)
+    assert windows["seven_day"]["resets_at"] == epoch("2026-12-01T03:23:36Z")
+    [call] = calls
+    assert call["command"] == ["agy", "-p", "/quota", "--output-format", "json"]
+    assert call["timeout"] == 30 and call["cwd_exists"]
+    assert str(agy_runner.worktree) not in call["cwd"]
+    env = call["env"]
+    assert (env["GH_TOKEN"], env["GITHUB_TOKEN"], env["GIT_SSH_COMMAND"], env["GIT_TERMINAL_PROMPT"]) == (
+        "no-github-for-agy", "", "/bin/false", "0")
+    saved = json.loads((agy_runner.state_dir / "quota-agy.json").read_text())
+    assert {name: set(w) for name, w in saved["windows"].items()} == {
+        "five_hour": {"used", "resets_at", "observed_at"}, "seven_day": {"used", "resets_at", "observed_at"}}
+    assert json.loads((agy_runner.state_dir / "credential-agy.json").read_text())["result"] == "authenticated"
+    assert quota.fresh(state, "agy", NOW, 60)
+    got = metrics(agy_runner)
+    for window in ("five_hour", "seven_day"):
+        assert got[("quota_window_state", window)] == 1
+        assert got[("quota_used_ratio", window)] == pytest.approx(windows[window]["used"])
+
+
+def test_an_unused_gemini_window_resets_one_window_length_from_now(agy_runner):
+    state = str(agy_runner.state_dir)
+    epoch0 = "1970-01-01T00:00:00Z"
+    windows = agy_cli.refresh_quota(state, NOW, run=answering(gemini(1, 1, epoch0, epoch0)))
+    assert windows == {"five_hour": {"used": 0, "resets_at": NOW + quota.WINDOW_SECONDS["five_hour"]},
+                       "seven_day": {"used": 0, "resets_at": NOW + quota.WINDOW_SECONDS["seven_day"]}}
+    assert quota.fresh(state, "agy", NOW, 60)
+    got = metrics(agy_runner)
+    for window in ("five_hour", "seven_day"):
+        assert got[("quota_window_state", window)] == 1
+        assert got[("quota_used_ratio", window)] == 0
+
+
+FAILURES = {
+    "timeout": raising(subprocess.TimeoutExpired(["agy"], 30)),
+    "missing": raising(FileNotFoundError("agy")),
+    "rc": answering(rc=1, stderr="boom"),
+    "not-json": answering("Gemini Models\tWeekly Limit Remaining\t65%\n"),
+    "status": answering(gemini(status="FAILED")),
+    "no-gemini": answering(json.dumps({"status": "SUCCESS", "command": {"data": {"groups": [
+        {"name": "Claude and GPT models", "buckets": []}]}}})),
+    "no-5h": answering(gemini(drop=("5h",))),
+    "no-weekly": answering(gemini(drop=("weekly",))),
+    "no-reset": answering(gemini(week_reset=None)),
+    "bad-reset": answering(gemini(five_reset="soon")),
+    "string-fraction": answering(gemini(five="0.5")),
+    "bool-fraction": answering(gemini(week=True)),
+    "nan-fraction": answering(gemini(five=float("nan"))),
+    "above-one": answering(gemini(five=1.5)),
+    "below-zero": answering(gemini(week=-0.1)),
+}
+
+
+@pytest.mark.parametrize("name", FAILURES)
+def test_a_failed_refresh_raises_and_records_nothing(agy_runner, name):
+    state = str(agy_runner.state_dir)
+    with pytest.raises(Exception):
+        agy_cli.refresh_quota(state, NOW, run=FAILURES[name])
+    assert not (agy_runner.state_dir / "quota-agy.json").exists()
+    assert not (agy_runner.state_dir / "credential-agy.json").exists()
+    before = {"five_hour": {"used": 0.5, "resets_at": NOW + 600}, "seven_day": {"used": 0.25, "resets_at": NOW + 6000}}
+    quota.record(state, "agy", before, NOW - 60)
+    saved = (agy_runner.state_dir / "quota-agy.json").read_text()
+    with pytest.raises(Exception):
+        agy_cli.refresh_quota(state, NOW, run=FAILURES[name])
+    assert (agy_runner.state_dir / "quota-agy.json").read_text() == saved
+
+
+@pytest.mark.parametrize("kwargs", [dict(rc=1, stderr="Error: authentication failed or timed out"),
+                                    dict(stdout=json.dumps({"status": "ERROR", "error": "not logged in"})),
+                                    dict(stdout=json.dumps({"status": "ERROR", "message": "Please log in"}))])
+def test_an_auth_failure_records_auth_expired_and_no_cooldown(agy_runner, kwargs):
+    state = str(agy_runner.state_dir)
+    with pytest.raises(Exception):
+        agy_cli.refresh_quota(state, NOW, run=answering(**kwargs))
+    assert json.loads((agy_runner.state_dir / "credential-agy.json").read_text())["result"] == "auth_expired"
+    assert not (agy_runner.state_dir / "agy-cooldown-until").exists()
+    assert not (agy_runner.state_dir / "quota-agy.json").exists()
+
+
+def test_auth_text_in_the_response_alone_is_not_an_auth_failure(agy_runner):
+    state = str(agy_runner.state_dir)
+    answer = json.dumps({"status": "ERROR", "error": "quota service down",
+                         "response": "please log in: authentication failed SECRET-REPLY"})
+    with pytest.raises(Exception) as raised:
+        agy_cli.refresh_quota(state, NOW, run=answering(answer))
+    assert "SECRET-REPLY" not in str(raised.value)
+    assert not (agy_runner.state_dir / "credential-agy.json").exists()
+
+
+def test_every_agy_run_ends_with_a_refresh(agy_runner):
+    agy_runner.plan(stream=stream())
+    assert agy_runner.run()["status"] == "success"
+    [call] = agy_runner.quota_calls()
+    assert call["args"] == ["-p", "/quota", "--output-format", "json"]
+    assert call["cwd"] != str(agy_runner.worktree)
+    assert set(quota.load(agy_runner.state_dir, "agy")["windows"]) == {"five_hour", "seven_day"}
+    assert "quota agy: week 58%" in agy_runner.runner_log()
+
+
+def test_a_failed_refresh_never_fails_the_step_and_logs_one_line(agy_runner):
+    state, logs = str(agy_runner.state_dir), str(agy_runner.logs_dir)
+    before = {"five_hour": {"used": 0.5, "resets_at": NOW + 600}, "seven_day": {"used": 0.25, "resets_at": NOW + 6000}}
+    quota.record(state, "agy", before, NOW - 60)
+    saved = (agy_runner.state_dir / "quota-agy.json").read_text()
+    agy_runner.quota(rc=1, stderr="boom")
+    assert settle.settle(state, "agy", "success", 0, "", "dev")[0] == 0
+    assert settle.probe(state, logs, "agy", "") is True
+    assert agy_runner.runner_log().count("quota: refreshing agy failed") == 2
+    assert json.loads((agy_runner.state_dir / "quota-agy.json").read_text())["windows"] == json.loads(saved)["windows"]
+    assert agy_runner.calls() == []
+
+
+def test_a_logged_out_refresh_in_settle_records_auth_expired_without_cooldown(agy_runner):
+    state = str(agy_runner.state_dir)
+    agy_runner.quota(rc=1, stderr="authentication failed or timed out")
+    assert settle.settle(state, "agy", "success", 0, "", "dev")[0] == 0
+    assert quota.credential_expired(state, "agy")
+    assert not (agy_runner.state_dir / "agy-cooldown-until").exists()
+
+
+def test_quota_cli_refreshes_the_named_api_vendor_only(agy_runner, monkeypatch, capsys):
+    from baton import cursor_cli
+    called = []
+    for module in (agy_cli, cursor_cli):
+        monkeypatch.setattr(module, "refresh_quota",
+                            lambda state, now, _id=module.ID, **kw: called.append(_id) or {})
+    assert quota.main(["refresh", "agy"]) == 0
+    assert quota.main(["refresh", "cursor"]) == 0
+    assert called == ["agy", "cursor"]
+    capsys.readouterr()
+    for argv in (["refresh"], ["refresh", "nope"], ["refresh", "claude"]):
+        assert quota.main(argv) == 2
+        assert capsys.readouterr().err.strip()
+    assert called == ["agy", "cursor"]
+
+
+def test_selection_reads_the_agy_snapshot(agy_runner):
+    state = str(agy_runner.state_dir)
+    agy_cli.refresh_quota(state, NOW, run=answering())
+    details = vendors.selection_details(state, ["claude", "codex"], ["agy"], "agy", "dev", now=NOW)
+    agy_part = details.split("agy[extra] ")[1]
+    assert "week=57.9%" in agy_part and f"reset_in={epoch('2026-12-01T03:23:36Z') - NOW}s" in agy_part
+    pace = agy_part.split("pace=")[1].split()[0]
+    assert pace != "unknown" and math.isfinite(float(pace)) and "gate=open" in agy_part
+    assert "5h=" not in details
+
+
+def test_a_full_agy_five_hour_window_blocks_the_pick(agy_runner):
+    state = str(agy_runner.state_dir)
+    agy_cli.refresh_quota(state, NOW, run=answering(gemini(five=0)))
+    details = vendors.selection_details(state, ["claude", "codex"], ["agy"], "agy", "dev", now=NOW)
+    assert "gate=5h 100%" in details
+    for vendor in ("claude", "codex", "cursor"):
+        Path(state, f"{vendor}-cooldown-until").write_text(str(NOW + 2 * 86400))
+    result, rc = vendors.pick(state, ["claude", "codex"], "dev", ["claude", "codex", "cursor", "agy"],
+                              by="contrib", now=NOW)
+    assert result["vendor"] != "agy" and "5h" in result["blocked"]["agy"]
+
+
+def test_a_pool_agy_config_loads(tmp_path):
+    cfg = write(tmp_path, with_agy(full_text()).replace('quota = "extra"\ncap = 0.9', 'quota = "pool"\ncap = 0.9'))
+    assert "agy" in cfg.pool()
+    assert '`[vendors.agy]`' in (ROOT / "README.md").read_text() and 'pool vendor\n    (`quota = "pool"`)' in (
+        ROOT / "README.md").read_text()
 
 
 def test_usage_of_a_recorded_result(agy_runner):

@@ -134,8 +134,9 @@ existing alternatives, replacement criteria and the proposed boundary for model-
   - Claude Code (`claude`)
   - Codex (`codex`)
   - Cursor (`cursor-agent`) as an optional extra vendor (`[vendors.cursor]` with `quota = "extra"`)
-  - Antigravity (`agy`) as an optional extra vendor (`[vendors.agy]` with `quota = "extra"`), Gemini models
-    only: a model that is not `gemini-*` is a config error, and its review route needs a model
+  - Antigravity (`agy`) as an extra vendor (`[vendors.agy]` with `quota = "extra"`) or a pool vendor
+    (`quota = "pool"`): baton reads its Gemini 5-hour and weekly windows from `agy -p /quota`. Gemini
+    models only: a model that is not `gemini-*` is a config error, and its review route needs a model
     distinct from its dev and fix routes (an effort suffix alone is not distinct)
 - whatever the watched repository's own checks need (its toolchain; `mise.toml` here pins one
   for everything under `~/baton`, edit it to suit)
