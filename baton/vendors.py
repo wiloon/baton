@@ -311,7 +311,8 @@ def same_vendor_review_mode(state, pr, vendor, model):
     resort, with the same model in a fresh session (every review run starts one). "" when the
     adapter does not allow it or a model is not proven: unknown authors are never review eligible.
     An adapter's distinct_models(a, b) compares aliases and IDs (Claude's "sonnet" is
-    claude-sonnet-*); SAME_VENDOR_SAME_MODEL says whether the fresh-session last resort is allowed."""
+    claude-sonnet-*, and its Opus, Sonnet, Haiku and Fable families differ);
+    SAME_VENDOR_SAME_MODEL says whether the fresh-session last resort is allowed."""
     if not same_vendor_review(vendor):
         return ""
     written = [row.split(maxsplit=1)[1] for row in _lines(state_path(state, pr, "author-models"))
