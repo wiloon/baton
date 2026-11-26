@@ -12,7 +12,7 @@ repository it does one of, in this order (the order is a contract):
   - a review the last run deferred (review-pending-N)
   - a PR the owner labelled agent-review
   - an agent PR labelled agent-fix (owner feedback)
-  - a ready-for-agent (or claude-found + needs-triage) issue: spec review, dev, review loop
+  - a ready-for-agent issue: spec review, dev, review loop
 Ticks for different repositories may overlap (ADR 0003, "Work locks"): a tick takes a
 repository's lock before it looks for work there, holds one at a time and skips a locked one; the
 housekeeping and the scan each have a lock of their own.
@@ -91,8 +91,8 @@ def open_blockers(item):
 
 def priority_of(labels):
     """The rank of an issue with these label names (ADR 0010): 0 for P0 to 3 for P3, the highest of
-    several, and P2 without one."""
-    return min((int(name[1]) for name in labels if re.fullmatch(r"[Pp][0-3]", name)), default=2)
+    several, and 4 (after P3) without one."""
+    return min((int(name[1]) for name in labels if re.fullmatch(r"[Pp][0-3]", name)), default=4)
 
 
 class Tick:
@@ -403,7 +403,8 @@ class Tick:
         return None
 
     def start(self, issue, note=""):
-        self.log(f"#{issue}: starting (P{self.priorities.get(str(issue), 2)}){note}")
+        rank = self.priorities.get(str(issue), 4)
+        self.log(f"#{issue}: starting ({f'P{rank}' if rank < 4 else 'no priority'}){note}")
         return self.attempt(lambda: dev.run(self, issue))
 
     def attempt(self, body):
@@ -437,9 +438,9 @@ class Tick:
                 continue
             n, verdict, url = str(issue["number"]), match["v"], f"https://github.com/{self.gh_repo}/issues/{issue['number']}"
             if verdict in ("accept", "revise"):
-                pr_helpers.gh("issue", "edit", n, "-R", self.gh_repo, "--remove-label", "needs-triage", "--add-label", "ready-for-agent")
-                self.log(f"#{n}: Cursor verdict {verdict}; handed to Cursor")
-                self.notify(f"#{n} handed to Cursor (Cursor: {verdict})", url)
+                pr_helpers.gh("issue", "edit", n, "-R", self.gh_repo, "--remove-label", "needs-triage")
+                self.log(f"#{n}: Cursor verdict {verdict}; waits for the owner's ready-for-agent")
+                self.notify(f"#{n} waits for your ready-for-agent (Cursor: {verdict})", url)
             elif verdict in ("reject", "human"):
                 pr_helpers.gh("issue", "edit", n, "-R", self.gh_repo, "--remove-label", "needs-triage", "--add-label", "ready-for-human")
                 self.log(f"#{n}: Cursor verdict {verdict}")
@@ -1030,11 +1031,9 @@ class Tick:
         return 80
 
     def pick_issue(self):
-        """Trusted authors' issues or external issues explicitly labelled ready-for-agent,
-        with a plan comment: the latest
-        accept/revise verdict from Claude's triage, from Cursor, or posted for Cursor (the spec
-        review posts one when Cursor accepts). python -m baton N takes any ready-for-agent issue, or a
-        claude-found one awaiting triage (any milestone)."""
+        """Start the next issue: a pending spec step first, then a candidates() one. A tick takes
+        only ready-for-agent issues; python -m baton N takes one of any milestone, and also a
+        claude-found one without that label."""
         if self.force_pr or self.force_review:
             return None
         pending = self.pending_specs()
@@ -1102,7 +1101,7 @@ class Tick:
         labels = self.gh_json("issue", "view", self.force_issue, "-R", self.gh_repo, "--json", "labels,author,blockedBy") or {"labels": []}
         label_names = [label["name"] for label in labels["labels"]]
         self.priorities[self.force_issue] = priority_of(label_names)
-        if "ready-for-agent" not in label_names and not ("claude-found" in label_names and "needs-triage" in label_names):
+        if "ready-for-agent" not in label_names and "claude-found" not in label_names:
             print(f"#{self.force_issue} needs the ready-for-agent label", file=sys.stderr)
             raise Stop(2)
         if "ready-for-agent" in label_names:
@@ -1314,35 +1313,29 @@ class Tick:
         return stalled
 
     def candidates(self, only=None):
-        """ready-for-agent says "specified", AGENT_MILESTONE says "wanted now" ("" for any
-        milestone); the scan's claude-found issues need no milestone. External authors need
-        ready-for-agent: scanner labels alone never authorize their issues. Priority labels only
-        order the candidates (ADR 0010). ONLY restricts them to these issue numbers."""
+        """The owner's ready-for-agent is what makes an issue a candidate, whoever opened it;
+        AGENT_MILESTONE says "wanted now" ("" for any milestone), which the scan's claude-found
+        issues do not need. Priority labels only order the candidates (ADR 0010). ONLY restricts
+        them to these issue numbers."""
         milestone = self.env.repo.agent_milestone
         found = {}
-        for labels in (("ready-for-agent",), ("claude-found", "needs-triage")):
-            args = [x for label in labels for x in ("--label", label)]
-            # 1000 is as far as a label search of `gh issue list` goes; REST has no blockedBy.
-            for i in self.gh_json("issue", "list", "-R", self.gh_repo, "--state", "open", *args, "--limit", "1000",
-                                  "--json", "number,author,labels,milestone,blockedBy") or []:
-                if only is not None and str(i["number"]) not in only:
-                    continue
-                label_names = [label["name"] for label in i["labels"]]
-                login = (i.get("author") or {}).get("login") or ""
-                trusted = login == self.owner or bool(re.fullmatch(self.cursor_login, login))
-                if not trusted and "ready-for-agent" not in label_names:
-                    continue
-                if milestone and not ((i.get("milestone") or {}).get("title") == milestone or "claude-found" in label_names):
-                    continue
-                if any(x in label_names for x in ("ready-for-human", "needs-info", "agent-wip")):
-                    continue
-                if blockers := open_blockers(i):
-                    self.log(f"#{i['number']}: skipped; blocked by {' '.join(f'#{n}' for n in blockers)}")
-                    continue
-                if (labels == ("ready-for-agent",) or "ready-for-agent" in label_names) and not self.owner_ready(i["number"]):
-                    self.log(f"#{i['number']}: skipped; cannot verify ready-for-agent was applied by {self.owner}")
-                    continue
-                found[i["number"]] = self.priorities[str(i["number"])] = priority_of(label_names)
+        # 1000 is as far as a label search of `gh issue list` goes; REST has no blockedBy.
+        for i in self.gh_json("issue", "list", "-R", self.gh_repo, "--state", "open", "--label", "ready-for-agent",
+                              "--limit", "1000", "--json", "number,author,labels,milestone,blockedBy") or []:
+            if only is not None and str(i["number"]) not in only:
+                continue
+            label_names = [label["name"] for label in i["labels"]]
+            if milestone and not ((i.get("milestone") or {}).get("title") == milestone or "claude-found" in label_names):
+                continue
+            if any(x in label_names for x in ("ready-for-human", "needs-info", "agent-wip")):
+                continue
+            if blockers := open_blockers(i):
+                self.log(f"#{i['number']}: skipped; blocked by {' '.join(f'#{n}' for n in blockers)}")
+                continue
+            if not self.owner_ready(i["number"]):
+                self.log(f"#{i['number']}: skipped; cannot verify ready-for-agent was applied by {self.owner}")
+                continue
+            found[i["number"]] = self.priorities[str(i["number"])] = priority_of(label_names)
         return sorted(found, key=lambda n: (found[n], n))
 
     def p0_issues(self):

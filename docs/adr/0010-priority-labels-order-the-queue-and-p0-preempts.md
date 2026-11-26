@@ -6,8 +6,9 @@ status: accepted
 
 The owner could say whether an issue is wanted and what it waits on, but not which ready issue
 goes first. Labels `P0`–`P3` on the target repository's issues now order each repository's
-candidates by (priority, issue number); an unlabelled issue ranks as `P2`. Priority never makes an
-issue a candidate.
+candidates by (priority, issue number); an unlabelled issue ranks after `P3`. Priority never makes
+an issue a candidate: only the owner's `ready-for-agent` does, also for a scan finding, which waits
+for that label after its verdict.
 
 `P0` is for urgent bugs that must be handled at once (owner, 2026-11-25). A `P0` candidate starts
 before the resumed work of lower-priority issues and is not limited by `max_pending_prs`. The
@@ -36,3 +37,5 @@ controls how many there are.
 ## Revision record
 
 - Issue #194: first recorded.
+- Issue #290: an unlabelled issue ranks after `P3` (it ranked as `P2`); scan findings are
+  candidates only with the owner's `ready-for-agent`.
