@@ -70,7 +70,7 @@ ANALYST_ENV_KEEP = ("CLAUDE_CONFIG_DIR",)
 ANALYST_ENV_STRIP = ("CLAUDE_CODE_", "ENABLE_CLAUDE")
 ANALYST_ENV_SET = {"CLAUDE_CODE_ENABLE_TELEMETRY": "0", "ENABLE_CLAUDEAI_MCP_SERVERS": "false"}
 MODEL = re.compile(
-    r"(?P<prefix>claude-)?(?P<family>opus|sonnet|haiku)(?P<version>(?:-[0-9]+)*?)(?:-(?P<snapshot>[0-9]{8}))?"
+    r"(?P<prefix>claude-)?(?P<family>opus|sonnet|haiku|fable)(?P<version>(?:-[0-9]+)*?)(?:-(?P<snapshot>[0-9]{8}))?"
 )
 
 

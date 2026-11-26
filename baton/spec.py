@@ -317,8 +317,8 @@ class Spec:
 
     def alternating_followup(self, vendor, route_role, preferred, other_model):
         """An alternating-phase vendor after itself: the preferred route when its model differs from
-        OTHER_MODEL, else the other route (Opus and Sonnet swap), so a same-vendor round never runs
-        on the writer's model."""
+        OTHER_MODEL, else the other route (e.g. Opus and Sonnet swap), so a same-vendor round never
+        runs on the writer's model."""
         routes = self.env.config.models
         for followup in (preferred, not preferred):
             if vendors.models_distinct(vendor, routes.route(route_role, vendor, followup=followup).model, other_model):
