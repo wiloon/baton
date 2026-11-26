@@ -657,7 +657,10 @@ def prepare_retry(env, episode, reason, item, binding):
     pending = {**waiting, "attempts": 0, "scheduled": now, "due": now + DELAYS[0]}
     atomic_json(waiting_path(env, episode, reason, item), waiting)
     restore_retry(env, episode, reason, item, pending)
-    notify.log(f"handoff-retry {reason} scheduled in {DELAYS[0]}s attempt=0/{MAX_ATTEMPTS} episode={episode}")
+    # Logged before every guarded write, not after a failure: REASON names the failure this record
+    # would recover from. Real retries log "handoff-retry REASON attempt=N/MAX" (retry_due).
+    notify.log(f"write-intent {reason.removesuffix('_failed')} recorded episode={episode} "
+               f"(replayed after {DELAYS[0]}s only if the write fails)")
     return pending
 
 
