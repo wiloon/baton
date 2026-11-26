@@ -46,7 +46,7 @@ STATE_RE = re.compile(r"<!-- baton-spec-(?P<k>review|reply) round=(?P<r>[0-9]+)(
 KIND_RE = r"<!-- baton-spec-%s round=[0-9]+( human)? by=(?P<v>[a-z]+) -->"
 VERDICT_LINE = re.compile(r"^(SPEC|RESULT): ")
 ADVISOR_ANSWER = re.compile(
-    r"^<!-- baton-advisor-answer round=(?P<r>\d+) questions=(?P<q>[0-9a-f]+) by=deepseek -->")
+    r"^<!-- baton-advisor-answer round=(?P<r>\d+) questions=(?P<q>[0-9a-f]+) by=(?:claude|deepseek) -->")
 PENDING_ACCEPT = re.compile(
     r"^<!-- baton-spec-accept-pending pr=(?P<pr>\d+)(?: head=(?P<head>[0-9a-f]{40}))? -->\n(?P<verdict>.*)", re.DOTALL)
 
@@ -928,9 +928,10 @@ class Spec:
             ).rstrip("\n")
             cites = ", ".join(row["citations"])
             cleaned.append(f"### {row['id']}\n{text}\n\nCitations: {cites}")
+        backend = binding.get("backend") or "deepseek"
         return (
-            f"<!-- baton-advisor-answer round={binding['round']} questions={questions_digest} by=deepseek -->\n"
-            f"## Advisor answers (DeepSeek), round {binding['round']}\n\n"
+            f"<!-- baton-advisor-answer round={binding['round']} questions={questions_digest} by={backend} -->\n"
+            f"## Advisor answers ({advisor.LABELS[backend]}), round {binding['round']}\n\n"
             f"Answering the reviser's questions (comment digest `{questions_digest[:12]}`).\n\n"
             + "\n\n".join(cleaned)
         )
@@ -1085,7 +1086,7 @@ class Spec:
                     sources, row["citations"], row.get("considered", ()), row["text"]):
                 self.handoff(f"{why} Advisor {issue}.", "spec_questions")
                 return "stop"
-        return self.publish_advisor_answers(binding, answers)
+        return self.publish_advisor_answers({**binding, "backend": result.decision.backend}, answers)
 
     def post_comment(self, reason, binding, *, initial, claim=None, context=None, after_save=None):
         """Save before sending a spec comment, or consume a due attempt before reconciling (#151).

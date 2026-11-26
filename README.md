@@ -261,11 +261,20 @@ systemctl --user try-restart baton-serve
 python -m baton.maintenance off
 ```
 
-### Advisor (DeepSeek)
+### Advisor (Claude, DeepSeek fallback)
 
 When a PR review or a spec review runs out of rounds, the optional routine advisor
-([ADR 0008](docs/adr/0008-model-judgement-is-advisory.md), #17) gets one fresh DeepSeek call with
-a redacted snapshot and the allowed actions (`extra_round` or `handoff`). In `mode = "live"` the
+([ADR 0008](docs/adr/0008-model-judgement-is-advisory.md), #17) gets one fresh model call with
+a redacted snapshot and the allowed actions (`extra_round` or `handoff`).
+`[advisor] backend_order` (default `["claude", "deepseek"]`) names the backends: Claude Code goes
+first and DeepSeek is the fallback. `["deepseek"]` uses DeepSeek only; `["claude"]` has no fallback.
+Listing `claude` is the grant for the advisor: Claude must be declared under `[vendors]` but needs
+no role. The call is a tool-less, isolated one-shot (`[advisor] claude = { model, effort }`, default
+`claude_strong` at `medium`) that takes no vendor lease; its quota use and quota, auth and busy
+rejections are accounted like any Claude run. Claude is skipped when it is undeclared, at its cap or
+five-hour limit, in cooldown, or its credential has expired. The next backend is tried once when one
+is skipped, fails or returns an unusable reply, never after a valid `handoff` or other well-formed
+outcome. Records, handoff notes and answer comments name the backend that answered. In `mode = "live"` the
 runner revalidates the state and grants at most one extra round per task episode. Failed
 review, fix, spec, implementation, local verification and worktree steps can also send a
 redacted step snapshot. Where the role and task allow it, `retry_step` repeats the failed step
@@ -277,8 +286,8 @@ description, the latest review and fix comments and, for an ADR, the acceptance 
 redacted. The only action offered there is one bounded read-only retry; it appears in the
 handoff text as "recommended, not executed (observation)" and never goes live, so the task is
 always handed off. `mode = "observe"` records the advice and follows the existing rule. `off` (the default)
-makes no call. `[[repos]] advisor = false` keeps a repository's issue and PR text off the
-provider. Decisions go to `<state>/advisor/decisions.jsonl`; once a day a "Advisor digest"
+makes no call. `[[repos]] advisor = false` keeps a repository's issue and PR text off both
+providers. Decisions go to `<state>/advisor/decisions.jsonl`; once a day a "Advisor digest"
 notification lists them with how the extra rounds ended (merged or accepted). `DEEPSEEK_API_KEY` comes from the
 environment or `[advisor] env_file` (mode 0600) and is never passed to agents.
 

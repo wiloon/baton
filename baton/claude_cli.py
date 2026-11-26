@@ -239,6 +239,15 @@ def analyst_command(settings, analyst, workspace, env):
             "--max-budget-usd", str(settings.budget_usd)]
 
 
+def advisor_command(model, effort, instructions):
+    """One isolated, tool-less advisor call (#236); the snapshot goes on stdin, never argv."""
+    return ["claude", "--safe-mode", "-p", "--model", model, *(["--effort", effort] if effort else []),
+            "--system-prompt", instructions, "--output-format", "stream-json", "--verbose", "--tools", "",
+            "--disallowedTools", "*", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+            "--disable-slash-commands", "--setting-sources", "", "--settings", '{"disableAllHooks":true}',
+            "--permission-mode", "dontAsk", "--no-session-persistence", "--max-turns", "1"]
+
+
 def _tool_event(node):
     if isinstance(node, dict):
         return node.get("type") in ("tool_call", "tool_use", "tool_result") or any(

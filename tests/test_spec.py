@@ -1089,7 +1089,7 @@ def test_a_live_spec_reject_makes_no_provider_call_and_one_handoff(loop, spec_ha
     from baton.config import Advisor
     calls = []
     monkeypatch.setenv(advisor.KEY, "sk-" + "s" * 24)
-    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="live"))
+    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, backend_order=("deepseek",), mode="live"))
     monkeypatch.setattr(advisor, "call_deepseek", lambda *a, **k: calls.append(1) or ({}, {}))
     loop.script = [{"rc": 0, "status": "success", "outcome": "SPEC: reject", "reply": "no\nSPEC: reject", "model": "", "defer": ""}]
     assert loop.run() is False
@@ -2064,7 +2064,7 @@ def advised(loop, monkeypatch):
     from baton import advisor
     from baton.config import Advisor
     monkeypatch.setenv(advisor.KEY, "sk-" + "t" * 24)   # built, so no scanner reads a key
-    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="live"))
+    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, backend_order=("deepseek",), mode="live"))
     loop.advice, loop.advice_calls = [], []
 
     def call(cfg, key, snapshot, actions, **_):
@@ -3585,7 +3585,7 @@ def test_observe_and_mixed_answer_sets_hand_off_without_an_answer_comment(advise
     advised.gh.body = f"Goal\n{excerpt}\n"
     advised.script = [CHANGES, reviser(QUESTIONS, outcome="SPEC: human")]
     # Observe: record the recommendation, execute the handoff rule, post nothing.
-    monkeypatch.setattr(spec.advisor, "settings", lambda env: Advisor(env_file=None, mode="observe"))
+    monkeypatch.setattr(spec.advisor, "settings", lambda env: Advisor(env_file=None, backend_order=("deepseek",), mode="observe"))
     advised.advice = [{"action": "answer_spec_questions", "reason": "settled",
                        "evidence": [excerpt],
                        "answers": [{"id": "q1", "case": "grounded", "text": excerpt,
@@ -3978,6 +3978,36 @@ def advice(*answers):
 
 
 TWO_QUESTIONS = QUESTIONS + "- Keep the old flag?\n"
+
+
+def test_claude_answers_name_claude_in_the_marker_heading_and_reader(advised, monkeypatch):
+    from baton import advisor, retrospective_analyst
+    from baton.config import Advisor
+
+    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="live"))
+    advised.gh.body = f"Goal\n{EXCERPT}\n"
+    advised.script = [CHANGES, reviser(QUESTIONS, outcome="SPEC: human"), reviser("adopted"), ACCEPT]
+    [reply] = advice(grounded())
+    row = {"type": "result", "subtype": "success", "is_error": False, "result": json.dumps(reply)}
+    monkeypatch.setattr(retrospective_analyst, "bounded_process",
+                        lambda *a, **k: ("success", json.dumps(row).encode(), 0, {}))
+    monkeypatch.setattr(dev, "setup_worktree", lambda *a, **k: ("", False))
+    assert advised.run() is True
+    [answer] = advised.gh.posted("<!-- baton-advisor-answer")
+    assert " by=claude -->\n## Advisor answers (Claude), round " in answer
+    assert advised.advice_calls == []
+    contexts = [p.read_text() for p in Path(advised.env["CTX"]).glob(f"issue-{N}-spec-*-revise-*.md")]
+    assert any('<advisor-answer author="Claude">' in text for text in contexts)
+
+
+@pytest.mark.parametrize("backend", ["claude", "deepseek"])
+def test_a_saved_answer_intent_reads_back_either_marker(backend):
+    # `deepseek` is also what an intent saved before the upgrade posted.
+    body = f"<!-- baton-advisor-answer round=1 questions=abc123 by={backend} -->\nanswer"
+    data = {"comments": [{"id": "q", "author": {"login": "owner"}, "body": "questions"},
+                         {"id": "a", "author": {"login": "owner"}, "body": body}]}
+    owner = SimpleNamespace(env=SimpleNamespace(owner="owner"))
+    assert list(spec.Spec.posted_answer_bodies(owner, data, {"question_id": "q", "questions": "abc123"})) == [body]
 
 
 def test_a_live_mixed_answer_set_hands_off_without_an_answer_comment(advised, monkeypatch):

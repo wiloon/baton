@@ -259,3 +259,35 @@ def test_the_advisor_section_is_optional_and_validated(tmp_path):
         broken = write(tmp_path, TEXT.replace(old, new, 1))
         with pytest.raises(config.ConfigError):
             config.load(broken, home=tmp_path)
+
+
+def advisor_with(tmp_path, lines):
+    return write(tmp_path, TEXT.split('\n[advisor]\n', 1)[0] + '\n[advisor]\nenv_file = "d.env"\n' + lines + '\n')
+
+
+def test_the_advisor_backends_default_to_claude_then_deepseek(tmp_path):
+    without = write(tmp_path, TEXT.split('\n[advisor]\n', 1)[0] + '\n')
+    for path in (without, advisor_with(tmp_path, '')):
+        c = config.load(path, home=tmp_path).advisor
+        assert c.backend_order == ("claude", "deepseek")
+        assert (c.claude.model, c.claude.effort) == ("opus", "medium")
+    c = config.load(advisor_with(tmp_path, 'backend_order = ["deepseek"]\nclaude = { effort = "low" }'),
+                    home=tmp_path).advisor
+    assert c.backend_order == ("deepseek",) and (c.claude.model, c.claude.effort) == ("opus", "low")
+    c = config.load(advisor_with(tmp_path, 'claude = { model = "claude_fast" }'), home=tmp_path).advisor
+    assert c.claude.model == "sonnet" and c.claude.effort == "medium"
+
+
+@pytest.mark.parametrize("line, message", [
+    ('backend_order = []', "advisor.backend_order"),
+    ('backend_order = ["claude", "claude"]', "advisor.backend_order"),
+    ('backend_order = ["codex"]', "advisor.backend_order"),
+    ('backend_order = "claude"', "advisor.backend_order"),
+    ('claude = { model = "no_such_alias" }', "advisor.claude.model"),
+    ('claude = { effort = "extreme" }', "advisor.claude.effort"),
+    ('claude = { budget = 1 }', "advisor.claude: unknown fields"),
+    ('claude = "opus"', "advisor.claude: expected a table"),
+])
+def test_invalid_advisor_backends_are_refused(tmp_path, line, message):
+    with pytest.raises(config.ConfigError, match=message):
+        config.load(advisor_with(tmp_path, line), home=tmp_path)
