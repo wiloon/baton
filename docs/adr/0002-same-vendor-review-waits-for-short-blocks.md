@@ -71,3 +71,5 @@ The rules for the previous round's vendor are unchanged.
   and `fix_followup` route models, so the never-stall fallback exists.
 - Issue #194: exempt `P0` issues from the one-extra-issue bound and from PR work going first, so an
   urgent bug starts at the next pick (ADR 0010).
+- Issue #274: spec review also avoids the issue's author vendor, so no vendor reviews a revision
+  it wrote while another eligible vendor has quota; the marker alone never stalls the step.
