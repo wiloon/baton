@@ -254,28 +254,32 @@ class Tick:
         if rc == 75:
             return 75 if self.manual else None
         if rc == 80:
-            self.chain_next()
-            return 0
+            return 80 if self.chain_next() else 0
         return rc or None
 
     def chain_next(self):
         """A partial slice merged in this tick touches chain-next (finish_merged_task); the tick
         then starts over at once instead of leaving the issue idle until the next timer tick.
-        CHAIN_MAX bounds the run."""
+        CHAIN_MAX bounds the run. A `serve` child never re-execs: True tells it to exit 80, and
+        the supervisor bounds the chain."""
         flag = self.state / "chain-next"
         if self.manual or not flag.exists():
-            return
+            return False
         flag.unlink(missing_ok=True)
+        if self.env.runtime.serve_child:
+            self.log("chain: a slice merged, the supervisor starts the next pass")
+            return True
         done, limit = int(self.env.runtime.chain or 0), int(self.env.config.scheduling.chain_max or 5)
         if done >= limit:
             self.log(f"chain: {limit} passes in a row, next slice waits for the timer")
-            return
+            return False
         self.log("chain: a slice merged, starting the next pass now")
         self.env.runtime.chain = done + 1
         if self.lock_file:
             self.lock_file.close()
         sys.stdout.flush()
         self.exec(sys.executable, [sys.executable, "-m", "baton", "--config", str(self.env.config.source), "--chain", str(done + 1)])
+        return False
 
     # --- agent steps that touch the item's markers ---------------------------------------
     def review_loop(self, pr, wt, note, fixer="agent", reviewer="pool", fixed_by="", issue=""):

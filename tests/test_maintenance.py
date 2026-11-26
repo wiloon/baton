@@ -498,7 +498,7 @@ def test_migrate_waits_for_a_collectors_probe_without_reporting_a_busy_pipeline(
     spec = importlib.util.spec_from_file_location("maintenance_telemetry", ROOT / "bin/telemetry.py")
     telemetry = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(telemetry)
-    monkeypatch.setattr(telemetry, "unit_state", lambda: (1, 1, 0))
+    monkeypatch.setattr(telemetry, "unit_state", lambda *args, **kwargs: (1, 1, 0))
     assert host.maint("on", "--wait") == 0
     (host.state / work_lock).parent.mkdir(parents=True, exist_ok=True)
     (host.state / work_lock).touch()   # telemetry probes the lock files on disk

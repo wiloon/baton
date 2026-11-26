@@ -24,6 +24,7 @@ class Runtime:
     telemetry_item: str = ""
     chain: int = 0
     manual: bool = False
+    serve_child: bool = False
     spec_followup: bool = False
     review_followup: bool = False
     fix_followup: bool = False

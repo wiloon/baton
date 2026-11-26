@@ -671,18 +671,30 @@ def run_span_payload(record):
             'status': {'code': 1 if record['status'] == 'success' else 2}}]}]}]}
 
 
-def unit_state():
-    output = subprocess.run(['systemctl', '--user', 'show', 'baton.timer',
+def unit_state(unit='baton.timer', *, optional=False):
+    """(enabled, active, active since) of a user UNIT; zeros for an OPTIONAL one the host lacks."""
+    output = subprocess.run(['systemctl', '--user', 'show', unit,
         '-p', 'LoadState', '-p', 'UnitFileState', '-p', 'ActiveState', '-p', 'ActiveEnterTimestampMonotonic'],
         capture_output=True, text=True, timeout=5, check=True).stdout
     values = dict(line.split('=', 1) for line in output.splitlines() if '=' in line)
+    if optional and values.get('LoadState') == 'not-found':
+        return 0, 0, 0
     if values.get('LoadState') != 'loaded' or not values.get('UnitFileState') or not values.get('ActiveState'):
-        raise ValueError('unknown timer state')
+        raise ValueError(f'unknown state of {unit}')
     if values['UnitFileState'] not in ('enabled', 'enabled-runtime', 'disabled', 'static', 'indirect', 'alias', 'generated', 'transient', 'linked', 'linked-runtime', 'masked', 'masked-runtime') or values['ActiveState'] not in ('active', 'inactive', 'failed', 'activating', 'deactivating', 'reloading', 'refreshing', 'maintenance'):
-        raise ValueError('unrecognized timer state')
+        raise ValueError(f'unrecognized state of {unit}')
     entered = int(values.get('ActiveEnterTimestampMonotonic', '0')) / 10**6
     return (int(values['UnitFileState'] in ('enabled', 'enabled-runtime')),
             int(values['ActiveState'] == 'active'), time.time() - time.monotonic() + entered if entered else 0)
+
+
+def serve_status(path):
+    """(heartbeat, running children) from the supervisor's serve.json."""
+    status = read(path)
+    heartbeat, running = (status.get('heartbeat'), status.get('running')) if isinstance(status, dict) else (None, None)
+    if type(heartbeat) not in (int, float) or not isinstance(running, list):
+        raise ValueError('invalid serve.json')
+    return heartbeat, len(running)
 
 
 def _runner_config(config):
@@ -1079,6 +1091,16 @@ def collect(ledger, config, output):
     emit('timer_enabled', enabled)
     emit('timer_active', active)
     emit('timer_active_since_seconds', entered)
+    enabled, active, entered = attempt(lambda: unit_state('baton-serve.service', optional=True),
+                                       (math.nan, math.nan, math.nan))
+    emit('serve_enabled', enabled)
+    emit('serve_active', active)
+    emit('serve_active_since_seconds', entered)
+    status_path = ledger.state / 'serve.json'
+    heartbeat, children = attempt(lambda: serve_status(status_path), (math.nan, math.nan)) \
+        if status_path.exists() else (math.nan, math.nan)
+    emit('serve_heartbeat_seconds', heartbeat)
+    emit('serve_running_children', children)
     cfg_obj = attempt(lambda: _runner_config(config), None)
     declared = cfg_obj.declared() if cfg_obj else ()
     emit('paused', int(cfg_obj.scheduling.paused) if cfg_obj else math.nan)
@@ -1110,7 +1132,7 @@ def collect(ledger, config, output):
     tick_path = ledger.root / 'last-scheduled-tick.json'
     tick = attempt(lambda: read(tick_path)['started'], math.nan) if tick_path.exists() else math.nan
     # A never-created timestamp is unknown; collection itself can still succeed.
-    # Timer active_since is the baseline for the future no-tick alert.
+    # The active unit's active_since (timer or serve) is the baseline for the future no-tick alert.
     emit('last_scheduled_tick_seconds', tick)
     retrospective, retrospective_interval = attempt(
         lambda: retrospective_activity(ledger.state, now), (math.nan, math.nan))
