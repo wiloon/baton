@@ -237,7 +237,7 @@ def test_a_damaged_saved_update_hands_off_without_an_update_or_merge(loop, monke
     assert any("damaged" in note for note in notes)
 
 
-def test_a_directory_at_the_update_record_hands_off_without_removing_its_contents(loop, monkeypatch):
+def test_a_directory_at_the_update_record_hands_off_without_removing_its_contents(loop, monkeypatch, macos_unlink):
     resume_pending(loop, monkeypatch)
     handoffs = record_handoffs(monkeypatch)
     path = update_file(loop)
@@ -246,6 +246,12 @@ def test_a_directory_at_the_update_record_hands_off_without_removing_its_content
     assert run_spec(loop) == 1
     assert handoffs == ["spec_adr_merge_failed"]
     assert updates(loop) == [] and merges(loop) == [] and (path / "keep").is_file()
+
+
+def test_a_refused_unlink_of_the_update_record_is_not_ignored(loop, denied_unlink):
+    update_file(loop).write_text("{}")
+    with pytest.raises(PermissionError):
+        merge.Merger(loop.env, None, 77, N).clear_update()
 
 
 @pytest.mark.parametrize("status, attempts", [("HTTP 403", 2), ("HTTP 502", 1), ("", 1)])
@@ -279,15 +285,16 @@ def test_a_refused_update_cannot_use_verification_that_finishes_at_the_deadline(
 
 def test_a_stalled_bounded_gh_call_is_killed_at_the_deadline(tmp_path, monkeypatch):
     gh = tmp_path / "gh"
-    gh.write_text("#!/bin/sh\ntrap '' TERM\n: > \"$ADR_STARTED\"\nexec sleep 2\n")
+    gh.write_text("#!/bin/sh\ntrap '' TERM\n: > \"$ADR_STARTED\"\nexec sleep 5\n")
     gh.chmod(0o755)
     started = tmp_path / "started"
     monkeypatch.setenv("ADR_STARTED", str(started))
     monkeypatch.setenv("PATH", f"{tmp_path}:/usr/bin:/bin")
     start = time.monotonic()
-    result = pr.gh("pr", "view", "77", until=time.time() + 0.2)
+    # Room for the first exec of a new script (~0.25 s on macOS); the kill still lands long before the sleep ends.
+    result = pr.gh("pr", "view", "77", until=time.time() + 1)
     assert started.is_file() and result.returncode != 0
-    assert time.monotonic() - start < 0.9
+    assert time.monotonic() - start < 3
 
 
 def test_a_submillisecond_budget_never_starts_an_unbounded_call(monkeypatch):

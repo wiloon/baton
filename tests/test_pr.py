@@ -483,3 +483,13 @@ def test_a_comment_with_an_unreadable_body_file_is_not_posted_again(scripted):
     fake = scripted((1, "", "TLS handshake timeout"))
     assert pr.gh("pr", "comment", "5", "-R", "o/r", "--body-file", "/nonexistent/x").returncode == 1
     assert [c[:2] for c in fake.calls] == [("pr", "comment")]
+
+
+def test_removing_a_body_request_unlinks_a_symlink_to_a_directory_as_a_link(tmp_path, macos_unlink):
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "child").write_text("kept")
+    request = tmp_path / "pr-1-body.md"
+    request.symlink_to(target)
+    pr.remove_body_request(request)
+    assert not request.is_symlink() and (target / "child").read_text() == "kept"
