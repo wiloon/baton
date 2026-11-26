@@ -1288,11 +1288,13 @@ def test_a_forced_pr_or_review_skips_the_issue_pick(ctx):
 def test_the_items_come_in_order(ctx, monkeypatch):
     order = []
     t = ctx.make()
-    for name in ("pending_reviews", "pick_review", "pick_fix", "pick_issue"):
+    for name in ("pending_openings", "pending_reviews", "pick_review", "pick_fix", "pick_issue"):
         monkeypatch.setattr(t, name, lambda name=name: order.append(name))
     monkeypatch.setattr(t, "scan_fallback", lambda: order.append("scan") or 0)
     assert t.run() == 0
-    assert order == ["pending_reviews", "pick_review", "pick_fix", "pick_issue", "scan"]
+    assert order == ["pending_openings", "pending_reviews", "pick_review", "pick_fix", "pick_issue", "scan"]
+    listings = [c for c in ctx.gh.ran("issue", "list") if "claude-found" not in c]
+    assert [("P0" in c) for c in listings] == [True]   # no P0 issue: one probe, nothing more
 
 
 def test_the_first_item_that_ends_the_tick_stops_it(ctx, monkeypatch):
@@ -3129,4 +3131,231 @@ def test_a_pending_ready_label_is_given_up_after_five_ticks_and_the_owner_is_tol
     handoff.retry_ready_labels(runner)
     assert not ctx.path("ready-label-pending-11").exists()
     assert told == ["PR #11 needs you"]
+
+
+# --- priority labels (#194) ----------------------------------------------------------------------------------
+def numbered(*specs):
+    """ready-for-agent issues from (number, *priority labels)."""
+    return [issue(n, labels=["ready-for-agent", *labels]) for n, *labels in specs]
+
+
+@pytest.mark.parametrize("specs, expected", [
+    ([(5, "P1"), (9, "P0")], [9, 5]),
+    ([(5,), (9, "P1")], [9, 5]),
+    ([(5, "P3"), (9,)], [9, 5]),
+    ([(5, "P2"), (9, "P1", "P3")], [9, 5]),
+    ([(9, "P1"), (5, "P1"), (7,), (3, "P2")], [5, 9, 3, 7]),
+    ([(3,), (5, "p1"), (9, "p0")], [9, 5, 3]),
+    ([(3,), (5, "P4"), (9, "priority:P0"), (10, "P1")], [10, 3, 5, 9]),
+])
+def test_candidates_are_ordered_by_priority_then_number(ctx, specs, expected):
+    issues(ctx, ready=numbered(*specs))
+    assert ctx.make().candidates() == expected
+
+
+def test_a_priority_candidate_beyond_the_first_50_listed_issues_comes_first(ctx):
+    ready = numbered(*[(n,) for n in range(100, 160)], (160, "P1"))
+    issues(ctx, ready=ready)
+
+    def answer(args):   # like gh: no more than --limit
+        listed = ready if "ready-for-agent" in args else []
+        return listed[:int(args[args.index("--limit") + 1])]
+    ctx.gh.answers["issue list"] = answer
+    assert ctx.make().candidates()[:2] == [160, 100]
+    assert all("blockedBy" in c[-1] for c in ctx.gh.ran("issue", "list"))
+
+
+@pytest.fixture
+def queue(ctx, monkeypatch):
+    """Tick.run() over a described queue; `ran` is what ran, in order."""
+    state = SimpleNamespace(ran=[], defer=set())
+    monkeypatch.setattr(spec, "verdict_plan", lambda env, n, listed=None: "plan")
+    monkeypatch.setattr(tick.Tick, "pick_vendor", lambda self, *a, **k: "codex")
+
+    def ran(name, rc=80):
+        state.ran.append(name)
+        if name in state.defer:
+            raise Deferred("pool", QUOTA)
+        return rc
+    monkeypatch.setattr(tick.Tick, "review_loop", lambda self, pr, *a, **k: ran(f"review {pr}", 0))
+    monkeypatch.setattr(tick.Tick, "fix_item", lambda self, pr, head: ran(f"fix {pr}"))
+    monkeypatch.setattr(tick.Tick, "resume_standalone_push", lambda self, pr, episodes: ran(f"push {pr}"))
+    monkeypatch.setattr(tick.dev, "run", lambda t, n: ran(f"dev {n}"))
+    monkeypatch.setattr(tick.dev, "resume_opening", lambda t, path: ran("opening"))
+
+    def p0_issues(numbers):
+        listed = ctx.gh.answers["issue list"]
+        labelled = [{"number": n, "labels": [{"name": "P0"}]} for n in numbers]
+        ctx.gh.answers["issue list"] = lambda args: labelled if "P0" in args else listed(args)
+
+    def setup(ready=(), p0=(), wip=(), prs=(), fix=(), review=()):
+        """P0 lists the open P0 issues; PRS, FIX (labelled agent-fix) and REVIEW (agent-review) are (pr, issue)."""
+        ctx.gh.answers["issue list"] = lambda args: (
+            [{"number": n} for n in wip] if "agent-wip" in args else [] if "claude-found" in args else list(ready))
+        p0_issues(p0)
+        for item in ready:
+            label_history(ctx, item["number"], [label_event(1, "owner")])
+
+        def rows(pairs):
+            return [{"number": pr, "headRefName": f"agent/issue-{n}", "labels": []} for pr, n in pairs]
+
+        def listed(args):
+            if "merged" in args:
+                return []
+            if "agent-fix" in args:
+                return rows(fix)
+            if "agent-review" in args:
+                return rows(review)
+            return rows([*prs, *fix, *review])
+        ctx.gh.answers["pr list"] = listed
+        ctx.gh.answers["pr view"] = lambda args: "OPEN\n" if "--jq" in args else {"state": "OPEN", "labels": []}
+        ctx.gh.answers["issue view"] = {"state": "OPEN", "labels": []}
+        for pr, n in prs:
+            ctx.path(f"recovery-{n}-{pr}.json").write_text("{}")
+    state.setup = setup
+    state.checkpoint = lambda pr, n: checkpoint(ctx, pr=str(pr), ISSUE=str(n))
+    state.spec = lambda n: ctx.path(f"handoff-waiting-{n}-spec_comments_read_failed.json").write_text("{}")
+    state.push = lambda pr, n: ctx.path(f"fix-push-waiting-{pr}").write_text(f"{n}\n")
+    state.run = lambda *argv: ctx.make(*argv).run()
+    return state
+
+
+@pytest.mark.parametrize("lower", ["review", "fix", "push", "spec"])
+def test_a_new_p0_issue_starts_ahead_of_lower_priority_work_and_the_cap(ctx, queue, lower):
+    queue.setup(ready=numbered((12,), (20, "p0")), p0=[20], wip=[5], prs=[(11, 5)],
+                fix=[(13, 6)] if lower == "fix" else [])
+    if lower == "review":
+        queue.checkpoint(11, 5)
+    elif lower == "push":
+        queue.push(11, 5)
+    elif lower == "spec":
+        queue.spec(5)
+    queue.run()
+    assert queue.ran == ["dev 20"]
+    assert "#20: starting (P0), ahead of lower-priority work; max_pending_prs not applied" in ctx.log()
+
+
+def test_in_flight_p0_work_runs_before_a_new_p0_issue(ctx, queue):
+    queue.setup(ready=numbered((12,), (20, "P0")), p0=[20, 21, 22, 23, 24], wip=[5, 21],
+                prs=[(11, 5), (31, 21), (32, 22)], fix=[(13, 6), (33, 23)], review=[(40, 24)])
+    queue.checkpoint(11, 5)
+    queue.checkpoint(31, 21)
+    queue.push(32, 22)
+    queue.spec(24)
+    queue.defer = {"review 31", "push 32", "fix 33", "dev 24", "dev 20"}
+    queue.run()
+    # P0 in flight, the new P0, then today's order; nothing is tried twice and agent-review stays below P0.
+    assert queue.ran == ["review 31", "push 32", "fix 33", "dev 24", "dev 20", "review 11"]
+
+
+def test_a_deferred_p0_item_is_not_tried_again_in_the_tick(ctx, queue):
+    queue.setup(ready=numbered((12,), (20, "P0")), p0=[20, 21], prs=[(31, 21)])
+    queue.checkpoint(31, 21)
+    queue.defer = {"review 31", "dev 20"}
+    queue.run()
+    assert queue.ran == ["review 31", "dev 20", "dev 12"]
+    assert "#12: starting (P2)" in ctx.log()
+
+
+def test_a_review_left_by_a_deferred_p0_start_is_not_retried_in_the_tick(ctx, queue, monkeypatch):
+    queue.setup(ready=numbered((20, "P0")), p0=[20])
+
+    def opens_a_pr(t, n):
+        queue.ran.append(f"dev {n}")
+        queue.checkpoint(50, n)
+        t.active["pr"] = "50"
+        raise Deferred("pool", QUOTA)
+    monkeypatch.setattr(tick.dev, "run", opens_a_pr)
+    queue.run()
+    assert queue.ran == ["dev 20"]
+
+
+def test_pending_openings_run_before_p0_work(ctx, queue):
+    queue.setup(ready=numbered((20, "P0")), p0=[20, 21], prs=[(31, 21)])
+    queue.checkpoint(31, 21)
+    ctx.path("pr-opening-3.json").write_text("{}")
+    queue.run()
+    assert queue.ran == ["opening"]
+
+
+@pytest.mark.parametrize("probe", ["empty", "fails"])
+def test_without_a_p0_issue_the_order_is_todays(ctx, queue, probe):
+    queue.setup(ready=numbered((12,), (14, "P1")), prs=[(11, 5)], fix=[(13, 6)])
+    queue.checkpoint(11, 5)
+    queue.defer = {"review 11", "fix 13"}
+    if probe == "fails":
+        listed = ctx.gh.answers["issue list"]
+        ctx.gh.answers["issue list"] = lambda args: (
+            subprocess.CompletedProcess(args, 1, "", "boom") if "P0" in args else listed(args))
+    queue.run()
+    assert queue.ran == ["review 11", "fix 13", "dev 14"]
+    assert "#14: starting (P1)" in ctx.log()
+    assert ("could not list open P0 issues" in ctx.log()) == (probe == "fails")
+
+
+@pytest.mark.parametrize("how", ["vendor", "payload", "read-defers", "item"])
+def test_a_p0_that_cannot_run_does_not_stall_lower_priority_work(ctx, queue, monkeypatch, how):
+    queue.setup(ready=numbered((20, "P0")), p0=[20], prs=[(11, 5)])
+    queue.checkpoint(11, 5)
+    reads = []
+
+    def payload(self):
+        reads.append(self.issue)
+        if how == "read-defers":
+            raise Deferred("handoff-retry", "spec_comments_read_failed")
+        return None if how == "payload" else {"comments": []}
+    monkeypatch.setattr(spec.Spec, "issue_payload", payload)
+    if how == "vendor":
+        monkeypatch.setattr(tick.Tick, "pick_vendor",
+                            lambda self, *a, **k: (_ for _ in ()).throw(Deferred("pool", QUOTA)))
+    queue.defer = {"dev 20"}
+    queue.run()
+    assert queue.ran == (["dev 20"] if how == "item" else []) + ["review 11"]
+    assert reads == ["20"]
+
+
+def test_a_deferred_p0_goes_on_to_the_next_p0(ctx, queue):
+    queue.setup(ready=numbered((22, "P0"), (20, "P0")), p0=[20, 21, 22, 23], fix=[(31, 21), (33, 23)])
+    queue.defer = {"fix 31", "fix 33", "dev 20"}
+    queue.run()
+    assert queue.ran == ["fix 31", "fix 33", "dev 20", "dev 22"]
+
+
+@pytest.mark.parametrize("skip", ["open-pr", "pending-spec", "blocked", "unauthorized", "pr-list-fails"])
+def test_the_p0_start_keeps_the_filters(ctx, queue, skip):
+    ready = numbered((20, "P0"))
+    if skip == "blocked":
+        ready = [issue(20, labels=["ready-for-agent", "P0"], blocked_by=[(2, "OPEN")])]
+    queue.setup(ready=ready, p0=[20], prs=[(31, 20)] if skip == "open-pr" else [])
+    if skip == "pending-spec":
+        queue.spec(20)
+        ctx.gh.answers["issue view"] = {"state": "OPEN", "labels": [{"name": "ready-for-human"}]}
+    if skip == "unauthorized":
+        label_history(ctx, 20, [label_event(1, "collaborator")])
+    if skip == "pr-list-fails":
+        listed = ctx.gh.answers["pr list"]
+        ctx.gh.answers["pr list"] = lambda args: (
+            subprocess.CompletedProcess(args, 1, "", "boom") if "--label" not in args and "merged" not in args
+            else listed(args))
+    queue.run()
+    assert queue.ran == []
+
+
+def test_open_p0_prs_count_toward_the_cap(ctx, queue):
+    queue.setup(ready=numbered((12,)), p0=[5], wip=[5], prs=[(11, 5)])
+    queue.run()
+    assert queue.ran == []
+    assert "not starting new work" in ctx.log()
+
+
+def test_a_forced_issue_has_no_p0_pass_and_logs_its_priority(ctx, queue):
+    queue.setup(ready=numbered((20, "P0")), p0=[20])
+    ctx.gh.answers["issue view"] = {"labels": [{"name": "ready-for-agent"}, {"name": "p1"}],
+                                    "author": {"login": "owner"}}
+    label_history(ctx, 7, [label_event(1, "owner")])
+    ctx.gh.answers["pr list"] = lambda args: "" if "--head" in args else []
+    queue.run("7")
+    assert queue.ran == ["dev 7"]
+    assert "#7: starting (P1)" in ctx.log()
+    assert not [c for c in ctx.gh.ran("issue", "list") if "P0" in c]
 

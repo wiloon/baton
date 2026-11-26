@@ -7,6 +7,8 @@ A tick takes the configured repositories in turn (#327): it starts with the one 
 repository whose item ran last (state `last-repo`), and still does one item in all. In each
 repository it does one of, in this order (the order is a contract):
   - reconcile a PR whose creation was interrupted (pr-opening-N.json)
+  - P0 issues (ADR 0010): their resumed reviews, fixes and specs, then a new one, whatever
+    max_pending_prs says
   - a review the last run deferred (review-pending-N)
   - a PR the owner labelled agent-review
   - an agent PR labelled agent-fix (owner feedback)
@@ -83,6 +85,12 @@ def open_blockers(item):
     return found
 
 
+def priority_of(labels):
+    """The rank of an issue with these label names (ADR 0010): 0 for P0 to 3 for P3, the highest of
+    several, and P2 without one."""
+    return min((int(name[1]) for name in labels if re.fullmatch(r"[Pp][0-3]", name)), default=2)
+
+
 class Tick:
     @session.scoped
     def __init__(self, env=None, argv=(), run_sh="", clock=time.time):
@@ -104,6 +112,8 @@ class Tick:
         self.exec = os.execv
         self.active = {}
         self.recovered_issues = {}
+        self.priorities = {}   # issue number -> priority_of, as last listed
+        self.tried = set()     # (kind, number) of what this tick already tried
         self.fetch_failed = False
 
     # --- logging, GitHub and git --------------------------------------------------------
@@ -320,11 +330,52 @@ class Tick:
                 and not self.is_agent_branch(self.force_pr)):
             print("python -m baton pr N takes an agent/issue-N PR; for the owner's own PR use python -m baton review N", file=sys.stderr)
             return 2
-        for step in (self.pending_openings, self.pending_reviews, self.pick_review, self.pick_fix, self.pick_issue):
+        self.tried = set()
+        for step in (self.pending_openings, self.p0_pass, self.pending_reviews, self.pick_review, self.pick_fix,
+                     self.pick_issue):
             done = step()
             if done is not None:
                 return done
         return None
+
+    # --- P0 goes first (ADR 0010) -----------------------------------------------------------
+    def p0_pass(self):
+        """The work of P0 issues ahead of everything else: what is in flight, then a new one. What
+        cannot run now leaves the tick to the next P0 item and then the normal order."""
+        if self.force_issue or self.force_pr or self.force_review:
+            return None
+        p0 = self.p0_issues()
+        if not p0:
+            return None
+        for step in (self.pending_reviews, self.pick_fix, self.resume_specs, self.start_p0):
+            done = step(p0)
+            if done is not None:
+                return done
+        return None
+
+    def start_p0(self, p0):
+        """A new P0 issue: every candidate filter applies, max_pending_prs does not."""
+        candidates = self.candidates(p0)
+        prs = self.open_prs() if candidates else None
+        if prs is None:
+            return None
+        for issue in self.runnable(candidates, {p["headRefName"] for p in prs}):
+            done = self.start(issue, ", ahead of lower-priority work; max_pending_prs not applied")
+            if done is not None:
+                return done
+        return None
+
+    def start(self, issue, note=""):
+        self.log(f"#{issue}: starting (P{self.priorities.get(str(issue), 2)}){note}")
+        return self.attempt(lambda: dev.run(self, issue))
+
+    def attempt(self, body):
+        """item(), then after_item. A review that a deferred item left behind has been tried: it is
+        not resumed again in the same tick."""
+        rc = self.item(body)
+        if rc == 75 and self.active.get("pr"):
+            self.tried.add(("review", self.active["pr"]))
+        return self.after_item(rc)
 
     # --- Cursor's verdicts on claude-found issues (no agent run) ---------------------------
     def advance_cursor_verdicts(self):
@@ -553,18 +604,29 @@ class Tick:
         return None
 
     # --- a paused local review stays discoverable --------------------------------------------
-    def pending_reviews(self):
+    def pending_reviews(self, only=None):
         """Even after its trigger label was removed, or after Cursor opened a PR: re-enter at the
-        saved review/fix step."""
+        saved review/fix step. ONLY restricts this to the checkpoints of these issues."""
         posts = owner_handoff.comment_post_episodes(self.env)
         paths = set(self.state.glob("review-pending-*"))
         paths.update(self.state / f"review-pending-{pr}" for pr in posts)
         for path in sorted(paths):
             pr = path.name.removeprefix("review-pending-")
+            if ("review", pr) in self.tried or only is not None and self.checkpoint_issue(path) not in only:
+                continue
+            self.tried.add(("review", pr))
             done = self.after_item(self.item(lambda: self.pending_review(path, posts.get(pr, set()))))
             if done is not None:
                 return done
         return None
+
+    @staticmethod
+    def checkpoint_issue(path):
+        """The issue a saved checkpoint names, "" when it names none or cannot be read."""
+        try:
+            return str((checkpoint.read(path) or {}).get("ISSUE") or "")
+        except (OSError, ValueError):
+            return ""
 
     def comment_post_pending(self, pr):
         if pr in owner_handoff.comment_post_episodes(self.env):
@@ -701,33 +763,43 @@ class Tick:
             found[pr] = {issue if issue.isdecimal() else pr}
         return found
 
-    def pick_fix(self):
+    def pick_fix(self, only=None):
         """The owner's review comments go to the vendor that changed the fewest lines of the PR and
-        can run now (pick_by_contrib), then the review loop runs again."""
+        can run now (pick_by_contrib), then the review loop runs again. ONLY restricts this to the
+        PRs of these issues, and then every one of them gets a turn."""
         if self.force_issue or self.force_review:
             return None
         pushes = self.fix_push_episodes()
         for pr, episodes in sorted(pushes.items(), key=lambda pair: int(pair[0])):
             if (self.force_pr and self.force_pr != pr) or (self.state / f"review-pending-{pr}").exists():
                 continue
-            done = self.after_item(self.item(lambda pr=pr, episodes=episodes: self.resume_standalone_push(pr, episodes)))
+            if ("fix", pr) in self.tried or only is not None and not episodes & only:
+                continue
+            self.tried.add(("fix", pr))
+            done = self.attempt(lambda pr=pr, episodes=episodes: self.resume_standalone_push(pr, episodes))
             if done is not None:
                 return done
         if self.force_pr in pushes:
             return None
         if self.force_pr:
-            pr = self.force_pr
-            head_ref = (self.gh("pr", "view", pr, "-R", self.gh_repo, "--json", "headRefName", "--jq", ".headRefName") or "").strip()
+            head_ref = (self.gh("pr", "view", self.force_pr, "-R", self.gh_repo, "--json", "headRefName",
+                                "--jq", ".headRefName") or "").strip()
+            found = [(self.force_pr, head_ref)]
         else:
             listed = self.gh_json("pr", "list", "-R", self.gh_repo, "--state", "open", "--label", "agent-fix",
                                   "--limit", "20", "--json", "number,headRefName") or []
-            listed = sorted((p for p in listed if names.issue_of(p["headRefName"])
+            listed = sorted((p for p in listed if (issue := names.issue_of(p["headRefName"]))
+                             and (only is None or issue in only)
+                             and ("fix", str(p["number"])) not in self.tried
                              and str(p["number"]) not in pushes
                              and not self.comment_post_pending(str(p["number"]))), key=lambda p: p["number"])
-            pr, head_ref = (str(listed[0]["number"]), listed[0]["headRefName"]) if listed else ("", "")
-        if not pr:
-            return None
-        return self.after_item(self.item(lambda: self.fix_item(pr, head_ref)))
+            found = [(str(p["number"]), p["headRefName"]) for p in (listed if only is not None else listed[:1])]
+        for pr, head_ref in found:
+            self.tried.add(("fix", pr))
+            done = self.attempt(lambda pr=pr, head_ref=head_ref: self.fix_item(pr, head_ref))
+            if done is not None:
+                return done
+        return None
 
     def fix_item(self, pr, head_ref):
         self.active["cursor_fix"] = self.active["pr"] = str(pr)
@@ -929,8 +1001,23 @@ class Tick:
         if self.force_pr or self.force_review:
             return None
         pending = self.pending_specs()
+        done = self.resume_specs()
+        if done is not None:
+            return done
+        if self.force_issue and self.force_issue in pending:
+            return None
+        issue = self.forced_issue() if self.force_issue else self.next_issue()
+        if not issue:
+            return None
+        return self.start(issue)
+
+    def resume_specs(self, only=None):
+        """The pending_specs() entries that are due; ONLY restricts them to these issues."""
+        pending = self.pending_specs()
         for issue in sorted(pending, key=int):
             if self.force_issue and self.force_issue != issue:
+                continue
+            if ("issue", issue) in self.tried or only is not None and issue not in only:
                 continue
             reason = pending[issue]
             accept_post = reason in owner_handoff.SPEC_ACCEPT_POSTS
@@ -964,23 +1051,20 @@ class Tick:
                 if not isinstance(labels, list) or any(not isinstance(label, dict)
                                                       or label.get("name") == "ready-for-human" for label in labels):
                     continue
+            self.tried.add(("issue", issue))
             if reason in ("spec_pending_adr_read_failed", *owner_handoff.SPEC_WRITE_POSTS,
                           owner_handoff.SPEC_ADR_PUSH, owner_handoff.SPEC_ADR_MERGE):
-                done = self.after_item(self.item(lambda: self.resume_spec(issue)))
+                done = self.attempt(lambda: self.resume_spec(issue))
             else:
-                done = self.after_item(self.item(lambda: dev.run(self, issue)))
+                done = self.attempt(lambda: dev.run(self, issue))
             if done is not None:
                 return done
-        if self.force_issue and self.force_issue in pending:
-            return None
-        issue = self.forced_issue() if self.force_issue else self.next_issue()
-        if not issue:
-            return None
-        return self.after_item(self.item(lambda: dev.run(self, issue)))
+        return None
 
     def forced_issue(self):
         labels = self.gh_json("issue", "view", self.force_issue, "-R", self.gh_repo, "--json", "labels,author,blockedBy") or {"labels": []}
         label_names = [label["name"] for label in labels["labels"]]
+        self.priorities[self.force_issue] = priority_of(label_names)
         if "ready-for-agent" not in label_names and not ("claude-found" in label_names and "needs-triage" in label_names):
             print(f"#{self.force_issue} needs the ready-for-agent label", file=sys.stderr)
             raise Stop(2)
@@ -1071,14 +1155,8 @@ class Tick:
             self.log("could not list open agent-wip issues; not starting new work")
             return ""
         cap = int(self.env.config.scheduling.max_pending_prs or 1)
-        prs = self.gh_json("pr", "list", "-R", self.gh_repo, "--state", "open", "--limit", "100",
-                           "--json", "number,headRefName,labels")
-        if isinstance(prs, list) and len(prs) == 100:
-            pulls = self.admission_items("pulls?state=open")
-            prs = None if pulls is None else [
-                {"number": pr["number"], "headRefName": pr["head"]["ref"], "labels": pr["labels"]} for pr in pulls]
-        if not isinstance(prs, list):
-            self.log("could not list open PRs; not starting new work")
+        prs = self.open_prs()
+        if prs is None:
             return ""
         branches = {p["headRefName"] for p in prs}
         # An agent-wip issue without an open PR holds no slot: release it, or leave it uncounted.
@@ -1110,15 +1188,36 @@ class Tick:
             self.log(f"{len(pending)} issue(s) still waiting on review (agent-wip), cap {cap}, {len(deferred)} deferred, "
                      f"{limit}; not starting new work: " + "; ".join(why))
             return ""
+        return next(self.runnable(self.candidates(), branches), "")
+
+    def open_prs(self):
+        """Every open PR (number, headRefName, labels), or None, logged, when they cannot be listed."""
+        prs = self.gh_json("pr", "list", "-R", self.gh_repo, "--state", "open", "--limit", "100",
+                           "--json", "number,headRefName,labels")
+        if isinstance(prs, list) and len(prs) == 100:
+            pulls = self.admission_items("pulls?state=open")
+            prs = None if pulls is None else [
+                {"number": pr["number"], "headRefName": pr["head"]["ref"], "labels": pr["labels"]} for pr in pulls]
+        if not isinstance(prs, list):
+            self.log("could not list open PRs; not starting new work")
+            return None
+        return prs
+
+    def runnable(self, candidates, branches):
+        """The CANDIDATES that can start now, in order: no open PR on BRANCHES, nothing pending,
+        not tried already in this tick, and a vendor for their next step."""
         from . import recovery
 
         waiting = self.pending_specs()
-        for n in self.candidates():
+        for n in candidates:
             if str(n) in waiting or any(names.issue_of(b) == str(n) for b in branches):
                 continue   # already has a PR
             # These issues can be at different steps: one whose next step no vendor can run now must
             # not block another (revision needs a pool vendor).
             issue = str(n)
+            if ("issue", issue) in self.tried:
+                continue
+            self.tried.add(("issue", issue))
             try:
                 payload = spec.Spec(self.env, self.hooks(issue), issue).issue_payload()
             except Deferred as deferred:
@@ -1126,22 +1225,17 @@ class Tick:
                 continue
             if payload is None:
                 continue
-            if spec.accept_pending(self.env, issue, listed=payload["comments"]):
-                self.recovered_issues[issue] = payload
-                return issue
-            if recovery.path(self.env, issue, issue).exists():
-                self.recovered_issues[issue] = payload
-                return issue
-            role = spec.role_from(payload["comments"], self.env)
-            candidates = list(self.env.config.pool()) if role == "reviser" else self.all_vendors()
-            try:
-                self.pick_vendor(role, "contrib", candidates, issue=issue)
-            except Deferred as deferred:
-                self.defer(deferred.vendor, deferred.reason)
-                continue
+            if not (spec.accept_pending(self.env, issue, listed=payload["comments"])
+                    or recovery.path(self.env, issue, issue).exists()):
+                role = spec.role_from(payload["comments"], self.env)
+                vendor_candidates = list(self.env.config.pool()) if role == "reviser" else self.all_vendors()
+                try:
+                    self.pick_vendor(role, "contrib", vendor_candidates, issue=issue)
+                except Deferred as deferred:
+                    self.defer(deferred.vendor, deferred.reason)
+                    continue
             self.recovered_issues[issue] = payload
-            return issue
-        return ""
+            yield issue
 
     PIPELINE_LABELS = frozenset({"ready-for-human", "agent-review", "agent-fix"})
 
@@ -1182,16 +1276,20 @@ class Tick:
             stalled.add(issue)
         return stalled
 
-    def candidates(self):
+    def candidates(self, only=None):
         """ready-for-agent says "specified", AGENT_MILESTONE says "wanted now" ("" for any
         milestone); the scan's claude-found issues need no milestone. External authors need
-        ready-for-agent: scanner labels alone never authorize their issues."""
+        ready-for-agent: scanner labels alone never authorize their issues. Priority labels only
+        order the candidates (ADR 0010). ONLY restricts them to these issue numbers."""
         milestone = self.env.repo.agent_milestone
         found = {}
         for labels in (("ready-for-agent",), ("claude-found", "needs-triage")):
             args = [x for label in labels for x in ("--label", label)]
-            for i in self.gh_json("issue", "list", "-R", self.gh_repo, "--state", "open", *args, "--limit", "50",
+            # 1000 is as far as a label search of `gh issue list` goes; REST has no blockedBy.
+            for i in self.gh_json("issue", "list", "-R", self.gh_repo, "--state", "open", *args, "--limit", "1000",
                                   "--json", "number,author,labels,milestone,blockedBy") or []:
+                if only is not None and str(i["number"]) not in only:
+                    continue
                 label_names = [label["name"] for label in i["labels"]]
                 login = (i.get("author") or {}).get("login") or ""
                 trusted = login == self.owner or bool(re.fullmatch(self.cursor_login, login))
@@ -1207,8 +1305,18 @@ class Tick:
                 if (labels == ("ready-for-agent",) or "ready-for-agent" in label_names) and not self.owner_ready(i["number"]):
                     self.log(f"#{i['number']}: skipped; cannot verify ready-for-agent was applied by {self.owner}")
                     continue
-                found[i["number"]] = None
-        return sorted(found)
+                found[i["number"]] = self.priorities[str(i["number"])] = priority_of(label_names)
+        return sorted(found, key=lambda n: (found[n], n))
+
+    def p0_issues(self):
+        """The open issues labelled P0 (the cheap probe); none when the listing fails."""
+        listed = self.gh_json("issue", "list", "-R", self.gh_repo, "--state", "open", "--label", "P0", "--limit", "1000",
+                              "--json", "number,labels")
+        if not isinstance(listed, list):
+            self.log("could not list open P0 issues; no P0 preemption this tick")
+            return set()
+        return {str(i["number"]) for i in listed
+                if priority_of(label["name"] for label in i.get("labels") or []) == 0}
 
     # --- nothing else to do: scan one area for a defect ----------------------------------------------
     def scan_fallback(self):

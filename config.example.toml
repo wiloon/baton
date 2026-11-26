@@ -31,6 +31,9 @@ auto_merge = true
 # Per repository: no new issue starts while this many agent PRs are still in the review loop
 # (a PR handed to the owner, ready-for-human, doesn't count). A PR whose next step is deferred for
 # vendor quota or cooldown lends its slot, so at most max_pending_prs + 1 issues are in flight.
+# Each repository's queue is ordered by the issue labels P0, P1, P2, P3 (none ranks as P2), then by
+# issue number, and PR work goes before new issues. P0 is the exception to both: it goes before
+# lower-priority PR work and starts even at max_pending_prs.
 max_pending_prs = 1
 # Reviews per PR before it goes to the owner; each review but the last can be followed by a fix.
 max_review_rounds = 2
