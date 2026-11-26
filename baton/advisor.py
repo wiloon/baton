@@ -23,7 +23,7 @@ import urllib.error
 import urllib.request
 from uuid import uuid4
 
-from . import credentials, notify, session
+from . import credentials, notify, session, statefile
 
 PROMPT_VERSION = "3"
 OBSERVATION_PROMPT_VERSION = "4"
@@ -286,7 +286,7 @@ def granted(env, point, item):
 def append(env, record):
     path = records_path(env)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a+b") as file:
+    with statefile.locked(env.config.paths.state), open(path, "a+b") as file:   # closed before unlocked
         file.seek(0, 2)
         if file.tell():   # a torn last record without its newline must not swallow this one
             file.seek(-1, 2)
@@ -628,24 +628,6 @@ def digest(env, now=None):
     env = session.resolve(env)
     now = int(now if now is not None else time.time())
     stamp = Path(str(env.config.paths.state), "advisor", "digest-last")
-    try:
-        last, *offset = map(int, stamp.read_text().split(maxsplit=1))
-    except (OSError, ValueError):
-        last, offset = 0, []
-    if now - last < DIGEST_SECONDS:
-        return ""
-    try:
-        records = read_records(env, strict=True)
-    except OSError:
-        return ""
-    if offset:
-        consumed = offset[0]
-        previous, recent = records[:consumed], records[consumed:]
-    else:
-        # Migrate the timestamp-only stamp. Its cutoff second may contain unreported records.
-        previous = [r for r in records if int(r.get("ts", 0)) < last]
-        recent = [r for r in records if int(r.get("ts", 0)) >= last]
-    decisions = [r for r in recent if r.get("kind") == "decision"]
 
     def keys(record):
         """A decision id; else a legacy record's (repo, point, item) with its snapshot hash, then without."""
@@ -654,12 +636,29 @@ def digest(env, now=None):
         base = (record.get("repo"), record.get("point"), record.get("item"))
         return [base + (record["snapshot_sha"],), base] if record.get("snapshot_sha") else [base]
 
-    closed = {keys(r)[0] for r in recent if r.get("kind") == "outcome"}
-    reported = [r for r in previous if r.get("kind") == "decision" and any(k in closed for k in keys(r))] + decisions
-    stamp.parent.mkdir(parents=True, exist_ok=True)
-    next_stamp = stamp.with_suffix(".tmp")
-    next_stamp.write_text(f"{now} {len(records)}\n")
-    next_stamp.replace(stamp)
+    # Read through write under the lock, so two ticks cannot both claim the window; send after it.
+    with statefile.locked(env.config.paths.state):
+        try:
+            last, *offset = map(int, stamp.read_text().split(maxsplit=1))
+        except (OSError, ValueError):
+            last, offset = 0, []
+        if now - last < DIGEST_SECONDS:
+            return ""
+        try:
+            records = read_records(env, strict=True)
+        except OSError:
+            return ""
+        if offset:
+            consumed = offset[0]
+            previous, recent = records[:consumed], records[consumed:]
+        else:
+            # Migrate the timestamp-only stamp. Its cutoff second may contain unreported records.
+            previous = [r for r in records if int(r.get("ts", 0)) < last]
+            recent = [r for r in records if int(r.get("ts", 0)) >= last]
+        decisions = [r for r in recent if r.get("kind") == "decision"]
+        closed = {keys(r)[0] for r in recent if r.get("kind") == "outcome"}
+        reported = [r for r in previous if r.get("kind") == "decision" and any(k in closed for k in keys(r))] + decisions
+        statefile.replace(stamp, f"{now} {len(records)}\n")
     if not reported:
         return ""
 

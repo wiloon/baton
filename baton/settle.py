@@ -17,7 +17,7 @@ import sys
 import tempfile
 import time
 
-from . import agents, capacity, hooks as telemetry, notify, quota
+from . import agents, capacity, hooks as telemetry, notify, quota, statefile, vendor_policy
 from .common import child_env, read
 
 # What an expired or missing login looks like in a probe's output (grep -Ei before).
@@ -34,11 +34,12 @@ def runs_file(state, vendor, day):
 
 def count_run(state, vendor, day=None):
     path = runs_file(state, vendor, day or time.strftime("%F"))
-    try:
-        before = int(path.read_text().split()[0])
-    except (OSError, IndexError, ValueError):
-        before = 0
-    path.write_text(f"{before + 1}\n")
+    with statefile.locked(state):
+        try:
+            before = int(path.read_text().split()[0])
+        except (OSError, IndexError, ValueError):
+            before = 0
+        statefile.replace(path, f"{before + 1}\n")
 
 
 def refresh_api(state, vendor):
@@ -80,19 +81,18 @@ def settle(state, vendor, status, rc, log, tag, deadline="", outcome="", credent
         record_credential(state, vendor, "auth_expired" if status == "auth" else "authenticated")
     record_quota(state, vendor, log)
     cooldown = Path(state, f"{vendor}-cooldown-until")
+    if status in ("auth", "quota", "busy"):
+        vendor_policy.rest(state, vendor, deadline)
     if status == "auth":
-        cooldown.write_text(f"{deadline}\n")
         notify.log(f"{tag}: vendor={vendor} outcome=auth rc={rc} retry={deadline} {outcome}")
         notify.notify(f"{tag}: {vendor} auth failure", f"Log {vendor} in again on the runner host, then rm {cooldown} "
                       f"to resume before epoch {deadline}.{f' See {log}' if log else ''}")
         return 75, outcome, f"authentication failed; cooldown until epoch {deadline}"
     if status == "quota":
-        cooldown.write_text(f"{deadline}\n")
         notify.log(f"{tag}: vendor={vendor} outcome=quota rc={rc} reset={deadline}")
         notify.notify(f"{tag}: {vendor} quota exhausted", f"Paused until epoch {deadline}; see {log}")
         return 75, outcome, f"quota exhausted; cooldown until epoch {deadline}"
     if status == "busy":
-        cooldown.write_text(f"{deadline}\n")
         notify.log(f"{tag}: vendor={vendor} outcome=busy rc={rc} retry={deadline}")
         return 75, outcome, f"model at capacity; cooldown until epoch {deadline}"
     notify.log(f"{tag}: vendor={vendor} outcome={status} rc={rc}")

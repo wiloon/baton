@@ -7,6 +7,7 @@ only goes into the request URL inside this process: never into argv or an agent'
 from . import credentials as runner_credentials, session
 import argparse
 import json
+import locale
 import os
 from pathlib import Path
 import re
@@ -35,9 +36,13 @@ def label(env=None):
 
 
 def append(logs, line):
-    """A timestamped line in LOGS/runner.log."""
-    with open(Path(str(logs), "runner.log"), "a") as file:
-        file.write(f"{time.strftime('%F %T')} {line}\n")
+    """A timestamped line in LOGS/runner.log. One O_APPEND write, so concurrent lines stay whole."""
+    data = f"{time.strftime('%F %T')} {line}\n".encode(locale.getpreferredencoding(False))
+    fd = os.open(Path(str(logs), "runner.log"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o666)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
 
 
 def log(message):

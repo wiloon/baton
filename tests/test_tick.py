@@ -136,6 +136,28 @@ def test_a_second_tick_waits_for_the_lock(ctx):
     assert not ctx.gh.calls
 
 
+def test_the_legacy_cooldown_upgrade_holds_the_shared_state_lock(ctx, monkeypatch):
+    """A cooldown writer must not land between the check and the rename, which would overwrite it (#276)."""
+    ctx.path("cooldown-until").write_text("123\n")
+    locked, rename = [], Path.rename
+
+    def probe(path, target):
+        if path.name == "cooldown-until":
+            lock = ctx.path("quota-locks") / "shared-state"
+            lock.parent.mkdir(exist_ok=True)
+            with lock.open("a") as file:
+                try:
+                    fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked.append(False)
+                except BlockingIOError:
+                    locked.append(True)
+        return rename(path, target)
+    monkeypatch.setattr(Path, "rename", probe)
+    assert ctx.make().run() == 0
+    assert locked == [True]
+    assert ctx.path("claude-cooldown-until").read_text() == "123\n"
+
+
 # --- Cursor's verdicts --------------------------------------------------------------------------------
 def test_cursor_verdicts_move_the_labels(ctx):
     def comment(login, body):
