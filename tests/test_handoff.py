@@ -634,7 +634,7 @@ def test_a_malformed_retry_record_hands_off_without_defaults(env, monkeypatch, p
 
 
 @pytest.mark.parametrize("damage", ["directory", "dangling link"])
-def test_a_non_file_retry_path_hands_off(env, monkeypatch, tmp_path, damage):
+def test_a_non_file_retry_path_hands_off(env, monkeypatch, tmp_path, macos_unlink, damage):
     """A retry path that exists but is not a regular file fails closed (#151)."""
     labelled = []
     hooks, _ = _hooks()
@@ -653,3 +653,18 @@ def test_a_non_file_retry_path_hands_off(env, monkeypatch, tmp_path, damage):
     done = handoff.perform(env, "spec_comments_read_failed", kind="issue", number="7", title="t", text="x",
                            hooks=hooks, item="7", episode="7", resume=True)
     assert done.action == handoff.HANDOFF and labelled == [1]
+    if damage == "directory":
+        assert not path.exists()
+        [moved] = path.parent.glob(f"damaged-*-{path.name}")
+        assert (moved / "child").read_text() == "damaged retry"
+
+
+def test_clearing_a_retry_unlinks_a_symlink_to_a_directory_as_a_link(env, tmp_path, macos_unlink):
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "child").write_text("kept")
+    path = handoff.retry_path(env, "7", "spec_comments_read_failed")
+    path.symlink_to(target)
+    handoff.clear_retry(env, "7", "spec_comments_read_failed")
+    assert not path.is_symlink() and not list(path.parent.glob("damaged-*"))
+    assert (target / "child").read_text() == "kept"

@@ -1191,7 +1191,7 @@ def test_a_second_tick_finishes_a_deferred_description_edit(ctx, worktree, monke
     assert reviewed or ctx.loops
 
 
-def test_tick_discards_a_directory_request_after_a_fix_needs_info(ctx, worktree, monkeypatch):
+def test_tick_discards_a_directory_request_after_a_fix_needs_info(ctx, worktree, monkeypatch, macos_unlink):
     request = Path(ctx.env["CTX"], "pr-11-body.md")
 
     def agent(*args):

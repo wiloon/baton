@@ -1,5 +1,6 @@
 """A fake `gh` (and `timeout`) on PATH: baton.pr / .ci run their real subprocess
 calls against one PR held in a directory. No network."""
+import errno
 import json
 import os
 from pathlib import Path
@@ -430,6 +431,30 @@ def typed_legacy_test_inputs(request, monkeypatch):
         return session.Session(config, rt, env, home, env.get('MATT_SKILLS_DIR',''),
                                tuple(Path(v) for v in env.get('CODEX_CACHE_DIRS','').split()), repo, dirs)
     monkeypatch.setattr(session, 'resolve', resolve)
+
+
+@pytest.fixture
+def macos_unlink(monkeypatch):
+    """`Path.unlink` on a real directory raises EPERM, as on macOS; Linux raises EISDIR (#281)."""
+    real = Path.unlink
+
+    def unlink(path, *args, **kwargs):
+        try:
+            directory = stat.S_ISDIR(path.lstat().st_mode)
+        except OSError:
+            directory = False
+        if directory:
+            raise PermissionError(errno.EPERM, "Operation not permitted", str(path))
+        return real(path, *args, **kwargs)
+    monkeypatch.setattr(Path, "unlink", unlink)
+
+
+@pytest.fixture
+def denied_unlink(monkeypatch):
+    """Every `Path.unlink` is refused with EPERM, whatever is at the path."""
+    def unlink(path, *args, **kwargs):
+        raise PermissionError(errno.EPERM, "Operation not permitted", str(path))
+    monkeypatch.setattr(Path, "unlink", unlink)
 
 
 @pytest.fixture
