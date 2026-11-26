@@ -251,16 +251,29 @@ python -m baton.maintenance [--config PATH] status
 
 While the flag is on, ticks (timer, manual and chained), the nightly run and the retrospectives
 worker start no new work; they log `maintenance (REASON)` and exit 0 (retrospectives print
-`{"state":"maintenance",...}`). Work already running finishes. `on --wait` returns 0 once the runner
-lock and the retrospectives worker lock are both free, and 75 when `--timeout` passes first (the flag
+`{"state":"maintenance",...}`). Work already running finishes. `on --wait` returns 0 once every work
+lock (each repository's, the housekeeping, scan and retrospectives locks) is free, and 75 when `--timeout` passes first (the flag
 stays on) or when `off` or a newer `on` replaced the request. A DURATION is a positive integer with an
 `s`, `m` or `h` suffix, such as `90s`, `30m` or `2h`. `--timeout` and `--ttl` default to `2h`. The flag
 expires after the TTL so an abandoned deploy cannot stop the pipeline: plain `on` lasts the TTL, `on
 --wait` lasts the timeout plus the TTL, and a successful wait restarts the full TTL when the drain
 completes. A malformed flag counts as active for 2h after its modification time. The next tick removes
 an expired flag and logs `maintenance expired`. `off` always succeeds; `status` shows on or off, the
-reason and expiry, and whether the runner and retrospectives locks are held. `baton.migrate` still
-runs while the flag is on. `scheduling.paused` stays the operator's long-term pause.
+reason and expiry, and whether each work lock is held. `baton.migrate` still runs while the flag is
+on. `scheduling.paused` stays the operator's long-term pause.
+
+Work locks ([ADR 0003](docs/adr/0003-maintenance-mode-is-a-local-flag.md), all under the state
+directory, none ever waited for):
+
+| Lock | Held by |
+| --- | --- |
+| `repos/OWNER/NAME/lock` | a tick or manual command while it works that repository; ticks for different repositories may overlap, and one finding it held logs `busy (another tick holds the lock)` and goes on |
+| `housekeeping.lock` | a tick doing the runner-wide chores; skipped when held |
+| `scan.lock` | the scan, one at a time; skipped when held |
+| `retrospectives/worker.lock` | the retrospectives worker |
+
+The nightly run and `baton.migrate` take every repository lock at once (migrate also the
+housekeeping and scan locks) and give up with 75 when one is held; `--preflight` reports 75 then.
 
 ### systemd units
 

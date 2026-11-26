@@ -1,4 +1,4 @@
-"""baton.nightly: the repository's nightly hook on main, on its own schedule and worktree, under the runner's lock.
+"""baton.nightly: the repository's nightly hook on main, on its own schedule and worktree, under every repository lock.
 
 What green means is the hook's exit code; a Playwright hook would judge its counts."""
 import fcntl
@@ -42,7 +42,7 @@ def world(tmp_path):
         def run(self):
             for directory in (self.state, self.logs, self.wt_root):
                 directory.mkdir(exist_ok=True)
-            return nightly.run(state=self.state, logs=self.logs, wt_root=self.wt_root, repo=self.repo,
+            return nightly.run(state=self.state, repos=["acme/app", "acme/shop"], logs=self.logs, wt_root=self.wt_root, repo=self.repo,
                                env_files=self.env_files, hook=self.hook, tools=None,
                                notify=lambda title, text="": self.notices.append((title, text)),
                                log=lambda message: (self.logs / "runner.log").open("a").write(message + "\n"))
@@ -80,14 +80,17 @@ def test_no_nightly_hook_means_nothing_runs(world):
     assert world.notices == [] and "no nightly hook" in world.runner_log()
 
 
-def test_a_busy_pipeline_is_left_alone(world):
+@pytest.mark.parametrize("repo", ["acme/app", "acme/shop", "gone/repo"])
+def test_a_busy_pipeline_is_left_alone(world, repo):
     world.script()
-    world.state.mkdir()
-    with open(world.state / "lock", "w") as held:
+    lock = world.state / "repos" / repo / "lock"
+    lock.parent.mkdir(parents=True)
+    with open(lock, "w") as held:
         fcntl.flock(held, fcntl.LOCK_EX)
         assert world.run() == nightly.BUSY
     assert not world.seen.exists() and world.notices == []
     assert "busy" in world.runner_log()
+    assert world.run() == 0   # none left held
 
 
 def test_a_worktree_left_by_a_crash_does_not_stop_the_next_night(world):

@@ -103,7 +103,7 @@ def prepare(config: Config) -> None:
 
 
 def expire_context(config: Config, now: float) -> None:
-    """Retain the runner's existing 14-day prompt cleanup, under its execution lock, in every
+    """Retain the runner's existing 14-day prompt cleanup, under the housekeeping lock, in every
     repository's ctx."""
     cutoff = now - 14 * 86400
     for repo in config.repos:

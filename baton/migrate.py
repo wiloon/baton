@@ -5,7 +5,7 @@
 Before #327 the runner watched one repository: its checkpoints and PR records sat in the state
 directory beside the machine's quota and cooldowns, its worktrees in wt_root, its ctx and run logs
 at the top of theirs, and its clone wherever the deploy put it. This moves all of that into
-OWNER/NAME's RepoDirs, under the runner's lock:
+OWNER/NAME's RepoDirs, holding every repository lock and the housekeeping and scan locks:
 
   state/<per-repo file>   -> state/repos/OWNER/NAME/   (saved worktree and ctx paths rewritten)
   wt_root/<worktree>      -> wt_root/OWNER/NAME/       (then `git worktree repair`)
@@ -17,7 +17,6 @@ What stays global is GLOBAL_STATE. Running it again finds nothing to move. The r
 start while `pending` finds single-repository files, so nothing is read from the old places.
 """
 import argparse
-import fcntl
 from pathlib import Path
 import re
 import shutil
@@ -27,10 +26,11 @@ import sys
 from . import maintenance
 from .config import ConfigError, load, repo_dirs
 
-# The machine's, not a repository's: the lock and the tick's turn, vendor cooldowns and run counts,
+# The machine's, not a repository's: the work locks and the tick's turn (`lock` and `chain-next` are
+# old files that stay on disk), vendor cooldowns and run counts,
 # quota and credential snapshots, telemetry/retrospectives, vendor leases, advisor decisions, and old
 # deploy backups.
-GLOBAL_STATE = re.compile(r"lock|maintenance(?:\.lock)?|last-repo|chain-next|telemetry|retrospectives|vendor-leases|quota-locks|quota-probes|deploy-backups|advisor|repos|"
+GLOBAL_STATE = re.compile(r"lock|housekeeping\.lock|scan\.lock|maintenance(?:\.lock)?|last-repo|chain-next|telemetry|retrospectives|vendor-leases|quota-locks|quota-probes|deploy-backups|advisor|repos|"
                           r"(?:[a-z]+-)?cooldown-until|(?:[a-z]+-)?runs-\d{4}-\d\d-\d\d|"
                           r"(?:quota|credential)-[a-z]+\.json")
 LABELLED = re.compile(r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d \[[^\]\s]+/[^\]\s]+\] ")
@@ -135,7 +135,7 @@ def migrate(config, gh_repo, old_clone, log=print):
         if repaired.returncode:
             raise SystemExit(f"migrate: git worktree repair failed: {repaired.stderr.strip()}")
     runner_log = config.paths.logs / "runner.log"
-    # Only with the move: later unlabelled lines are runner-wide ("busy", "no work in any repository").
+    # Only with the move: later unlabelled lines are runner-wide (such as "no work in any repository").
     if moved and runner_log.is_file():
         label = f"[{repo.gh_repo}] "
         lines = runner_log.read_text(errors="surrogateescape").splitlines(keepends=True)
@@ -160,16 +160,14 @@ def main(argv=None):
         print(f"Invalid configuration: {error}", file=sys.stderr)
         return 2
     config.paths.state.mkdir(parents=True, exist_ok=True)
-    # Not maintenance.admit: migrate runs while maintenance is active, but takes its lock under admission.
+    # Not maintenance.admit: migrate runs while maintenance is active, but takes its locks under admission.
     with maintenance.admission(config.paths.state):
-        lock = open(config.paths.state / "lock", "w")
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            lock.close()
-            print("migrate: a tick holds the lock; try again when it ends", file=sys.stderr)
-            return 75
-    with lock:
+        locks = maintenance.take_all(config.paths.state, [repo.gh_repo for repo in config.repos],
+                                     maintenance.HOUSEKEEPING_LOCK, maintenance.SCAN_LOCK)
+    if locks is None:
+        print("migrate: a tick holds a work lock; try again when it ends", file=sys.stderr)
+        return 75
+    with locks:
         migrate(config, args.repo, args.clone)
     return 0
 

@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import threading
 import time
 
@@ -17,6 +18,8 @@ from baton import bootstrap, maintenance, migrate, nightly, notify
 from baton import retrospectives as retro
 
 ROOT = Path(__file__).resolve().parents[1]
+APP_LOCK = "repos/acme/app/lock"
+WORK_LOCKS = [APP_LOCK, "repos/gone/repo/lock", "housekeeping.lock", "scan.lock", "retrospectives/worker.lock"]
 
 
 class Host:
@@ -102,7 +105,8 @@ def test_on_status_and_off(host, capsys):
     assert host.maint("status") == 0
     out = capsys.readouterr().out
     assert "maintenance: on" in out and "deploy v1" in out
-    assert "runner lock: free" in out and "retrospectives lock: free" in out
+    assert ("repository lock acme/app: free\nhousekeeping lock: free\nscan lock: free\n"
+            "retrospectives lock: free\n") in out
     assert host.maint("off") == 0
     assert host.maint("off") == 0
     assert not (host.state / "maintenance").exists()
@@ -112,16 +116,19 @@ def test_on_status_and_off(host, capsys):
     assert "maintenance: off" in capsys.readouterr().out
 
 
-def test_status_reports_each_work_lock_independently(host, capsys):
-    runner = host.hold("lock")
-    host.maint("status")
-    out = capsys.readouterr().out
-    assert "runner lock: held" in out and "retrospectives lock: free" in out
-    fcntl.flock(runner, fcntl.LOCK_UN)
-    worker = host.hold("retrospectives/worker.lock")
-    host.maint("status")
-    out = capsys.readouterr().out
-    assert "runner lock: free" in out and "retrospectives lock: held" in out
+@pytest.mark.parametrize("name, label", [
+    (APP_LOCK, "repository lock acme/app"), ("repos/gone/repo/lock", "repository lock gone/repo"),
+    ("housekeeping.lock", "housekeeping lock"), ("scan.lock", "scan lock"),
+    ("retrospectives/worker.lock", "retrospectives lock"),
+])
+def test_status_reports_each_work_lock_independently(host, capsys, name, label):
+    with host.hold(name):
+        host.maint("status")
+        out = capsys.readouterr().out
+    assert f"{label}: held" in out and out.count(": held") == 1
+    labels = [line.rsplit(":", 1)[0] for line in out.splitlines() if " lock" in line]
+    gone = ["repository lock gone/repo"] if "gone" in name else []   # sorted, with the configured one
+    assert labels == ["repository lock acme/app", *gone, "housekeeping lock", "scan lock", "retrospectives lock"]
 
 
 @pytest.mark.parametrize("bad", ["0s", "-5m", "1.5h", "2d", "h", "10", ""])
@@ -183,7 +190,7 @@ def test_an_expired_flag_is_off_and_a_malformed_one_lasts_the_default_ttl(host, 
 
 # --- waiting for the drain ---------------------------------------------------------------
 
-@pytest.mark.parametrize("name", ["lock", "retrospectives/worker.lock"])
+@pytest.mark.parametrize("name", WORK_LOCKS)
 def test_wait_returns_only_after_the_holder_releases(host, name):
     held = host.hold(name)
     released = []
@@ -195,7 +202,7 @@ def test_wait_returns_only_after_the_holder_releases(host, name):
     assert host.flag()["reason"] == "deploy"
 
 
-@pytest.mark.parametrize("name", ["lock", "retrospectives/worker.lock"])
+@pytest.mark.parametrize("name", WORK_LOCKS)
 def test_wait_timeout_exits_75_and_leaves_the_flag(host, name, monkeypatch):
     held = host.hold(name)
     ticks = iter(range(100))
@@ -207,7 +214,7 @@ def test_wait_timeout_exits_75_and_leaves_the_flag(host, name, monkeypatch):
 
 
 def test_wait_does_not_refresh_after_a_late_release(host, monkeypatch):
-    held = host.hold("lock")
+    held = host.hold(APP_LOCK)
     elapsed = [0.0]
     monkeypatch.setattr(maintenance, "monotonic", lambda: elapsed[0])
     monkeypatch.setattr(maintenance, "POLL", 2)
@@ -241,7 +248,7 @@ def test_wait_times_out_while_admission_is_held(host, monkeypatch):
         elapsed[0] += delay
 
     monkeypatch.setattr(maintenance.time, "sleep", elapse)
-    with host.hold("lock"):
+    with host.hold(APP_LOCK):
         waiter, box = run_thread(lambda: host.maint("on", "--wait", "--timeout", "1s", "--ttl", "5m"))
         try:
             waiter.join(5)
@@ -256,7 +263,7 @@ def test_wait_times_out_while_admission_is_held(host, monkeypatch):
 
 def test_wait_keeps_the_flag_active_and_restarts_the_ttl_when_the_drain_ends(host, capsys):
     tick = ["--config", str(host.config)]
-    held = host.hold("lock")
+    held = host.hold(APP_LOCK)
     waiter, box = run_thread(lambda: host.maint("on", "--wait", "--timeout", "2h", "--ttl", "10s", "--reason", "deploy"))
     try:
         publication = host.state / "maintenance"
@@ -267,7 +274,7 @@ def test_wait_keeps_the_flag_active_and_restarts_the_ttl_when_the_drain_ends(hos
         host.clock[0] += 5000
         assert host.maint("status") == 0
         status = capsys.readouterr().out
-        assert "maintenance: on" in status and "runner lock: held" in status
+        assert "maintenance: on" in status and "repository lock acme/app: held" in status
         assert "(in 2210s)" in status
         assert bootstrap.main(tick) == 0
         assert host.runner_log().count("maintenance (deploy)") == 1
@@ -279,7 +286,7 @@ def test_wait_keeps_the_flag_active_and_restarts_the_ttl_when_the_drain_ends(hos
     assert host.flag()["expires"] == host.clock[0] + 10
     assert host.maint("status") == 0
     status = capsys.readouterr().out
-    assert "maintenance: on" in status and "runner lock: free" in status
+    assert "maintenance: on" in status and "repository lock acme/app: free" in status
     assert "(in 10s)" in status
     assert bootstrap.main(tick) == 0
     assert host.runner_log().count("maintenance (deploy)") == 2
@@ -287,7 +294,7 @@ def test_wait_keeps_the_flag_active_and_restarts_the_ttl_when_the_drain_ends(hos
 
 
 def test_a_waiter_leaves_a_later_request_intact(host):
-    held = host.hold("lock")
+    held = host.hold(APP_LOCK)
     waiter, box = run_thread(lambda: host.maint("on", "--wait", "--timeout", "30s", "--reason", "old"))
     time.sleep(0.2)
     host.maint("on", "--reason", "new")
@@ -299,7 +306,7 @@ def test_a_waiter_leaves_a_later_request_intact(host):
 
 
 def test_a_waiter_does_not_recreate_a_cleared_flag(host):
-    held = host.hold("lock")
+    held = host.hold(APP_LOCK)
     waiter, box = run_thread(lambda: host.maint("on", "--wait", "--timeout", "30s"))
     time.sleep(0.2)
     host.maint("off")
@@ -319,7 +326,7 @@ def test_an_active_flag_skips_every_tick_without_github_calls(host, argv):
     assert "maintenance (deploy v2)" in host.runner_log()
     assert "paused" not in host.runner_log()
     assert not host.gh_calls.exists()
-    assert not (host.state / "lock").exists() or fcntl_free(host.state / "lock")
+    assert not (host.state / APP_LOCK).exists() or fcntl_free(host.state / APP_LOCK)
 
 
 def test_a_scheduled_tick_does_not_launch_enabled_telemetry_in_maintenance(host):
@@ -423,8 +430,8 @@ def test_nightly_skips_before_any_worktree_or_hook(host, monkeypatch):
     assert not host.hook_ran.exists()
 
 
-def test_a_busy_runner_lock_is_not_a_maintenance_skip_for_nightly(host):
-    held = host.hold("lock")
+def test_a_busy_repository_lock_is_not_a_maintenance_skip_for_nightly(host):
+    held = host.hold(APP_LOCK)
     assert nightly.main(["--config", str(host.config)]) == nightly.BUSY
     held.close()
 
@@ -477,19 +484,24 @@ def test_migrate_acquires_its_lock_while_the_flag_is_active_and_keeps_global_fil
     assert (host.state / "repos" / "acme" / "app" / "checkpoint-123").exists()
 
 
-def test_migrate_still_reports_a_busy_pipeline(host, capsys):
-    held = host.hold("lock")
-    assert migrate.main(["acme/app", "--config", str(host.config)]) == 75
-    held.close()
+@pytest.mark.parametrize("name", WORK_LOCKS[:-1])   # not the retrospectives worker's
+def test_migrate_still_reports_a_busy_pipeline(host, capsys, name):
+    (host.state / "checkpoint-123").write_text("old\n")
+    with host.hold(name):
+        assert migrate.main(["acme/app", "--config", str(host.config)]) == 75
+    assert (host.state / "checkpoint-123").exists()
+    assert migrate.main(["acme/app", "--config", str(host.config)]) == 0   # none left held
 
 
-@pytest.mark.parametrize("work_lock", ["lock", "retrospectives/worker.lock"])
+@pytest.mark.parametrize("work_lock", [APP_LOCK, "retrospectives/worker.lock"])
 def test_migrate_waits_for_a_collectors_probe_without_reporting_a_busy_pipeline(host, monkeypatch, work_lock):
     spec = importlib.util.spec_from_file_location("maintenance_telemetry", ROOT / "bin/telemetry.py")
     telemetry = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(telemetry)
     monkeypatch.setattr(telemetry, "unit_state", lambda: (1, 1, 0))
     assert host.maint("on", "--wait") == 0
+    (host.state / work_lock).parent.mkdir(parents=True, exist_ok=True)
+    (host.state / work_lock).touch()   # telemetry probes the lock files on disk
     metrics = host.root / "metrics"
     ledger = telemetry.Ledger(host.state)
     probe_held, resume_probe = threading.Event(), threading.Event()
@@ -538,6 +550,35 @@ def test_the_tick_sees_the_flag_not_a_legacy_state_error(host, capsys):
     capsys.readouterr()
     assert bootstrap.main(["--config", str(host.config)]) == 0
     assert "Single-repository" not in capsys.readouterr().err
+
+
+def test_preflight_reports_a_busy_pipeline_while_a_repository_lock_is_held(host, capsys):
+    with host.hold(APP_LOCK):
+        assert bootstrap.main(["--config", str(host.config), "--preflight"]) == 75
+    assert "Pipeline is busy" in capsys.readouterr().err
+
+
+def test_a_tick_finds_its_repository_busy_while_the_nightly_hook_runs(host):
+    started, release = host.root / "hook-started", host.root / "hook-release"
+    host.hook.write_text(f"#!/bin/sh\ntouch {started}\nwhile [ ! -e {release} ]; do sleep 0.05; done\n")
+    clone, origin = host.root / "clones/acme/app", host.root / "origin"
+    git = ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+    subprocess.run([*git, "init", "-q", "-b", "main", str(origin)], check=True)
+    subprocess.run([*git, "-C", str(origin), "commit", "-q", "--allow-empty", "-m", "base"], check=True)
+    subprocess.run([*git, "clone", "-q", str(origin), str(clone)], check=True)
+    night, box = run_thread(lambda: nightly.main(["--config", str(host.config)]))
+    try:
+        deadline = time.monotonic() + 20
+        while not started.exists() and night.is_alive() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert started.exists()
+        assert bootstrap.main(["--config", str(host.config)]) == 0
+        assert "busy (another tick holds the lock)" in host.runner_log()
+        assert not host.gh_calls.exists()
+    finally:
+        release.touch()
+        night.join(20)
+    assert box["rc"] == 0
 
 
 def test_readme_documents_the_command():

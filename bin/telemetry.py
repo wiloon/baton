@@ -1101,12 +1101,10 @@ def collect(ledger, config, output):
     attempt(lambda: contribution_metrics(ledger.state, emit, now, declared) if declared else None, None)
 
     def lock_held():
-        with maintenance.admission(ledger.state), (ledger.state / 'lock').open('a') as stream:
-            try:
-                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                return 0
-            except BlockingIOError:
-                return 1
+        """1 when any repository lock is held."""
+        with maintenance.admission(ledger.state):
+            return int(any([maintenance.held(maintenance.repository_lock(ledger.state, name))
+                            for name in maintenance.repositories(ledger.state)]))
     held = attempt(lock_held, math.nan)
     emit('lock_held', held)
     tick_path = ledger.root / 'last-scheduled-tick.json'

@@ -1,6 +1,7 @@
 """baton.merge: the merge or the handoff after a passed review, the CI repair round and the
 task recovery, against a real git worktree and the fake `gh` of conftest. Ported from
 tests/shots.sh, tests/verify.sh and tests/test_pr_lifecycle.py."""
+import dataclasses
 import io
 import json
 import os
@@ -624,6 +625,20 @@ def test_a_merged_partial_pr_releases_its_task_once(run):
     assert len(edits) == 1 and "agent-wip" in edits[0] and "ready-for-agent" in edits[0] and "297" in edits[0]
     assert not run.wt.exists() and Path(run.env["STATE"], "chain-next").exists()
     assert Path(run.env["STATE"], "last-slice-297").read_text() == f"{PR}\n"
+
+
+def test_the_chain_flag_belongs_to_the_merged_tasks_repository(run, tmp_path):
+    run.gh.set(open_prs=[], body=PARTIAL)
+    sh(run.wt, "git", "push", "-q", "origin", "HEAD:main")
+    sh(run.repo, "git", "fetch", "-q", "origin")
+    merger = run.merger()
+    runner_state = tmp_path / "runner-state"
+    runner_state.mkdir()
+    config = merger.env.config
+    merger.env = dataclasses.replace(merger.env, config=dataclasses.replace(
+        config, paths=dataclasses.replace(config.paths, state=runner_state)))
+    assert merger.finish_merged_task()
+    assert Path(run.env["STATE"], "chain-next").exists() and not (runner_state / "chain-next").exists()
 
 
 def test_a_failed_pr_read_returns_false_and_changes_nothing(run):
