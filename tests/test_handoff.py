@@ -59,7 +59,7 @@ def test_a_category_4_reason_hands_off_with_no_advisor_call(env, monkeypatch):
                         lambda env, kind, number, remove=(): labelled.append((kind, number, remove)) or MagicMock(returncode=0))
     monkeypatch.setattr(handoff.notify, "notify", lambda title, text="": notes.append((title, text)))
     monkeypatch.setattr(handoff.advisor, "advise", lambda *a, **k: calls.append(1) or handoff.advisor.Decision("handoff"))
-    monkeypatch.setattr(handoff.advisor, "settings", lambda e: Advisor(env_file=None, mode="live"))
+    monkeypatch.setattr(handoff.advisor, "settings", lambda e: Advisor(env_file=None, backend_order=("deepseek",), mode="live"))
     result = handoff.perform(env, "auto_merge_off", kind="pr", number="1",
                              title="PR #1 review passed", text="auto-merge is off", hooks=Hooks())
     assert result.action == handoff.HANDOFF and result.handed_off
@@ -127,7 +127,7 @@ def test_a_live_worker_reason_without_offered_actions_still_hands_off(env, monke
                         lambda *a, **k: labelled.append(1) or MagicMock(returncode=0))
     monkeypatch.setattr(handoff.notify, "notify", lambda *a, **k: None)
     monkeypatch.setattr(handoff.advisor, "advise", lambda *a, **k: calls.append(1) or handoff.advisor.Decision("handoff"))
-    monkeypatch.setattr(handoff.advisor, "settings", lambda e: Advisor(env_file=None, mode="live"))
+    monkeypatch.setattr(handoff.advisor, "settings", lambda e: Advisor(env_file=None, backend_order=("deepseek",), mode="live"))
     result = handoff.perform(env, "review_run_failed", kind="pr", number="1",
                              title="t", text="failed", hooks=Hooks())
     assert result.handed_off and labelled == [1] and calls == []
@@ -142,7 +142,7 @@ def test_a_live_retry_step_is_returned_when_the_caller_offers_it(env, monkeypatc
 
     monkeypatch.setattr(handoff, "label_ready", lambda *a, **k: labelled.append(1))
     monkeypatch.setattr(handoff.notify, "notify", lambda *a, **k: None)
-    monkeypatch.setattr(handoff.advisor, "settings", lambda e: Advisor(env_file=None, mode="live"))
+    monkeypatch.setattr(handoff.advisor, "settings", lambda e: Advisor(env_file=None, backend_order=("deepseek",), mode="live"))
     monkeypatch.setattr(handoff.advisor, "enabled", lambda e: True)
 
     def advise(env, reason, number, snapshot, actions, **kw):

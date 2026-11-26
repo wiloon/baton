@@ -297,7 +297,7 @@ def granted_round(ctx, monkeypatch):
     from baton.config import Advisor
     calls = []
     monkeypatch.setenv(advisor.KEY, "sk-" + "t" * 24)
-    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="live"))
+    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, backend_order=("deepseek",), mode="live"))
     monkeypatch.setattr(advisor, "call_deepseek", lambda *a, **k: (
         calls.append(a) or {"action": "extra_round", "reason": "fixable", "evidence": []}, {}))
     tick_env = ctx.make().env
@@ -1794,7 +1794,7 @@ def advised_dev(devrun, monkeypatch):
     from baton.config import Advisor
 
     monkeypatch.setenv(advisor.KEY, "sk-" + "d" * 24)
-    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="live"))
+    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, backend_order=("deepseek",), mode="live"))
     devrun.gh.answers["issue view"].update(state="OPEN", labels=[{"name": "ready-for-agent"}])
     monkeypatch.setattr(tick.Tick, "owner_ready", lambda self, issue: True)
     devrun.advice_calls, devrun.action = [], "retry_step_other_vendor"
@@ -1989,7 +1989,7 @@ def test_dirty_fix_worktree_hands_off_without_advisor(ctx, monkeypatch):
     seen = _watch_handoffs(monkeypatch)
     calls = []
     monkeypatch.setenv(advisor.KEY, "sk-" + "d" * 24)
-    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="live"))
+    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, backend_order=("deepseek",), mode="live"))
     monkeypatch.setattr(advisor, "call_deepseek", lambda *a, **k: calls.append(1) or ({"action": "handoff"}, {}))
     real = tick.session.run_process
 
@@ -2015,7 +2015,7 @@ def test_worktree_retry_checks_the_pr_before_retrying(ctx, worktree, monkeypatch
           "body": "Refs #297", "comments": [], "reviews": []}
     ctx.gh.answers["pr view"] = lambda args: dict(pr)
     monkeypatch.setenv(advisor.KEY, "sk-" + "d" * 24)
-    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="live"))
+    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, backend_order=("deepseek",), mode="live"))
 
     def advise(*args, **kwargs):
         if stale:

@@ -106,14 +106,14 @@ def environment(config):
     return env
 
 
-def bounded_process(command, prompt, workspace, env, seconds, max_bytes, lease_fd):
+def bounded_process(command, prompt, workspace, env, seconds, max_bytes, lease_fd=None):
     """Bound stdout/stderr in memory and kill the entire process group on timeout/overflow."""
     with (workspace / 'input.json').open('w+') as source:
         source.write(prompt)
         source.seek(0)
         try:
             process = subprocess.Popen(['timeout', '--kill-after=5', f'{seconds}s', *command], stdin=source, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                       cwd=workspace, env=env, start_new_session=True, pass_fds=(lease_fd,))
+                                       cwd=workspace, env=env, start_new_session=True, pass_fds=() if lease_fd is None else (lease_fd,))
         except OSError:
             return 'unavailable', b'', 127, {}
         buffers = {process.stdout: bytearray(), process.stderr: bytearray()}

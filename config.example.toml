@@ -363,12 +363,16 @@ budget_usd = 1.0
 # recommendations for implementation and ADR PRs stay in observation in either enabled mode.
 # Complete, cited grounded answers to SPEC: human questions may resume revision in live mode.
 # Decisions go to STATE/advisor/decisions.jsonl and a daily digest. A [[repos]] entry with
-# advisor = false keeps that repository's text off the provider. Per-repository excerpt flags
+# advisor = false keeps that repository's text off both providers. Per-repository excerpt flags
 # (advisor_diff_excerpts, advisor_ci_log_excerpts, advisor_local_documents) default off.
 [advisor]
 env_file = "~/.config/baton/deepseek.env"     # DEEPSEEK_API_KEY
+# Backends, tried in order: "claude" (Claude Code, the grant for the advisor; Claude must be
+# declared under [vendors]) and "deepseek". ["deepseek"] uses DeepSeek only.
+backend_order = ["claude", "deepseek"]
+claude = { model = "claude_strong", effort = "medium" }   # model alias and effort for Claude
 mode = "off"
-model = "deepseek-flash"
+model = "deepseek-flash"                      # the DeepSeek model
 base_url = "https://api.deepseek.com"
 timeout_seconds = 60
 snapshot_chars = 24000

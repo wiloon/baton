@@ -35,7 +35,7 @@ def adv(tmp_path, monkeypatch):
         usage = {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
     state = State()
     state.replies, state.calls, state.notes = [], [], []
-    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=state.env_file, mode=state.mode))
+    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=state.env_file, backend_order=("deepseek",), mode=state.mode))
 
     def call(cfg, key, snapshot, actions, **options):
         state.calls.append({**options, "key": key, "snapshot": snapshot, "actions": actions, "model": cfg.model})
@@ -201,12 +201,12 @@ def test_the_digest_is_sent_once_a_day_with_outcomes(adv):
 
 
 def test_the_handoff_note_says_what_the_advisor_chose():
-    d = advisor.Decision("handoff", "needs the owner", (), "handoff", "", True)
+    d = advisor.Decision("handoff", "needs the owner", (), "handoff", "", True, backend="deepseek")
     assert advisor.handoff_note(d) == " Advisor (DeepSeek) chose handoff: needs the owner."
 
 
 def test_the_handoff_note_says_an_observed_recommendation_was_not_executed():
-    d = advisor.Decision("handoff", "poll once", (), "retry_step", "", True)
+    d = advisor.Decision("handoff", "poll once", (), "retry_step", "", True, backend="deepseek")
     assert advisor.handoff_note(d) == " Advisor (DeepSeek) recommended retry_step, not executed (observation): poll once."
 
 

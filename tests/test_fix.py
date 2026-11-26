@@ -1623,7 +1623,7 @@ def advised_fix(run, monkeypatch):
     from baton import advisor
     from baton.config import Advisor
     monkeypatch.setenv(advisor.KEY, "sk-" + "f" * 24)
-    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="live"))
+    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, backend_order=("deepseek",), mode="live"))
     run.fake_gh.set(state="OPEN", baseRefName="main", headRefOid=run.remote_head(), comments=[], labels=[], reviews=[])
     run.advice, run.advice_calls = [], []
 
@@ -1909,7 +1909,7 @@ def test_observe_records_a_recommendation_without_rerunning(advised_fix, monkeyp
     from baton import advisor
     from baton.config import Advisor
 
-    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="observe"))
+    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, backend_order=("deepseek",), mode="observe"))
     if not enabled:
         from dataclasses import replace
 

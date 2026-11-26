@@ -133,6 +133,8 @@ ROLE_ROUTE = {
 }
 ROUTE_ROLE = {route: role for role, route in ROLE_ROUTE.items()}
 COVERAGE_ROLES = ("dev", "fixer", "reviewer", "spec_reviewer", "reviser")
+ADVISOR_BACKENDS = ("claude", "deepseek")
+EFFORTS = ("", "low", "medium", "high", "xhigh", "max")
 BUILTIN_ALIASES = {
     "claude_strong": "opus",
     "codex_fast": "gpt-6.2-sol",
@@ -252,6 +254,8 @@ class Advisor:
     base_url: str = "https://api.deepseek.com"
     timeout_seconds: int = 60
     snapshot_chars: int = 24000
+    backend_order: tuple[str, ...] = ADVISOR_BACKENDS   # tried in order; "claude" is the owner's grant
+    claude: ModelRoute = ModelRoute("opus", "medium")   # resolved from [advisor] claude (`_advisor_claude`)
 
 
 @dataclass(frozen=True)
@@ -583,13 +587,25 @@ def _model_routes(raw, aliases, vendors):
             if model != "" or not agents.ADAPTERS[vendor].EMPTY_MODEL_OK:
                 model = _model_alias(model, aliases, f"{field}.model")
             effort = entry.get("effort", "")
-            if effort not in ("", "low", "medium", "high", "xhigh", "max"):
+            if effort not in EFFORTS:
                 raise ConfigError(f"{field}.effort: unsupported effort")
             subagent = entry.get("subagent_model", "")
             if subagent != "":
                 subagent = _model_alias(subagent, aliases, f"{field}.subagent_model")
             routes.append((name, vendor, ModelRoute(model, effort, subagent)))
     return tuple(routes)
+
+
+def _advisor_claude(table, aliases):
+    """[advisor] claude = { model = <alias>, effort = <route effort> }; either key may be omitted."""
+    if not isinstance(table, dict):
+        raise ConfigError("advisor.claude: expected a table")
+    if table.keys() - {"model", "effort"}:
+        raise ConfigError("advisor.claude: unknown fields")
+    effort = table.get("effort", "medium")
+    if effort not in EFFORTS:
+        raise ConfigError("advisor.claude.effort: unsupported effort")
+    return ModelRoute(_model_alias(table.get("model", "claude_strong"), aliases, "advisor.claude.model"), effort)
 
 
 def _check_adapter_models(vendors, routes):
@@ -666,6 +682,10 @@ def load(path: str | Path, *, home: Path | None = None) -> Config:
     vendors = _load_vendors(data["vendors"], source.parent, home, aliases)
     routes = _model_routes(models.pop("routes", None), aliases, vendors)
     _check_adapter_models(vendors, routes)
+    advisor_claude = {}
+    if isinstance(data.get("advisor"), dict):
+        advisor_claude = data["advisor"].pop("claude", {})
+    advisor_claude = _advisor_claude(advisor_claude, aliases)
     sections = {name: _section(name, cls, data[name], source.parent, home)
                 for name, cls in SECTIONS.items()}
     sections.update({name: _section(name, cls, data[name], source.parent, home)
@@ -736,7 +756,11 @@ def load(path: str | Path, *, home: Path | None = None) -> Config:
     config = Config(**sections, vendors=vendors, repos=repos,
                     preferences=tuple((k, tuple(v)) for k, v in sorted(preferences.items())), source=source,
                     analyst_models=tuple(alias_models))
+    config = replace(config, advisor=replace(config.advisor, claude=advisor_claude))
     adv = config.advisor
+    order = adv.backend_order
+    if not order or len(set(order)) != len(order) or set(order) - set(ADVISOR_BACKENDS):
+        raise ConfigError('advisor.backend_order: expected distinct entries from "claude" and "deepseek"')
     if adv.mode not in ('off', 'observe', 'live'):
         raise ConfigError('advisor.mode: expected "off", "observe" or "live"')
     if not adv.base_url.startswith('https://'):
