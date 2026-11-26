@@ -1,8 +1,10 @@
 """Offline lifecycle, usage, scheduling and fault tests; no agent calls/secrets."""
 import contextlib
+import fcntl
 import importlib.util
 import json
 import math
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -104,6 +106,26 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(t.usage(vendor, self.log([event, event]), 'success')['usage_state'], 'unavailable')
         path = self.log([{'type': 'turn.completed', 'usage': {'input_tokens': 5, 'output_tokens': True}}])
         self.assertEqual(t.usage('codex', path, 'success')['usage_state'], 'unavailable')
+
+    def test_two_overlapping_items_are_both_reported_while_their_repositories_are_locked(self):
+        config = self.state / 'config.toml'
+        config.write_text((Path(__file__).resolve().parents[2] / 'config.example.toml').read_text())
+        output = self.state / 'metrics.prom'
+        holders = []
+        for repo, vendor, issue in (('acme/app', 'claude', 1), ('acme/shop', 'codex', 2)):
+            lock = self.state / 'repos' / repo / 'lock'
+            lock.parent.mkdir(parents=True)
+            holders.append(lock.open('a'))
+            self.addCleanup(holders[-1].close)
+            fcntl.flock(holders[-1], fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.ledger.begin(vendor, 'dev', os.getpid(), 600, issue, repo=repo)   # a live owner
+        with patch.object(t, 'unit_state', return_value=(1, 1, 0)):
+            t.collect(self.ledger, config, output)
+        metrics = output.read_text()
+        for line in ('baton_running 2', 'baton_lock_held 1', 'baton_execution_healthy 1', 'baton_state_collect_success 1'):
+            self.assertIn(line + '\n', metrics)
+        records = [json.loads(path.read_text()) for path in (self.state / 'telemetry' / 'runs').glob('*.json')]
+        self.assertEqual(sorted((r['repo'], r['issue']) for r in records), [('acme/app', 1), ('acme/shop', 2)])
 
     def test_settings_runtime_caps_no_cap_and_invalid_reads(self):
         config = self.state / 'config.toml'

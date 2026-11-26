@@ -116,7 +116,7 @@ still collected and retried.
 
 **Heartbeat.** A detached heartbeat checks the supervising process every 60 s,
 using its start identity and the boot ID. All inherited file descriptors are
-closed, so it can't hold the runner lock.
+closed, so it can't hold a work lock.
 
 **Reconciliation.** The collector turns any of these into one terminal
 `interrupted` record:
@@ -207,7 +207,7 @@ off or paused:
 - today's vendor run counters;
 - cooldown files;
 - the timer's properties;
-- the runner lock.
+- the repository locks (`baton_lock_held` is 1 when any is held).
 
 ### Quota
 

@@ -5,7 +5,8 @@
 
 [paths]
 # Runner-wide roots. Each repository gets OWNER/NAME below clones, wt_root, state/repos, logs and ctx;
-# quota, vendor cooldowns, run counts, telemetry, runner.log and the lock stay global.
+# quota, vendor cooldowns, run counts, telemetry and runner.log stay global. A tick locks one
+# repository at a time (state/repos/OWNER/NAME/lock), so ticks for different repositories may overlap.
 # Where the runner is installed (this checkout). Informational: nothing reads it yet.
 agent_home = "~/baton"
 # Each repository's clone, at clones/OWNER/NAME. Clone it there yourself before the first tick.

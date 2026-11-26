@@ -13,6 +13,10 @@ repository it does one of, in this order (the order is a contract):
   - a PR the owner labelled agent-review
   - an agent PR labelled agent-fix (owner feedback)
   - a ready-for-agent (or claude-found + needs-triage) issue: spec review, dev, review loop
+Ticks for different repositories may overlap (ADR 0003, "Work locks"): a tick takes a
+repository's lock before it looks for work there, holds one at a time and skips a locked one; the
+housekeeping and the scan each have a lock of their own.
+
 Before any of that: Cursor's verdicts on claude-found issues, the cleanup of finished worktrees,
 and the follow-ups of PRs the owner merged. When no repository has any of that, at most every
 SCAN_INTERVAL_HOURS Claude scans one area of the first one in turn that has scan areas. By hand
@@ -98,7 +102,7 @@ class Tick:
         self.env, self.run_sh, self.clock = env, run_sh, clock
         self.force_issue, self.force_pr, self.force_review, self.scan_cmd, self.scan_arg = parse_args(list(argv))
         self.manual = self.force_issue + self.force_pr + self.force_review + self.scan_cmd
-        # The repository's own files; runner_state (the lock, cooldowns, chain-next, last-repo) is shared.
+        # The repository's own files; runner_state (the work locks, cooldowns, last-repo) is shared.
         self.state, self.logs = Path(str(env.dirs.state)), Path(str(env.dirs.logs))
         self.ctx, self.wt_root = Path(str(env.dirs.ctx)), Path(str(env.dirs.worktrees))
         self.runner_state = Path(str(env.config.paths.state))
@@ -258,7 +262,7 @@ class Tick:
         """A partial slice merged in this tick touches chain-next (finish_merged_task); the tick
         then starts over at once instead of leaving the issue idle until the next timer tick.
         CHAIN_MAX bounds the run."""
-        flag = self.runner_state / "chain-next"
+        flag = self.state / "chain-next"
         if self.manual or not flag.exists():
             return
         flag.unlink(missing_ok=True)
@@ -304,10 +308,39 @@ class Tick:
         """This repository's tick alone (by hand, or with one repository configured)."""
         return run([self])
 
+    # --- work locks ----------------------------------------------------------------------
+    def take(self, path):
+        """PATH's work lock, or None when another process holds it. Maintenance found on here
+        stops the tick."""
+        logs = self.env.config.paths.logs
+        admitted = maintenance.admit(self.runner_state, path,
+                                     on_expired=lambda: notify.append(logs, "maintenance expired"))
+        if admitted.reason is not None:
+            notify.append(logs, f"maintenance ({admitted.reason})")
+            raise Stop(0)
+        return admitted.lock
+
+    def log_busy(self):
+        label = f"{notify.label(self.env)} " if len(self.env.config.repos) > 1 else ""
+        notify.append(self.env.config.paths.logs, f"{label}busy (another tick holds the lock)")
+
+    def take_repository(self):
+        """This repository's lock (also kept for chain_next to release), or None when busy. Only its
+        holder clears the chain flag."""
+        self.lock_file = self.take(maintenance.repository_lock(self.runner_state, self.gh_repo))
+        if self.lock_file is None:
+            self.log_busy()
+        else:
+            (self.state / "chain-next").unlink(missing_ok=True)
+        return self.lock_file
+
     def pass_(self):
+        """The one repository's work and, still holding its lock, the scan."""
         rc = self.work()
         if rc is None and not self.fetch_failed:
-            rc = self.scan_fallback()
+            if scan_lock := self.take(self.runner_state / maintenance.SCAN_LOCK):
+                with scan_lock:
+                    rc = self.scan_fallback()
         if rc is None:
             self.log("no work" if not self.fetch_failed else "git fetch failed; nothing done")
         return 1 if rc is None and self.fetch_failed else rc or 0
@@ -1389,8 +1422,8 @@ def rotation(names, last):
 
 
 def run(ticks):
-    """One tick over TICKS (one per repository, in configured order): the lock and the
-    runner-wide housekeeping once, then each repository's work in turn, then the scan."""
+    """One tick over TICKS (one per repository, in configured order): the runner-wide housekeeping
+    once, then each repository's work in turn, then the scan, each under its own lock."""
     first = ticks[0]
     config, runner_state, manual = first.env.config, first.runner_state, bool(first.manual)
     if first.scan_cmd == "scan" and first.scan_arg == "list":
@@ -1399,7 +1432,7 @@ def run(ticks):
         return 0
     paused = config.scheduling.paused is True and not manual
     admitted = maintenance.admit(
-        runner_state, runner_state / "lock", acquire=not paused,
+        runner_state, None, acquire=False,
         on_expired=lambda: notify.append(config.paths.logs, "maintenance expired"),
     )
     if admitted.reason is not None:
@@ -1408,51 +1441,84 @@ def run(ticks):
     if paused:
         notify.append(config.paths.logs, "paused")
         return 0
-    lock = admitted.lock
-    if lock is None:
-        notify.append(config.paths.logs, "busy (another tick holds the lock)")
-        return 0
-    for t in ticks:
-        t.lock_file = lock
     first.hooks().tick(manual)
-    from .initialization import expire_context
-    expire_context(config, first.clock())
     try:
-        with session_bound(first.env):
-            advisor.digest(first.env)   # the daily owner digest of advisor decisions (#17)
-    except Exception as error:   # a digest never stops the tick
-        notify.append(config.paths.logs, f"advisor digest failed: {type(error).__name__}")
-    (runner_state / "chain-next").unlink(missing_ok=True)
-    # Upgrade the old global cooldown as Claude-only; retain today's Claude counter.
-    old, new = runner_state / "cooldown-until", runner_state / "claude-cooldown-until"
-    with statefile.locked(runner_state):   # a cooldown written in between would be overwritten
-        if old.is_file() and not new.exists():
-            old.rename(new)
-    if len(ticks) == 1:
+        housekeeping(first)
+        return run_one(first) if len(ticks) == 1 else walk(ticks)
+    except Stop as stop:
+        return stop.rc
+
+
+def housekeeping(first):
+    """The runner-wide chores, skipped when another tick is doing them."""
+    config, runner_state = first.env.config, first.runner_state
+    lock = first.take(runner_state / maintenance.HOUSEKEEPING_LOCK)
+    if lock is None:
+        return
+    with lock:
+        from .initialization import expire_context
+        expire_context(config, first.clock())
         try:
-            return first.pass_()
-        except Stop as stop:
-            return stop.rc
+            with session_bound(first.env):
+                advisor.digest(first.env)   # the daily owner digest of advisor decisions (#17)
+        except Exception as error:   # a digest never stops the tick
+            notify.append(config.paths.logs, f"advisor digest failed: {type(error).__name__}")
+        # Upgrade the old global cooldown as Claude-only; retain today's Claude counter.
+        old, new = runner_state / "cooldown-until", runner_state / "claude-cooldown-until"
+        with statefile.locked(runner_state):   # a cooldown written in between would be overwritten
+            if old.is_file() and not new.exists():
+                old.rename(new)
+
+
+def run_one(t):
+    """The only repository of this tick (the one configured, or a command's)."""
+    lock = t.take_repository()
+    if lock is None:
+        return 0
+    with lock:
+        if t.scan_cmd != "scan":
+            return t.pass_()
+        scan_lock = t.take(t.runner_state / maintenance.SCAN_LOCK)
+        if scan_lock is None:
+            t.log_busy()
+            return 0
+        with scan_lock:
+            return t.pass_()
+
+
+def walk(ticks):
+    """Several repositories in turn; a locked one is another tick's and is left to it."""
+    first = ticks[0]
     try:
-        last = (runner_state / "last-repo").read_text().strip()
+        last = (first.runner_state / "last-repo").read_text().strip()
     except OSError:
         last = ""
     by_name = {t.gh_repo: t for t in ticks}
     turn = [by_name[name] for name in rotation(by_name, last)]
-    try:
-        for t in turn:
-            with session_bound(t.env):
-                rc = t.work()
-            if rc is not None:
-                return rc
-        for t in turn:
-            with session_bound(t.env):
-                rc = t.scan_fallback()
-            if rc is not None:
-                return rc
-    except Stop as stop:
-        return stop.rc
-    notify.append(config.paths.logs, "no work in any repository")
+    locked = set()
+
+    def visit(t, step):
+        lock = t.take_repository()
+        if lock is None:
+            locked.add(t.gh_repo)
+            return None
+        with lock, session_bound(t.env):
+            return step()
+
+    for t in turn:
+        rc = visit(t, t.work)
+        if rc is not None:
+            return rc
+    if scan_lock := first.take(first.runner_state / maintenance.SCAN_LOCK):
+        with scan_lock:
+            for t in turn:
+                if t.gh_repo in locked:   # it has another tick's work
+                    continue
+                rc = visit(t, t.scan_fallback)
+                if rc is not None:
+                    return rc
+    if not locked:
+        notify.append(first.env.config.paths.logs, "no work in any repository")
     return 1 if any(t.fetch_failed for t in turn) else 0
 
 

@@ -1,8 +1,8 @@
 """Nonblocking per-vendor leases, shared by workloads, probes and retrospectives.
 
-A lease bounds CLI/session contention on one account without taking the runner lock.
+A lease bounds CLI/session contention on one account without taking a work lock.
 Other vendors may execute concurrently. Workload selection skips an occupied vendor;
-an unlucky start race defers rather than waiting while holding the runner lock.
+an unlucky start race defers rather than waiting while holding a repository lock.
 """
 from contextlib import contextmanager
 import fcntl

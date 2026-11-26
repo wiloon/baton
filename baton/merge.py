@@ -275,7 +275,7 @@ class Merger:
             # starts clean (the issue episode stays open until the issue is, but its grants do not).
             advisor.finish_episode(self.env, "issue", issue, "merged")
             Path(state_dir, f"last-slice-{issue}").write_text(f"{pr}\n")
-            Path(self.env.config.paths.state, "chain-next").touch()   # global: the next pass may be any repository's
+            Path(state_dir, "chain-next").touch()   # this repository's: only its lock holder clears it
             notify.log(f"PR #{pr}: partial slice merged; #{issue} ready for its next slice")
         elif state.stdout.strip() == "CLOSED":
             # Closed is the done state; a leftover ready-for-agent would only mislead.

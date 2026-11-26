@@ -11,7 +11,7 @@ from .initialization import Runtime, child_environment, skills_directory, cache_
 @dataclass
 class Session:
     """One invocation on one repository: `repo` and its `dirs`. Global state (quota, cooldowns,
-    run counts, telemetry, runner.log, the lock) is under config.paths; the repository's own
+    run counts, telemetry, runner.log, the work locks) is under config.paths; the repository's own
     files (checkpoints, PR records, logs of its runs, ctx, worktrees, its clone) under dirs."""
     config: Config
     runtime: Runtime

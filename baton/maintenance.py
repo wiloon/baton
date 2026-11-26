@@ -7,8 +7,10 @@
 The flag is <state>/maintenance (expiry and reason). While it is active, the tick, the nightly run and
 the retrospectives worker start no new work; work already running finishes. `maintenance.lock` is the
 short admission lock: a starter checks the flag and takes its work lock under it, so no starter can
-slip in between the check and the lock. DURATION is a positive integer with an s, m or h suffix; the
-TTL and the wait timeout default to 2h. `on --wait` exits 75 when the drain does not finish in time.
+slip in between the check and the lock. The work locks are one per repository
+(<state>/repos/OWNER/NAME/lock), the tick's housekeeping and scan locks and the retrospectives
+worker's. DURATION is a positive integer with an s, m or h suffix; the TTL and the wait timeout
+default to 2h. `on --wait` exits 75 when the drain does not finish in time.
 """
 import argparse
 from contextlib import contextmanager
@@ -29,7 +31,8 @@ DEFAULT = 7200  # the default TTL and wait timeout, and how long a malformed fla
 BUSY = 75
 POLL = 0.5
 FLAG, ADMISSION = "maintenance", "maintenance.lock"
-RUNNER_LOCK, WORKER_LOCK = "lock", "retrospectives/worker.lock"
+HOUSEKEEPING_LOCK, SCAN_LOCK = "housekeeping.lock", "scan.lock"
+WORKER_LOCK = "retrospectives/worker.lock"
 INVALID = "invalid flag"
 UNITS = {"s": 1, "m": 60, "h": 3600}
 
@@ -133,6 +136,43 @@ class Admission:
         self.lock, self.reason = lock, reason
 
 
+class Locks(list):
+    """Several held work locks, released together."""
+    def close(self):
+        for file in self:
+            file.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def try_lock(path):
+    """PATH's lock file, locked without blocking; None when another descriptor holds it."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    file = open(path, "a")
+    try:
+        fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        file.close()
+        return None
+    return file
+
+
+def repository_lock(state, gh_repo):
+    return Path(state) / "repos" / gh_repo / "lock"
+
+
+def repositories(state, configured=()):
+    """The repositories whose locks count, sorted: CONFIGURED and any with a lock file on disk (one
+    dropped from the configuration may still be running)."""
+    found = {f"{path.parent.parent.name}/{path.parent.name}" for path in Path(state).glob("repos/*/*/lock")}
+    return sorted(found | set(configured))
+
+
 def admit(state, lock_path, *, on_expired=None, acquire=True):
     """Check the flag and, when inactive, take LOCK_PATH without blocking, both under admission.
     With ACQUIRE false only the flag is checked. The admission lock is released before returning."""
@@ -140,39 +180,52 @@ def admit(state, lock_path, *, on_expired=None, acquire=True):
         reason = active(state, on_expired)
         if reason is not None:
             return Admission(reason=reason)
-        if not acquire:
-            return Admission()
-        lock_path = Path(lock_path)
-        lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        file = open(lock_path, "a")
-        try:
-            fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            file.close()
-            return Admission()
-        return Admission(lock=file)
+        return Admission(lock=try_lock(lock_path) if acquire else None)
+
+
+def take_all(state, configured, *names):
+    """Every repository lock and the state files NAMES, all or none: Locks, or None when one is held.
+    Call under admission."""
+    paths = [repository_lock(state, repo) for repo in repositories(state, configured)]
+    locks = Locks()
+    for path in [*paths, *(Path(state) / name for name in names)]:
+        file = try_lock(path)
+        if file is None:
+            locks.close()
+            return None
+        locks.append(file)
+    return locks
+
+
+def admit_all(state, configured):
+    """admit() for every repository lock at once, all or none."""
+    with admission(state):
+        reason = active(state)
+        if reason is not None:
+            return Admission(reason=reason)
+        return Admission(lock=take_all(state, configured))
 
 
 def held(path):
     """Whether another descriptor holds PATH's lock, by a nonblocking probe. Call under admission."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with open(path, "a") as file:
-        try:
-            fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            return True
-        fcntl.flock(file, fcntl.LOCK_UN)
-        return False
+    file = try_lock(path)
+    if file is None:
+        return True
+    fcntl.flock(file, fcntl.LOCK_UN)
+    file.close()
+    return False
 
 
-def probe(state):
-    """The names of the work locks that are held. Call under admission."""
+def probe(state, configured):
+    """{status label: whether held} of every work lock, in status order. Call under admission."""
     state = Path(state)
-    return [name for name, path in (("runner", RUNNER_LOCK), ("retrospectives", WORKER_LOCK)) if held(state / path)]
+    paths = {f"repository lock {repo}": repository_lock(state, repo) for repo in repositories(state, configured)}
+    paths.update({"housekeeping lock": state / HOUSEKEEPING_LOCK, "scan lock": state / SCAN_LOCK,
+                  "retrospectives lock": state / WORKER_LOCK})
+    return {label: held(path) for label, path in paths.items()}
 
 
-def turn_on(state, args):
+def turn_on(state, configured, args):
     token = uuid.uuid4().hex
     with admission(state):
         initial = now() + args.ttl + (args.timeout if args.wait else 0)
@@ -188,7 +241,7 @@ def turn_on(state, args):
             if flag is None or flag[2] != token:
                 print("maintenance: the request was cleared or replaced while waiting", file=sys.stderr)
                 return BUSY
-            if not probe(state) and monotonic() < deadline:
+            if not any(probe(state, configured).values()) and monotonic() < deadline:
                 write_flag(state, now() + args.ttl, args.reason, token)
                 return 0
         wait_for_poll(deadline)
@@ -196,10 +249,10 @@ def turn_on(state, args):
     return BUSY
 
 
-def status(state):
+def status(state, configured):
     with admission(state):
         flag = read_flag(state)
-        busy = probe(state)
+        locks = probe(state, configured)
         current = now()
         is_active = flag is not None and current < flag[0]
         print(f"maintenance: {'on' if is_active else 'off'}")
@@ -208,8 +261,8 @@ def status(state):
             expiry = time.strftime('%F %T %z', time.localtime(flag[0]))
             remaining = f"in {int(flag[0] - current)}s" if is_active else "expired"
             print(f"expires: {expiry} ({remaining})")
-        print(f"runner lock: {'held' if 'runner' in busy else 'free'}")
-        print(f"retrospectives lock: {'held' if 'retrospectives' in busy else 'free'}")
+        for label, busy in locks.items():
+            print(f"{label}: {'held' if busy else 'free'}")
     return 0
 
 
@@ -226,17 +279,18 @@ def main(argv=None):
     sub.add_parser("status", help="On or off, reason, expiry and whether each work lock is held")
     args = parser.parse_args(argv)
     try:
-        state = load(args.config).paths.state
+        config = load(args.config)
     except ConfigError as error:
         print(f"Invalid configuration: {error}", file=sys.stderr)
         return 2
+    state, configured = config.paths.state, [repo.gh_repo for repo in config.repos]
     if args.command == "on":
-        return turn_on(state, args)
+        return turn_on(state, configured, args)
     if args.command == "off":
         with admission(state):
             (Path(state) / FLAG).unlink(missing_ok=True)
         return 0
-    return status(state)
+    return status(state, configured)
 
 
 if __name__ == "__main__":

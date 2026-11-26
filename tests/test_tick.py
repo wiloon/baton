@@ -129,7 +129,9 @@ def test_a_paused_runner_does_nothing_unless_a_target_is_given(ctx):
 
 
 def test_a_second_tick_waits_for_the_lock(ctx):
-    with open(ctx.path("lock"), "w") as held:
+    lock = ctx.path("repos/owner/app/lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock, "w") as held:
         fcntl.flock(held, fcntl.LOCK_EX)
         assert ctx.make().run() == 0
     assert "busy (another tick holds the lock)" in ctx.log()
@@ -1659,12 +1661,14 @@ def test_opening_recovery_rejects_mismatched_head(devrun, monkeypatch):
     assert path.exists() and not devrun.loops
 
 
-def test_opening_recovery_waits_for_the_runner_lock(devrun, monkeypatch):
+def test_opening_recovery_waits_for_the_repository_lock(devrun, monkeypatch):
     devrun.script = [implements()]
     monkeypatch.setattr(dev, "finish_opening", lambda *a: (_ for _ in ()).throw(OSError("interrupted")))
     t, rc = devrun.go()
     assert rc == 1
-    with open(devrun.path("lock"), "w") as held:
+    lock = devrun.path("repos/owner/app/lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock, "w") as held:
         fcntl.flock(held, fcntl.LOCK_EX)
         assert devrun.make().run() == 0
     assert dev.opening_path(t, "300").exists() and not devrun.loops

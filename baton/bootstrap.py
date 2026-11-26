@@ -36,10 +36,10 @@ def main(argv=None):
         import subprocess
         invocation = session.create(config, repo=config.repos[0])
         from . import maintenance
-        lock = config.paths.state / 'lock'
-        if lock.exists():
-            with maintenance.admission(config.paths.state):
-                busy = maintenance.held(lock)
+        state = config.paths.state
+        if locked := maintenance.repositories(state):   # a held lock has a file
+            with maintenance.admission(state):
+                busy = any([maintenance.held(maintenance.repository_lock(state, name)) for name in locked])
             if busy:
                 print('Pipeline is busy', file=sys.stderr)
                 return 75
@@ -55,7 +55,7 @@ def main(argv=None):
             if done.returncode:
                 print(f'Preflight failed: {command[0]}', file=sys.stderr)
                 return 1
-        print('Preflight passed: configuration, lock, GitHub authentication and agent executables')
+        print('Preflight passed: configuration, locks, GitHub authentication and agent executables')
         return 0
     from . import migrate
     from .tick import Tick, Stop, run
@@ -81,8 +81,4 @@ def main(argv=None):
     except Stop as error:
         return error.rc
     prepare(config)
-    try:
-        return run(ticks)
-    finally:
-        if ticks[0].lock_file:
-            ticks[0].lock_file.close()
+    return run(ticks)

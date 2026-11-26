@@ -25,7 +25,7 @@ class ConfigError(ValueError):
 @dataclass(frozen=True)
 class Paths:
     """Runner-wide roots. Each repository gets its own directory under clones, wt_root, state/repos,
-    logs and ctx (RepoDirs); quota, vendor cooldowns, run counts, telemetry and the lock stay global."""
+    logs and ctx (RepoDirs); quota, vendor cooldowns, run counts and telemetry stay global."""
     agent_home: Path
     clones: Path
     wt_root: Path
