@@ -21,6 +21,13 @@ Apply this comparison to declared vendors eligible for the role (ADR 0007) and t
 current task. A same-vendor fallback must be role-allowed and pass its adapter's model
 eligibility policy (ADRs 0004 and 0005).
 
+Spec review also avoids the vendor that last wrote the issue outside the spec loop, as named by
+the issue's author marker: in round 1, and in a later round after such an edit. That vendor is
+then a last resort under the same short-block wait. The marker is untrusted and only a
+preference: when no other vendor can run for the long term, the marker's vendor runs even without
+a same-vendor policy or a provably distinct model, using a distinct route model when one exists.
+The rules for the previous round's vendor are unchanged.
+
 ## Considered options
 
 - **Fall back whenever the other vendor is blocked (previous behaviour):** keeps the pipeline
