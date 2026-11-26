@@ -33,6 +33,11 @@ file already under `<state>/repos`, so a repository dropped from the configurati
 still waited for. `on --wait` returns once all the work locks above are free, and `status` lists
 each of them.
 
+ADR 0011 (#271) adds a resident supervisor, `baton serve`, without an API. It amends the
+statements below that baton has no resident process and that a chained tick re-execs: a
+supervisor child exits instead, and its successor passes the same admission check. The timer path
+keeps the re-exec while it remains.
+
 ## Considered options
 
 - **REST API on a resident process:** the natural shape for "ask the runner to drain", and
@@ -75,3 +80,5 @@ each of them.
 - Issue #270, round 1. Replaced the single runner lock with per-repository work locks plus
   housekeeping and scan locks, so ticks for different repositories may overlap; drain, nightly,
   migrate and `status` cover the whole set.
+- Issue #271, round 1. Noted that ADR 0011 amends "no resident process" and the chained re-exec,
+  because `baton serve` replaces the timer; the "no API" decision is unchanged.
