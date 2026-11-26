@@ -34,20 +34,36 @@ issue labelled ready-for-agent
 first thing it finds, in this order:
 
 1. finish a PR whose creation was interrupted;
-2. a review the last run deferred;
-3. a PR the owner labelled `agent-review`;
-4. an agent PR the owner labelled `agent-fix`;
-5. the next `ready-for-agent` issue (or a `claude-found` + `needs-triage` issue).
+2. work of `P0` issues: first what is already in flight (a deferred review, an `agent-fix` PR, a
+   saved push or spec step), then a new `P0` issue;
+3. a review the last run deferred;
+4. a PR the owner labelled `agent-review`;
+5. an agent PR the owner labelled `agent-fix`;
+6. the next `ready-for-agent` issue (or a `claude-found` + `needs-triage` issue).
+
+**Priority.** The labels `P0`, `P1`, `P2` and `P3` (any letter case) on an issue order its
+repository's queue: `P0` first, then by issue number within one priority. An issue with none ranks
+as `P2`; with several, the highest counts. Create the labels in each repository you want to use them
+in. Priority never makes an issue a candidate: `ready-for-agent`, the milestone, the excluded
+labels, open blockers and owner authorization still decide that. Work already on a PR goes before a
+new issue, and `max_pending_prs` limits new issues, with one exception: `P0`, for urgent bugs. A
+`P0` issue goes before the resumed work of lower-priority issues and is not limited by
+`max_pending_prs`, however many `P0` issues there are (their PRs count toward it as usual). A
+running step is never interrupted, and a `P0` that cannot run now does not hold up other work.
+Priority is per repository: the turns across repositories do not change, so a `P0` may wait while
+another repository takes its turn. A run by hand on one issue or PR has no `P0` step
+([ADR 0010](docs/adr/0010-priority-labels-order-the-queue-and-p0-preempts.md)).
 
 When a step ends, the tick can go straight on to the next one, up to `chain_max`. With
 nothing to do and `scan` on, Claude scans one of the repository's `scan_areas` for bugs and files
 what it finds as an issue.
 
 **How many issues run at once.** `max_pending_prs` (per repository) is how many `agent-wip` issues
-may be in flight before baton starts a new one. A PR waiting for the owner (`ready-for-human`) is
+may be in flight before baton starts a new one; a new `P0` issue starts anyway. A PR waiting for the owner (`ready-for-human`) is
 not counted. A PR whose next agent step was deferred for vendor quota or cooldown lends its slot
 until that step runs again without a deferral, so another vendor can start the next issue. At most
-`max_pending_prs + 1` counted issues are in flight through normal scheduling. An `agent-wip` issue
+`max_pending_prs + 1` counted issues are in flight through normal scheduling (`P0` issues are not
+bound by this). An `agent-wip` issue
 with no open PR holds no slot: unless its newest PR on either agent branch is a merge not yet
 settled, baton removes `agent-wip` (also when the issue has no PR at all, such as an interrupted or
 deferred dev run) and logs `released agent-wip (no open PR)`; an unsettled merge keeps the label but
