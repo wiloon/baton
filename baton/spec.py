@@ -1326,6 +1326,14 @@ class Spec:
     def save_last_marker(self, vendor, model):
         self.path("spec-last-marker").write_text(f"{vendor} {model}\n" if vendor else "")
 
+    def owner_edited(self, inputs):
+        """True when someone other than the reviser edited the body since the loop's earlier turn:
+        an edit after the latest spec comment, or one that reply already carries. A reviser's own
+        body edit lands before its reply is posted."""
+        last_kind, last_body, last_created_at = _latest_spec_comment(inputs["comments"], self.env.owner)
+        return (_iso_after(inputs.get("lastEditedAt"), last_created_at)
+                or (last_kind == "reply" and _has_author_edit_marker(last_body)))
+
     def review_author_state(self, round, inputs):
         """(avoid_author, prompt_vendor, prompt_model, telemetry_author, stale, marker_vendor, marker_model)."""
         declared = set(self.env.config.declared())
@@ -1333,10 +1341,7 @@ class Spec:
         if round == 1:
             return (marker_vendor, marker_vendor, marker_model, marker_vendor or "unknown",
                     False, marker_vendor, marker_model)
-        last_kind, last_body, last_created_at = _latest_spec_comment(inputs["comments"], self.env.owner)
-        edited = (_iso_after(inputs.get("lastEditedAt"), last_created_at)
-                  or (last_kind == "reply" and _has_author_edit_marker(last_body)))
-        if not edited:
+        if not self.owner_edited(inputs):
             return ("", marker_vendor, marker_model, marker_vendor or "unknown",
                     False, marker_vendor, marker_model)
         stale = bool(marker_vendor) and (marker_vendor, marker_model) == self.last_seen_marker()
@@ -2330,8 +2335,7 @@ class Spec:
             stale.unlink()
         last_vendor = last_by(listed, env.owner, "review")
         other_model = last_model(env, n, "review", round, last_vendor)
-        _, _, review_created_at = _latest_spec_comment(listed, env.owner, kinds=("review",))
-        author_edit = _iso_after(inputs.get("lastEditedAt"), review_created_at)
+        author_edit = self.owner_edited(inputs)
         marker_vendor, marker_model = parse_author_marker(issue_body, set(env.config.declared()))
         marker_stale = author_edit and bool(marker_vendor) and (marker_vendor, marker_model) == self.last_seen_marker()
         prompt_author = author_note("" if marker_stale else marker_vendor, "" if marker_stale else marker_model)

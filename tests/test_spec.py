@@ -4381,6 +4381,48 @@ def test_stale_marker_after_owner_edit_avoids_both_and_says_unknown(loop):
     assert "unknown" in loop.runs[0]["prompt"].lower()
 
 
+@pytest.mark.parametrize("edit_before_first_revision", [False, True])
+def test_revision_after_an_owner_answer_ignores_the_revisers_own_body_edit(loop, edit_before_first_revision):
+    state = loop.env["STATE"]
+    loop.env["VENDOR_POOL"] = "claude codex"
+    loop.env["VENDOR_EXTRA"] = "cursor"
+    for v in ("claude", "codex", "cursor"):
+        _write_quota(state, v, five_hour=0.1, seven_day=0.1)
+    marker = "<!-- baton-author: vendor=claude model=claude-opus-5-5 -->"
+    loop.gh.body = f"{marker}\nGoal\n"
+    loop.path("spec-owner-body").write_text(f"{marker}\nGoal\n")
+    loop.gh.comments = [{"author": {"login": "owner"}, "createdAt": "2026-11-26T10:00:00Z",
+                         "body": "<!-- baton-spec-review round=1 by=claude -->\nfix"}]
+    if edit_before_first_revision:
+        loop.gh.last_edited_at = "2026-11-26T10:01:00Z"
+
+    def asking(vendor, output, cwd):
+        loop.gh.last_edited_at = "2026-11-26T10:02:00Z"   # the reviser's own body edit
+        return reviser("which one?", body="Revised goal\n", outcome="SPEC: human")(vendor, output, cwd)
+
+    loop.script = [asking]
+    assert loop.run() is False
+    [asked] = [c for c in loop.gh.comments if c["body"].startswith("<!-- baton-spec-reply round=1 human")]
+    asked["createdAt"] = "2026-11-26T10:03:00Z"
+    loop.gh.comments.append({"author": {"login": "owner"}, "body": "the first one",
+                             "createdAt": "2026-11-26T10:04:00Z"})
+    loop.gh.labels.discard("ready-for-human")
+    loop.runs.clear()
+    loop.script = [reviser("ok"), ACCEPT]
+    assert loop.run() is True
+
+    final = loop.gh.posted("<!-- baton-spec-reply round=1 by=")[-1]
+    assert ("<!-- baton-spec-author-edit -->" in final) is edit_before_first_revision
+    revision, review = loop.runs
+    assert review["vendor"] != revision["vendor"]
+    if edit_before_first_revision:
+        # A real edit is kept: the next review also avoids the drafting agent.
+        assert review["vendor"] != "claude" and "drafting agent is unknown" in revision["prompt"]
+    else:
+        # Only the last reviser is avoided, so the first eligible vendor, claude, reviews.
+        assert review["vendor"] == "claude" and "claude (claude-opus-5-5)" in revision["prompt"]
+
+
 def test_reviser_cannot_drop_or_forge_author_marker_and_malformed_marker_is_unknown(loop):
     state = loop.env["STATE"]
     _write_quota(state, "claude", five_hour=0.1, seven_day=0.1)
