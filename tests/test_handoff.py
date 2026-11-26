@@ -569,6 +569,15 @@ def test_an_issue_push_record_accepts_landed_but_never_finished(env, monkeypatch
         handoff.load_retry(env, "1", reason)
 
 
+def test_preparing_a_retry_logs_an_intent_not_a_failure(env, monkeypatch):
+    """The record is written before every guarded write; its log line must not read as a failure."""
+    lines = []
+    monkeypatch.setattr(handoff, "clock", lambda: 1_000)
+    monkeypatch.setattr(handoff.notify, "log", lines.append)
+    assert handoff.prepare_retry(env, "1", "dev_push_failed", "1", issue_push_binding("1")) is not None
+    assert lines == ["write-intent dev_push recorded episode=1 (replayed after 60s only if the write fails)"]
+
+
 def test_a_dev_push_record_for_a_non_built_in_vendor_is_resumed(env, monkeypatch):
     from types import SimpleNamespace
     from baton import dev
