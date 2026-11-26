@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # A resident supervisor runs one tick child per repository
@@ -40,8 +40,15 @@ ADR 0003's "no API" part and its local maintenance flag stand.
 - The supervisor keeps running the code it started with. Every deploy runs, in order:
   `maintenance on --wait`, checkout, migrate, `systemctl --user try-restart baton-serve`,
   `maintenance off`.
-- Shutdown behaviour (what SIGTERM does to running children, and the unit's `KillMode` and
-  `TimeoutStopSec`) is pending the owner's decision in #271.
+- SIGTERM drains and never interrupts, as ADR 0003 asks of a resident process: the supervisor
+  starts nothing new, does not signal its running children, waits for them and then exits.
+- The unit sets `KillMode=mixed`, so a stop signals only the supervisor, and `TimeoutStopSec=2h`
+  (the deploy's drain timeout), so a stuck child cannot block a stop forever. When that expires,
+  systemd kills everything left in the unit. It also kills the children if the supervisor itself
+  dies.
+- `systemctl --user kill baton-serve` is the immediate abort: it signals every process in the
+  unit, children and agent CLIs included. It is not a stop: unless a stop is already pending,
+  `Restart=always` starts the supervisor again.
 
 ## Considered options
 
@@ -51,3 +58,11 @@ ADR 0003's "no API" part and its local maintenance flag stand.
   and a deploy would have to replace code in a process that is working.
 - **A distinct "did an item" exit code:** would start the next item without waiting a poll, at the
   cost of another exit protocol. A wait of one poll is short enough.
+- **Forward SIGTERM to the children:** stops quickly, but loses work and quota and needs cleanup
+  code in the tick for `agent-wip` and worktrees.
+
+## Revision record
+
+- Issue #271, round 1. The owner decided that SIGTERM drains without signalling the children,
+  with `KillMode=mixed` and `TimeoutStopSec=2h`, to keep ADR 0003's drain-and-never-interrupt
+  semantics; status moved to accepted.
