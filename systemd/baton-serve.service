@@ -1,0 +1,20 @@
+[Unit]
+Description=baton serve: resident supervisor that runs one tick per repository
+Documentation=file://%h/baton/config.toml
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/baton
+ExecStart=/usr/bin/uv run --quiet --frozen --no-dev --project %h/baton --directory %h/baton python -m baton serve
+Restart=always
+RestartSec=30
+Nice=10
+# A stop signals only the supervisor, which drains: it waits for its ticks without signalling them
+# (ADR 0011). After the deploy's drain timeout, systemd kills everything left in the unit.
+KillMode=mixed
+TimeoutStopSec=2h
+
+[Install]
+WantedBy=default.target

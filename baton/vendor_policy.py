@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 
-from . import capacity, quota
+from . import capacity, quota, statefile
 
 
 SHORT, LONG = 'short', 'long'
@@ -31,6 +31,19 @@ def cooldown_until(state, vendor, now):
     except (OSError, IndexError):
         return None
     return int(value) if value.isdecimal() and now < int(value) else None
+
+
+def rest(state, vendor, deadline):
+    """Write VENDOR's cooldown until DEADLINE, unless a later one is already there."""
+    path = Path(state) / f'{vendor}-cooldown-until'
+    new = str(deadline)
+    with statefile.locked(state):
+        try:
+            existing = path.read_text().splitlines()[0]
+        except (OSError, IndexError, UnicodeDecodeError):
+            existing = ''
+        if not (existing.isdecimal() and new.isdecimal() and int(existing) > int(new)):
+            statefile.replace(path, new + '\n')
 
 
 def cooldown(state, vendor, now):
@@ -102,7 +115,4 @@ def observe_failure(state, vendor, result, now):
         quota.credential(state, vendor, 'auth_expired', now)
     until = result.get('cooldown_until')
     if result['state'] in ('auth', 'quota', 'busy') and type(until) is int and until > now:
-        path = Path(state) / f'{vendor}-cooldown-until'
-        temporary = path.with_suffix('.tmp')
-        temporary.write_text(str(until) + '\n')
-        temporary.replace(path)
+        rest(state, vendor, until)

@@ -17,34 +17,16 @@ import tempfile
 import time
 import uuid
 
-from . import agents, analyst_pool, maintenance, vendor_policy, quota
+from . import agents, analyst_pool, maintenance, statefile, vendor_policy, quota
 from .config import ConfigError, load
 from .retrospective_analyst import ANALYZER_VERSION, analyze, prompt_for
 from .retrospective_evidence import (EvidenceError, Ledger, VERSION, VOLATILE_POSTMERGE, digest, encoded, eligible,
                                      evidence, markdown, material, source_digest)
+from .statefile import sync_directory
 
 
 def atomic(path, value):
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    fd, name = tempfile.mkstemp(prefix='.' + path.name, dir=path.parent)
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, 'w') as file:
-            file.write(encoded(value) + '\n')
-            file.flush()
-            os.fsync(file.fileno())
-        os.replace(name, path)
-        sync_directory(path.parent)
-    finally:
-        Path(name).unlink(missing_ok=True)
-
-
-def sync_directory(path):
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    statefile.replace(path, encoded(value) + '\n', mode=0o600, dir_mode=0o700)
 
 
 def read(path, default=None):

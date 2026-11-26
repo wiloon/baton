@@ -12,7 +12,11 @@ repository it does one of, in this order (the order is a contract):
   - a review the last run deferred (review-pending-N)
   - a PR the owner labelled agent-review
   - an agent PR labelled agent-fix (owner feedback)
-  - a ready-for-agent (or claude-found + needs-triage) issue: spec review, dev, review loop
+  - a ready-for-agent issue: spec review, dev, review loop
+Ticks for different repositories may overlap (ADR 0003, "Work locks"): a tick takes a
+repository's lock before it looks for work there, holds one at a time and skips a locked one; the
+housekeeping and the scan each have a lock of their own.
+
 Before any of that: Cursor's verdicts on claude-found issues, the cleanup of finished worktrees,
 and the follow-ups of PRs the owner merged. When no repository has any of that, at most every
 SCAN_INTERVAL_HOURS Claude scans one area of the first one in turn that has scan areas. By hand
@@ -39,7 +43,7 @@ import sys
 import tempfile
 import time
 
-from . import advisor, after_merge, agents, checkpoint, dev, fix, handoff as owner_handoff, hooks as telemetry, maintenance, merge, names, notify, pick, pr as pr_helpers, pr_contract, review, scan, spec, tmp_sweep, vendors
+from . import advisor, after_merge, agents, checkpoint, dev, fix, handoff as owner_handoff, hooks as telemetry, maintenance, merge, names, notify, pick, pr as pr_helpers, pr_contract, review, scan, spec, statefile, tmp_sweep, vendors
 from .common import Deferred, git
 
 AGENT_REVIEW_NOTE = ("The PR description{issue} give the problem, its cause and the fix. Check the diagnosis first: does the "
@@ -87,8 +91,8 @@ def open_blockers(item):
 
 def priority_of(labels):
     """The rank of an issue with these label names (ADR 0010): 0 for P0 to 3 for P3, the highest of
-    several, and P2 without one."""
-    return min((int(name[1]) for name in labels if re.fullmatch(r"[Pp][0-3]", name)), default=2)
+    several, and 4 (after P3) without one."""
+    return min((int(name[1]) for name in labels if re.fullmatch(r"[Pp][0-3]", name)), default=4)
 
 
 class Tick:
@@ -98,7 +102,7 @@ class Tick:
         self.env, self.run_sh, self.clock = env, run_sh, clock
         self.force_issue, self.force_pr, self.force_review, self.scan_cmd, self.scan_arg = parse_args(list(argv))
         self.manual = self.force_issue + self.force_pr + self.force_review + self.scan_cmd
-        # The repository's own files; runner_state (the lock, cooldowns, chain-next, last-repo) is shared.
+        # The repository's own files; runner_state (the work locks, cooldowns, last-repo) is shared.
         self.state, self.logs = Path(str(env.dirs.state)), Path(str(env.dirs.logs))
         self.ctx, self.wt_root = Path(str(env.dirs.ctx)), Path(str(env.dirs.worktrees))
         self.runner_state = Path(str(env.config.paths.state))
@@ -142,7 +146,7 @@ class Tick:
     def begin_item(self):
         self.active = {"review": "", "spec": "", "issue": "", "cursor_fix": "", "pr": ""}
         if not self.manual:   # the next tick starts with the repository after this one
-            (self.runner_state / "last-repo").write_text(f"{self.gh_repo}\n")
+            statefile.replace(self.runner_state / "last-repo", f"{self.gh_repo}\n")
         fd, path = tempfile.mkstemp(prefix="baton-telemetry-item.", dir=self.env.tools.get("TMPDIR", "/tmp") or "/tmp")
         os.close(fd)
         self.env.runtime.telemetry_item = path
@@ -250,28 +254,32 @@ class Tick:
         if rc == 75:
             return 75 if self.manual else None
         if rc == 80:
-            self.chain_next()
-            return 0
+            return 80 if self.chain_next() else 0
         return rc or None
 
     def chain_next(self):
         """A partial slice merged in this tick touches chain-next (finish_merged_task); the tick
         then starts over at once instead of leaving the issue idle until the next timer tick.
-        CHAIN_MAX bounds the run."""
-        flag = self.runner_state / "chain-next"
+        CHAIN_MAX bounds the run. A `serve` child never re-execs: True tells it to exit 80, and
+        the supervisor bounds the chain."""
+        flag = self.state / "chain-next"
         if self.manual or not flag.exists():
-            return
+            return False
         flag.unlink(missing_ok=True)
+        if self.env.runtime.serve_child:
+            self.log("chain: a slice merged, the supervisor starts the next pass")
+            return True
         done, limit = int(self.env.runtime.chain or 0), int(self.env.config.scheduling.chain_max or 5)
         if done >= limit:
             self.log(f"chain: {limit} passes in a row, next slice waits for the timer")
-            return
+            return False
         self.log("chain: a slice merged, starting the next pass now")
         self.env.runtime.chain = done + 1
         if self.lock_file:
             self.lock_file.close()
         sys.stdout.flush()
         self.exec(sys.executable, [sys.executable, "-m", "baton", "--config", str(self.env.config.source), "--chain", str(done + 1)])
+        return False
 
     # --- agent steps that touch the item's markers ---------------------------------------
     def review_loop(self, pr, wt, note, fixer="agent", reviewer="pool", fixed_by="", issue=""):
@@ -304,10 +312,39 @@ class Tick:
         """This repository's tick alone (by hand, or with one repository configured)."""
         return run([self])
 
+    # --- work locks ----------------------------------------------------------------------
+    def take(self, path):
+        """PATH's work lock, or None when another process holds it. Maintenance found on here
+        stops the tick."""
+        logs = self.env.config.paths.logs
+        admitted = maintenance.admit(self.runner_state, path,
+                                     on_expired=lambda: notify.append(logs, "maintenance expired"))
+        if admitted.reason is not None:
+            notify.append(logs, f"maintenance ({admitted.reason})")
+            raise Stop(0)
+        return admitted.lock
+
+    def log_busy(self):
+        label = f"{notify.label(self.env)} " if len(self.env.config.repos) > 1 else ""
+        notify.append(self.env.config.paths.logs, f"{label}busy (another tick holds the lock)")
+
+    def take_repository(self):
+        """This repository's lock (also kept for chain_next to release), or None when busy. Only its
+        holder clears the chain flag."""
+        self.lock_file = self.take(maintenance.repository_lock(self.runner_state, self.gh_repo))
+        if self.lock_file is None:
+            self.log_busy()
+        else:
+            (self.state / "chain-next").unlink(missing_ok=True)
+        return self.lock_file
+
     def pass_(self):
+        """The one repository's work and, still holding its lock, the scan."""
         rc = self.work()
         if rc is None and not self.fetch_failed:
-            rc = self.scan_fallback()
+            if scan_lock := self.take(self.runner_state / maintenance.SCAN_LOCK):
+                with scan_lock:
+                    rc = self.scan_fallback()
         if rc is None:
             self.log("no work" if not self.fetch_failed else "git fetch failed; nothing done")
         return 1 if rc is None and self.fetch_failed else rc or 0
@@ -366,7 +403,8 @@ class Tick:
         return None
 
     def start(self, issue, note=""):
-        self.log(f"#{issue}: starting (P{self.priorities.get(str(issue), 2)}){note}")
+        rank = self.priorities.get(str(issue), 4)
+        self.log(f"#{issue}: starting ({f'P{rank}' if rank < 4 else 'no priority'}){note}")
         return self.attempt(lambda: dev.run(self, issue))
 
     def attempt(self, body):
@@ -400,9 +438,9 @@ class Tick:
                 continue
             n, verdict, url = str(issue["number"]), match["v"], f"https://github.com/{self.gh_repo}/issues/{issue['number']}"
             if verdict in ("accept", "revise"):
-                pr_helpers.gh("issue", "edit", n, "-R", self.gh_repo, "--remove-label", "needs-triage", "--add-label", "ready-for-agent")
-                self.log(f"#{n}: Cursor verdict {verdict}; handed to Cursor")
-                self.notify(f"#{n} handed to Cursor (Cursor: {verdict})", url)
+                pr_helpers.gh("issue", "edit", n, "-R", self.gh_repo, "--remove-label", "needs-triage")
+                self.log(f"#{n}: Cursor verdict {verdict}; waits for the owner's ready-for-agent")
+                self.notify(f"#{n} waits for your ready-for-agent (Cursor: {verdict})", url)
             elif verdict in ("reject", "human"):
                 pr_helpers.gh("issue", "edit", n, "-R", self.gh_repo, "--remove-label", "needs-triage", "--add-label", "ready-for-human")
                 self.log(f"#{n}: Cursor verdict {verdict}")
@@ -993,11 +1031,9 @@ class Tick:
         return 80
 
     def pick_issue(self):
-        """Trusted authors' issues or external issues explicitly labelled ready-for-agent,
-        with a plan comment: the latest
-        accept/revise verdict from Claude's triage, from Cursor, or posted for Cursor (the spec
-        review posts one when Cursor accepts). python -m baton N takes any ready-for-agent issue, or a
-        claude-found one awaiting triage (any milestone)."""
+        """Start the next issue: a pending spec step first, then a candidates() one. A tick takes
+        only ready-for-agent issues; python -m baton N takes one of any milestone, and also a
+        claude-found one without that label."""
         if self.force_pr or self.force_review:
             return None
         pending = self.pending_specs()
@@ -1065,7 +1101,7 @@ class Tick:
         labels = self.gh_json("issue", "view", self.force_issue, "-R", self.gh_repo, "--json", "labels,author,blockedBy") or {"labels": []}
         label_names = [label["name"] for label in labels["labels"]]
         self.priorities[self.force_issue] = priority_of(label_names)
-        if "ready-for-agent" not in label_names and not ("claude-found" in label_names and "needs-triage" in label_names):
+        if "ready-for-agent" not in label_names and "claude-found" not in label_names:
             print(f"#{self.force_issue} needs the ready-for-agent label", file=sys.stderr)
             raise Stop(2)
         if "ready-for-agent" in label_names:
@@ -1277,35 +1313,29 @@ class Tick:
         return stalled
 
     def candidates(self, only=None):
-        """ready-for-agent says "specified", AGENT_MILESTONE says "wanted now" ("" for any
-        milestone); the scan's claude-found issues need no milestone. External authors need
-        ready-for-agent: scanner labels alone never authorize their issues. Priority labels only
-        order the candidates (ADR 0010). ONLY restricts them to these issue numbers."""
+        """The owner's ready-for-agent is what makes an issue a candidate, whoever opened it;
+        AGENT_MILESTONE says "wanted now" ("" for any milestone), which the scan's claude-found
+        issues do not need. Priority labels only order the candidates (ADR 0010). ONLY restricts
+        them to these issue numbers."""
         milestone = self.env.repo.agent_milestone
         found = {}
-        for labels in (("ready-for-agent",), ("claude-found", "needs-triage")):
-            args = [x for label in labels for x in ("--label", label)]
-            # 1000 is as far as a label search of `gh issue list` goes; REST has no blockedBy.
-            for i in self.gh_json("issue", "list", "-R", self.gh_repo, "--state", "open", *args, "--limit", "1000",
-                                  "--json", "number,author,labels,milestone,blockedBy") or []:
-                if only is not None and str(i["number"]) not in only:
-                    continue
-                label_names = [label["name"] for label in i["labels"]]
-                login = (i.get("author") or {}).get("login") or ""
-                trusted = login == self.owner or bool(re.fullmatch(self.cursor_login, login))
-                if not trusted and "ready-for-agent" not in label_names:
-                    continue
-                if milestone and not ((i.get("milestone") or {}).get("title") == milestone or "claude-found" in label_names):
-                    continue
-                if any(x in label_names for x in ("ready-for-human", "needs-info", "agent-wip")):
-                    continue
-                if blockers := open_blockers(i):
-                    self.log(f"#{i['number']}: skipped; blocked by {' '.join(f'#{n}' for n in blockers)}")
-                    continue
-                if (labels == ("ready-for-agent",) or "ready-for-agent" in label_names) and not self.owner_ready(i["number"]):
-                    self.log(f"#{i['number']}: skipped; cannot verify ready-for-agent was applied by {self.owner}")
-                    continue
-                found[i["number"]] = self.priorities[str(i["number"])] = priority_of(label_names)
+        # 1000 is as far as a label search of `gh issue list` goes; REST has no blockedBy.
+        for i in self.gh_json("issue", "list", "-R", self.gh_repo, "--state", "open", "--label", "ready-for-agent",
+                              "--limit", "1000", "--json", "number,author,labels,milestone,blockedBy") or []:
+            if only is not None and str(i["number"]) not in only:
+                continue
+            label_names = [label["name"] for label in i["labels"]]
+            if milestone and not ((i.get("milestone") or {}).get("title") == milestone or "claude-found" in label_names):
+                continue
+            if any(x in label_names for x in ("ready-for-human", "needs-info", "agent-wip")):
+                continue
+            if blockers := open_blockers(i):
+                self.log(f"#{i['number']}: skipped; blocked by {' '.join(f'#{n}' for n in blockers)}")
+                continue
+            if not self.owner_ready(i["number"]):
+                self.log(f"#{i['number']}: skipped; cannot verify ready-for-agent was applied by {self.owner}")
+                continue
+            found[i["number"]] = self.priorities[str(i["number"])] = priority_of(label_names)
         return sorted(found, key=lambda n: (found[n], n))
 
     def p0_issues(self):
@@ -1389,8 +1419,8 @@ def rotation(names, last):
 
 
 def run(ticks):
-    """One tick over TICKS (one per repository, in configured order): the lock and the
-    runner-wide housekeeping once, then each repository's work in turn, then the scan."""
+    """One tick over TICKS (one per repository, in configured order): the runner-wide housekeeping
+    once, then each repository's work in turn, then the scan, each under its own lock."""
     first = ticks[0]
     config, runner_state, manual = first.env.config, first.runner_state, bool(first.manual)
     if first.scan_cmd == "scan" and first.scan_arg == "list":
@@ -1399,7 +1429,7 @@ def run(ticks):
         return 0
     paused = config.scheduling.paused is True and not manual
     admitted = maintenance.admit(
-        runner_state, runner_state / "lock", acquire=not paused,
+        runner_state, None, acquire=False,
         on_expired=lambda: notify.append(config.paths.logs, "maintenance expired"),
     )
     if admitted.reason is not None:
@@ -1408,50 +1438,84 @@ def run(ticks):
     if paused:
         notify.append(config.paths.logs, "paused")
         return 0
-    lock = admitted.lock
-    if lock is None:
-        notify.append(config.paths.logs, "busy (another tick holds the lock)")
-        return 0
-    for t in ticks:
-        t.lock_file = lock
     first.hooks().tick(manual)
-    from .initialization import expire_context
-    expire_context(config, first.clock())
     try:
-        with session_bound(first.env):
-            advisor.digest(first.env)   # the daily owner digest of advisor decisions (#17)
-    except Exception as error:   # a digest never stops the tick
-        notify.append(config.paths.logs, f"advisor digest failed: {type(error).__name__}")
-    (runner_state / "chain-next").unlink(missing_ok=True)
-    # Upgrade the old global cooldown as Claude-only; retain today's Claude counter.
-    old, new = runner_state / "cooldown-until", runner_state / "claude-cooldown-until"
-    if old.is_file() and not new.exists():
-        old.rename(new)
-    if len(ticks) == 1:
+        housekeeping(first)
+        return run_one(first) if len(ticks) == 1 else walk(ticks)
+    except Stop as stop:
+        return stop.rc
+
+
+def housekeeping(first):
+    """The runner-wide chores, skipped when another tick is doing them."""
+    config, runner_state = first.env.config, first.runner_state
+    lock = first.take(runner_state / maintenance.HOUSEKEEPING_LOCK)
+    if lock is None:
+        return
+    with lock:
+        from .initialization import expire_context
+        expire_context(config, first.clock())
         try:
-            return first.pass_()
-        except Stop as stop:
-            return stop.rc
+            with session_bound(first.env):
+                advisor.digest(first.env)   # the daily owner digest of advisor decisions (#17)
+        except Exception as error:   # a digest never stops the tick
+            notify.append(config.paths.logs, f"advisor digest failed: {type(error).__name__}")
+        # Upgrade the old global cooldown as Claude-only; retain today's Claude counter.
+        old, new = runner_state / "cooldown-until", runner_state / "claude-cooldown-until"
+        with statefile.locked(runner_state):   # a cooldown written in between would be overwritten
+            if old.is_file() and not new.exists():
+                old.rename(new)
+
+
+def run_one(t):
+    """The only repository of this tick (the one configured, or a command's)."""
+    lock = t.take_repository()
+    if lock is None:
+        return 0
+    with lock:
+        if t.scan_cmd != "scan":
+            return t.pass_()
+        scan_lock = t.take(t.runner_state / maintenance.SCAN_LOCK)
+        if scan_lock is None:
+            t.log_busy()
+            return 0
+        with scan_lock:
+            return t.pass_()
+
+
+def walk(ticks):
+    """Several repositories in turn; a locked one is another tick's and is left to it."""
+    first = ticks[0]
     try:
-        last = (runner_state / "last-repo").read_text().strip()
+        last = (first.runner_state / "last-repo").read_text().strip()
     except OSError:
         last = ""
     by_name = {t.gh_repo: t for t in ticks}
     turn = [by_name[name] for name in rotation(by_name, last)]
-    try:
-        for t in turn:
-            with session_bound(t.env):
-                rc = t.work()
-            if rc is not None:
-                return rc
-        for t in turn:
-            with session_bound(t.env):
-                rc = t.scan_fallback()
-            if rc is not None:
-                return rc
-    except Stop as stop:
-        return stop.rc
-    notify.append(config.paths.logs, "no work in any repository")
+    locked = set()
+
+    def visit(t, step):
+        lock = t.take_repository()
+        if lock is None:
+            locked.add(t.gh_repo)
+            return None
+        with lock, session_bound(t.env):
+            return step()
+
+    for t in turn:
+        rc = visit(t, t.work)
+        if rc is not None:
+            return rc
+    if scan_lock := first.take(first.runner_state / maintenance.SCAN_LOCK):
+        with scan_lock:
+            for t in turn:
+                if t.gh_repo in locked:   # it has another tick's work
+                    continue
+                rc = visit(t, t.scan_fallback)
+                if rc is not None:
+                    return rc
+    if not locked:
+        notify.append(first.env.config.paths.logs, "no work in any repository")
     return 1 if any(t.fetch_failed for t in turn) else 0
 
 

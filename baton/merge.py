@@ -23,7 +23,7 @@ import subprocess
 import sys
 import time
 
-from . import advisor, after_merge, check_verdicts, checkpoint, checks, ci, design_findings, fix, hooks as telemetry, names, notify, pick, pr as pr_helpers, pr_contract
+from . import advisor, after_merge, check_verdicts, checkpoint, checks, ci, design_findings, fix, hooks as telemetry, names, notify, pick, pr as pr_helpers, pr_contract, statefile
 from .common import Deferred, git
 
 
@@ -275,7 +275,7 @@ class Merger:
             # starts clean (the issue episode stays open until the issue is, but its grants do not).
             advisor.finish_episode(self.env, "issue", issue, "merged")
             Path(state_dir, f"last-slice-{issue}").write_text(f"{pr}\n")
-            Path(self.env.config.paths.state, "chain-next").touch()   # global: the next pass may be any repository's
+            Path(state_dir, "chain-next").touch()   # this repository's: only its lock holder clears it
             notify.log(f"PR #{pr}: partial slice merged; #{issue} ready for its next slice")
         elif state.stdout.strip() == "CLOSED":
             # Closed is the done state; a leftover ready-for-agent would only mislead.
@@ -376,10 +376,7 @@ class Merger:
         os.replace(tmp, path)
 
     def clear_update(self):
-        try:
-            self.update_file().unlink(missing_ok=True)
-        except IsADirectoryError:
-            pass  # Leave a damaged directory and its contents in place.
+        statefile.unlink_unless_directory(self.update_file())   # a damaged directory stays, contents and all
 
     def load_update(self, accepted):
         """None when no update is saved; the record when whole and in range; False when the file

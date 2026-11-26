@@ -188,6 +188,14 @@ def test_model_route_config_rejects_invalid_references_and_entries(tmp_path, old
         config.load(write(tmp_path, TEXT.replace(old, new, 1)))
 
 
+def test_claude_route_accepts_a_fable_alias(tmp_path):
+    old = 'claude = { model = "claude_strong", subagent_model = "claude_fast", effort = "high" }'
+    assert old in TEXT
+    text = TEXT.replace('claude_probe = "haiku"', 'claude_probe = "haiku"\nclaude_fable = "fable"')
+    c = config.load(write(tmp_path, text.replace(old, 'claude = { model = "claude_fable" }')), home=tmp_path)
+    assert 'fable' in {route.model for _, vendor, route in c.models.routes if vendor == 'claude'}
+
+
 def test_retrospective_aliases_default_and_preserve_legacy_opt_in(tmp_path):
     base = TEXT.split('[retrospectives]')[0].replace('codex_fast = "gpt-6.2-sol"', 'codex_fast = "gpt-6.1-sol"')
     for suffix, enabled in [('', False), ('[retrospectives]\nmodel = "legacy"\n', True),

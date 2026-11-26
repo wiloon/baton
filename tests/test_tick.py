@@ -129,27 +129,60 @@ def test_a_paused_runner_does_nothing_unless_a_target_is_given(ctx):
 
 
 def test_a_second_tick_waits_for_the_lock(ctx):
-    with open(ctx.path("lock"), "w") as held:
+    lock = ctx.path("repos/owner/app/lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock, "w") as held:
         fcntl.flock(held, fcntl.LOCK_EX)
         assert ctx.make().run() == 0
     assert "busy (another tick holds the lock)" in ctx.log()
     assert not ctx.gh.calls
 
 
+def test_the_legacy_cooldown_upgrade_holds_the_shared_state_lock(ctx, monkeypatch):
+    """A cooldown writer must not land between the check and the rename, which would overwrite it (#276)."""
+    ctx.path("cooldown-until").write_text("123\n")
+    locked, rename = [], Path.rename
+
+    def probe(path, target):
+        if path.name == "cooldown-until":
+            lock = ctx.path("quota-locks") / "shared-state"
+            lock.parent.mkdir(exist_ok=True)
+            with lock.open("a") as file:
+                try:
+                    fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked.append(False)
+                except BlockingIOError:
+                    locked.append(True)
+        return rename(path, target)
+    monkeypatch.setattr(Path, "rename", probe)
+    assert ctx.make().run() == 0
+    assert locked == [True]
+    assert ctx.path("claude-cooldown-until").read_text() == "123\n"
+
+
 # --- Cursor's verdicts --------------------------------------------------------------------------------
-def test_cursor_verdicts_move_the_labels(ctx):
+def test_cursor_verdicts_move_the_labels(ctx, monkeypatch):
     def comment(login, body):
         return {"author": {"login": login}, "body": body}
-    ctx.gh.answers["issue list"] = [
+    # like gh: an issue whose needs-triage label was removed is no longer listed
+    ctx.gh.answers["issue list"] = lambda args: [
+        i for i in listed if str(i["number"]) not in
+        {e[2] for e in ctx.gh.ran("issue", "edit") if e[5:7] == ["--remove-label", "needs-triage"]}]
+    sent = []
+    monkeypatch.setattr(tick.Tick, "notify", lambda self, title, text="": sent.append(title))
+    listed = [
         {"number": 1, "author": {"login": "owner"}, "comments": [comment("cursor", "<!-- baton-verdict: accept -->\nplan")]},
         {"number": 2, "author": {"login": "owner"}, "comments": [comment("owner", "<!-- baton-verdict: reject by=cursor -->")]},
         {"number": 3, "author": {"login": "owner"}, "comments": [comment("other", "<!-- baton-verdict: accept -->")]},
         {"number": 4, "author": {"login": "stranger"}, "comments": [comment("cursor", "<!-- baton-verdict: accept -->")]}]
-    ctx.make().advance_cursor_verdicts()
-    edits = ctx.gh.ran("issue", "edit")
-    assert [e[2] for e in edits] == ["1", "2"]
-    assert "ready-for-agent" in edits[0] and "ready-for-human" in edits[1]
-    assert "#1: Cursor verdict accept; handed to Cursor" in ctx.log() and "#2: Cursor verdict reject" in ctx.log()
+    t = ctx.make()
+    t.advance_cursor_verdicts()
+    t.advance_cursor_verdicts()
+    edit = lambda n, *added: ["issue", "edit", n, "-R", "owner/app", "--remove-label", "needs-triage", *added]
+    assert ctx.gh.ran("issue", "edit") == [edit("1"), edit("2", "--add-label", "ready-for-human")]
+    assert sent == ["#1 waits for your ready-for-agent (Cursor: accept)", "#2 needs you (Cursor: reject)"]
+    assert "#1: Cursor verdict accept; waits for the owner's ready-for-agent" in ctx.log()
+    assert "#2: Cursor verdict reject" in ctx.log()
 
 
 # --- the item boundary ---------------------------------------------------------------------------------
@@ -520,8 +553,7 @@ def label_history(ctx, number, events):
 def test_the_lowest_eligible_issue_is_picked(ctx, monkeypatch):
     issues(ctx, ready=[issue(30, labels=["ready-for-agent"]), issue(12, labels=["ready-for-agent"]),
                        issue(13, milestone="Later"), issue(14, login="stranger"), issue(15, labels=["agent-wip"]),
-                       issue(16, labels=["needs-info"])],
-           found=[issue(40, milestone=None, labels=["claude-found"])])
+                       issue(16, labels=["needs-info"])])
     monkeypatch.setattr(spec, "verdict_plan", lambda env, n, listed=None: "plan")
     assert ctx.make().next_issue() == "12"
 
@@ -573,10 +605,22 @@ def test_a_failed_label_read_never_authorizes(ctx):
     assert not ctx.make().owner_ready(7)
 
 
-def test_scanner_labels_do_not_admit_an_external_issue(ctx):
-    issues(ctx, found=[issue(7, login="contributor", milestone=None,
+@pytest.mark.parametrize("author", ["contributor", "owner", "cursor"])
+def test_scanner_labels_alone_never_make_a_candidate(ctx, monkeypatch, author):
+    issues(ctx, found=[issue(7, login=author, milestone=None,
                              labels=["claude-found", "needs-triage"])])
+    monkeypatch.setattr(spec, "verdict_plan", lambda env, n, listed=None: "plan")
     assert ctx.make().next_issue() == ""
+
+
+@pytest.mark.parametrize("force, bound", [("", False), ("8", False), ("7", True)])
+def test_an_unlabelled_finding_is_bound_only_by_a_manual_run_on_it(ctx, monkeypatch, force, bound):
+    """So a scheduled recovery retry of a finding without ready-for-agent does not run."""
+    payload = {"labels": [{"name": "claude-found"}, {"name": "needs-triage"}]}
+    monkeypatch.setattr(dev.spec, "read_issue", lambda env, issue, **kw: (payload, False))
+    monkeypatch.setattr(dev, "issue_binding", lambda wt, issue, branch, fresh: "binding")
+    t = ctx.make(*([force] if force else []))
+    assert dev.live_issue_binding(t, t.env, "/wt", "7", "agent/issue-7") == ("binding" if bound else None)
 
 
 @pytest.mark.parametrize("label", ["needs-info", "ready-for-human", "agent-wip"])
@@ -1147,7 +1191,7 @@ def test_a_second_tick_finishes_a_deferred_description_edit(ctx, worktree, monke
     assert reviewed or ctx.loops
 
 
-def test_tick_discards_a_directory_request_after_a_fix_needs_info(ctx, worktree, monkeypatch):
+def test_tick_discards_a_directory_request_after_a_fix_needs_info(ctx, worktree, monkeypatch, macos_unlink):
     request = Path(ctx.env["CTX"], "pr-11-body.md")
 
     def agent(*args):
@@ -1248,8 +1292,8 @@ def test_a_spec_in_review_needs_a_pool_vendor(ctx, monkeypatch):
 
 
 @pytest.mark.parametrize("labels, pr, ok", [
-    (["ready-for-agent"], "", True), (["claude-found", "needs-triage"], "", True), (["claude-found"], "", False),
-    (["ready-for-agent"], "5", False)])
+    (["ready-for-agent"], "", True), (["claude-found", "needs-triage"], "", True), (["claude-found"], "", True),
+    (["needs-triage"], "", False), (["ready-for-agent"], "5", False)])
 def test_a_forced_issue_needs_a_label_and_no_pr(ctx, capsys, labels, pr, ok):
     ctx.gh.answers["issue view"] = {"labels": [{"name": n} for n in labels], "author": {"login": "owner"}}
     label_history(ctx, 7, [label_event(1, "owner")])
@@ -1272,8 +1316,9 @@ def test_manual_issue_execution_requires_the_owner_label_too(ctx, actor, capsys)
     assert stop.value.rc == 2 and "cannot verify owner authorization" in capsys.readouterr().err
 
 
-def test_manual_execution_cannot_use_scanner_labels_for_external_issues(ctx, capsys):
-    ctx.gh.answers["issue view"] = {"labels": [{"name": n} for n in ("claude-found", "needs-triage")],
+@pytest.mark.parametrize("labels", [("claude-found",), ("claude-found", "needs-triage")])
+def test_manual_execution_cannot_use_scanner_labels_for_external_issues(ctx, capsys, labels):
+    ctx.gh.answers["issue view"] = {"labels": [{"name": n} for n in labels],
                                     "author": {"login": "contributor"}}
     with pytest.raises(tick.Stop) as stop:
         ctx.make("7").forced_issue()
@@ -1637,12 +1682,14 @@ def test_opening_recovery_rejects_mismatched_head(devrun, monkeypatch):
     assert path.exists() and not devrun.loops
 
 
-def test_opening_recovery_waits_for_the_runner_lock(devrun, monkeypatch):
+def test_opening_recovery_waits_for_the_repository_lock(devrun, monkeypatch):
     devrun.script = [implements()]
     monkeypatch.setattr(dev, "finish_opening", lambda *a: (_ for _ in ()).throw(OSError("interrupted")))
     t, rc = devrun.go()
     assert rc == 1
-    with open(devrun.path("lock"), "w") as held:
+    lock = devrun.path("repos/owner/app/lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock, "w") as held:
         fcntl.flock(held, fcntl.LOCK_EX)
         assert devrun.make().run() == 0
     assert dev.opening_path(t, "300").exists() and not devrun.loops
@@ -3142,7 +3189,7 @@ def numbered(*specs):
 @pytest.mark.parametrize("specs, expected", [
     ([(5, "P1"), (9, "P0")], [9, 5]),
     ([(5,), (9, "P1")], [9, 5]),
-    ([(5, "P3"), (9,)], [9, 5]),
+    ([(5, "P3"), (9,)], [5, 9]),
     ([(5, "P2"), (9, "P1", "P3")], [9, 5]),
     ([(9, "P1"), (5, "P1"), (7,), (3, "P2")], [5, 9, 3, 7]),
     ([(3,), (5, "p1"), (9, "p0")], [9, 5, 3]),
@@ -3151,6 +3198,12 @@ def numbered(*specs):
 def test_candidates_are_ordered_by_priority_then_number(ctx, specs, expected):
     issues(ctx, ready=numbered(*specs))
     assert ctx.make().candidates() == expected
+
+
+def test_p3_is_picked_before_an_issue_with_no_priority_label(ctx, monkeypatch):
+    issues(ctx, ready=numbered((5,), (9, "P3")))
+    monkeypatch.setattr(spec, "verdict_plan", lambda env, n, listed=None: "plan")
+    assert ctx.make().next_issue() == "9"
 
 
 def test_a_priority_candidate_beyond_the_first_50_listed_issues_comes_first(ctx):
@@ -3254,7 +3307,7 @@ def test_a_deferred_p0_item_is_not_tried_again_in_the_tick(ctx, queue):
     queue.defer = {"review 31", "dev 20"}
     queue.run()
     assert queue.ran == ["review 31", "dev 20", "dev 12"]
-    assert "#12: starting (P2)" in ctx.log()
+    assert "#12: starting (no priority)" in ctx.log()
 
 
 def test_a_review_left_by_a_deferred_p0_start_is_not_retried_in_the_tick(ctx, queue, monkeypatch):

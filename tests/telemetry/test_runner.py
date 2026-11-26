@@ -1,8 +1,10 @@
 """Offline lifecycle, usage, scheduling and fault tests; no agent calls/secrets."""
 import contextlib
+import fcntl
 import importlib.util
 import json
 import math
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -105,6 +107,26 @@ class RunnerTests(unittest.TestCase):
         path = self.log([{'type': 'turn.completed', 'usage': {'input_tokens': 5, 'output_tokens': True}}])
         self.assertEqual(t.usage('codex', path, 'success')['usage_state'], 'unavailable')
 
+    def test_two_overlapping_items_are_both_reported_while_their_repositories_are_locked(self):
+        config = self.state / 'config.toml'
+        config.write_text((Path(__file__).resolve().parents[2] / 'config.example.toml').read_text())
+        output = self.state / 'metrics.prom'
+        holders = []
+        for repo, vendor, issue in (('acme/app', 'claude', 1), ('acme/shop', 'codex', 2)):
+            lock = self.state / 'repos' / repo / 'lock'
+            lock.parent.mkdir(parents=True)
+            holders.append(lock.open('a'))
+            self.addCleanup(holders[-1].close)
+            fcntl.flock(holders[-1], fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.ledger.begin(vendor, 'dev', os.getpid(), 600, issue, repo=repo)   # a live owner
+        with patch.object(t, 'unit_state', return_value=(1, 1, 0)):
+            t.collect(self.ledger, config, output)
+        metrics = output.read_text()
+        for line in ('baton_running 2', 'baton_lock_held 1', 'baton_execution_healthy 1', 'baton_state_collect_success 1'):
+            self.assertIn(line + '\n', metrics)
+        records = [json.loads(path.read_text()) for path in (self.state / 'telemetry' / 'runs').glob('*.json')]
+        self.assertEqual(sorted((r['repo'], r['issue']) for r in records), [('acme/app', 1), ('acme/shop', 2)])
+
     def test_settings_runtime_caps_no_cap_and_invalid_reads(self):
         config = self.state / 'config.toml'
         config.write_text((Path(__file__).resolve().parents[2] / 'config.example.toml').read_text())
@@ -137,6 +159,51 @@ class RunnerTests(unittest.TestCase):
         self.assertIn('baton_timer_enabled NaN', output.read_text())
         self.assertIn('baton_state_collect_success 0', output.read_text())
         self.assertEqual(output.stat().st_mode & 0o777, 0o644)
+
+    def collect(self, units):
+        """The metrics of one collection, with systemctl answering from UNITS."""
+        config = self.state / 'config.toml'
+        config.write_text((Path(__file__).resolve().parents[2] / 'config.example.toml').read_text())
+        output = self.state / 'metrics.prom'
+        real = t.subprocess.run
+
+        def run(argv, **kwargs):
+            if argv[:3] != ['systemctl', '--user', 'show']:
+                return real(argv, **kwargs)
+            return t.subprocess.CompletedProcess(argv, 0, stdout=units[argv[3]])
+        with patch.object(t.subprocess, 'run', run):
+            t.collect(self.ledger, config, output)
+        return output.read_text().splitlines()
+
+    LOADED = 'LoadState=loaded\nUnitFileState=enabled\nActiveState=active\nActiveEnterTimestampMonotonic=1000000\n'
+    ABSENT = 'LoadState=not-found\nUnitFileState=\nActiveState=inactive\nActiveEnterTimestampMonotonic=0\n'
+
+    def test_the_supervisor_unit_and_serve_json_are_exported(self):
+        (self.state / 'serve.json').write_text(json.dumps(
+            {'pid': 7, 'heartbeat': 1234.5, 'running': ['acme/app', 'acme/shop']}))
+        metrics = self.collect({'baton.timer': self.LOADED, 'baton-serve.service': self.LOADED})
+        for line in ('baton_serve_heartbeat_seconds 1234.5', 'baton_serve_running_children 2',
+                     'baton_serve_enabled 1', 'baton_serve_active 1', 'baton_state_collect_success 1'):
+            self.assertIn(line, metrics)
+        since = next(float(m.split()[1]) for m in metrics if m.startswith('baton_serve_active_since_seconds '))
+        self.assertGreater(since, 0)
+
+    def test_a_host_without_the_supervisor_reports_zero_and_stays_healthy(self):
+        metrics = self.collect({'baton.timer': self.LOADED, 'baton-serve.service': self.ABSENT})
+        for line in ('baton_serve_heartbeat_seconds NaN', 'baton_serve_running_children NaN',
+                     'baton_serve_enabled 0', 'baton_serve_active 0', 'baton_serve_active_since_seconds 0',
+                     'baton_state_collect_success 1'):
+            self.assertIn(line, metrics)
+
+    def test_an_unreadable_serve_json_or_unit_is_unknown(self):
+        units = {'baton.timer': self.LOADED, 'baton-serve.service': 'LoadState=error\n'}
+        for text in ('{', '[]', '{"heartbeat": "now", "running": []}', '{"heartbeat": 1, "running": 2}'):
+            (self.state / 'serve.json').write_text(text)
+            metrics = self.collect(units)
+            for line in ('baton_serve_heartbeat_seconds NaN', 'baton_serve_running_children NaN',
+                         'baton_serve_enabled NaN', 'baton_serve_active NaN', 'baton_timer_active 1',
+                         'baton_state_collect_success 0'):
+                self.assertIn(line, metrics)
 
     def test_delivery_retries_stable_identity_and_ack(self):
         run = self.begin()

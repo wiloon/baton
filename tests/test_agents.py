@@ -171,6 +171,16 @@ def test_claude_end_line_reports_the_requested_effort(env):
     assert env.run("claude", "review").summary.endswith(" effort=default")
 
 
+def test_claude_records_the_fable_model_of_the_main_session(env):
+    main = {"type": "assistant", "parent_tool_use_id": None,
+            "message": {"model": "claude-fable-5-2", "content": [{"type": "text", "text": "REVIEW: pass"}]}}
+    subagent = {"type": "assistant", "parent_tool_use_id": "tool",
+                "message": {"model": "claude-haiku-4-5", "content": []}}
+    env.plan(stream=lines({"type": "system", "subtype": "init", "model": "claude-fable-5-2"}, subagent, main,
+                          {"type": "result", "subtype": "success", "is_error": False, "result": "REVIEW: pass"}))
+    assert env.run("claude", "review", model="fable").model == "claude-fable-5-2"
+
+
 def test_codex_runs_without_unused_features_and_is_told_not_to_reread_agents_md(env):
     env.plan(stream=CODEX_STREAM, final="Looks right.\nREVIEW: pass")
     rollout(env)

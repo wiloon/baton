@@ -25,7 +25,7 @@ class ConfigError(ValueError):
 @dataclass(frozen=True)
 class Paths:
     """Runner-wide roots. Each repository gets its own directory under clones, wt_root, state/repos,
-    logs and ctx (RepoDirs); quota, vendor cooldowns, run counts, telemetry and the lock stay global."""
+    logs and ctx (RepoDirs); quota, vendor cooldowns, run counts and telemetry stay global."""
     agent_home: Path
     clones: Path
     wt_root: Path
@@ -54,6 +54,8 @@ class Scheduling:
     scan: bool
     scan_interval_hours: int
     scan_max_waiting: int
+    # Tick children `python -m baton serve` runs at once, across all repositories (ADR 0011).
+    max_parallel: int = 1
 
 
 Pairs = tuple[tuple[str, str], ...]
@@ -253,6 +255,13 @@ class Advisor:
 
 
 @dataclass(frozen=True)
+class Serve:
+    """The resident supervisor (ADR 0011): how often it looks, and how long a finished or idle
+    repository waits."""
+    poll_seconds: int = 60
+
+
+@dataclass(frozen=True)
 class Environment:
     path_prefix: tuple[Path, ...]
     # Host settings: "" leaves the tools whatever the runner's own environment has.
@@ -305,6 +314,7 @@ class Config:
     telegram: Telegram | None = None
     retrospectives: Retrospectives = Retrospectives()
     advisor: Advisor = Advisor(env_file=None)
+    serve: Serve = Serve()
     # Resolved ANALYST_ALIAS of each retrospective-capable adapter without a model_<id> setting.
     analyst_models: Pairs = ()
 
@@ -367,7 +377,8 @@ class Config:
 SECTIONS = {"paths": Paths, "scheduling": Scheduling, "models": ModelSettings,
             "quota": QuotaSettings, "environment": Environment}
 # Integrations a runner may go without (#328): no section, no integration.
-OPTIONAL = {"linear": Linear, "telegram": Telegram, "retrospectives": Retrospectives, "advisor": Advisor}
+OPTIONAL = {"linear": Linear, "telegram": Telegram, "retrospectives": Retrospectives, "advisor": Advisor,
+            "serve": Serve}
 VENDORS = frozenset(agents.ADAPTERS)
 ROLES = {"dev", "reviewer", "fixer", "screenshot_reviewer", "spec_reviewer", "reviser", "retrospective", "scan"}
 MOVED_QUOTA = {
@@ -638,7 +649,7 @@ def load(path: str | Path, *, home: Path | None = None) -> Config:
     required = set(SECTIONS) | {"repos", "preferences", "vendors"}
     if not required <= data.keys() or data.keys() - required - OPTIONAL.keys():
         raise ConfigError("configuration sections do not match the schema (paths, scheduling, repos, vendors, models, "
-                          "quota, environment, preferences; optional: linear, telegram, retrospectives, advisor)")
+                          "quota, environment, preferences; optional: linear, telegram, retrospectives, advisor, serve)")
     models = data["models"]
     if not isinstance(models, dict):
         raise ConfigError("models: expected a table")
@@ -746,6 +757,8 @@ def load(path: str | Path, *, home: Path | None = None) -> Config:
         raise ConfigError('retrospectives.effort: expected high or xhigh')
     if retro.timeout_seconds > 600 or retro.input_chars > 20000 or retro.output_chars > 20000:
         raise ConfigError('retrospectives: deadline/character limits exceed Stage 1 bounds')
+    if config.serve.poll_seconds < 10:
+        raise ConfigError('serve.poll_seconds: expected at least 10')
     schedule = config.scheduling
     for key in ('cursor_login_re', 'cursor_branch_re'):
         try:

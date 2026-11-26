@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
-from . import advisor, agents, notify, recovery
+from . import advisor, agents, notify, recovery, statefile
 from . import pr as pr_helpers
 from .quota import atomic_json
 
@@ -725,9 +725,7 @@ def check_push_landed(binding):
 
 
 def _clear_path(path):
-    try:
-        path.unlink(missing_ok=True)
-    except IsADirectoryError:
+    if statefile.unlink_unless_directory(path):
         path.rename(path.with_name(f"damaged-{uuid4().hex}-{path.name}"))
 
 

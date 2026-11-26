@@ -143,6 +143,7 @@ def fix_worktree(gh, tmp_path, monkeypatch):
             request = Path(env_ctx(), f"pr-{PR}-body.md")
             if plan["request_directory"]:
                 request.mkdir()
+                state.requests.append(request)
             else:
                 request.write_text(plan["request"])
         if output and plan.get("file") is not None:
@@ -151,12 +152,14 @@ def fix_worktree(gh, tmp_path, monkeypatch):
             request = Path(f"{output}.body")
             if plan["request_directory"]:
                 request.mkdir()
+                state.requests.append(request)
             else:
                 request.write_text(plan["description"])
         return {"rc": 0, "status": "success", "outcome": plan["outcome"], "reply": plan["reply"], "model": plan["model"],
                 "defer": ""}
     state.agent_calls = []
     state.prompts = []
+    state.requests = []
     state.dispatch_agent = stub
     state.verify_script("pass")
     yield state
@@ -915,7 +918,7 @@ def test_task_partial_accepts_a_matching_or_copied_body_and_pushes(run, gh, fixe
 
 @pytest.mark.parametrize("fixer", ["cursor", "codex"])
 @pytest.mark.parametrize("directory", [True, False], ids=["directory", "no-relation"])
-def test_a_rejected_request_reports_the_exact_reason(run, gh, fixer, directory):
+def test_a_rejected_request_reports_the_exact_reason(run, gh, fixer, directory, macos_unlink):
     reply = "TASK: partial\nRESULT: fixed"
     if directory:
         reason = "description request must be a non-empty regular file and cannot be a symlink"
@@ -932,6 +935,7 @@ def test_a_rejected_request_reports_the_exact_reason(run, gh, fixer, directory):
     ]
     if directory:
         assert "completion=partial" in run.body() and "Refs #419" in run.body()
+        assert run.requests and not any(path.exists() for path in run.requests)
 
 
 @pytest.mark.parametrize("fixer", ["cursor", "codex"])

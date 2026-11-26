@@ -39,11 +39,11 @@ first thing it finds, in this order:
 3. a review the last run deferred;
 4. a PR the owner labelled `agent-review`;
 5. an agent PR the owner labelled `agent-fix`;
-6. the next `ready-for-agent` issue (or a `claude-found` + `needs-triage` issue).
+6. the next `ready-for-agent` issue.
 
 **Priority.** The labels `P0`, `P1`, `P2` and `P3` (any letter case) on an issue order its
 repository's queue: `P0` first, then by issue number within one priority. An issue with none ranks
-as `P2`; with several, the highest counts. Create the labels in each repository you want to use them
+after `P3`; with several, the highest counts. Create the labels in each repository you want to use them
 in. Priority never makes an issue a candidate: `ready-for-agent`, the milestone, the excluded
 labels, open blockers and owner authorization still decide that. Work already on a PR goes before a
 new issue, and `max_pending_prs` limits new issues, with one exception: `P0`, for urgent bugs. A
@@ -56,7 +56,8 @@ another repository takes its turn. A run by hand on one issue or PR has no `P0` 
 
 When a step ends, the tick can go straight on to the next one, up to `chain_max`. With
 nothing to do and `scan` on, Claude scans one of the repository's `scan_areas` for bugs and files
-what it finds as an issue.
+what it finds as an issue. Such a finding waits for the owner: a verdict that accepts it only removes
+`needs-triage`, and no tick takes it until the owner applies `ready-for-agent`.
 
 **How many issues run at once.** `max_pending_prs` (per repository) is how many `agent-wip` issues
 may be in flight before baton starts a new one; a new `P0` issue starts anyway. A PR waiting for the owner (`ready-for-human`) is
@@ -102,7 +103,7 @@ Create these labels in each watched repository (see the quick start).
 | `needs-info` | owner | waiting for information; baton skips it |
 | `agent-review` | owner | review an eligible same-repository PR by the owner or configured Cursor account |
 | `agent-fix` | owner | the owner left feedback on an agent PR; fix it |
-| `claude-found` | baton | an issue a code scan filed |
+| `claude-found` | baton | an issue a code scan filed; without `ready-for-agent` it waits for the owner |
 | `needs-triage` | baton | a scan issue or a side bug the runner filed, waiting for triage |
 | `follow-up` | baton | non-blocking nits from a merged PR; a PR that implements a follow-up issue files no further nits |
 
@@ -187,16 +188,16 @@ uv run python -m baton --preflight    # gh login and the enabled vendors' CLIs
 # 5. Try one issue by hand: label it ready-for-agent, then
 uv run python -m baton 42             # 42 = the issue number
 
-# 6. Run on a timer
+# 6. Run unattended: the resident supervisor (see "Supervisor" below)
 mkdir -p ~/.config/systemd/user
-cp systemd/baton.service systemd/baton.timer systemd/baton-tmp-sweep.* ~/.config/systemd/user/
+cp systemd/baton-serve.service systemd/baton.service systemd/baton.timer systemd/baton-tmp-sweep.* ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now baton.timer baton-tmp-sweep.timer
+systemctl --user enable --now baton-serve.service baton-tmp-sweep.timer
 loginctl enable-linger "$USER"
 ```
 
 Logs are in `~/.local/state/baton/logs` (`runner.log`, plus one file per agent run). Set
-`paused = true` in `config.toml` to stop the timer's ticks while keeping manual runs.
+`paused = true` in `config.toml` to stop unattended ticks while keeping manual runs.
 
 Inspect an issue with `uv run python -m baton.audit --repo OWNER/NAME 42`, or inspect global
 quota-probe overhead with `uv run python -m baton.audit probes` (when telemetry is enabled).
@@ -209,14 +210,56 @@ The last-attempt duration measures the most recent invocation, including a resum
 ### More commands
 
 ```text
-python -m baton [N]              an issue: the same pipeline the timer runs
+python -m baton serve            the resident supervisor: no --repo, no further arguments
+python -m baton [N]              an issue: the same pipeline the supervisor runs
 python -m baton pr N             an agent PR with owner feedback, as with agent-fix
 python -m baton review N         review PR N, as with agent-review
 python -m baton scan [N|list]    scan area N (default: the next one) and keep the draft
 python -m baton file-scan DRAFT  file a kept draft as claude-found + needs-triage
 ```
 
-With several `[[repos]]`, put `--repo OWNER/NAME` before the command.
+With several `[[repos]]`, put `--repo OWNER/NAME` before the command. Manual runs keep working
+beside the supervisor: the repository lock keeps them apart.
+
+### Supervisor
+
+`python -m baton serve` is a resident process that replaces the timer
+([ADR 0011](docs/adr/0011-resident-supervisor-runs-one-tick-child-per-repository.md)). It only
+schedules: it never calls GitHub or an agent CLI. Each tick is a child process for one repository,
+which honours maintenance and `scheduling.paused`, takes its own locks and scans when its
+repository is idle and a scan is due.
+
+- **`[scheduling] max_parallel`** (default 1): children running at once, across all repositories,
+  never two for one repository. Repositories take turns in the configured order.
+- **`[serve] poll_seconds`** (default 60, at least 10): how often it looks, and how long a
+  repository waits after its tick exits. After a merged partial slice the next tick starts at once,
+  at most `chain_max` times in a row.
+- A failing tick doubles its repository's wait each time, up to one hour; success resets it.
+- `config.toml` is read again on every loop; while it is invalid nothing starts. Lowering
+  `max_parallel` or removing a repository never stops a running tick.
+- Its decisions are in `runner.log` (`serve: ...`) and the journal; `<state>/serve.json` holds its
+  heartbeat and running repositories for telemetry.
+
+**systemd:** `baton-serve.service` restarts it 30 seconds after any exit. Do not enable it together
+with `baton.timer` (`systemctl --user disable --now baton.timer` first); the locks keep it safe if
+both are. `baton.service` and `baton.timer` stay for one release as the rollback path.
+
+**Shutdown:** `systemctl --user stop baton-serve` (or `restart`) drains and never interrupts: the
+supervisor starts nothing new, does not signal its running ticks, waits for them and exits. After
+2 hours (`TimeoutStopSec`) systemd kills what is left.
+
+**Immediate abort:** `systemctl --user kill baton-serve` signals every process in the unit, ticks
+and agent CLIs included. It is not a stop: unless a stop is already pending, `Restart=always` starts
+the service again.
+
+**Deploy:** the supervisor keeps running the code it started with, so every deploy runs, in order:
+
+```sh
+python -m baton.maintenance on --wait
+# check out the new code, then migrate (python -m baton.migrate OWNER/NAME, when needed)
+systemctl --user try-restart baton-serve
+python -m baton.maintenance off
+```
 
 ### Advisor (DeepSeek)
 
@@ -249,24 +292,38 @@ python -m baton.maintenance [--config PATH] off
 python -m baton.maintenance [--config PATH] status
 ```
 
-While the flag is on, ticks (timer, manual and chained), the nightly run and the retrospectives
+While the flag is on, ticks (supervisor, timer, manual and chained), the nightly run and the retrospectives
 worker start no new work; they log `maintenance (REASON)` and exit 0 (retrospectives print
-`{"state":"maintenance",...}`). Work already running finishes. `on --wait` returns 0 once the runner
-lock and the retrospectives worker lock are both free, and 75 when `--timeout` passes first (the flag
+`{"state":"maintenance",...}`). Work already running finishes. `on --wait` returns 0 once every work
+lock (each repository's, the housekeeping, scan and retrospectives locks) is free, and 75 when `--timeout` passes first (the flag
 stays on) or when `off` or a newer `on` replaced the request. A DURATION is a positive integer with an
 `s`, `m` or `h` suffix, such as `90s`, `30m` or `2h`. `--timeout` and `--ttl` default to `2h`. The flag
 expires after the TTL so an abandoned deploy cannot stop the pipeline: plain `on` lasts the TTL, `on
 --wait` lasts the timeout plus the TTL, and a successful wait restarts the full TTL when the drain
 completes. A malformed flag counts as active for 2h after its modification time. The next tick removes
 an expired flag and logs `maintenance expired`. `off` always succeeds; `status` shows on or off, the
-reason and expiry, and whether the runner and retrospectives locks are held. `baton.migrate` still
-runs while the flag is on. `scheduling.paused` stays the operator's long-term pause.
+reason and expiry, and whether each work lock is held. `baton.migrate` still runs while the flag is
+on. `scheduling.paused` stays the operator's long-term pause.
+
+Work locks ([ADR 0003](docs/adr/0003-maintenance-mode-is-a-local-flag.md), all under the state
+directory, none ever waited for):
+
+| Lock | Held by |
+| --- | --- |
+| `repos/OWNER/NAME/lock` | a tick or manual command while it works that repository; ticks for different repositories may overlap, and one finding it held logs `busy (another tick holds the lock)` and goes on |
+| `housekeeping.lock` | a tick doing the runner-wide chores; skipped when held |
+| `scan.lock` | the scan, one at a time; skipped when held |
+| `retrospectives/worker.lock` | the retrospectives worker |
+
+The nightly run and `baton.migrate` take every repository lock at once (migrate also the
+housekeeping and scan locks) and give up with 75 when one is held; `--preflight` reports 75 then.
 
 ### systemd units
 
 | Unit | What it does |
 | --- | --- |
-| `baton.timer` / `.service` | a tick every 10 minutes |
+| `baton-serve.service` | the resident supervisor, one tick per repository ([Supervisor](#supervisor)) |
+| `baton.timer` / `.service` | a tick every 10 minutes: the rollback path for one release |
 | `baton-quota.*` | every 5 minutes after completion: refreshes only stale vendor quota observations |
 | `baton-retrospectives.*` | every minute after completion: analyzes eligible task episodes |
 | `baton-tmp-sweep.*` | hourly: removes the agents' stale `/tmp` files |

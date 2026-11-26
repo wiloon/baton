@@ -27,8 +27,9 @@ codex  = { model = "codex_strong", effort = "xhigh" }
 
 - The task profile is produced at the **intake** decision point (ADR 0008), when the runner
   picks up an issue, and refreshed when its spec is accepted, against the current main branch.
-  It records size, kind (docs, test, bugfix, feature, refactor), risk and a split
-  recommendation, each with a reason. The runner stores it with the task episode.
+  It records size, kind (docs, test, bugfix, feature, refactor) and risk, each with a reason.
+  The runner stores it with the task episode. Whether an issue is split is decided at spec
+  review (#272), not by the profile.
 - The profile maps to one tier per role. Code applies floors that judgement cannot lower: a
   change to an owner-review path, or a profile with high risk, never gets `light` review.
 - A tier entry follows ADR 0004's inheritance: an absent `ROLE_TIER` entry for a vendor inherits
@@ -36,6 +37,10 @@ codex  = { model = "codex_strong", effort = "xhigh" }
   round re-checks earlier findings whatever the task's size.
 - Same-vendor rules (ADR 0002, ADR 0004's distinct-model policies) use the resolved model of the
   chosen tier, so a tier never turns a review into a same-model review.
+- The profile does not choose the vendor. Vendor selection stays with code: quota caps and
+  cooldowns, the owner's `[preferences]` order, and review independence (the reviewer of an
+  issue or a PR is a different vendor from its author whenever one can run; ADR 0002). Judgement
+  decides the model and the effort of a step, through the tier, and nothing else.
 - The intake decision point starts in observation mode: the runner records the profile and the
   tier it would use, and dispatches the standard tier. Going live needs evaluation evidence from
   observation (tokens per task, review rounds, bounce rate per tier), per ADR 0008.
@@ -49,13 +54,14 @@ codex  = { model = "codex_strong", effort = "xhigh" }
 - **Rule-based sizing from labels or diff size:** cheap, but an issue's size is known before
   any diff exists, and labels are often missing. Rules remain the fallback when the advisor has
   no answer: the standard tier.
+- **Let the profile also order or pick the vendor:** considered and dropped (owner,
+  2026-11-26). What matters about the vendor is independence between author and reviewer, which
+  code already enforces; there is no evidence that one vendor suits a kind of task better.
 - **Tiers chosen by the advisor from owner-configured routes (chosen).**
 
 ## Consequences
 
 - ADR 0004 gains a tier dimension: route = role × tier × phase × vendor.
-- A split recommendation is data. Opening sub-issues is a separate action that starts in
-  observation and, when live, is limited to proposing them to the owner.
 - Telemetry records the tier with every run, so the improvement loop (ADR 0001) can compare
   tiers per vendor.
 
@@ -64,3 +70,6 @@ codex  = { model = "codex_strong", effort = "xhigh" }
 - Owner, 2026-11-24: let a task's profile choose a configured route tier for every vendor, so
   each step's model and effort fit the task without wasting tokens; judgement never names a
   model.
+- Owner, 2026-11-26: the profile chooses model and effort only (through the tier). The vendor is
+  not a judgement call: code keeps author and reviewer on different vendors. The split
+  recommendation moved to spec review (#272).

@@ -116,7 +116,7 @@ still collected and retried.
 
 **Heartbeat.** A detached heartbeat checks the supervising process every 60 s,
 using its start identity and the boot ID. All inherited file descriptors are
-closed, so it can't hold the runner lock.
+closed, so it can't hold a work lock.
 
 **Reconciliation.** The collector turns any of these into one terminal
 `interrupted` record:
@@ -201,13 +201,20 @@ world-readable. They carry no run, PID, issue or PR labels.
 **Read failures:** a failed read gives NaN or a collection failure and keeps the
 last success; it never reads as disabled or zero.
 
-**Inputs:** the collector reads only these, and it collects while the timer is
-off or paused:
+**Inputs:** the collector reads only these, and it collects while the timer and
+the supervisor are off or paused:
 - the numeric settings in `config.toml`;
 - today's vendor run counters;
 - cooldown files;
-- the timer's properties;
-- the runner lock.
+- the properties of `baton.timer` and `baton-serve.service` (a host without the
+  latter reports 0 for `baton_serve_enabled`, `_active` and
+  `_active_since_seconds`);
+- `serve.json` (`baton_serve_heartbeat_seconds` and
+  `baton_serve_running_children`, NaN when the file is absent or unreadable);
+- the repository locks (`baton_lock_held` is 1 when any is held).
+
+The future no-tick alert takes its baseline from the `active_since` gauge of
+whichever unit is active, the timer or the supervisor.
 
 ### Quota
 

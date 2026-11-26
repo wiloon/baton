@@ -2,7 +2,7 @@
 
 For checks CI doesn't run (such as a Playwright suite), so a merged change is run again every
 night. The hook gets a fresh worktree with the repository's env files; exit 0 is green and its
-last output line is the summary. It takes the runner's lock because such checks may bind fixed
+last output line is the summary. It takes every repository lock because such checks may bind fixed
 ports, and a run in progress wins: the night is skipped. Anything but green reaches the owner.
 """
 from pathlib import Path
@@ -35,11 +35,11 @@ def summary(output):
     return lines[-1] if lines else "no output"
 
 
-def run(*, state, logs, wt_root, repo, env_files, hook, tools, notify, log):
+def run(*, state, repos, logs, wt_root, repo, env_files, hook, tools, notify, log):
     if hook is None:
         log("nightly: no nightly hook configured; nothing to run")
         return 0
-    admitted = maintenance.admit(state, Path(state, "lock"))
+    admitted = maintenance.admit_all(state, repos)
     if admitted.reason is not None:
         log(f"nightly: maintenance ({admitted.reason})")
         return 0
@@ -89,7 +89,8 @@ def main(argv=None):
         env = session.create(config, repo=repo)
         token = session.bind(env)
         try:
-            results.append(run(state=config.paths.state, logs=env.dirs.logs, wt_root=env.dirs.worktrees, repo=env.dirs.clone,
+            results.append(run(state=config.paths.state, repos=[r.gh_repo for r in config.repos],
+                               logs=env.dirs.logs, wt_root=env.dirs.worktrees, repo=env.dirs.clone,
                                env_files=repo.env_files, hook=repo.nightly_hook, tools=env.tools,
                                notify=notify.notify, log=notify.log))
         finally:

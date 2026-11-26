@@ -21,10 +21,20 @@ or declare a failed check passed.
 
 The **routine advisor** makes one stateless call per decision. Its first backend is Claude Code
 in print mode (`claude -p`), run on the owner's subscription with no tools, given the same
-bounded snapshot and allowed actions. When Claude cannot take the call (its cap or five-hour
-window is reached, it is cooling down, or the call fails or times out), the same call goes to
-the **fallback backend**: an API model outside the worker subscriptions, DeepSeek by default,
-paid per use. Scheduling judgement so keeps working when every worker vendor is out of quota. Before a task handoff, the runner classifies the reason in code.
+bounded snapshot and allowed actions. When Claude cannot take the call (it is not a declared
+vendor, its credential has expired, its cap or five-hour window is reached, it is cooling down,
+or the call fails, times out or returns an invalid reply), the same call goes to the **fallback
+backend**: an API model outside the worker subscriptions, DeepSeek by default, paid per use.
+Scheduling judgement so keeps working when every worker vendor is out of quota.
+
+The Claude call takes no vendor lease and runs isolated from task checkouts, user and project
+settings, hooks and the runner's credentials. It goes first whatever the decision is about, also
+when Claude wrote or reviewed the work: the advisor chooses among bounded actions and does not
+judge who is right, so the review-independence rules don't apply. It is not a dispatched
+workload, so listing Claude in the advisor's backend order is the owner's grant. It needs no
+vendor role (ADR 0007), only a declared vendor.
+
+Before a task handoff, the runner classifies the reason in code.
 Rules handle known waits and safe retries. Owner-only reasons go directly to the owner.
 For judgement calls, the routine advisor can choose among the applicable bounded recovery
 actions. For a problem that needs investigation, it may recommend one retry of the failed
@@ -86,6 +96,10 @@ advisor action per reason and task episode, and a recurrence after that action g
 - **DeepSeek as the only routine backend** (the first version): independent of every worker
   subscription and fast, but weaker than Claude on judgement and paid per call, while the
   Claude subscription has quota to spare.
+- **Claude advisor call under the vendor lease:** one rule for every Claude process, but the
+  advisor would fall back almost every time a Claude workload runs, for a short tool-less call.
+- **A separate advisor role under ADR 0007:** an explicit grant like retrospectives, but it
+  repeats what the advisor's backend order already says.
 - **Advisory decision points (chosen):** keep the deterministic loop, and replace rule branches
   with model judgement one decision point at a time, each with a rule fallback.
 
@@ -144,3 +158,7 @@ advisor action per reason and task episode, and a recurrence after that action g
   subscription quota is spare, while DeepSeek is paid per call. The fallback keeps the
   pipeline's judgement available when Claude is out of quota. Both backends get the same
   snapshot and action set; a backend with read-only tools stays a separate follow-up.
+- Issue #236 (spec round 1): list every case that falls back, and record that the Claude call is
+  isolated, takes no vendor lease, goes first regardless of authorship (owner, 2026-11-26) and is
+  granted by the backend order rather than a vendor role, so implementations can't differ on
+  quota, independence or authorization.
