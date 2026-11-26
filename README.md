@@ -39,11 +39,11 @@ first thing it finds, in this order:
 3. a review the last run deferred;
 4. a PR the owner labelled `agent-review`;
 5. an agent PR the owner labelled `agent-fix`;
-6. the next `ready-for-agent` issue (or a `claude-found` + `needs-triage` issue).
+6. the next `ready-for-agent` issue.
 
 **Priority.** The labels `P0`, `P1`, `P2` and `P3` (any letter case) on an issue order its
 repository's queue: `P0` first, then by issue number within one priority. An issue with none ranks
-as `P2`; with several, the highest counts. Create the labels in each repository you want to use them
+after `P3`; with several, the highest counts. Create the labels in each repository you want to use them
 in. Priority never makes an issue a candidate: `ready-for-agent`, the milestone, the excluded
 labels, open blockers and owner authorization still decide that. Work already on a PR goes before a
 new issue, and `max_pending_prs` limits new issues, with one exception: `P0`, for urgent bugs. A
@@ -56,7 +56,8 @@ another repository takes its turn. A run by hand on one issue or PR has no `P0` 
 
 When a step ends, the tick can go straight on to the next one, up to `chain_max`. With
 nothing to do and `scan` on, Claude scans one of the repository's `scan_areas` for bugs and files
-what it finds as an issue.
+what it finds as an issue. Such a finding waits for the owner: a verdict that accepts it only removes
+`needs-triage`, and no tick takes it until the owner applies `ready-for-agent`.
 
 **How many issues run at once.** `max_pending_prs` (per repository) is how many `agent-wip` issues
 may be in flight before baton starts a new one; a new `P0` issue starts anyway. A PR waiting for the owner (`ready-for-human`) is
@@ -102,7 +103,7 @@ Create these labels in each watched repository (see the quick start).
 | `needs-info` | owner | waiting for information; baton skips it |
 | `agent-review` | owner | review an eligible same-repository PR by the owner or configured Cursor account |
 | `agent-fix` | owner | the owner left feedback on an agent PR; fix it |
-| `claude-found` | baton | an issue a code scan filed |
+| `claude-found` | baton | an issue a code scan filed; without `ready-for-agent` it waits for the owner |
 | `needs-triage` | baton | a scan issue or a side bug the runner filed, waiting for triage |
 | `follow-up` | baton | non-blocking nits from a merged PR; a PR that implements a follow-up issue files no further nits |
 

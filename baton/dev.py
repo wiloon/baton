@@ -334,7 +334,7 @@ def live_issue_binding(tick, env, wt, issue, branch):
     if "ready-for-agent" in labels:
         if not tick.owner_ready(issue):
             return None
-    elif tick.force_issue != str(issue) and not {"claude-found", "needs-triage"} <= labels:
+    elif tick.force_issue != str(issue):
         return None
     return issue_binding(wt, issue, branch, fresh)
 
