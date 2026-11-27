@@ -3,7 +3,7 @@ and guard.sh (a PreToolUse hook that reads BATON_AGENT_*), not from this adapter
 import json
 import re
 
-from . import scratch
+from . import credentials, scratch
 from .common import (MODEL_CODE, Run, analyst_result, analyst_rows, analyst_tool_use, child_env, events,
                      last_result, outcome_line, read, run_cli)
 
@@ -33,7 +33,8 @@ VERSION_EXECUTABLE = "claude"
 PROBE_SENDS_MODEL = True
 RUNS_STEM = "runs"
 LOG_SUFFIX = ""
-CONFIG_FIELDS = frozenset({"fallback_models", "quota_probe_model"})
+CONFIG_FIELDS = frozenset({"fallback_models", "quota_probe_model", "env_file"})
+OAUTH_KEY = "CLAUDE_CODE_OAUTH_TOKEN"
 BUSY_RERUN = False
 REQUIRES_CACHE_DIRS = False
 COMMIT_MARKERS = ()
@@ -73,6 +74,25 @@ ANALYST_ENV_SET = {"CLAUDE_CODE_ENABLE_TELEMETRY": "0", "ENABLE_CLAUDEAI_MCP_SER
 MODEL = re.compile(
     r"(?P<prefix>claude-)?(?P<family>opus|sonnet|haiku|fable)(?P<version>(?:-[0-9]+)*?)(?:-(?P<snapshot>[0-9]{8}))?"
 )
+
+
+def oauth_env(vendor):
+    """The setup-token for one `claude` child (#255): {} without `env_file` (the stored /login
+    credential), else the runner's CLAUDE_CODE_OAUTH_TOKEN or the file's. Raises CredentialError,
+    naming the file and never its contents, for a file that must not be used. Starts no process."""
+    path = getattr(vendor, "env_file", None)
+    if path is None or getattr(vendor, "adapter", ID) != ID:
+        return {}
+    return credentials.load(path, (OAUTH_KEY,))
+
+
+def preflight(vendor=None):
+    """None when the configured env file can be used, else the failed outcome (status auth)."""
+    try:
+        oauth_env(vendor)
+    except credentials.CredentialError as error:
+        return f"RESULT: failed {error}"
+    return None
 
 
 def configure(role, route, settings, env):

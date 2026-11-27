@@ -251,6 +251,14 @@ def secret_values(env):
             values.update(credentials.load(path, tuple(keys), environ={}).values())
         except credentials.CredentialError:
             pass
+    # Claude's setup-token may come only from its env file (#255).
+    for vendor in getattr(getattr(env, "config", None), "vendors", ()):
+        if vendor.adapter == claude_cli.ID and vendor.env_file:
+            try:
+                token = credentials.load(vendor.env_file, (claude_cli.OAUTH_KEY,), environ={})
+            except credentials.CredentialError:
+                continue
+            values.update(v for v in token.values() if len(v) >= 8)
     for name, value in os.environ.items():
         if (SECRET_NAME.search(name) or name in keys or name in credentials.RUNNER_KEYS) and len(value) >= 8:
             values.add(value)
@@ -429,6 +437,10 @@ def claude_unavailable(env):
     if "claude" not in env.config.declared():
         return "claude is not declared"
     try:
+        claude_cli.oauth_env(env.config.vendor("claude"))
+    except credentials.CredentialError as error:
+        return str(error)
+    try:
         until = vendor_policy.cooldown_until(state, "claude", now)
     except ValueError:
         until = None
@@ -486,7 +498,10 @@ def claude_usage(spent):
 def call_claude(cfg, env, snapshot, actions, *, category=None):
     """(parsed reply, usage dict) from one tool-less, isolated Claude Code call. No vendor lease."""
     command = claude_cli.advisor_command(cfg.claude.model, cfg.claude.effort, instructions(actions, category))
-    child = retrospective_analyst.environment(env.config)
+    try:
+        child = retrospective_analyst.environment(env.config, env.config.vendor("claude"))
+    except credentials.CredentialError as error:
+        raise BackendError(str(error)) from None
     child["BATON_INVOCATION_KIND"] = "advisor"
     with tempfile.TemporaryDirectory(prefix="baton-advisor-") as workspace:
         status, raw, rc, diagnostics = retrospective_analyst.bounded_process(

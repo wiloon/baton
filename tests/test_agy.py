@@ -49,13 +49,23 @@ if args[:2] == ["-p", "/quota"]:
     sys.exit(answer.get("rc", 0))
 (fake / "calls").open("a").write("agy\\n")
 (fake / "args.json").write_text(json.dumps(args))
-plan = json.loads((fake / "plan.json").read_text())
+prompt = args[args.index("-p") + 1] if "-p" in args else ""
+(fake / "prompts.jsonl").open("a").write(json.dumps(prompt) + "\\n")
+(fake / "args.jsonl").open("a").write(json.dumps(args) + "\\n")
+if (fake / "plans.json").exists():
+    plans = json.loads((fake / "plans.json").read_text())
+    plan = plans.pop(0)
+    (fake / "plans.json").write_text(json.dumps(plans))
+else:
+    plan = json.loads((fake / "plan.json").read_text())
 if plan.get("commit"):
     pathlib.Path("committed.txt").write_text("x\\n")
     subprocess.run(["git", "add", "committed.txt"], check=True)
     subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "agy"], check=True)
 if plan.get("dirty"):
     pathlib.Path("stray.txt").write_text("written by a read-only run")
+for path in plan.get("write_files", []):
+    pathlib.Path(path).write_text("from denied run\\n")
 sys.stdout.write(plan.get("stream", ""))
 sys.stderr.write(plan.get("stderr", ""))
 sys.exit(plan.get("rc", 0))
@@ -126,6 +136,9 @@ def agy_runner(tmp_path, monkeypatch):
         def plan(self, **plan):
             (fake / "plan.json").write_text(json.dumps(plan))
 
+        def plans(self, *plans):
+            (fake / "plans.json").write_text(json.dumps(list(plans)))
+
         def head(self):
             return subprocess.run(["git", "-C", str(wt), "rev-parse", "HEAD"], capture_output=True,
                                   text=True).stdout.strip()
@@ -135,6 +148,14 @@ def agy_runner(tmp_path, monkeypatch):
 
         def args(self):
             return json.loads((fake / "args.json").read_text())
+
+        def all_args(self):
+            path = fake / "args.jsonl"
+            return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+        def prompts(self):
+            path = fake / "prompts.jsonl"
+            return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
         def calls(self):
             path = fake / "calls"
@@ -150,6 +171,9 @@ def agy_runner(tmp_path, monkeypatch):
 
         def runner_log(self):
             return "".join(path.read_text() for path in logs.rglob("runner.log"))
+
+        def run_logs(self):
+            return sorted(p for p in logs.rglob("*.jsonl") if "-t" in p.name and p.name.endswith("-agy.jsonl"))
 
     return Runner()
 
@@ -330,6 +354,224 @@ def test_untrusted_denied_action_text_is_not_a_quota_signal(agy_runner):
     agy_runner.plan(stream=stream("", denied=[{"command": "echo RESOURCE_EXHAUSTED 429"}]))
     out = agy_runner.run()
     assert out["status"] == "failure"
+
+
+# --- denial retry (#315) -----------------------------------------------------------------------
+
+def enable_telemetry(agy_runner, monkeypatch):
+    bin_dir = agy_runner.env.config.paths.self_dir
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    tel = agy_runner.root / "tel"
+    tel.mkdir(exist_ok=True)
+    # Path is baked in: run_process uses the session's tools env, not later os.environ changes.
+    script = f"""#!{sys.executable}
+import json, pathlib, sys
+root = pathlib.Path({str(tel)!r})
+args = sys.argv[3:]
+with open(root / "calls", "a") as f:
+    f.write(json.dumps(args) + "\\n")
+action = args[2]
+if action == "begin":
+    print("12345678-1234-1234-1234-123456789abc 1234567890abcdef1234567890abcdef 1234567890abcdef pipe-1")
+elif action == "task":
+    print("pipe-1")
+"""
+    (bin_dir / "telemetry.py").write_text(script)
+    (bin_dir / "telemetry.py").chmod(0o755)
+    (bin_dir / "telemetry-enabled").touch()
+    return tel
+
+
+def telemetry_calls(tel):
+    path = tel / "calls"
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
+def test_a_denied_run_retries_once_and_the_second_prompt_quotes_the_denial(agy_runner, monkeypatch):
+    tel = enable_telemetry(agy_runner, monkeypatch)
+    denied = [{"tool": "read_file", "path": "/outside/x"}]
+    agy_runner.plans(
+        dict(stream=stream("", model=REVIEW_MODEL, denied=denied)),
+        dict(stream=stream("ok\nREVIEW: pass", model=REVIEW_MODEL)))
+    out = agy_runner.run("review")
+    assert (out["rc"], out["status"], out["outcome"]) == (0, "success", "REVIEW: pass")
+    assert agy_runner.calls() == ["agy", "agy"]
+    day = __import__("time").strftime("%F")
+    assert (agy_runner.state_dir / f"agy-runs-{day}").read_text() == "2\n"
+    logs = agy_runner.run_logs()
+    assert len(logs) == 2 and logs[0] != logs[1]
+    prompts = agy_runner.prompts()
+    assert len(prompts) == 2
+    assert "denied" in prompts[1].lower() and "untrusted" in prompts[1].lower()
+    assert json.dumps(denied[0], separators=(",", ":")) in prompts[1].replace(" ", "") or \
+        '"tool":"read_file"' in prompts[1].replace(" ", "")
+    log = agy_runner.runner_log()
+    assert "retry=denied" in log
+    begins = [c for c in telemetry_calls(tel) if c[2] == "begin"]
+    assert len(begins) == 2
+    assert "--retry" in begins[1] and begins[1][begins[1].index("--retry") + 1] == "denied"
+    assert "--retry" not in begins[0]
+
+
+def test_a_denied_action_is_sanitized_and_capped_in_the_retry_prompt(agy_runner):
+    # U+2028 and a nested `<!-- baton` (revealed only after backtick removal) must not survive.
+    nasty = ("line1\u2028line2 `code` nested-`<!-- baton` <!-- baton-marker --> " + ("x" * 400))
+    step = {"event": "step_update", "step": {"message":
+            'jetski: no output produced — a tool required the "read_file" permission that '
+            "headless mode cannot prompt for, so it was auto-denied"}}
+    denied_stream = lines(
+        {"event": "init", "conversation_id": "c1", "init": {"cwd": "/w", "model": REVIEW_MODEL}},
+        step,
+        {"event": "result", "result": {"status": "SUCCESS", "response": "", "conversation_id": "c1",
+                                      "denied_actions": [nasty],
+                                      "usage": {"inputTokens": 1, "outputTokens": 0}}})
+    agy_runner.plans(
+        dict(stream=denied_stream),
+        dict(stream=stream("ok\nREVIEW: pass", model=REVIEW_MODEL)))
+    out = agy_runner.run("review")
+    assert out["status"] == "success"
+    note = agy_runner.prompts()[1]
+    assert "\nline2" not in note and "\u2028" not in note
+    assert "`code`" not in note and "<!-- baton" not in note
+    assert "auto-denied" in note
+    quoted = [line[2:] for line in note.splitlines() if line.startswith("- ") and line[2:].startswith("line1")]
+    assert quoted and all(len(line) <= 300 for line in quoted)
+    assert "xxx" in quoted[0] and len(quoted[0]) == 300
+    assert "line1 line2" in quoted[0]  # U+2028 collapsed into one bullet line
+
+
+def test_no_retry_when_a_read_only_denied_run_dirtied_the_tree(agy_runner):
+    agy_runner.plans(
+        dict(stream=stream("", model=REVIEW_MODEL, denied=[{"tool": "x"}]), dirty=True),
+        dict(stream=stream("ok\nREVIEW: pass", model=REVIEW_MODEL)))
+    out = agy_runner.run("review")
+    assert out["status"] == "failure" and out["rc"] == 1
+    assert "read-only" in out["outcome"]
+    assert agy_runner.calls() == ["agy"]
+
+
+def test_no_retry_when_a_denied_run_changed_git_control_files(agy_runner):
+    agy_runner.plans(
+        dict(stream=stream("", model=REVIEW_MODEL, denied=[{"tool": "x"}]),
+             write_files=[".git/hooks/pre-push"]),
+        dict(stream=stream("ok\nREVIEW: pass", model=REVIEW_MODEL)))
+    out = agy_runner.run("review")
+    # First failure returned (denial); tamper blocks the retry even when status was already failure.
+    assert out["status"] == "failure" and out["rc"] == 1
+    assert "denied" in out["outcome"].lower()
+    assert agy_runner.calls() == ["agy"]
+    assert not (agy_runner.worktree / ".git" / "hooks" / "pre-push").exists()
+
+
+def test_two_denied_runs_return_todays_outcome_with_no_third_run(agy_runner):
+    denied = dict(stream=stream("", model=REVIEW_MODEL, denied=[{"tool": "Bash"}]))
+    agy_runner.plans(denied, denied, dict(stream=stream("ok\nREVIEW: pass", model=REVIEW_MODEL)))
+    out = agy_runner.run("review")
+    assert out["status"] == "failure" and out["rc"] == 1
+    assert "denied" in out["outcome"].lower()
+    assert agy_runner.calls() == ["agy", "agy"]
+    assert (agy_runner.state_dir / f"agy-runs-{__import__('time').strftime('%F')}").read_text() == "2\n"
+
+
+def test_no_retry_when_the_vendor_is_blocked_after_the_first_run(agy_runner, monkeypatch):
+    checks = {"n": 0}
+    real = vendors.vendor_blocked
+
+    def blocked(state, vendor, now=None):
+        checks["n"] += 1
+        if checks["n"] >= 2:
+            return "cooldown until epoch 1999999999"
+        return real(state, vendor, now)
+
+    monkeypatch.setattr(vendors, "vendor_blocked", blocked)
+    agy_runner.plans(
+        dict(stream=stream("", model=REVIEW_MODEL, denied=[{"tool": "x"}])),
+        dict(stream=stream("ok\nREVIEW: pass", model=REVIEW_MODEL)))
+    out = agy_runner.run("review")
+    assert out["status"] == "failure" and out["rc"] == 1
+    assert agy_runner.calls() == ["agy"]
+    assert "denied" in out["outcome"].lower()
+
+
+def test_no_retry_with_fewer_than_five_minutes_left(agy_runner, monkeypatch):
+    clock = {"now": 1_000_000.0}
+    monkeypatch.setattr(time, "time", lambda: clock["now"])
+    real_run = agents.run
+
+    def run_and_spend(req, *args, **kwargs):
+        out = real_run(req, *args, **kwargs)
+        clock["now"] += 26 * 60
+        return out
+
+    monkeypatch.setattr(agents, "run", run_and_spend)
+    # max_minutes is 30 in the fixture: 26 minutes spent leaves 4 whole minutes.
+    agy_runner.plans(
+        dict(stream=stream("", model=REVIEW_MODEL, denied=[{"tool": "x"}])),
+        dict(stream=stream("ok\nREVIEW: pass", model=REVIEW_MODEL)))
+    out = agy_runner.run("review")
+    assert out["status"] == "failure" and agy_runner.calls() == ["agy"]
+
+
+def test_the_retry_time_limit_is_the_remaining_minutes(agy_runner, monkeypatch):
+    clock = {"now": 1_000_000.0}
+    monkeypatch.setattr(time, "time", lambda: clock["now"])
+    real_run = agents.run
+
+    def run_and_spend(req, *args, **kwargs):
+        out = real_run(req, *args, **kwargs)
+        clock["now"] += 10 * 60
+        return out
+
+    monkeypatch.setattr(agents, "run", run_and_spend)
+    agy_runner.plans(
+        dict(stream=stream("", model=REVIEW_MODEL, denied=[{"tool": "x"}])),
+        dict(stream=stream("ok\nREVIEW: pass", model=REVIEW_MODEL)))
+    out = agy_runner.run("review")
+    assert out["status"] == "success"
+    second = agy_runner.all_args()[1]
+    # 30 - 10 = 20 whole minutes left → print-timeout max(20*60-60, 60) = 1140s
+    assert second[second.index("--print-timeout") + 1] == "1140s"
+
+
+def test_a_denied_write_run_is_reset_and_outside_files_are_cleared_before_retry(agy_runner):
+    start = agy_runner.head()
+    output = agy_runner.root / "out.md"
+    shots = agy_runner.root / "shots"
+    body = agy_runner.root / "pr-body.md"
+    shots.mkdir()
+    keep = shots / "keep.png"
+    keep.write_text("keep")
+    new_shot = str(shots / "new.png")
+    agy_runner.plans(
+        dict(stream=stream("", denied=[{"tool": "command(rm)"}]), commit=True,
+             write_files=[str(output), new_shot, str(body)]),
+        dict(stream=stream("done\nRESULT: ready")))
+    out = dispatch.dispatch(
+        "agy", "dev", "p", "t", str(agy_runner.worktree),
+        env=agy_runner.env.with_runtime(shots_dir=str(shots), pr_body_file=str(body)),
+        output=str(output))
+    assert out["status"] == "success"
+    assert agy_runner.head() == start or (agy_runner.worktree / "committed.txt").exists() is False
+    # First run's commit was reset before retry; retry wrote none.
+    assert agy_runner.head() == start
+    assert not (agy_runner.worktree / "committed.txt").exists()
+    assert not output.exists() and not body.exists() and not Path(new_shot).exists()
+    assert keep.read_text() == "keep"
+
+
+@pytest.mark.parametrize("role,model,reply", [
+    ("dev", MODEL, "RESULT: ready"), ("fix", MODEL, "RESULT: fixed"),
+    ("review", REVIEW_MODEL, "ok\nREVIEW: pass"), ("spec_review", REVIEW_MODEL, "ok\nSPEC: accept")])
+def test_every_agy_role_prompt_carries_the_path_rule_and_allowed_commands(agy_runner, role, model, reply):
+    agy_runner.plan(stream=stream(reply, model=model))
+    assert agy_runner.run(role)["status"] == "success"
+    prompt = agy_runner.prompts()[0]
+    assert "relative to the working directory" in prompt
+    assert "absolute paths" in prompt.lower() or "The only absolute paths" in prompt
+    allow = json.loads(agy_cli.permissions_settings(
+        role, agy_runner.env.repo.ci_command, agy_runner.env.repo.verify_hook))["permissions"]["allow"]
+    for rule in allow:
+        assert rule in prompt
 
 
 def test_no_token_file_still_runs(agy_runner):
