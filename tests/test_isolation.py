@@ -26,3 +26,15 @@ def test_tests_pass_under_a_parent_runs_environment():
     result = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *selected],
                             cwd=ROOT, env={**os.environ, **LEAKY}, capture_output=True, text=True, timeout=300)
     assert result.returncode == 0, result.stdout[-3000:] + result.stderr[-2000:]
+
+
+def test_a_test_session_leaves_no_baton_entry_in_the_temporary_directory(tmp_path):
+    scratch = tmp_path / "tmpdir"   # not the host's /tmp: a concurrent runner tick may write there
+    scratch.mkdir()
+    selected = ["tests/test_fix.py::test_a_failed_fix_does_not_apply_its_description_request",
+                "tests/test_tick.py::test_item_finalization_clears_the_recorded_reply_owner_files"]
+    result = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *selected],
+                            cwd=ROOT, env={**os.environ, "TMPDIR": str(scratch)}, capture_output=True, text=True,
+                            timeout=300)
+    assert result.returncode == 0, result.stdout[-3000:] + result.stderr[-2000:]
+    assert sorted(p.name for p in scratch.glob("baton-*")) == []

@@ -1,9 +1,11 @@
 """A fake `gh` (and `timeout`) on PATH: baton.pr / .ci run their real subprocess
 calls against one PR held in a directory. No network."""
+import atexit
 import errno
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
 import tempfile
 
@@ -53,6 +55,7 @@ def full_text(baseline=None):
 
 # Hooks in it are relative to its own directory, like a deployed config's.
 FULL = Path(tempfile.mkdtemp(prefix='baton-tests-')) / 'config.toml'
+atexit.register(shutil.rmtree, FULL.parent, ignore_errors=True)
 FULL.write_text(full_text())
 
 FAKE_GH = r'''#!/usr/bin/env python3
