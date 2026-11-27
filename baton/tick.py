@@ -432,7 +432,8 @@ class Tick:
 
     # --- clean up worktrees whose work is finished -----------------------------------------
     def sweep(self, number):
-        env = {**self.env.tools, "BATON_TMP_PREFIXES": tmp_sweep.prefixes([self.env.repo])}
+        env = {**self.env.tools, "BATON_TMP_PREFIXES": tmp_sweep.prefixes([self.env.repo]),
+               "BATON_SCRATCH_DIRS": str(self.env.dirs.scratch)}  # #n of this repository only
         session.run_process([str(self.self_dir / "tmp-sweep.sh"), str(number)], env=env)
 
     def state_of(self, kind, number):

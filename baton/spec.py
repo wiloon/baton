@@ -31,7 +31,7 @@ import subprocess
 import sys
 import time
 
-from . import advisor, agents, checks as check_section, dispatch, e2e_gate, fix, handoff as owner_handoff, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, recovery, review, tiers, vendors
+from . import advisor, agents, checks as check_section, dispatch, e2e_gate, fix, handoff as owner_handoff, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, recovery, review, scratch, tiers, vendors
 from .common import Deferred, changed, child_env, git, permission_denials, push, restore, strip_markers
 from .quota import atomic_json
 
@@ -1677,7 +1677,12 @@ class Spec:
             return "changed"
         return "ok"
 
-    def finish_revision_reply(self, reviser, model, round, human, reply, mode_note, max_rounds, inputs, applied,
+    def remove_reply_files(self, round):
+        """This repository's reply and body files of one revision round."""
+        for leftover in scratch.directory(self.env.dirs).glob(f"spec-{self.issue}-{round}.*"):
+            leftover.unlink()
+
+    def finish_revision_reply(self, reviser,model, round, human, reply, mode_note, max_rounds, inputs, applied,
                               after_save=None):
         """Post the reply after ADR work (or when there was none) and clear the worker grant."""
         n = self.issue
@@ -1693,8 +1698,7 @@ class Spec:
         try:
             return self.post_comment(owner_handoff.SPEC_REPLY_POST, binding, initial=True, after_save=after_save)
         finally:
-            for leftover in Path("/tmp").glob(f"baton-spec-{n}-{round}.*"):
-                leftover.unlink()
+            self.remove_reply_files(round)
 
     def body_edit_binding(self, intended, original, round, reviser, model, human, reply, mode_note,
                           max_rounds, inputs):
@@ -2235,9 +2239,8 @@ class Spec:
         listed, issue_body = inputs["comments"], inputs["body"]
         if max_rounds is None:
             max_rounds = max(int(env.config.scheduling.max_spec_rounds or 3), round + 1)
-        out_base = f"/tmp/baton-spec-{n}-{round}"
-        for stale in Path("/tmp").glob(f"baton-spec-{n}-{round}.*"):
-            stale.unlink()
+        out_base = str(scratch.path(env.dirs, "spec", n, round))
+        self.remove_reply_files(round)
         last_vendor = last_by(listed, env.owner, "review")
         other_model = last_model(env, n, "review", round, last_vendor)
         alternating = vendors.alternating_spec_vendor()
@@ -2326,8 +2329,7 @@ class Spec:
             try:
                 return self.edit_body(binding, initial=True)
             finally:
-                for leftover in Path("/tmp").glob(f"baton-spec-{n}-{round}.*"):
-                    leftover.unlink()
+                self.remove_reply_files(round)
         if git(wt, "rev-list", f"{self.base}..HEAD"):
             try:
                 self.record(reviser, model)
@@ -2339,8 +2341,7 @@ class Spec:
             try:
                 return self.push_adr(binding, initial=True)
             finally:
-                for leftover in Path("/tmp").glob(f"baton-spec-{n}-{round}.*"):
-                    leftover.unlink()
+                self.remove_reply_files(round)
         try:
             self.record(reviser, model)
         except OSError:

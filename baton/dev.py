@@ -13,7 +13,7 @@ import re
 import subprocess
 import time
 
-from . import advisor, after_merge, agents, checks as check_section, dispatch, fix, handoff as owner_handoff, md, names, pr as pr_helpers, pr_contract, prompts, recovery, restart, spec, tiers, vendors
+from . import advisor, after_merge, agents, checks as check_section, dispatch, fix, handoff as owner_handoff, md, names, pr as pr_helpers, pr_contract, prompts, recovery, restart, scratch, spec, tiers, vendors
 from .common import Deferred, git, push, strip_markers
 
 REPLY_CAP = 60000
@@ -164,7 +164,7 @@ def finish_opening(tick, intent, path):
                 vendors.record_author_model(state, pr, author, model)
             vendors.record_author(state, pr, author)
             vendors.record_contrib(state, pr, author, intent["wt"], start, end, once=True)
-    Path(f"/tmp/baton-dev-{issue}.pr.md").unlink(missing_ok=True)
+    scratch.path(tick.env.dirs, "dev", issue).unlink(missing_ok=True)
     tick.active["issue"] = ""
     if (tick.state / f"review-pending-{pr}").exists():
         path.unlink(missing_ok=True)
@@ -386,7 +386,7 @@ def finish_dev_push(tick, binding):
     intent = {"issue": str(issue), "branch": branch, "wt": str(wt), "base": binding["base"],
               "head": binding["commit"], "vendor": binding["vendor"],
               "model": binding["model"], "attempts": binding["attempts"], "pr": ""}
-    Path(f"/tmp/baton-dev-{issue}.pr.md").write_text(binding["title"] + "\n\n" + binding["body_text"] + "\n")
+    scratch.path(tick.env.dirs, "dev", issue).write_text(binding["title"] + "\n\n" + binding["body_text"] + "\n")
     save_opening(opening_path(tick, issue), intent)
     recovery.clear(tick.env, issue, issue)
     attempts_path(tick, issue).unlink(missing_ok=True)
@@ -576,7 +576,7 @@ def waiting_dev_push(tick, env, issue):
 def run(tick, issue):
     env, repo = tiers.carry(tick.env.with_runtime(issue=str(issue)), "dev", issue), tick.gh_repo
     branch, wt = names.for_issue(tick.wt_root, issue)
-    body = f"/tmp/baton-dev-{issue}.pr.md"
+    body = str(scratch.path(env.dirs, "dev", issue))
     shots = str(tick.ctx / f"issue-{issue}-shots")
     url = f"https://github.com/{repo}/issues/{issue}"
     tick.active["issue"] = issue

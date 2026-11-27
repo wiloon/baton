@@ -113,12 +113,14 @@ class RepoDirs:
     state: Path
     logs: Path
     ctx: Path
+    scratch: Path   # agents' output files (baton.scratch); the only part of state they may write (#306)
 
 
 def repo_dirs(paths, repo):
     slug = Path(*repo.gh_repo.split('/'))
-    return RepoDirs(clone=paths.clones / slug, worktrees=paths.wt_root / slug, state=paths.state / 'repos' / slug,
-                    logs=paths.logs / slug, ctx=paths.ctx / slug)
+    state = paths.state / 'repos' / slug
+    return RepoDirs(clone=paths.clones / slug, worktrees=paths.wt_root / slug, state=state,
+                    logs=paths.logs / slug, ctx=paths.ctx / slug, scratch=state / 'scratch')
 
 
 ROUTE_ROLES = ("dev", "fix", "review", "screenshot_review", "spec_review", "spec", "scan")

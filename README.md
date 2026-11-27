@@ -347,6 +347,17 @@ directory, none ever waited for):
 The nightly run and `baton.migrate` take every repository lock at once (migrate also the
 housekeeping and scan locks) and give up with 75 when one is held; `--preflight` reports 75 then.
 
+### Agent scratch files
+
+Files the runner exchanges with an agent run (PR descriptions, review and fix replies, spec and
+scan drafts) are written under `<state>/repos/OWNER/NAME/scratch/` (mode `0700`), so two
+repositories with the same issue or PR number never share a file. Besides its worktree, this is
+the only directory `bin/guard.sh` lets a Claude run write with the file tools; `/tmp` is not
+allowed. The runner removes a task's files when it cleans up the task, and `baton-tmp-sweep.timer`
+removes anything left there after a day without writes. A repository that overrides prompt
+templates (`prompt_dir`) names these files with `{{REPLY_FILE}}` (fix), `{{REVIEW_FILE}}` (review)
+and `{{OUT}}` (spec, scan), never a fixed `/tmp` path.
+
 ### systemd units
 
 | Unit | What it does |
@@ -355,7 +366,7 @@ housekeeping and scan locks) and give up with 75 when one is held; `--preflight`
 | `baton.timer` / `.service` | a tick every 10 minutes: the rollback path for one release |
 | `baton-quota.*` | every 5 minutes after completion: refreshes only stale vendor quota observations |
 | `baton-retrospectives.*` | every minute after completion: analyzes eligible task episodes |
-| `baton-tmp-sweep.*` | hourly: removes the agents' stale `/tmp` files |
+| `baton-tmp-sweep.*` | hourly: removes the agents' stale `/tmp` and [scratch](#agent-scratch-files) files |
 | `baton-postmerge.*` | every 6 hours: finds reverts of, and issues about, merged agent PRs (telemetry) |
 | `baton-e2e-nightly.*` | nightly: runs the repository's `nightly_hook` on `origin/main`, notifies when red |
 

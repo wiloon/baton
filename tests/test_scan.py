@@ -31,7 +31,7 @@ def agent(monkeypatch, outcome, files=None, rc=0):
         if rc == 75:
             return {"rc": 75, "outcome": "", "reply": None, "defer": "quota exhausted"}
         for suffix, text in (files or {}).items():
-            base = re.search(r"/tmp/baton-scan-\d{8}-\d{6}", prompt).group(0)
+            base = re.search(r"[^\s`]+/scratch/scan-\d{8}-\d{6}", prompt).group(0)
             Path(f"{base}{suffix}").write_text(text)
         return {"rc": 0, "outcome": outcome, "reply": outcome, "defer": ""}
     monkeypatch.setattr(scan.dispatch, "dispatch", run)

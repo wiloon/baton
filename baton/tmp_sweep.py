@@ -1,4 +1,5 @@
-"""The /tmp sweep for the timer: bin/tmp-sweep.sh with every watched repository's name prefixes.
+"""The sweep for the timer: bin/tmp-sweep.sh with every watched repository's /tmp name prefixes
+and scratch directory.
 
     python -m baton.tmp_sweep [--config PATH]
 """
@@ -8,7 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-from .config import ConfigError, load
+from .config import ConfigError, load, repo_dirs
 
 
 def prefixes(repos):
@@ -25,7 +26,8 @@ def main(argv=None):
     except ConfigError as error:
         print(f'Invalid configuration: {error}', file=sys.stderr)
         return 2
-    env = {**os.environ, 'BATON_TMP_PREFIXES': prefixes(config.repos)}
+    env = {**os.environ, 'BATON_TMP_PREFIXES': prefixes(config.repos),
+           'BATON_SCRATCH_DIRS': '\n'.join(str(repo_dirs(config.paths, repo).scratch) for repo in config.repos)}
     return subprocess.run([str(config.paths.self_dir / 'tmp-sweep.sh')], env=env).returncode
 
 

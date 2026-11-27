@@ -105,11 +105,10 @@ def distinct_models(first, second):
 
 
 def configure(role, route, settings, env):
-    # The PR-description artifact lives in /tmp (dev); the ctx directory holds the prompts' context files.
-    dirs = [str(env.dirs.ctx), "/tmp"] if role == "dev" else [str(env.dirs.ctx)]
+    # The ctx directory holds the prompts' context files; the artifact's directory is added with the output.
     return route.model, settings.max_minutes, LOG_SUFFIX, {
         "fallback_models": " ".join(settings.fallback_models),
-        "add_dirs": dirs, "shots_dir": env.runtime.shots_dir,
+        "add_dirs": [str(env.dirs.ctx)], "shots_dir": env.runtime.shots_dir,
     }
 
 
