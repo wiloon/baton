@@ -155,10 +155,11 @@ def classify(vendor, rc, log_text, outcome="", cooldown_hours=COOLDOWN_HOURS):
     return "success", None
 
 
-def preflight(vendor):
-    """None when VENDOR's CLI can run, else the failed outcome (an auth failure)."""
+def preflight(vendor, settings=None):
+    """None when VENDOR's CLI can run, else the failed outcome (an auth failure). SETTINGS: the
+    vendor's config entry (Claude checks its env_file there)."""
     check = getattr(ADAPTERS[vendor], "preflight", None)
-    return check() if check else None
+    return check(settings) if check else None
 
 
 def run(req, cooldown_hours=COOLDOWN_HOURS):
@@ -225,7 +226,7 @@ def main(argv=None):
         print(json.dumps({"status": "failure", "outcome": f"RESULT: failed {reason}"}))
         return 1
     if a.command == "preflight":
-        outcome = preflight(a.vendor)
+        outcome = preflight(a.vendor, session.resolve().config.vendor(a.vendor))
         print(json.dumps({"status": "auth" if outcome else "success", "outcome": outcome or ""}))
         return 1 if outcome else 0
     options = {k: v for k, v in vars(a).items() if k not in ("command", "cooldown_hours")}
