@@ -230,7 +230,7 @@ class TaskAlloyTests(unittest.TestCase):
         record = dict(run_id='aaaaaaaa-0000-4000-8000-000000000001', trace_id='0'*32, span_id='0'*16,
                       agent='cursor', role='probe', stage='probe', status='success', usage_state='complete',
                       started=1., ended=2., issue=0, pr=0, round=0,
-                      requested_model='auto', actual_model='unknown')
+                      requested_model='auto', actual_model='unknown', tier='heavy')
         payload = t.summary_payload(record)
         row = payload['resourceLogs'][0]['scopeLogs'][0]['logRecords'][0]
         row['attributes'] += [{'key': 'active_ms', 'value': {'intValue': '1234'}},
@@ -242,7 +242,8 @@ class TaskAlloyTests(unittest.TestCase):
                 time.sleep(.05)
             self.assertTrue(harness.received)
             output = json.dumps(harness.received)
-            for expected in ('requested_model', 'actual_model', 'auto', 'unknown', 'probe', 'active_ms', '1234', 'partial'):
+            for expected in ('requested_model', 'actual_model', 'auto', 'unknown', 'probe', 'active_ms', '1234', 'partial',
+                             'tier', 'heavy'):
                 self.assertIn(expected, output)
 
     def test_verify_event_survives_allowlist(self):
@@ -334,8 +335,8 @@ class SummaryContractTest(unittest.TestCase):
         kept = set(json.loads(re.search(r'keep_keys\(attributes, (\["event_id"[^\]]*\])\)', alloy).group(1)))
         record = {'run_id': 'r1', 'trace_id': '0' * 32, 'span_id': '0' * 16, 'agent': 'codex', 'role': 'review', 'status': 'success',
                   'usage_state': 'reported', 'started': 1.0, 'ended': 2.0, 'issue': 7, 'pr': 8, 'round': 2,
-                  'input_tokens': 3}
+                  'input_tokens': 3, 'tier': 'light'}
         row = t.summary_payload(record)['resourceLogs'][0]['scopeLogs'][0]['logRecords'][0]['attributes']
         keys = {a['key'] for a in row}
-        self.assertTrue({'baton.issue', 'baton.pr', 'baton.round'} <= keys, keys)
+        self.assertTrue({'baton.issue', 'baton.pr', 'baton.round', 'tier'} <= keys, keys)
         self.assertEqual(keys - kept, set())

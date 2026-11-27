@@ -414,3 +414,64 @@ def test_a_deferred_run_keeps_its_status_but_the_files_are_still_restored(runner
     out = runner.run()
     assert out["status"] == "quota" and out["rc"] == 75
     assert not (runner.worktree / ".git" / "hooks" / "post-checkout").exists()
+
+
+# --- route tiers (#237) --------------------------------------------------------------------
+
+LIGHT_DEV = '\n[models.routes.dev_light]\nclaude = { model = "claude_probe", effort = "low" }\n'
+HEAVY_FIX = '\n[models.routes.fix_heavy]\nclaude = { model = "claude_strong", effort = "high" }\n'
+
+
+def tiered(runner, tables):
+    """The runner's session, its config's routes extended by `tables`."""
+    from dataclasses import replace
+    from baton import config, session
+    sess = session.resolve(runner.env)
+    path = runner.root / "tiered.toml"
+    path.write_text(sess.config.source.read_text() + tables)
+    sess.config = replace(sess.config, models=config.load(path, home=runner.root / "home").models)
+    return sess
+
+
+def requested(runner, sess, role):
+    runner.plan(stream=claude_stream("ok"))
+    dispatch.dispatch("claude", role, "p", "t", str(runner.worktree), settings="/s/settings.json", env=sess)
+    args = json.loads((runner.root / "fake" / "args.json").read_text())
+    return args[args.index("--model") + 1], args[args.index("--effort") + 1]
+
+
+@pytest.mark.parametrize("tables, model", [(LIGHT_DEV, ("haiku", "low")), ("", ("sonnet", "medium"))])
+def test_a_stored_light_tier_runs_the_dev_step_on_its_route(runner, tables, model):
+    from baton import tiers
+    sess = tiered(runner, tables)
+    tiers.write(sess, "142", {"dev": "light"})
+    assert requested(runner, sess, "dev") == model
+
+
+def test_a_follow_up_run_ignores_the_stored_tier(runner):
+    from baton import tiers
+    sess = tiered(runner, HEAVY_FIX)
+    tiers.write(sess, "142", {"fix": "heavy"})
+    assert requested(runner, sess, "fix") == ("opus", "high")
+    assert requested(runner, sess.with_runtime(fix_followup=True), "fix") == ("sonnet", "medium")
+    ends = [line for line in runner.runner_log() if line.startswith("end t ")]
+    assert ends[-1].endswith(" tier=heavy")   # the step's tier, whichever entry ran
+
+
+def test_the_end_line_and_the_run_record_name_the_tier(runner):
+    from baton import tiers
+    runner.enable_telemetry()
+    sess = tiered(runner, LIGHT_DEV)
+    tiers.write(sess, "142", {"dev": "light"})
+    requested(runner, sess, "dev")
+    assert runner.runner_log()[1].startswith("end t rc=0 ") and runner.runner_log()[1].endswith(" tier=light")
+    begin = runner.calls()[0]
+    assert begin[begin.index("--tier") + 1] == "light"
+
+
+def test_an_adapter_error_still_names_the_tier(runner, monkeypatch):
+    def boom(*args):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(dispatch.agents, "run", boom)
+    runner.run()
+    assert "end t adapter rc=1, no result tier=standard" in runner.runner_log()

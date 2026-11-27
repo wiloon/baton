@@ -23,8 +23,9 @@ itself.
 _Avoid_: AI scheduler
 
 **Supervisor**:
-The resident `baton serve` process that schedules tick children, one per repository. It makes no
-judgement.
+The resident `baton serve` process that schedules tick children, one per repository. Under
+contention it lists GitHub read-only to order ready work by priority across repositories; it never
+writes to GitHub or runs an agent CLI.
 
 **Decision record**:
 The stored account of one advisor recommendation: what it saw, what it could choose, what it
@@ -32,7 +33,7 @@ chose and why, and later what happened.
 
 **Task profile**:
 An assessment of a task made when it is picked up and refreshed when its spec is accepted:
-its size, kind, risk and whether it should be split, each with a reason.
+its size, kind and risk, each with a reason.
 
 **Route tier**:
 One of three owner-configured levels (light, standard, heavy) of model and effort for a step;

@@ -15,6 +15,8 @@ def main(argv=None):
     parser.add_argument('--preflight', action='store_true', help='Check local dependencies without starting tasks')
     parser.add_argument('--chain', type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument('--serve-child', action='store_true', help=argparse.SUPPRESS)   # `serve`'s tick
+    parser.add_argument('--issue', default='', metavar='N', help=argparse.SUPPRESS)   # serve child assignment
+    parser.add_argument('--no-new-issue', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--repo', default='', metavar='OWNER/NAME',
                         help='The repository a command is for; needed when several are configured')
     parser.add_argument('command', nargs='*', help='serve | ISSUE | pr N | review N | scan [N|list] | file-scan DRAFT')
@@ -25,6 +27,15 @@ def main(argv=None):
         return 2
     if args.serve_child and (not args.repo or args.command):
         print('usage: python -m baton --repo OWNER/NAME --serve-child (no command)', file=sys.stderr)
+        return 2
+    if (args.issue or args.no_new_issue) and not args.serve_child:
+        print('usage: --issue N and --no-new-issue only with --serve-child', file=sys.stderr)
+        return 2
+    if args.issue and args.no_new_issue:
+        print('usage: --issue N and --no-new-issue cannot be combined', file=sys.stderr)
+        return 2
+    if args.issue and not args.issue.isdecimal():
+        print('usage: --issue N needs an issue number', file=sys.stderr)
         return 2
     try:
         config = load(args.config)
@@ -83,6 +94,8 @@ def main(argv=None):
         invocation.runtime.chain = args.chain
         invocation.runtime.manual = bool(args.command)
         invocation.runtime.serve_child = args.serve_child
+        invocation.runtime.assign_issue = args.issue
+        invocation.runtime.no_new_issue = args.no_new_issue
         invocations.append(invocation)
     session.bind(invocations[0])
     if args.command == ['scan', 'list']:

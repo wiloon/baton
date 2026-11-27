@@ -31,7 +31,7 @@ import subprocess
 import sys
 import time
 
-from . import advisor, agents, checks as check_section, dispatch, e2e_gate, fix, handoff as owner_handoff, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, recovery, review, vendors
+from . import advisor, agents, checks as check_section, dispatch, e2e_gate, fix, handoff as owner_handoff, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, recovery, review, scratch, tiers, vendors
 from .common import Deferred, changed, child_env, git, permission_denials, push, restore, strip_markers
 from .quota import atomic_json
 
@@ -331,8 +331,10 @@ class Spec:
         OTHER_MODEL, else the other route (e.g. Opus and Sonnet swap), so a same-vendor round never
         runs on the writer's model."""
         routes = self.env.config.models
+        tier = tiers.step(self.env, route_role, self.issue)
         for followup in (preferred, not preferred):
-            if vendors.models_distinct(vendor, routes.route(route_role, vendor, followup=followup).model, other_model):
+            model = routes.route(route_role, vendor, followup=followup, tier=tier).model
+            if vendors.models_distinct(vendor, model, other_model):
                 return followup
         return preferred
 
@@ -1346,6 +1348,7 @@ class Spec:
 
     def review_round(self, round, max_rounds, context, inputs):
         """"accept", "changes" or "stop" (the owner or a failure took over)."""
+        self.env = tiers.carry(self.env, "spec_review", self.issue)
         n, wt, env = self.issue, self.wt, self.env
         listed, issue_body = inputs["comments"], inputs["body"]
         adr_note = "No ADR has been revised yet."
@@ -1362,7 +1365,7 @@ class Spec:
 
         def review_followup(vendor):
             return alt_followup if vendor == alternating else self.followup(round, vendor, last_vendor)
-        pending = self.resume_worker("spec_reviewer", "spec_review_run_failed", round, other_model)
+        pending = self.resume_worker("spec_reviewer", "spec_review_run_failed", round, other_model, alt_followup)
         if pending is False:
             return "stop"
         reviewer = pending[1] if pending else self.pick("spec_reviewer", pick.all_vendors(env),
@@ -1419,7 +1422,7 @@ class Spec:
             retry = self.recover_worker(
                 f"{reviewer}'s spec review failed: {outcome}", "spec_review_run_failed", reviewer, outcome,
                 round_s=str(round), issue_body=issue_body, listed=listed, last_vendor=last_vendor,
-                other_model=other_model, spec_followup=review_followup(reviewer))
+                other_model=other_model, spec_followup=alt_followup)
             if not retry:
                 return "stop"
             _, reviewer = retry
@@ -1674,7 +1677,12 @@ class Spec:
             return "changed"
         return "ok"
 
-    def finish_revision_reply(self, reviser, model, round, human, reply, mode_note, max_rounds, inputs, applied,
+    def remove_reply_files(self, round):
+        """This repository's reply and body files of one revision round."""
+        for leftover in scratch.directory(self.env.dirs).glob(f"spec-{self.issue}-{round}.*"):
+            leftover.unlink()
+
+    def finish_revision_reply(self, reviser,model, round, human, reply, mode_note, max_rounds, inputs, applied,
                               after_save=None):
         """Post the reply after ADR work (or when there was none) and clear the worker grant."""
         n = self.issue
@@ -1690,8 +1698,7 @@ class Spec:
         try:
             return self.post_comment(owner_handoff.SPEC_REPLY_POST, binding, initial=True, after_save=after_save)
         finally:
-            for leftover in Path("/tmp").glob(f"baton-spec-{n}-{round}.*"):
-                leftover.unlink()
+            self.remove_reply_files(round)
 
     def body_edit_binding(self, intended, original, round, reviser, model, human, reply, mode_note,
                           max_rounds, inputs):
@@ -2227,13 +2234,13 @@ class Spec:
     # --- the reviser's round ---
     def revise_round(self, round, context, inputs, max_rounds=None, *, answer_intent=None):
         """"revised", "answered" (advisor posted grounded answers) or "stop"."""
+        self.env = tiers.carry(self.env, "spec", self.issue)
         n, wt, env = self.issue, self.wt, self.env
         listed, issue_body = inputs["comments"], inputs["body"]
         if max_rounds is None:
             max_rounds = max(int(env.config.scheduling.max_spec_rounds or 3), round + 1)
-        out_base = f"/tmp/baton-spec-{n}-{round}"
-        for stale in Path("/tmp").glob(f"baton-spec-{n}-{round}.*"):
-            stale.unlink()
+        out_base = str(scratch.path(env.dirs, "spec", n, round))
+        self.remove_reply_files(round)
         last_vendor = last_by(listed, env.owner, "review")
         other_model = last_model(env, n, "review", round, last_vendor)
         alternating = vendors.alternating_spec_vendor()
@@ -2322,8 +2329,7 @@ class Spec:
             try:
                 return self.edit_body(binding, initial=True)
             finally:
-                for leftover in Path("/tmp").glob(f"baton-spec-{n}-{round}.*"):
-                    leftover.unlink()
+                self.remove_reply_files(round)
         if git(wt, "rev-list", f"{self.base}..HEAD"):
             try:
                 self.record(reviser, model)
@@ -2335,8 +2341,7 @@ class Spec:
             try:
                 return self.push_adr(binding, initial=True)
             finally:
-                for leftover in Path("/tmp").glob(f"baton-spec-{n}-{round}.*"):
-                    leftover.unlink()
+                self.remove_reply_files(round)
         try:
             self.record(reviser, model)
         except OSError:

@@ -48,7 +48,7 @@ def test_fix_prompts_route_description_fixes_through_the_runner():
     for name in ("fix-prompt.md", "codex-fix-prompt.md"):
         prompt = text(name)
         assert "`{{PR_DESCRIPTION_FILE}}`" in prompt, name
-        assert "`/tmp/baton-fix-{{PR}}.md.body`" in prompt, name
+        assert "`{{REPLY_FILE}}.body`" in prompt, name
         assert "adopt a description review point" in prompt, name
         assert "make that description inaccurate" in prompt, name
         assert "keeping the task relation" in prompt, name

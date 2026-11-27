@@ -494,6 +494,26 @@ def test_an_agent_fix_review_excludes_every_attempt_author(ctx, worktree, monkey
     assert set(args[5].split()) == {"claude", "codex"}
 
 
+def test_an_agent_fix_picks_and_fixes_on_one_read_of_the_tier(ctx, worktree, monkeypatch):
+    from baton import tiers
+    real_fix_pr, seen = tick.Tick.fix_pr, []
+    fix_ctx(ctx, worktree, monkeypatch)
+
+    def pick(self, *args, env=None, **kwargs):
+        seen.append(tiers.step(env or self.env, "fix", "297", "20"))
+        tiers.write(self.env, "297", {"fix": "light"})   # a record that changes after the step read it
+        return "codex"
+
+    monkeypatch.setattr(tick.Tick, "pick_vendor", pick)
+    monkeypatch.setattr(tick.Tick, "fix_pr", real_fix_pr)
+    monkeypatch.setattr(tick.fix, "fix_pr",
+                        lambda runner, *a, **k: seen.append(tiers.step(runner.env, "fix", "297", "20")) or 1)
+    t = ctx.make()
+    tiers.write(t.env, "297", {"fix": "heavy"})
+    assert t.pick_fix() == 0
+    assert seen == ["heavy", "heavy"]
+
+
 def test_no_feedback_means_nothing_to_fix(ctx, worktree, monkeypatch):
     fix_ctx(ctx, worktree, monkeypatch, feedback=" \n")
     assert ctx.make().pick_fix() == 0
@@ -1268,6 +1288,7 @@ def test_tick_discards_a_directory_request_after_a_fix_needs_info(ctx, worktree,
         return {**DONE, "outcome": "RESULT: needs-info", "reply": "1. Which option?"}
 
     monkeypatch.setattr(fix.dispatch, "dispatch", agent)
+    ctx.gh.answers["pr view"] = {"headRefName": "cursor/issue-297"}
     runner = ctx.make()
     assert runner.item(lambda: runner.fix_pr("11", str(worktree.wt), "cursor", "owner", "feedback")) == 1
     assert not request.exists() and "Cursor PR #11 has questions" in ctx.log()
@@ -1586,6 +1607,8 @@ def devrun(ctx, worktree, monkeypatch):
     state.issue, state.runs, state.verify, state.script = issue, [], (0, "", 0), []
     state.gh.answers["issue view"] = {"title": "A title", "body": "A body", "comments": []}
     state.gh.answers["pr create"] = "https://github.com/owner/app/pull/301\n"
+    for branch in ("agent/issue-300", "cursor/issue-300"):   # no closed PR: the push and resume read it (#303)
+        state.gh.answers[f"api repos/owner/app/pulls?state=all&head=owner:{branch}&per_page=100"] = [[]]
     monkeypatch.setattr(spec, "verdict_plan", lambda env, n, listed=None: "the plan")
     monkeypatch.setattr(tick.Tick, "pick_vendor", lambda self, role, mode, cands, **k: "codex")
     verify = fix.Runner.verify
@@ -1597,11 +1620,9 @@ def devrun(ctx, worktree, monkeypatch):
     monkeypatch.setattr(dev.dispatch, "dispatch", agent)
     state.filed = []
     monkeypatch.setattr(dev.after_merge, "file_pr_bugs", lambda pr, issue: state.filed.append((pr, issue)))
-    state.body = Path("/tmp/baton-dev-300.pr.md")
-    state.body.unlink(missing_ok=True)
+    state.body = Path(ctx.env["STATE"], "scratch", "dev-300.pr.md")
     state.go = lambda **extra: (lambda t: (t, t.item(lambda: dev.run(t, issue))))(ctx.make(**extra))
     yield state
-    state.body.unlink(missing_ok=True)
 
 
 def body_of(call):
@@ -1636,6 +1657,7 @@ def test_the_dev_run_opens_a_pr_and_starts_the_review(devrun, monkeypatch):
     run, = devrun.runs
     assert run["vendor"] == "codex" and run["role"] == "dev" and run["tag"] == "issue-300-dev"
     assert run["env"].runtime.shots_dir == str(Path(devrun.env["CTX"]) / "issue-300-shots")
+    assert run["output"] == str(devrun.body) and f"`{devrun.body}`" in run["prompt"]   # the same string: Codex rewrites it
     assert "the plan" in Path(re_context(run["prompt"])).read_text()
     create, = devrun.gh.ran("pr", "create")
     assert create[create.index("--title") + 1] == "Add the thing" and create[create.index("--head") + 1] == "agent/issue-300"
@@ -3479,4 +3501,157 @@ def test_a_forced_issue_has_no_p0_pass_and_logs_its_priority(ctx, queue):
     assert queue.ran == ["dev 7"]
     assert "#7: starting (P1)" in ctx.log()
     assert not [c for c in ctx.gh.ran("issue", "list") if "P0" in c]
+
+
+def test_a_serve_assigned_issue_starts_only_that_issue(ctx, queue):
+    queue.setup(ready=numbered((12,), (20, "P1")))
+    t = ctx.make()
+    t.env.runtime.assign_issue = "12"   # not the one the tick would pick itself
+    t.env.runtime.serve_child = True
+    assert t.work() == 0
+    assert queue.ran == ["dev 12"]
+
+
+def test_a_vendor_deferred_serve_assignment_starts_no_other_issue_and_exits_81(ctx, queue, monkeypatch):
+    queue.setup(ready=numbered((12,), (20, "P1")))
+
+    def pick_vendor(self, *args, issue="", **kwargs):
+        if str(issue) == "12":
+            raise Deferred("pool", QUOTA)
+        return "codex"
+    monkeypatch.setattr(tick.Tick, "pick_vendor", pick_vendor)
+    t = ctx.make()
+    t.env.runtime.assign_issue = "12"
+    t.env.runtime.serve_child = True
+    assert t.pass_() == 81
+    assert queue.ran == []
+
+
+@pytest.mark.parametrize("mode", ["assign", "no-new"])
+def test_a_serve_assigned_child_removes_stale_slot_markers(ctx, queue, mode):
+    queue.setup(ready=numbered((12,)))
+    marker = ctx.path("slot-deferred-99")
+    marker.write_text('{"vendor": "codex", "reason": "cooldown"}')
+    t = ctx.make()
+    if mode == "assign":
+        t.env.runtime.assign_issue = "12"
+    else:
+        t.env.runtime.no_new_issue = True
+    t.env.runtime.serve_child = True
+    t.work()
+    assert not marker.exists()
+
+
+def test_a_serve_no_new_issue_child_starts_no_new_issue(ctx, queue):
+    queue.setup(ready=numbered((12,), (20, "P1")))
+    t = ctx.make()
+    t.env.runtime.no_new_issue = True
+    t.env.runtime.serve_child = True
+    assert t.work() is None
+    assert queue.ran == []
+
+
+def test_an_ineligible_serve_assignment_starts_nothing(ctx, queue):
+    queue.setup(ready=numbered((12,)))
+    t = ctx.make()
+    t.env.runtime.assign_issue = "99"
+    t.env.runtime.serve_child = True
+    assert t.work() is None
+    assert queue.ran == []
+
+
+def test_tick_resumes_a_saved_review_in_a_detached_worktree_and_pushes_to_head_branch(
+    gh, worktree, tmp_path, monkeypatch,
+):
+    """#304: Tick.run resumes a saved review whose reused worktree is detached and pushes the fix to headRefName."""
+    from baton import checkpoint as cp
+
+    branch = "agent/issue-125"
+    pr = "156"
+    wt = worktree.wt
+    origin = worktree.origin
+    sh(wt, "git", "checkout", "-q", "-b", branch)
+    sh(wt, "git", "push", "-q", "origin", f"HEAD:refs/heads/{branch}")
+    base_head = sh(wt, "git", "rev-parse", "HEAD")
+    sh(wt, "git", "checkout", "-q", "--detach")
+
+    selfdir = tmp_path / "self"
+    selfdir.mkdir()
+    for path in BIN.iterdir():
+        if path.is_file():
+            (selfdir / path.name).symlink_to(path)
+    (selfdir / "verify.sh").unlink()
+    verify = selfdir / "verify.sh"
+    verify.write_text("#!/bin/sh\necho 'Verification passed'\n")
+    verify.chmod(0o755)
+
+    for name in ("VERIFY_HOOK", "GATE_HOOK", "CI_COMMAND"):
+        monkeypatch.delenv(name, raising=False)
+    for name in ("state", "ctx", "logs", "home", "worktrees"):
+        (tmp_path / name).mkdir(exist_ok=True)
+    env = {
+        "PATH": os.environ["PATH"], "FAKE_GH": os.environ["FAKE_GH"],
+        "STATE": str(tmp_path / "state"), "CTX": str(tmp_path / "ctx"), "LOGS": str(tmp_path / "logs"),
+        "GH_REPO": "owner/app", "OWNER": "owner", "SELF_DIR": str(selfdir), "VENDOR_POOL": "claude codex",
+        "CURSOR_BRANCH_RE": "^cursor/", "CURSOR_LOGIN_RE": LOGIN, "WT_ROOT": str(tmp_path / "worktrees"),
+        "REPO_DIR": str(worktree.repo), "HOME": str(tmp_path / "home"), "CROSS_REVIEW": "1",
+        "MAX_REVIEW_ROUNDS": "2", "MAX_VERIFY_FIXES": "2", "AUTO_MERGE": "0",
+    }
+    monkeypatch.setenv("HOME", env["HOME"])
+    monkeypatch.setenv("LOGS", env["LOGS"])
+    monkeypatch.setenv("GH_REPO", env["GH_REPO"])
+    monkeypatch.setattr(pick.settle, "probe", lambda *args: None)
+
+    feedback = "## Must fix\n1. Fix it.\n\nREVIEW: changes"
+    posted = f"<!-- baton-review round=1 by=codex -->\n{feedback}"
+    gh.set(
+        headRefName=branch, baseRefName="main", author={"login": "owner"}, title="Fix",
+        body="<!-- baton-task issue=125 completion=complete -->\n\nCloses #125\n\n## Checks to verify\nnone\n",
+        comments=[{"id": 1, "author": {"login": "owner"}, "body": posted}],
+        reviews=[], labels=[], state="OPEN", headRefOid=base_head,
+    )
+    cp.write(Path(env["STATE"], f"review-pending-{pr}"), {
+        "pr": pr, "wt": str(wt), "note": "n", "fixer": "claude", "reviewer": "codex",
+        "round": 1, "step": "fix", "fix_head": base_head, "ISSUE": "125",
+        "reviewed_head": base_head, "base_branch": "main", "reviewed_issue": "125",
+        "verdict_round": 1, "verdict_digest": hashlib.sha256(posted.encode()).hexdigest(),
+    })
+
+    def stub_dispatch(vendor, role, prompt, tag, cwd, settings="", output="", env=None, hooks=None):
+        if role == "fix":
+            Path(cwd, "fix.txt").write_text("fixed\n")
+            sh(cwd, "git", "add", "-A")
+            sh(cwd, "git", "commit", "-q", "-m", "fix")
+            if output:
+                Path(output).write_text("Done.\n\n## Checks to verify\nnone\n\nRESULT: fixed\n")
+            return {"rc": 0, "status": "success", "outcome": "RESULT: fixed", "reply": "RESULT: fixed",
+                    "model": "claude-test", "defer": ""}
+        if role == "review":
+            if output:
+                Path(output).write_text("Looks good.\n\nREVIEW: pass\n")
+            return {"rc": 0, "status": "success", "outcome": "REVIEW: pass", "reply": "REVIEW: pass",
+                    "model": "codex-test", "defer": ""}
+        raise AssertionError(f"unexpected role {role}")
+
+    real_push = fix.push
+
+    def push_and_sync(*args, **kwargs):
+        res = real_push(*args, **kwargs)
+        if res:
+            gh.set(headRefOid=sh(origin, "git", "rev-parse", branch))
+        return res
+
+    monkeypatch.setattr(fix, "push", push_and_sync)
+    monkeypatch.setattr(fix.dispatch, "dispatch", stub_dispatch)
+    monkeypatch.setattr(review.dispatch, "dispatch", stub_dispatch)
+    monkeypatch.setattr(merge.Merger, "merge_or_handoff", lambda self, *a, **k: 0)
+
+    t = tick.Tick(env, (), run_sh="python -m baton")
+    assert t.run() == 0
+    log = Path(env["LOGS"], "runner.log").read_text() if Path(env["LOGS"], "runner.log").exists() else ""
+    new_head = sh(wt, "git", "rev-parse", "HEAD")
+    assert new_head != base_head, log
+    assert sh(origin, "git", "rev-parse", branch) == new_head, log
+    assert not any(c[:2] == ["pr", "edit"] and "ready-for-human" in c for c in gh.calls()), log
+
 

@@ -28,7 +28,8 @@ SCAN_INTERVAL_HOURS Claude scans one area of the first one in turn that has scan
     python -m baton file-scan DRAFT  file a kept draft as claude-found + needs-triage
 
 Exit codes: 0 ok, 1 error, 2 usage, 75 deferred (a vendor must rest), 80 inside the tick only:
-the item ended and the next pass may start (chain_next).
+the item ended and the next pass may start (chain_next), 81 an assigned serve child (--issue /
+--no-new-issue) that ran no item (ADR 0012).
 """
 
 from . import session
@@ -43,8 +44,9 @@ import sys
 import tempfile
 import time
 
-from . import advisor, after_merge, agents, checkpoint, dev, fix, handoff as owner_handoff, hooks as telemetry, maintenance, merge, names, notify, pick, pr as pr_helpers, pr_contract, review, scan, spec, statefile, tmp_sweep, vendors
+from . import advisor, after_merge, agents, checkpoint, dev, eligibility, fix, handoff as owner_handoff, hooks as telemetry, maintenance, merge, names, notify, pick, pr as pr_helpers, pr_contract, review, scan, spec, statefile, tiers, tmp_sweep, vendors
 from .common import Deferred, git
+from .eligibility import open_blockers, priority_of
 
 AGENT_REVIEW_NOTE = ("The PR description{issue} give the problem, its cause and the fix. Check the diagnosis first: does the "
                      "stated cause hold, and does the change fix it rather than a symptom? Then review the code.")
@@ -75,24 +77,6 @@ def parse_args(argv):
     if first in ("scan", "file-scan"):
         return "", "", "", first, second
     return first, "", "", "", ""
-
-
-def open_blockers(item):
-    """The open issues that block ITEM, from GitHub's issue dependencies (`blockedBy`, #70).
-    A "Blocked by #N" line in a body is not a dependency. When GitHub lists fewer blockers than
-    it counts, the unlisted ones are unknown and count as open ("?")."""
-    blocked = item.get("blockedBy") or {}
-    nodes = blocked.get("nodes") or []
-    found = [n.get("number") for n in nodes if (n.get("state") or "").upper() != "CLOSED"]
-    if (blocked.get("totalCount") or 0) > len(nodes):
-        found.append("?")
-    return found
-
-
-def priority_of(labels):
-    """The rank of an issue with these label names (ADR 0010): 0 for P0 to 3 for P3, the highest of
-    several, and 4 (after P3) without one."""
-    return min((int(name[1]) for name in labels if re.fullmatch(r"[Pp][0-3]", name)), default=4)
 
 
 class Tick:
@@ -240,14 +224,7 @@ class Tick:
 
     def slot_markers(self):
         """{PR number: "vendor reason"} of the PRs that lend their slots."""
-        found = {}
-        for path in self.state.glob("slot-deferred-*"):
-            try:
-                data = json.loads(path.read_text())
-                found[path.name.removeprefix("slot-deferred-")] = f"{data['vendor']} {data['reason']}"
-            except (OSError, ValueError, KeyError, TypeError):
-                path.unlink(missing_ok=True)
-        return found
+        return eligibility.slot_markers(self.state, unreadable=lambda path: path.unlink(missing_ok=True))
 
     def after_item(self, rc):
         """What the tick does with an item's exit code: None to go on, else the exit code."""
@@ -288,9 +265,9 @@ class Tick:
         loop = review.Review(self.env.with_runtime(issue=issue), self.hooks(issue, pr), pr, wt, issue, fixed_by)
         return loop.loop(note, fixer, reviewer)
 
-    def fix_pr(self, pr, wt, fixer, source, feedback, issue="", head="", *, owner_triggered=False):
+    def fix_pr(self, pr, wt, fixer, source, feedback, issue="", head="", *, owner_triggered=False, env=None):
         self.active["cursor_fix"] = str(pr)
-        runner = fix.Runner(self.env.with_runtime(issue=issue, pr=str(pr)), self.hooks(issue, pr), pr, "")
+        runner = fix.Runner((env or self.env).with_runtime(issue=issue, pr=str(pr)), self.hooks(issue, pr), pr, "")
         runner.required_retry_label = "agent-fix"
         self.fix_runner = runner
         return fix.fix_pr(runner, pr, wt, fixer, source, feedback, head, owner_triggered=owner_triggered)
@@ -301,8 +278,9 @@ class Tick:
         return spec.Spec(self.env.with_runtime(issue=str(issue)), self.hooks(issue), str(issue)).loop(
             issue_payload=payload)
 
-    def pick_vendor(self, role, mode, candidates, pr="", issue="", exclude="", current="agent"):
-        return pick.choose(self.env, role, current, mode, candidates, pr=str(pr), issue=str(issue), exclude=exclude)
+    def pick_vendor(self, role, mode, candidates, pr="", issue="", exclude="", current="agent", env=None):
+        return pick.choose(env or self.env, role, current, mode, candidates, pr=str(pr), issue=str(issue),
+                           exclude=exclude)
 
     def all_vendors(self):
         return pick.all_vendors(self.env)
@@ -340,14 +318,20 @@ class Tick:
 
     def pass_(self):
         """The one repository's work and, still holding its lock, the scan."""
+        assigned = bool(self.env.runtime.assign_issue or self.env.runtime.no_new_issue)
         rc = self.work()
-        if rc is None and not self.fetch_failed:
+        # An assigned serve child never scans: the supervisor already chose its work (#291).
+        if rc is None and not self.fetch_failed and not assigned:
             if scan_lock := self.take(self.runner_state / maintenance.SCAN_LOCK):
                 with scan_lock:
                     rc = self.scan_fallback()
         if rc is None:
             self.log("no work" if not self.fetch_failed else "git fetch failed; nothing done")
-        return 1 if rc is None and self.fetch_failed else rc or 0
+            if self.fetch_failed:
+                return 1
+            # Exit 81: an assigned child that took the lock and ran no item (ADR 0012).
+            return 81 if assigned else 0
+        return rc
 
     def work(self):
         """This repository's item, if it has one: its exit code, or None for nothing to do here."""
@@ -448,7 +432,8 @@ class Tick:
 
     # --- clean up worktrees whose work is finished -----------------------------------------
     def sweep(self, number):
-        env = {**self.env.tools, "BATON_TMP_PREFIXES": tmp_sweep.prefixes([self.env.repo])}
+        env = {**self.env.tools, "BATON_TMP_PREFIXES": tmp_sweep.prefixes([self.env.repo]),
+               "BATON_SCRATCH_DIRS": str(self.env.dirs.scratch)}  # #n of this repository only
         session.run_process([str(self.self_dir / "tmp-sweep.sh"), str(number)], env=env)
 
     def state_of(self, kind, number):
@@ -912,8 +897,9 @@ class Tick:
             return 1
         for commit in vendors.seed_contrib(str(self.state), pr, wt):
             self.log(f"PR #{pr}: commit {commit} has no known vendor; not counted")
+        step = tiers.carry(self.env.with_runtime(issue=issue), "fix", issue, pr)   # one read: pick and fix
         fixer = recovery.pending_fix(self.env, episode, pr) or self.pick_vendor(
-            "fixer", "contrib", self.all_vendors(), pr=pr, issue=issue)
+            "fixer", "contrib", self.all_vendors(), pr=pr, issue=issue, env=step)
         self.notify(f"PR #{pr}: {fixer} is addressing your review", url)
         feedback = review.format_fix_feedback(owner_text, findings)
         # Posting a fix reply advances human_feedback's cutoff even when an edit defers.
@@ -924,7 +910,7 @@ class Tick:
         # The label stays only on a deferral, so the fix resumes; any other outcome drops it.
         self.fix_runner = None
         rc = self.fix_pr(pr, wt, fixer, f"{self.owner} (the repository owner)", feedback, issue,
-                         owner_triggered=True)
+                         owner_triggered=True, env=step)
         return self.finish_standalone_fix(pr, wt, fixer, feedback, issue, rc)
 
     @staticmethod
@@ -1015,15 +1001,7 @@ class Tick:
     # --- pick work: an issue for the pipeline ------------------------------------------------------
     def pending_specs(self):
         """Resume durable spec reads, comment posts and issue-scoped pushes before new work can be blocked."""
-        found = {}
-        for reason in ("spec_comments_read_failed", "spec_pending_adr_read_failed",
-                       *owner_handoff.SPEC_WRITE_POSTS, *owner_handoff.ISSUE_PUSHES, owner_handoff.SPEC_ADR_MERGE):
-            for prefix in ("waiting", "retry"):
-                for path in self.state.glob(f"handoff-{prefix}-*-{reason}.json"):
-                    issue = path.name.removeprefix(f"handoff-{prefix}-").removesuffix(f"-{reason}.json")
-                    if issue.isdecimal():
-                        found[issue] = reason
-        return found
+        return eligibility.pending_specs(self.state)
 
     def resume_spec(self, issue):
         if self.spec_loop(issue):
@@ -1033,7 +1011,8 @@ class Tick:
     def pick_issue(self):
         """Start the next issue: a pending spec step first, then a candidates() one. A tick takes
         only ready-for-agent issues; python -m baton N takes one of any milestone, and also a
-        claude-found one without that label."""
+        claude-found one without that label. A serve assignment (--issue N / --no-new-issue) keeps
+        scheduled semantics and may only start N (or nothing); p0_pass still may start a P0."""
         if self.force_pr or self.force_review:
             return None
         pending = self.pending_specs()
@@ -1045,6 +1024,13 @@ class Tick:
         if self.force_issue:
             issue = self.forced_issue()
             return self.start(issue) if issue else None
+        assign = self.env.runtime.assign_issue
+        if self.env.runtime.no_new_issue:
+            self.housekeep_admission()
+            return None
+        if assign:
+            self.housekeep_admission()
+            return self.start(assign) if self.assigned_ready(assign) else None
         # A deferred issue waits alone (ADR 0002): the tick goes on to the next candidate, through
         # the whole admission check again, since the deferred one may have opened a PR (#323).
         while issue := self.next_issue():
@@ -1052,6 +1038,49 @@ class Tick:
             if done is not None:
                 return done
         return None
+
+    def housekeep_admission(self):
+        """The writes that come before a new issue: release stale agent-wip, hand off stalled PRs,
+        drop stale slot markers. Returns (the cap count, the open PRs' branches), or None, logged,
+        when GitHub cannot be listed."""
+        wip = eligibility.list_wip_numbers(self.gh_json, self.gh_repo)
+        if wip is None:
+            self.log("could not list open agent-wip issues; not starting new work")
+            return None
+        prs = self.open_prs()
+        if prs is None:
+            return None
+        branches = {p["headRefName"] for p in prs}
+        # An agent-wip issue without an open PR holds no slot: release it, or leave it uncounted.
+        for issue in wip:
+            if not branches.intersection(names.branches(issue)):
+                self.release_stale(issue)
+        wip = [issue for issue in wip if branches.intersection(names.branches(issue))]
+        # A PR waiting for the owner uses no agent capacity; it must not hold up the queue.
+        with_owner = eligibility.with_owner_issues(prs)
+        with_owner |= self.hand_off_stalled(set(wip), prs, with_owner)
+        slots = eligibility.counted_wip(prs, wip, self.slot_markers(), with_owner)
+        for pr in set(slots.markers) - {slots.held[n] for n in slots.deferred}:
+            (self.state / f"slot-deferred-{pr}").unlink(missing_ok=True)
+        return slots, branches
+
+    def assigned_ready(self, issue):
+        """Whether the serve-assigned ISSUE may start now (eligibility + vendor), else False."""
+        cap = int(self.env.config.scheduling.max_pending_prs or 1)
+        result = eligibility.eligible_candidates(
+            self.gh_json, self.gh_repo, self.state,
+            milestone=self.env.repo.agent_milestone, owner=self.owner, cap=cap, only={issue},
+            log=self.log)
+        if result is None:
+            return False
+        candidates, _ = result
+        if not candidates or str(candidates[0].number) != str(issue):
+            return False
+        self.priorities[str(issue)] = candidates[0].priority
+        prs = self.open_prs()
+        if prs is None:
+            return False
+        return next(self.runnable([candidates[0].number], {p["headRefName"] for p in prs}), "") == str(issue)
 
     def resume_specs(self, only=None):
         """The pending_specs() entries that are due; ONLY restricts them to these issues."""
@@ -1137,29 +1166,7 @@ class Tick:
     def owner_ready(self, issue):
         """Only the owner's latest ready-for-agent label event authorizes work. Missing or
         unreadable history is not approval; all pages count, including later removals/relabels."""
-        pages = self.gh_json("api", f"repos/{self.gh_repo}/issues/{issue}/events?per_page=100", "--paginate", "--slurp")
-        if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
-            return False
-        latest = None
-        for page in pages:
-            for event in page:
-                if not isinstance(event, dict):
-                    return False
-                if event.get("event") not in ("labeled", "unlabeled") or (event.get("label") or {}).get("name") != "ready-for-agent":
-                    continue
-                if type(event.get("id")) is not int:
-                    return False
-                if latest is None or event["id"] > latest["id"]:
-                    latest = event
-        return bool(latest and latest["event"] == "labeled"
-                    and ((latest.get("actor") or {}).get("login") or "").casefold() == self.owner.casefold())
-
-    def admission_items(self, query):
-        """Fetch every page when an admission list reaches its limit."""
-        pages = self.gh_json("api", f"repos/{self.gh_repo}/{query}&per_page=100", "--paginate", "--slurp")
-        if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
-            return None
-        return [item for page in pages for item in page]
+        return eligibility.owner_ready(self.gh_json, self.gh_repo, issue, self.owner)
 
     def pr_history(self, issue):
         """Every PR of the issue's agent branches (same repository, base main), any state, or None
@@ -1188,40 +1195,15 @@ class Tick:
         self.log(f"#{issue}: released agent-wip (no open PR)")
 
     def next_issue(self):
-        listed = self.gh_json("issue", "list", "-R", self.gh_repo, "--state", "open", "--label", "agent-wip", "--limit", "100",
-                              "--json", "number")
-        if isinstance(listed, list) and len(listed) == 100:
-            issues = self.admission_items("issues?state=open&labels=agent-wip")
-            listed = None if issues is None else [item for item in issues if "pull_request" not in item]
-        if not isinstance(listed, list):
-            self.log("could not list open agent-wip issues; not starting new work")
+        admission = self.housekeep_admission()
+        if admission is None:
             return ""
+        (pending, deferred, held, markers), branches = admission
         cap = int(self.env.config.scheduling.max_pending_prs or 1)
-        prs = self.open_prs()
-        if prs is None:
-            return ""
-        branches = {p["headRefName"] for p in prs}
-        # An agent-wip issue without an open PR holds no slot: release it, or leave it uncounted.
-        for p in listed:
-            if not branches.intersection(names.branches(str(p["number"]))):
-                self.release_stale(str(p["number"]))
-        listed = [p for p in listed if branches.intersection(names.branches(str(p["number"])))]
-        # A PR waiting for the owner uses no agent capacity; it must not hold up the queue.
-        with_owner = {names.issue_of(p["headRefName"]) for p in prs
-                      if any(label.get("name") == "ready-for-human" for label in p.get("labels") or [])}
-        with_owner |= self.hand_off_stalled({str(p["number"]) for p in listed}, prs, with_owner)
-        pending = [p for p in listed if str(p["number"]) not in with_owner]
-        pr_of = {names.issue_of(p["headRefName"]): str(p.get("number", "")) for p in prs
-                 if names.issue_of(p["headRefName"]) not in with_owner}
-        markers = self.slot_markers()
-        held = {str(p["number"]): pr_of.get(str(p["number"])) for p in pending}
-        deferred = {n for n, pr in held.items() if pr and pr in markers}
-        for pr in set(markers) - {held[n] for n in deferred}:
-            (self.state / f"slot-deferred-{pr}").unlink(missing_ok=True)
-        if len(pending) - len(deferred) >= cap or len(pending) >= cap + 1:
+        # P0 skips the cap through p0_pass; here every new issue counts as unprioritised (4).
+        if not eligibility.cap_allows(4, pending, deferred, cap):
             why = []
-            for p in pending:
-                n = str(p["number"])
+            for n in pending:
                 if n in deferred:
                     why.append(f"#{n}: PR #{held[n]} deferred ({markers[held[n]]})")
                 else:
@@ -1234,15 +1216,9 @@ class Tick:
 
     def open_prs(self):
         """Every open PR (number, headRefName, labels), or None, logged, when they cannot be listed."""
-        prs = self.gh_json("pr", "list", "-R", self.gh_repo, "--state", "open", "--limit", "100",
-                           "--json", "number,headRefName,labels")
-        if isinstance(prs, list) and len(prs) == 100:
-            pulls = self.admission_items("pulls?state=open")
-            prs = None if pulls is None else [
-                {"number": pr["number"], "headRefName": pr["head"]["ref"], "labels": pr["labels"]} for pr in pulls]
-        if not isinstance(prs, list):
+        prs = eligibility.list_open_prs(self.gh_json, self.gh_repo)
+        if prs is None:
             self.log("could not list open PRs; not starting new work")
-            return None
         return prs
 
     def runnable(self, candidates, branches):
@@ -1322,27 +1298,15 @@ class Tick:
         """The owner's ready-for-agent is what makes an issue a candidate, whoever opened it;
         AGENT_MILESTONE says "wanted now" ("" for any milestone), which the scan's claude-found
         issues do not need. Priority labels only order the candidates (ADR 0010). ONLY restricts
-        them to these issue numbers."""
-        milestone = self.env.repo.agent_milestone
-        found = {}
-        # 1000 is as far as a label search of `gh issue list` goes; REST has no blockedBy.
-        for i in self.gh_json("issue", "list", "-R", self.gh_repo, "--state", "open", "--label", "ready-for-agent",
-                              "--limit", "1000", "--json", "number,author,labels,milestone,blockedBy") or []:
-            if only is not None and str(i["number"]) not in only:
-                continue
-            label_names = [label["name"] for label in i["labels"]]
-            if milestone and not ((i.get("milestone") or {}).get("title") == milestone or "claude-found" in label_names):
-                continue
-            if any(x in label_names for x in ("ready-for-human", "needs-info", "agent-wip")):
-                continue
-            if blockers := open_blockers(i):
-                self.log(f"#{i['number']}: skipped; blocked by {' '.join(f'#{n}' for n in blockers)}")
-                continue
-            if not self.owner_ready(i["number"]):
-                self.log(f"#{i['number']}: skipped; cannot verify ready-for-agent was applied by {self.owner}")
-                continue
-            found[i["number"]] = self.priorities[str(i["number"])] = priority_of(label_names)
-        return sorted(found, key=lambda n: (found[n], n))
+        them to these issue numbers. Shared with the serve supervisor (eligibility.ready_candidates)."""
+        ready = eligibility.ready_candidates(
+            self.gh_json, self.gh_repo, milestone=self.env.repo.agent_milestone, owner=self.owner,
+            only=only, log=self.log)
+        if ready is None:
+            return []
+        for candidate in ready:
+            self.priorities[str(candidate.number)] = candidate.priority
+        return [candidate.number for candidate in ready]
 
     def p0_issues(self):
         """The open issues labelled P0 (the cheap probe); none when the listing fails."""

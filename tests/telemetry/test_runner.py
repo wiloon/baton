@@ -39,6 +39,13 @@ class RunnerTests(unittest.TestCase):
         path.write_text('\n'.join(json.dumps(e) for e in events))
         return path
 
+    def test_begin_records_a_denied_retry(self):
+        with patch.object(t, 'identity', return_value=OWNER):
+            run = self.ledger.begin('codex', 'review', 123, 60, repo='test/repo', retry='denied')
+            plain = self.ledger.begin('codex', 'review', 123, 60, repo='test/repo')
+        self.assertEqual(run['retry'], 'denied')
+        self.assertNotIn('retry', plain)
+
     def test_pid_reuse_boot_heartbeat_deadline_and_zombie(self):
         run = self.begin()
         self.assertEqual(t.health(run, identify=lambda _: OWNER), 'running')

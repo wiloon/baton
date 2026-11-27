@@ -63,6 +63,7 @@ class RunResult:
     cooldown_until: int | None
     summary: str            # the runner.log end line after "rc=N"
     model: str = ""         # Codex rollout's actual model, never inferred from a requested alias
+    denial: list | None = None  # adapter signal: denial-ended SUCCESS; see common.Run (#315)
 
     @property
     def exit_code(self):
@@ -155,10 +156,11 @@ def classify(vendor, rc, log_text, outcome="", cooldown_hours=COOLDOWN_HOURS):
     return "success", None
 
 
-def preflight(vendor):
-    """None when VENDOR's CLI can run, else the failed outcome (an auth failure)."""
+def preflight(vendor, settings=None):
+    """None when VENDOR's CLI can run, else the failed outcome (an auth failure). SETTINGS: the
+    vendor's config entry (Claude checks its env_file there)."""
     check = getattr(ADAPTERS[vendor], "preflight", None)
-    return check() if check else None
+    return check(settings) if check else None
 
 
 def run(req, cooldown_hours=COOLDOWN_HOURS):
@@ -174,7 +176,7 @@ def run(req, cooldown_hours=COOLDOWN_HOURS):
         r = adapter.run(req)
         status, until = classify(req.vendor, r.rc, read(req.log), r.outcome, cooldown_hours)
     return RunResult(status, r.outcome, r.reply, r.usage, str(req.log), r.rc, r.rc in (124, 137), until,
-                     r.summary, adapter.reported_model(r))
+                     r.summary, adapter.reported_model(r), getattr(r, "denial", None))
 
 
 def main(argv=None):
@@ -190,7 +192,7 @@ def main(argv=None):
     r.add_argument("--network", choices=("on", "off"), default="")
     r.add_argument("--add-dir", dest="add_dirs", action="append", default=[])
     r.add_argument("--otel", action="store_true")
-    for name in ("model", "effort", "fallback-models", "output", "settings", "budget", "subagent-model", "repo", "shots-dir", "skills-dir"):
+    for name in ("model", "effort", "fallback-models", "output", "settings", "budget", "subagent-model", "repo", "scratch", "shots-dir", "skills-dir"):
         r.add_argument(f"--{name}", default="")
     r.add_argument("--cooldown-hours", type=int, default=COOLDOWN_HOURS)
     f = sub.add_parser("preflight")
@@ -225,7 +227,7 @@ def main(argv=None):
         print(json.dumps({"status": "failure", "outcome": f"RESULT: failed {reason}"}))
         return 1
     if a.command == "preflight":
-        outcome = preflight(a.vendor)
+        outcome = preflight(a.vendor, session.resolve().config.vendor(a.vendor))
         print(json.dumps({"status": "auth" if outcome else "success", "outcome": outcome or ""}))
         return 1 if outcome else 0
     options = {k: v for k, v in vars(a).items() if k not in ("command", "cooldown_hours")}

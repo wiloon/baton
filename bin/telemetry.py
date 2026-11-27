@@ -19,6 +19,7 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from baton import agents, maintenance, timing
+from baton.config import TIERS
 
 VENDORS = tuple(sorted(agents.CATALOG))
 CREDENTIAL_STALE_SECONDS = 24 * 60 * 60
@@ -524,7 +525,8 @@ class Ledger:
         # Never accept a filename from CLI or agent output.
         return self.root / 'runs' / (str(uuid.UUID(run_id)) + '.json')
 
-    def begin(self, vendor, role, pid, minutes, issue=0, pr=0, round_=0, *, repo, requested_model=''):
+    def begin(self, vendor, role, pid, minutes, issue=0, pr=0, round_=0, *, repo, requested_model='', tier='',
+              retry=''):
         if vendor not in agents.CATALOG or role not in ROLES or not 1 <= minutes <= 1440:
             raise ValueError('invalid bounded run metadata')
         declared = _declared_from_runner_config()
@@ -546,6 +548,10 @@ class Ledger:
             record['issue'] = issue
         if requested_model and MODEL_RE.fullmatch(requested_model):
             record['requested_model'] = requested_model
+        if tier in TIERS:
+            record['tier'] = tier
+        if retry == 'denied':
+            record['retry'] = retry
         if task:
             record['pipeline_id'] = task['pipeline_id']
         record.update(fingerprints(Path(__file__).parent))
@@ -641,7 +647,7 @@ def summary_payload(record):
              'status': record['status'],
              'usage_state': record['usage_state'], 'cost_state': 'unavailable',
              'duration_ms': int(max(0, record['ended'] - record['started']) * 1000)}
-    for key in ('pipeline_id', 'workflow_version', 'config_version', 'cli_version', 'requested_model', 'actual_model'):
+    for key in ('pipeline_id', 'workflow_version', 'config_version', 'cli_version', 'requested_model', 'actual_model', 'tier'):
         if key in record:
             attrs[key] = record[key]
     for key in ('issue', 'pr', 'round'):
@@ -1180,6 +1186,8 @@ def main():
         begin.add_argument(name, type=int)
     begin.add_argument('--repo', required=True)
     begin.add_argument('--requested-model', default='')
+    begin.add_argument('--tier', default='')
+    begin.add_argument('--retry', default='', choices=('', 'denied'))
     attempt = sub.add_parser('attempt')
     attempt.add_argument('pipeline')
     attempt.add_argument('attempt_id')
@@ -1225,7 +1233,8 @@ def main():
             parser.error('begin requires --runner-config')
         try:
             record = ledger.begin(args.vendor, args.role, args.pid, args.minutes, args.issue, args.pr, args.round,
-                                  repo=args.repo, requested_model=args.requested_model)
+                                  repo=args.repo, requested_model=args.requested_model, tier=args.tier,
+                                  retry=args.retry)
         except ValueError as error:
             parser.error(str(error))
         print(record['run_id'], record['trace_id'], record['span_id'], record.get('pipeline_id', ''))

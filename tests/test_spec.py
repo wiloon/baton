@@ -1331,10 +1331,10 @@ def test_same_vendor_denial_retry_publishes_only_the_verified_attempt(loop, monk
         model, outcome, rc = next(attempts)
         result = {"type": "result", "result": outcome}
         if rc:
-            Path(f"/tmp/baton-spec-{N}-1.body").write_text("Goal\nUnverified revision\n")
+            Path(loop.env["STATE"], "scratch", f"spec-{N}-1.body").write_text("Goal\nUnverified revision\n")
             result["permission_denials"] = [{"tool_name": "Bash", "tool_input": {"command": "wc -l /ctx/issue.md"}}]
         if outcome == "SPEC: revised":
-            Path(f"/tmp/baton-spec-{N}-1.comment").write_text("Verified reply")
+            Path(loop.env["STATE"], "scratch", f"spec-{N}-1.comment").write_text("Verified reply")
         message = {"type": "assistant", "parent_tool_use_id": None, "message": {"model": model}}
         log.write_text("\n".join(map(json.dumps, [message, result])))
         return rc
@@ -1388,8 +1388,8 @@ def test_claude_spec_revision_verifies_main_session_models(loop, monkeypatch, sp
         if not review and scenario == "ambiguous":
             events.append({**message, "message": {"model": review_model}})
         if not review:
-            Path(f"/tmp/baton-spec-{N}-{round}.body").write_text("Goal\nRevised step\n")
-            Path(f"/tmp/baton-spec-{N}-{round}.comment").write_text("done")
+            Path(loop.env["STATE"], "scratch", f"spec-{N}-{round}.body").write_text("Goal\nRevised step\n")
+            Path(loop.env["STATE"], "scratch", f"spec-{N}-{round}.comment").write_text("done")
         events.append({"type": "result", "result": "SPEC: changes" if review else "SPEC: revised",
                        "modelUsage": {model: {}, "claude-haiku-4-5": {}}})
         log.write_text("\n".join(map(json.dumps, events)))
@@ -1423,8 +1423,6 @@ def test_claude_spec_revision_verifies_main_session_models(loop, monkeypatch, sp
     else:
         assert not replies
         assert loop.gh.body == "Goal\nOld step\n"
-        for artifact in Path("/tmp").glob(f"baton-spec-{N}-{round}.*"):
-            artifact.unlink()
     refused = scenario in ("fallback", "fallback snapshot", "unknown", "ambiguous")
     spec_handoffs("spec_reviser_model_unverified" if refused else None)
 
@@ -1497,8 +1495,8 @@ def test_a_revision_after_a_retried_review_runs_on_the_reviewers_other_model(loo
         review = len(calls) == 1
         model = opus if review else sonnet
         if not review:
-            Path(f"/tmp/baton-spec-{N}-1.body").write_text("Goal\nRevised step\n")
-            Path(f"/tmp/baton-spec-{N}-1.comment").write_text("done")
+            Path(loop.env["STATE"], "scratch", f"spec-{N}-1.body").write_text("Goal\nRevised step\n")
+            Path(loop.env["STATE"], "scratch", f"spec-{N}-1.comment").write_text("done")
         log.write_text("\n".join(map(json.dumps, [
             {"type": "system", "subtype": "init", "model": model},
             {"type": "assistant", "parent_tool_use_id": None, "message": {"model": model}},
@@ -1564,7 +1562,7 @@ def test_codex_spec_fallback_verifies_actual_model_at_cli(loop, monkeypatch, spe
                 {"type": "turn_context", "payload": {"model": model}}))
         if revision:
             work = next(s.wt.glob(".baton-codex-*"))
-            (work / f"baton-spec-{N}-2.comment").write_text("done")
+            (work / f"spec-{N}-2.comment").write_text("done")
         Path(args[args.index("--output-last-message") + 1]).write_text(
             "SPEC: revised" if revision else "SPEC: changes")
         return 0
@@ -1583,8 +1581,6 @@ def test_codex_spec_fallback_verifies_actual_model_at_cli(loop, monkeypatch, spe
         assert f"same-vendor-different-model (codex/{base} after codex/{other})" in posted[0]
     else:
         assert not posted
-        for artifact in Path("/tmp").glob(f"baton-spec-{N}-2.*"):
-            artifact.unlink()
     refused = scenario in ("reported unknown", "fallback identical")
     unverified = "spec_reviser_model_unverified" if revision else "spec_reviewer_model_unverified"
     spec_handoffs(unverified if refused else None)
@@ -2733,7 +2729,7 @@ def test_a_deferred_reply_keeps_the_loops_limit_and_leaves_no_temp_files(loop, m
     limit = max(int(session.resolve(loop.env).config.scheduling.max_spec_rounds or 3), 2)
     saved = handoff.load_retry(session.resolve(loop.env), N, "spec_reply_post_failed")
     assert saved["continuation"]["max_rounds"] == limit
-    assert not list(Path("/tmp").glob(f"baton-spec-{N}-1.*"))
+    assert not list(Path(loop.env["STATE"], "scratch").glob(f"spec-{N}-1.*"))
 
 
 @pytest.mark.parametrize("action", ["handoff", "extra_round"])
@@ -4265,13 +4261,34 @@ def test_claude_after_claude_takes_the_route_whose_model_differs(tmp_path, monke
     from types import SimpleNamespace
     routes = {("spec_review", False): "opus", ("spec_review", True): "sonnet",
               ("spec", False): "opus", ("spec", True): "sonnet"}
-    models = SimpleNamespace(route=lambda role, vendor, followup=False: SimpleNamespace(model=routes[(role, followup)]))
-    fake = SimpleNamespace(env=SimpleNamespace(config=SimpleNamespace(models=models)))
+    models = SimpleNamespace(route=lambda role, vendor, followup=False, tier="standard":
+                             SimpleNamespace(model=routes[(role, followup)]))
+    fake = SimpleNamespace(env=SimpleNamespace(config=SimpleNamespace(models=models),
+                                               runtime=SimpleNamespace(tiers={"spec_review": "standard",
+                                                                              "spec": "standard"})), issue=N)
     pick_route = lambda *args: spec.Spec.alternating_followup(fake, "claude", *args)
     assert pick_route("spec_review", True, "claude-sonnet-5-5") is False   # Sonnet wrote it: review on Opus
     assert pick_route("spec_review", False, "claude-sonnet-5-5") is False
     assert pick_route("spec", False, "claude-opus-5-5") is True             # Opus reviewed: revise on Sonnet
     assert pick_route("spec", True, "claude-opus-5-5") is True
+
+
+def test_alternating_followup_compares_the_tier_route_with_the_follow_up_route():
+    """#237: a Sonnet tier route counts as Sonnet, whatever the standard route runs."""
+    from types import SimpleNamespace
+
+    def route(role, vendor, followup=False, tier="standard"):
+        return SimpleNamespace(model="sonnet" if followup else {"light": "sonnet", "standard": "opus"}[tier])
+
+    def pick_route(tier, other_model):
+        fake = SimpleNamespace(env=SimpleNamespace(config=SimpleNamespace(models=SimpleNamespace(route=route)),
+                                                   runtime=SimpleNamespace(tiers={"spec_review": tier})), issue=N)
+        return spec.Spec.alternating_followup(fake, "claude", "spec_review", False, other_model)
+
+    assert pick_route("standard", "claude-sonnet-5-5") is False   # Opus differs: the preferred route
+    assert pick_route("light", "claude-sonnet-5-5") is False      # both candidates are Sonnet
+    assert pick_route("light", "claude-opus-5-5") is False
+    assert pick_route("standard", "claude-opus-5-5") is True
 
 
 # --- spec same-vendor policy and Stub on the spec path (#114) -------------------------------
@@ -4363,3 +4380,222 @@ def test_stub_end_line_model_reads_the_logged_model_field():
     from baton import stub_cli
     assert stub_cli.end_line_model(["revised", "model=stub-model-1"]) == "stub-model-1"
     assert stub_cli.end_line_model(["revised"]) == ""
+
+
+# --- the saved other-vendor retry keeps the same-vendor last resort (#329) ----------------------
+
+MAIN_MODELS = {"opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5-5"}
+FAILED = {**CHANGES, "rc": 1, "status": "failure", "outcome": "RESULT: failed Agy actions denied by the allowlist (1)"}
+
+
+class SavedRetry:
+    """Spec steps through the real pick and recovery; only the worker run, the advisor, vendor
+    availability and GitHub are faked."""
+
+    def __init__(self, loop, *, review_by="codex", reply_by="claude", reply_model="sonnet", review_model=""):
+        self.loop = loop
+        loop.gh.labels = {"needs-triage", "agent-wip"}
+        loop.gh.comments = [{"author": {"login": "owner"}, "body": f"<!-- baton-spec-{kind} round=1 by={by} -->\nx"}
+                            for kind, by in (("review", review_by), ("reply", reply_by)) if by]
+        lines = []
+        if reply_model:
+            lines.append(f"end issue-{N}-spec-reply-1 rc=0 claude_model={MAIN_MODELS[reply_model]} SPEC: revised")
+        if review_model:
+            lines.append(f"end issue-{N}-spec-1 rc=0 claude_model={MAIN_MODELS[review_model]} SPEC: changes")
+        runner_log(loop, lines)
+        self.context = Path(loop.env["CTX"], "issue.md")
+        self.context.write_text("issue")
+        assert self.spec().worktree()
+
+    def spec(self):
+        env = session.resolve(self.loop.env)
+        return spec.Spec(env, spec.telemetry.from_env(env, issue=N), N)
+
+    def review(self):
+        s = self.spec()
+        return s.review_round(2, 6, self.context, s.issue_payload())
+
+    def block(self, *vendors, seconds=86400):
+        for vendor in vendors:
+            Path(self.loop.env["STATE"], f"{vendor}-cooldown-until").write_text(str(int(time.time()) + seconds))
+
+    def free(self, *vendors):
+        for vendor in vendors:
+            Path(self.loop.env["STATE"], f"{vendor}-cooldown-until").unlink()
+
+    def model(self, route="spec_review"):
+        """The model alias the last dispatch asked for."""
+        run = self.loop.runs[-1]
+        models = session.resolve(self.loop.env).config.models
+        return models.route(route, run["vendor"], followup=run["followup"]).model
+
+    def worker(self, step=CHANGES, *, route="spec_review", before=None):
+        """A scripted run: BEFORE changes availability while it runs; a Claude run reports its model."""
+        def run(vendor, output, cwd):
+            if before:
+                before()
+            done = step(vendor, output, cwd) if callable(step) else step
+            return {**done, "model": MAIN_MODELS[self.model(route)] if vendor == "claude" else ""}
+        return run
+
+    def ran(self):
+        return [run["vendor"] for run in self.loop.runs]
+
+    def saved(self):
+        return json.loads(Path(self.loop.env["STATE"], f"recovery-{N}-{N}.json").read_text())
+
+
+def other_vendor(reason="spec_review_run_failed"):
+    return {"action": "retry_step_other_vendor", "reason": "try another vendor",
+            "evidence": [f"Decision point: {reason}"]}
+
+
+def assert_same_vendor_review(retry):
+    assert retry.model() == "opus"   # not the revision's Sonnet
+    posted, = retry.loop.gh.posted("<!-- baton-spec-review round=2 by=claude -->")
+    assert "Review mode: same-vendor-different-model (claude after claude)." in posted
+
+
+def test_the_granted_other_vendor_review_runs_on_the_last_resort_in_the_same_tick(advised, spec_handoffs):
+    retry = SavedRetry(advised)
+    retry.block("codex")
+    advised.script = [retry.worker(FAILED), retry.worker()]
+    advised.advice = [other_vendor()]
+    assert retry.review() == "changes"
+    assert retry.ran() == ["cursor", "claude"]
+    assert_same_vendor_review(retry)
+    spec_handoffs(None)
+
+
+def deferred_retry(advised, retry):
+    """The first reviewer (the extra vendor) fails, the grant is saved and the pick defers,
+    Claude being blocked for a moment too."""
+    retry.block("codex")
+    advised.script = [retry.worker(FAILED, before=lambda: retry.block("claude", seconds=60))]
+    advised.advice = [other_vendor()]
+    with pytest.raises(Deferred):
+        retry.review()
+    assert retry.ran() == ["cursor"]
+    record = retry.saved()
+    assert (record["action"], record["failed_vendor"], record["exclusions"], record["role"], record["reason"],
+            record["fingerprint"]["round"], record["state"]) == (
+        "retry_step_other_vendor", "cursor", ["claude"], "spec_reviewer", "spec_review_run_failed", "2", "granted")
+    assert "selected_vendor" not in record
+    retry.free("claude")
+
+
+def test_a_saved_other_vendor_review_resumes_on_the_last_resort(advised, spec_handoffs):
+    retry = SavedRetry(advised)
+    deferred_retry(advised, retry)
+    advised.script = [retry.worker()]
+    assert retry.review() == "changes"
+    assert retry.ran() == ["cursor", "claude"] and len(advised.advice_calls) == 1
+    assert_same_vendor_review(retry)
+    spec_handoffs(None)
+
+
+def test_a_resumed_last_resort_review_takes_the_followup_route(advised, spec_handoffs):
+    retry = SavedRetry(advised, reply_model="opus")   # revised on the base `spec` route
+    deferred_retry(advised, retry)
+    advised.script = [retry.worker()]
+    assert retry.review() == "changes"
+    assert retry.ran() == ["cursor", "claude"] and retry.model() == "sonnet"
+    assert advised.gh.posted("<!-- baton-spec-review round=2 by=claude -->")
+    spec_handoffs(None)
+
+
+def test_a_last_resort_review_interrupted_by_a_short_block_resumes_on_it(advised, spec_handoffs):
+    retry = SavedRetry(advised)
+    retry.block("codex")
+    advised.script = [retry.worker(FAILED), {"rc": 75, "defer": "quota", "outcome": "", "reply": "", "model": ""}]
+    advised.advice = [other_vendor()]
+    with pytest.raises(Deferred):
+        retry.review()
+    assert retry.saved()["selected_vendor"] == "claude"
+    advised.script = [retry.worker()]
+    assert retry.review() == "changes"
+    assert retry.ran() == ["cursor", "claude", "claude"]
+    assert_same_vendor_review(retry)
+    spec_handoffs(None)
+
+
+def test_a_saved_retry_with_an_unknown_revision_model_is_deferred(advised, spec_handoffs):
+    retry = SavedRetry(advised, reply_model="")
+    retry.block("codex")
+    advised.script = [retry.worker(FAILED)]
+    advised.advice = [other_vendor()]
+    with pytest.raises(Deferred, match="no vendor can run now"):
+        retry.review()
+    assert retry.ran() == ["cursor"] and not advised.gh.posted("<!-- baton-spec-review round=2")
+    spec_handoffs(None)
+
+
+def test_a_saved_retry_prefers_a_free_independent_vendor(advised, spec_handoffs):
+    retry = SavedRetry(advised)
+    retry.block("codex")
+    advised.script = [retry.worker(FAILED, before=lambda: retry.free("codex")), retry.worker()]
+    advised.advice = [other_vendor()]
+    assert retry.review() == "changes"
+    assert retry.ran() == ["cursor", "codex"]
+    posted, = advised.gh.posted("<!-- baton-spec-review round=2 by=codex -->")
+    assert "same-vendor" not in posted
+    spec_handoffs(None)
+
+
+def test_a_saved_retry_waits_for_a_short_blocked_vendor(advised, spec_handoffs):
+    retry = SavedRetry(advised)
+    retry.block("codex", seconds=60)
+    advised.script = [retry.worker(FAILED)]
+    advised.advice = [other_vendor()]
+    with pytest.raises(Deferred, match="waiting for codex .* instead of same-vendor claude"):
+        retry.review()
+    assert retry.ran() == ["cursor"]
+    spec_handoffs(None)
+
+
+def test_a_saved_retry_never_picks_the_failed_vendor_also_when_excluded(advised, spec_handoffs):
+    retry = SavedRetry(advised)
+    retry.block("codex", "cursor")
+    advised.script = [retry.worker(FAILED)]   # Claude, already the last resort
+    advised.advice = [other_vendor()]
+    with pytest.raises(Deferred, match="no vendor can run now"):
+        retry.review()
+    record = retry.saved()
+    assert record["failed_vendor"] == "claude" and record["exclusions"] == ["claude"]
+    with pytest.raises(Deferred, match="no vendor can run now"):
+        retry.review()
+    assert retry.ran() == ["claude"]
+    spec_handoffs(None)
+
+
+def test_a_saved_retry_with_no_independent_vendor_left_hands_off(advised, spec_handoffs):
+    retry = SavedRetry(advised)
+    deferred_retry(advised, retry)
+    advised.env["VENDOR_POOL"] = "claude"   # Codex has left the config; Cursor is the failed vendor
+    advised.advice = [{"action": "handoff", "reason": "needs the owner", "evidence": []}]
+    assert retry.review() == "stop"
+    assert retry.ran() == ["cursor"]
+    spec_handoffs("spec_review_run_failed")
+
+
+def test_a_saved_other_vendor_revision_runs_on_the_last_resort(advised, spec_handoffs):
+    retry = SavedRetry(advised, review_by="claude", reply_by="", reply_model="", review_model="opus")
+    retry.block("claude", "codex")
+    s = retry.spec()
+    inputs = s.issue_payload()
+    advised.advice = [other_vendor("spec_revision_run_failed")]
+    # The failed reviser is not in this pool: save its grant through the runner's own writer.
+    with pytest.raises(Deferred):
+        s.recover_worker("agy spec run failed", "spec_revision_run_failed", "agy", "RESULT: failed",
+                         role="reviser", round_s="1", issue_body=inputs["body"], listed=inputs["comments"],
+                         last_vendor="claude", other_model=MAIN_MODELS["opus"],
+                         budget={"denied_spent": False, "denied_command": ""})
+    assert retry.saved()["exclusions"] == ["claude"] and not advised.runs
+    retry.free("claude")
+    advised.script = [retry.worker(reviser(body="Goal\nRevised step\n"), route="spec")]
+    s = retry.spec()
+    assert s.revise_round(1, retry.context, s.issue_payload()) == "revised"
+    assert retry.ran() == ["claude"] and retry.model("spec") == "sonnet"   # not the review's Opus
+    reply, = advised.gh.posted("<!-- baton-spec-reply round=1 by=claude -->")
+    assert "Revision mode: same-vendor-different-model (claude after claude)." in reply
+    spec_handoffs(None)

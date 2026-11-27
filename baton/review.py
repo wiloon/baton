@@ -24,7 +24,7 @@ import sys
 import time
 from typing import NamedTuple
 
-from . import advisor, agents, check_verdicts, checkpoint, checks as check_section, design_findings, dispatch, fix, handoff as owner_handoff, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, vendors
+from . import advisor, agents, check_verdicts, checkpoint, checks as check_section, design_findings, dispatch, fix, handoff as owner_handoff, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, scratch, tiers, vendors
 from .common import Deferred, Exhausted, changed, git, restore, strip_markers
 from . import recovery as task_recovery
 
@@ -932,11 +932,13 @@ class Review:
         head = git(wt, "rev-parse", "HEAD") or ""
         if not self.seed():
             return self.failed("review_author_state_failed", "RESULT: failed recording PR authors")
+        self.env = tiers.carry(self.env, "review", self.issue, pr)
         if reviewer is None:
             reviewer = self.review_vendor("pool")
         self.values.update(round=round, step="review", reviewer=reviewer)
         followup = self.review_followup(round, reviewer)
-        expected = self.env.config.models.route("review", reviewer, followup=followup).model
+        tier = tiers.step(self.env, "review", self.issue, pr)
+        expected = self.env.config.models.route("review", reviewer, followup=followup, tier=tier).model
         if not self.review_allowed(reviewer, expected):
             return self.failed(ALREADY, "RESULT: failed reviewer model may be a PR author")
         numstat = git(wt, "diff", "--numstat", "origin/main...HEAD") or ""
@@ -959,8 +961,10 @@ class Review:
                      "runner artifact.\n</runner-preflight>\n")
         context.write_text(text)
         adapter = agents.ADAPTERS[reviewer]
-        review_file = None if adapter.REVIEW_DELIVERY == "reply" else Path(f"/tmp/baton-review-{pr}-{round}.md")
-        fields = {"PR": str(pr), "ISSUE": self.issue or "unknown", "GH_REPO": self.repo, "WORKTREE": str(wt),
+        review_file = None if adapter.REVIEW_DELIVERY == "reply" else scratch.path(self.env.dirs, "review", pr, round)
+        # First, so the path is filled in before any untrusted value could carry the placeholder.
+        path_field = {} if review_file is None else {"REVIEW_FILE": str(review_file)}
+        fields = {**path_field, "PR": str(pr),"ISSUE": self.issue or "unknown", "GH_REPO": self.repo, "WORKTREE": str(wt),
                   "ROUND": str(round), "MAX_ROUNDS": str(self.max_rounds), "ROUND_NOTE": note,
                   "CONTEXT_FILE": str(context), "NIT_RULE": nit_rule(self.repo, self.issue)}
         runtime = self.env.with_runtime(review_followup=followup)
@@ -1038,7 +1042,7 @@ class Review:
         limit = int(self.env.config.scheduling.review_context_max_chars or 20000)
         context = Path(self.ctx, f"pr-{pr}-screenshot-review-{round}-{time.strftime('%Y%m%d-%H%M%S')}.md")
         context.write_text(issue_context(self.env, self.issue) if re.fullmatch(r"\d+", str(self.issue or "")) else "")
-        review_file = Path(f"/tmp/baton-screenshot-review-{pr}-{round}.md")
+        review_file = scratch.path(self.env.dirs, "screenshot-review", pr, round)
         review_file.unlink(missing_ok=True)
         if agents.ADAPTERS[vendor].SCREENSHOT_DELIVERY == "final_message":
             delivery = "Include the full review in your final message, above the verdict line."
@@ -1185,6 +1189,7 @@ class Review:
             self.binding_fields = {}
             self.design, self.design_unusable = [], False
             self.shot_round, self.design_only, self.loop_id = 0, False, self.new_loop_id()
+        self.env = tiers.carry(self.env, "review", self.issue, pr)
         pending_post = self.post_pending()
         screenshot_post = self.screenshot_post_pending()
         cfg = self.env.config
@@ -1459,7 +1464,7 @@ class Review:
                 if resuming_fix and self.seed():
                     self.seed_contrib()
                 if not task_recovery.pending_fix(self.env, self.issue or pr, pr):
-                    fixer = pick.choose(self.env, "fixer", fixer, "contrib", self.vendors(), pr=str(pr),
+                    fixer = pick.choose(runner.env, "fixer", fixer, "contrib", self.vendors(), pr=str(pr),
                                         exclude=exclude, issue=self.issue)
                 self.values["fixer"] = fixer
                 self.save()

@@ -57,7 +57,8 @@ def test_each_repository_has_its_own_directories_under_the_runners_roots(tmp_pat
     assert shop == config.RepoDirs(clone=home / "baton/repos/acme/shop", worktrees=home / "baton/worktrees/acme/shop",
                                    state=home / ".local/state/baton/repos/acme/shop",
                                    logs=home / ".local/state/baton/logs/acme/shop",
-                                   ctx=home / ".local/state/baton/ctx/acme/shop")
+                                   ctx=home / ".local/state/baton/ctx/acme/shop",
+                                   scratch=home / ".local/state/baton/repos/acme/shop/scratch")
     assert not set(vars(app).values()) & set(vars(shop).values())
 
 
