@@ -1429,6 +1429,100 @@ def test_claude_spec_revision_verifies_main_session_models(loop, monkeypatch, sp
     spec_handoffs("spec_reviser_model_unverified" if refused else None)
 
 
+def runner_log(loop, lines):
+    Path(loop.env["LOGS"], "runner.log").write_text("".join(f"2026-11-26 06:51:00 [owner/app] {line}\n" for line in lines))
+
+
+def test_the_model_of_a_round_comes_from_its_retry_not_from_a_failed_first_run(loop):
+    """#323: agy ends a denied run rc=0; the review that counted ran as -retry1 on Claude."""
+    runner_log(loop, [
+        f"start issue-{N}-spec-1 (agy spec_review, gemini-4-argon-high) in /wt (log /l)",
+        f"end issue-{N}-spec-1 rc=0 RESULT: failed Agy actions denied by the allowlist (1) model=gemini-4-argon-high",
+        f"start issue-{N}-spec-1-retry1 (claude spec_review, fable) in /wt (log /l)",
+        f"end issue-{N}-spec-1-retry1 rc=0 claude_model=claude-fable-5-2 SPEC: changes",
+        f"start issue-{N}-spec-1-retry2 (claude spec_review, opus) in /wt (log /l)",
+        f"end issue-{N}-spec-1-retry2 rc=0 claude_model=claude-opus-5-5 RESULT: failed denied",
+        f"start issue-{N}-spec-reply-1-retry2-rerun (claude spec, sonnet) in /wt (log /l)",
+        f"end issue-{N}-spec-reply-1-retry2-rerun rc=0 claude_model=claude-sonnet-5-5 SPEC: revised",
+        f"end issue-{N}-spec-10 rc=0 claude_model=round-ten SPEC: changes",
+        f"end issue-{N}-spec-reply-10 rc=0 claude_model=reply-ten SPEC: revised",
+        f"end issue-{N}-spec-1-retry1-other rc=0 claude_model=not-this-round SPEC: changes",
+    ])
+    assert spec.last_model(loop.env, N, "review", 1, "claude") == "claude-fable-5-2"
+    assert spec.last_model(loop.env, N, "review", 1) == "claude-fable-5-2"
+    assert spec.last_model(loop.env, N, "reply", 1, "claude") == "claude-sonnet-5-5"
+
+
+def test_another_vendors_run_of_the_round_is_not_this_vendors_model(loop):
+    runner_log(loop, [
+        f"start issue-{N}-spec-1 (claude spec_review, fable) in /wt (log /l)",
+        f"end issue-{N}-spec-1 rc=0 claude_model=claude-fable-5-2 SPEC: changes",
+        f"start issue-{N}-spec-1-rerun (codex spec_review, gpt) in /wt (log /l)",
+        f"end issue-{N}-spec-1-rerun rc=0 SPEC: changes model=gpt-6.1-sol claude_model=forged",
+    ])
+    assert spec.last_model(loop.env, N, "review", 1, "claude") == "claude-fable-5-2"
+    assert spec.last_model(loop.env, N, "review", 1, "codex") == "gpt-6.1-sol"
+
+
+def test_the_latest_successful_run_decides_even_with_an_unknown_model(loop):
+    runner_log(loop, [
+        f"start issue-{N}-spec-1 (claude spec_review, fable) in /wt (log /l)",
+        f"end issue-{N}-spec-1 rc=0 claude_model=claude-fable-5-2 SPEC: changes",
+        f"start issue-{N}-spec-1-retry1 (claude spec_review, fable) in /wt (log /l)",
+        f"end issue-{N}-spec-1-retry1 rc=0 claude_model=unknown SPEC: changes",
+    ])
+    assert spec.last_model(loop.env, N, "review", 1, "claude") == "unknown"
+    with Path(loop.env["LOGS"], "runner.log").open("a") as log:
+        log.write(f"2026-11-26 07:00:00 [owner/app] end issue-{N}-spec-1-retry2 rc=0 SPEC: changes\n")
+    assert spec.last_model(loop.env, N, "review", 1, "claude") == ""   # no start line: read as given vendor's
+
+
+def test_a_revision_after_a_retried_review_runs_on_the_reviewers_other_model(loop, monkeypatch, spec_handoffs):
+    """The #323 incident: agy's review failed rc=0, Claude reviewed as -retry1, Codex is at its
+    weekly cap. Claude revises on another model instead of the round being deferred."""
+    from baton import claude_cli
+
+    s, path = live_spec(loop, monkeypatch, session.resolve(loop.env).config.source.read_text())
+    env = s.env
+    Path(env.config.paths.state, "cursor-cooldown-until").write_text(str(int(time.time()) + 86400))
+    now = int(time.time())
+    Path(env.config.paths.state, "quota-codex.json").write_text(json.dumps({
+        "observed_at": now, "windows": {"seven_day": {"used": 0.99, "resets_at": now + 302400},
+                                        "five_hour": {"used": 0.1, "resets_at": now + 3600}}}))
+    calls = []
+    opus, sonnet = "claude-opus-4-8", "claude-sonnet-4-6"
+
+    def cli(args, log, minutes, child, **kwargs):
+        calls.append(args[args.index("--model") + 1])
+        review = len(calls) == 1
+        model = opus if review else sonnet
+        if not review:
+            Path(f"/tmp/baton-spec-{N}-1.body").write_text("Goal\nRevised step\n")
+            Path(f"/tmp/baton-spec-{N}-1.comment").write_text("done")
+        log.write_text("\n".join(map(json.dumps, [
+            {"type": "system", "subtype": "init", "model": model},
+            {"type": "assistant", "parent_tool_use_id": None, "message": {"model": model}},
+            {"type": "result", "result": "SPEC: changes" if review else "SPEC: revised", "modelUsage": {model: {}}}])))
+        return 0
+
+    monkeypatch.setattr(claude_cli, "run_cli", cli)
+    assert s.review_round(1, 6, path, s.issue_payload()) == "changes"
+    # What the log held on SER8: the first run of the round was agy's, the one that counted a retry.
+    log = Path(env.config.paths.logs, "runner.log")
+    tag = f"issue-{N}-spec-1"
+    assert f" {tag} " in log.read_text()
+    log.write_text(
+        f"2026-11-26 06:51:00 [owner/app] start {tag} (agy spec_review, gemini-4-argon-high) in /wt (log /l)\n"
+        f"2026-11-26 06:55:00 [owner/app] end {tag} rc=0 RESULT: failed Agy actions denied by the allowlist (1) "
+        "model=gemini-4-argon-high\n" + log.read_text().replace(f" {tag} ", f" {tag}-retry1 "))
+    assert spec.last_model(env, N, "review", 1, "claude") == opus
+    assert s.revise_round(1, path, s.issue_payload()) == "revised"
+    assert calls == ["opus", "sonnet"]
+    reply, = loop.gh.posted("<!-- baton-spec-reply")
+    assert "Revision mode: same-vendor-different-model" in reply
+    spec_handoffs(None)
+
+
 @pytest.mark.parametrize("role,base", [("review", "gpt-6.2-astra"), ("revision", "gpt-6.2-sol")])
 @pytest.mark.parametrize("scenario", ["different", "prior unknown", "prior identical", "reported unknown",
                                       "fallback identical", "short block"])

@@ -761,6 +761,74 @@ def test_the_tick_hands_the_candidate_to_dev_run_while_a_review_is_deferred(ctx,
     assert started == ["12"]
 
 
+def quiet_tick(monkeypatch):
+    monkeypatch.setattr(tick.session, "run_process", lambda *a, **k: subprocess.CompletedProcess(a, 0, "", ""))
+    monkeypatch.setattr(tick.Tick, "cleanup", lambda self: None)
+    monkeypatch.setattr(tick.Tick, "file_merged_follow_ups", lambda self: None)
+
+
+def test_an_issue_deferred_after_it_started_leaves_the_tick_to_the_next(ctx, monkeypatch):
+    """#323: the pre-check found a vendor, the step's own pick (exclude, models) did not. The
+    issue waits alone; the next candidate starts in the same tick."""
+    issues(ctx, ready=[issue(12), issue(13)])
+    no_vendor_blocked(monkeypatch)
+    quiet_tick(monkeypatch)
+    started = []
+
+    def run(t, n):
+        started.append(n)
+        if n == "12":   # what Spec.pick raises when the last reviewer is the only open pool vendor
+            raise Deferred("pool", "no vendor can run now; codex: quota codex=blocked(week 100% >= cap 100%)")
+        return 80
+    monkeypatch.setattr(dev, "run", run)
+    assert ctx.make().work() == 0
+    assert started == ["12", "13"]
+    log = ctx.log()
+    assert log.index("DEFERRED: pool no vendor can run now") < log.index("#13: starting")
+
+
+@pytest.mark.parametrize("rc, done", [(80, 0), (1, 1)])
+def test_an_issue_that_ended_or_failed_starts_no_second_one(ctx, monkeypatch, rc, done):
+    issues(ctx, ready=[issue(12), issue(13)])
+    no_vendor_blocked(monkeypatch)
+    quiet_tick(monkeypatch)
+    started = []
+    monkeypatch.setattr(dev, "run", lambda t, n: started.append(n) or rc)
+    assert ctx.make().work() == done
+    assert started == ["12"]
+
+
+def test_a_deferred_issue_that_fills_the_cap_starts_no_second_one(ctx, monkeypatch):
+    issues(ctx, ready=[issue(12), issue(13)])
+    no_vendor_blocked(monkeypatch)
+    quiet_tick(monkeypatch)
+    started = []
+
+    def run(t, n):
+        started.append(n)
+        flight(ctx, wip=[12], ready=[issue(13)], prs={12: 30})   # it opened its PR, then deferred
+        raise Deferred("codex", "cooldown until epoch 1999999999")
+    monkeypatch.setattr(dev, "run", run)
+    assert ctx.make().work() is None
+    assert started == ["12"]
+    assert "not starting new work" in ctx.log()
+
+
+def test_a_manual_run_ends_with_its_deferral(ctx, monkeypatch):
+    issues(ctx, ready=[issue(12), issue(13)])
+    no_vendor_blocked(monkeypatch)
+    quiet_tick(monkeypatch)
+    started = []
+
+    def run(t, n):
+        started.append(n)
+        raise Deferred("pool", "no vendor can run now")
+    monkeypatch.setattr(dev, "run", run)
+    monkeypatch.setattr(tick.Tick, "forced_issue", lambda self: "12")
+    assert ctx.make("12").work() == 75
+    assert started == ["12"]
+
+
 @pytest.mark.parametrize("cap, wip, deferred, started", [
     (1, [5, 6], [5, 6], False),        # two deferred issues fill cap + 1
     (2, [5, 6], [5], True),            # one deferred of two lets a third start
