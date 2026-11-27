@@ -179,6 +179,7 @@ def test_needs_info_marker_from_fix_pr_keeps_the_earlier_decision(
         run, ctx, worktree, monkeypatch, fixer):
     """The marker comes from production posting (Claude/Codex or Cursor), not a fixture."""
     if fixer == "cursor":
+        ctx.gh.answers["pr view"] = {"headRefName": "cursor/issue-419"}
         run.agent(cursor_plan("1. Which option?\nRESULT: needs-info", commit=False,
                               outcome="RESULT: needs-info"))
     else:
