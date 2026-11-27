@@ -358,7 +358,13 @@ The units assume the checkout is at `~/baton` and uv at `/usr/bin/uv`; adjust `E
 quota probe retry settings, and `[[repos]]` `auto_merge` are optional. The repository's `auto_merge` defaults to `true`. Set it to `false` to keep
 that repository's PRs for manual merging. `owner_review_paths` (globs, default empty) keeps only the PRs that touch those files for the owner, after review and CI pass. Edit the `[[repos]]` entry, declare your installed vendors under `[vendors.<id>]`, and
 choose whether `[scheduling].auto_merge` should be enabled. The optional
-`[linear]` and `[telegram]` tables are at the end of the file.
+`[linear]` and `[telegram]` tables are at the end of the file. Their keys, like `DEEPSEEK_API_KEY`
+and `CLAUDE_CODE_OAUTH_TOKEN`, come from the runner's environment or from a mode 0600 env file
+(`[linear] env_file`, `[telegram] env_file`, `[advisor] env_file`, `[vendors.claude] env_file`)
+and never reach other tools. `CLAUDE_CODE_OAUTH_TOKEN` is the one-year login `claude setup-token`
+prints; set `[vendors.claude] env_file` (e.g. `~/.config/baton/claude.env`) and only the `claude`
+processes baton starts (runs, quota probes, the retrospective analyst, the advisor) get it. A file
+others can read stops Claude as an auth failure. Without it, Claude uses its stored `/login`.
 
 Define model identifiers in `[models.aliases]` and reference those aliases in
 `[models.routes.<role>]` for each vendor. An optional `<role>_followup` entry replaces the

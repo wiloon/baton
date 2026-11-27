@@ -164,6 +164,7 @@ class Vendor:
     fallback_models: tuple[str, ...] = ()
     cache_dirs: tuple[Path, ...] = ()
     quota_probe_model: str = ""
+    env_file: Path | None = None   # claude: CLAUDE_CODE_OAUTH_TOKEN for its runs only (#255)
 
 
 @dataclass(frozen=True)
@@ -526,7 +527,7 @@ def _load_vendors(raw, directory, home, aliases):
         if quota == "pool" and "seven_day" not in agents.ADAPTERS[adapter].QUOTA_WINDOWS:
             raise ConfigError(f"{label}.quota: pool vendors need a weekly quota window")
         extra = set(entry) - {"adapter", "roles", "quota", "cap", "max_minutes", "five_hour_max",
-                              "fallback_models", "cache_dirs", "quota_probe_model"}
+                              "fallback_models", "cache_dirs", "quota_probe_model", "env_file"}
         if extra:
             raise ConfigError(f"{label}: unknown fields: {', '.join(sorted(extra))}")
         cli = agents.ADAPTERS[adapter]
@@ -534,6 +535,7 @@ def _load_vendors(raw, directory, home, aliases):
             "fallback_models": "fallback_models" in cli.CONFIG_FIELDS,
             "cache_dirs": "cache_dirs" in cli.CONFIG_FIELDS,
             "quota_probe_model": "quota_probe_model" in cli.CONFIG_FIELDS,
+            "env_file": "env_file" in cli.CONFIG_FIELDS,
         }
         for field, supported in adapter_fields.items():
             if field in entry and not supported:
@@ -549,8 +551,13 @@ def _load_vendors(raw, directory, home, aliases):
         probe = entry.get("quota_probe_model", "")
         if cli.PROBE_SENDS_MODEL or probe:
             probe = _model_alias(probe, aliases, f"{label}.quota_probe_model")
+        env_file = entry.get("env_file")
+        if env_file is not None:
+            if type(env_file) is not str or not env_file.strip():
+                raise ConfigError(f"{label}.env_file: expected a path")
+            env_file = _path(env_file, directory, home)
         vendors.append(Vendor(vendor_id, adapter, tuple(roles), quota, float(cap), max_minutes,
-                              five_hour_max, fallback, cache, probe))
+                              five_hour_max, fallback, cache, probe, env_file))
     if len({v.id for v in vendors}) != len(vendors):
         raise ConfigError("vendors: each vendor id may be configured once")
     return tuple(vendors)
