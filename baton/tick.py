@@ -43,7 +43,7 @@ import sys
 import tempfile
 import time
 
-from . import advisor, after_merge, agents, checkpoint, dev, fix, handoff as owner_handoff, hooks as telemetry, maintenance, merge, names, notify, pick, pr as pr_helpers, pr_contract, review, scan, spec, statefile, tmp_sweep, vendors
+from . import advisor, after_merge, agents, checkpoint, dev, fix, handoff as owner_handoff, hooks as telemetry, maintenance, merge, names, notify, pick, pr as pr_helpers, pr_contract, review, scan, spec, statefile, tiers, tmp_sweep, vendors
 from .common import Deferred, git
 
 AGENT_REVIEW_NOTE = ("The PR description{issue} give the problem, its cause and the fix. Check the diagnosis first: does the "
@@ -288,9 +288,9 @@ class Tick:
         loop = review.Review(self.env.with_runtime(issue=issue), self.hooks(issue, pr), pr, wt, issue, fixed_by)
         return loop.loop(note, fixer, reviewer)
 
-    def fix_pr(self, pr, wt, fixer, source, feedback, issue="", head="", *, owner_triggered=False):
+    def fix_pr(self, pr, wt, fixer, source, feedback, issue="", head="", *, owner_triggered=False, env=None):
         self.active["cursor_fix"] = str(pr)
-        runner = fix.Runner(self.env.with_runtime(issue=issue, pr=str(pr)), self.hooks(issue, pr), pr, "")
+        runner = fix.Runner((env or self.env).with_runtime(issue=issue, pr=str(pr)), self.hooks(issue, pr), pr, "")
         runner.required_retry_label = "agent-fix"
         self.fix_runner = runner
         return fix.fix_pr(runner, pr, wt, fixer, source, feedback, head, owner_triggered=owner_triggered)
@@ -913,8 +913,9 @@ class Tick:
             return 1
         for commit in vendors.seed_contrib(str(self.state), pr, wt):
             self.log(f"PR #{pr}: commit {commit} has no known vendor; not counted")
+        step = tiers.carry(self.env.with_runtime(issue=issue), "fix", issue, pr)   # one read: pick and fix
         fixer = recovery.pending_fix(self.env, episode, pr) or self.pick_vendor(
-            "fixer", "contrib", self.all_vendors(), pr=pr, issue=issue)
+            "fixer", "contrib", self.all_vendors(), pr=pr, issue=issue, env=step)
         self.notify(f"PR #{pr}: {fixer} is addressing your review", url)
         feedback = review.format_fix_feedback(owner_text, findings)
         # Posting a fix reply advances human_feedback's cutoff even when an edit defers.
@@ -925,7 +926,7 @@ class Tick:
         # The label stays only on a deferral, so the fix resumes; any other outcome drops it.
         self.fix_runner = None
         rc = self.fix_pr(pr, wt, fixer, f"{self.owner} (the repository owner)", feedback, issue,
-                         owner_triggered=True)
+                         owner_triggered=True, env=step)
         return self.finish_standalone_fix(pr, wt, fixer, feedback, issue, rc)
 
     @staticmethod
