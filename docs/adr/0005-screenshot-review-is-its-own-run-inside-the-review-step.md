@@ -83,7 +83,12 @@ fix                        reads both, answers Must fix and design findings, re-
   answers`. An id with no valid, single answer stays open, however many rounds pass. Only the
   fixer's *current* answer decides a disposition: the answer to that id in the fix replies since
   the previous screenshot review, which must be exactly one valid line (an id answered twice, even
-  identically, or in two of those replies, counts as unanswered). An earlier round's answer is
+  identically, or in two of those replies, counts as unanswered). A round with no screenshot
+  review does not move that window, and its fixer still gets the block and is asked to answer
+  every id in it. If it answers an id an earlier reply in the window already answered, neither
+  answer counts: the next reviewer sees none, a `held` makes no disagreement, and the id stays
+  open. This is accepted because it fails safe: the finding still blocks its checks, although
+  the fixer's position is lost. An earlier round's answer is
   history: the block shows it, labelled as earlier, but it never makes a disagreement and never
   closes an id. A held finding whose current answer is `rejected` is a disagreement for the owner;
   a held finding the fixer adopted, did not answer, or answered ambiguously stays open. Only a
@@ -140,3 +145,5 @@ fix                        reads both, answers Must fix and design findings, re-
 - Issue #178: a fix comment records a runner-observed `needs-info` outcome in its marker, and such
   a comment does not end the owner feedback window, because both posting paths drop the agent's
   `RESULT:` line and a label-only retry after a question otherwise lost the owner's decision.
+- Issue #321: record what the two-replies rule does across a round with no screenshot review (the
+  rule is unchanged), because the multi-round tests pin that outcome and it was only implied.
