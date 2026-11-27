@@ -43,7 +43,6 @@ ROUTE_FIELDS = frozenset({"model"})
 EMPTY_MODEL_OK = False
 RECORDS_AUTHOR_MODEL = True
 SAME_VENDOR_REVIEW = True
-SAME_VENDOR_SAME_MODEL = False
 # config.load: the review route's model must differ from the dev/fix routes' (effort alone is not distinct).
 DISTINCT_REVIEW_MODEL = True
 DEFAULT_MAX_MINUTES = 60
