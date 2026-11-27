@@ -130,7 +130,7 @@ def test_adapters_declare_the_spec_same_vendor_policy():
         "agy": "known-distinct-model", "stub": ""}
     assert {name: a.SPEC_TEMPLATE for name, a in agents.ADAPTERS.items()} == {
         "claude": "spec-prompt.md", "codex": "codex-spec-prompt.md", "cursor": "spec-prompt.md",
-        "agy": "spec-prompt.md", "stub": "spec-prompt.md"}
+        "agy": "agy-spec-prompt.md", "stub": "spec-prompt.md"}
     assert {name: a.SPEC_UNMARKED_REVIEWER for name, a in agents.ADAPTERS.items()} == {
         "claude": True, "codex": False, "cursor": False, "agy": False, "stub": False}
 

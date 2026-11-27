@@ -30,7 +30,7 @@ ANALYST_BUDGET = "deadline_and_call_caps"
 ANALYST_ENV_KEEP = ()
 ANALYST_ENV_STRIP = ()
 ANALYST_ENV_SET = {}
-SUPPORTED_ROLES = frozenset({"dev", "fixer", "reviewer", "spec_reviewer"})
+SUPPORTED_ROLES = frozenset({"dev", "fixer", "reviewer", "spec_reviewer", "reviser"})
 QUOTA_SOURCE = "api"
 QUOTA_WINDOWS = frozenset({"five_hour", "seven_day"})
 # A run's output carries no quota data (refresh_quota asks `agy -p /quota`); a limit a run hits
@@ -77,9 +77,9 @@ USAGE_EVENT_KEY = "event"
 USAGE_FIELDS = {"input_tokens": "input_tokens", "cache_read_tokens": "cache_read_tokens",
                 "cache_write_tokens": "cache_write_tokens", "output_tokens": "output_tokens"}
 USAGE_CACHE_IN_INPUT = False
-SPEC_STAGE = "spec-review"
+SPEC_STAGE = "spec-reply"
 SPEC_SAME_VENDOR = "known-distinct-model"
-SPEC_TEMPLATE = "spec-prompt.md"
+SPEC_TEMPLATE = "agy-spec-prompt.md"
 SPEC_UNMARKED_REVIEWER = False
 
 CLI_LOG = ".gemini/antigravity-cli/cli.log"

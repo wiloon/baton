@@ -4644,3 +4644,137 @@ def test_a_saved_other_vendor_revision_runs_on_the_last_resort(advised, spec_han
     reply, = advised.gh.posted("<!-- baton-spec-reply round=1 by=claude -->")
     assert "Revision mode: same-vendor-different-model (claude after claude)." in reply
     spec_handoffs(None)
+
+
+# --- extra vendors may revise (#324) ------------------------------------------------------------
+
+def install_agy_reviser(loop, monkeypatch, *, spec_alias="agy_dev"):
+    """Load a config where agy (extra) holds reviser; keep the loop's paths and clone."""
+    from dataclasses import replace
+    from baton.config import load
+    from conftest import full_text
+    from test_agy import with_agy_reviser
+
+    env = session.resolve(loop.env)
+    path = Path(loop.env["CTX"], "agy-reviser.toml")
+    path.write_text(with_agy_reviser(full_text(), spec_alias=spec_alias))
+    loaded = load(path, home=Path(str(env.home)))
+    cfg = replace(env.config, vendors=loaded.vendors, models=loaded.models,
+                  quota=replace(env.config.quota, vendor_pool=loaded.quota.vendor_pool,
+                                vendor_extra=loaded.quota.vendor_extra, caps=loaded.quota.caps,
+                                five_hour_maxes=loaded.quota.five_hour_maxes),
+                  source=path)
+    sess = replace(env, config=cfg)
+    monkeypatch.setattr(session, "resolve", resolve_session)
+    monkeypatch.setattr(session, "_active", ContextVar("test_session", default=sess))
+    loop.gh.labels = {"needs-triage", "agent-wip"}
+    return sess
+
+
+def test_claude_reviewed_revision_goes_to_agy_when_pool_is_blocked(loop, monkeypatch):
+    sess = install_agy_reviser(loop, monkeypatch)
+    for vendor in ("claude", "codex"):
+        Path(sess.config.paths.state, f"{vendor}-cooldown-until").write_text(str(int(time.time()) + 86400))
+    loop.gh.comments = [{"author": {"login": "owner"},
+                         "body": "<!-- baton-spec-review round=1 by=claude -->\nx"}]
+    context = Path(loop.env["CTX"], "issue.md")
+    context.write_text("issue")
+    loop.script = [reviser(body="Goal\nNew step\n", commit=True, model="gemini-4-neon-medium")]
+    s = spec.Spec(sess, spec.telemetry.from_env(sess, issue=N), N)
+    assert s.worktree()
+    base = spec.git(s.wt, "rev-parse", "HEAD")
+    assert s.revise_round(1, context, s.issue_payload()) == "revised"
+    assert [r["vendor"] for r in loop.runs if r["role"] == "spec"] == ["agy"]
+    prompt = loop.runs[0]["prompt"]
+    assert "Shell commands are limited to an exact allowlist" in prompt
+    assert "`git`" in prompt and "file tools" in prompt
+    reply, = loop.gh.posted("<!-- baton-spec-reply round=1 by=agy -->")
+    assert "same-vendor" not in reply
+    assert spec.git(s.wt, "diff", "--name-only", f"{base}..HEAD") == "adr.md"
+    assert loop.gh.adr_pr == "77" and "ADR revisions: #77" in reply
+
+
+def test_agy_revises_its_own_review_only_with_a_distinct_spec_model(loop, monkeypatch):
+    sess = install_agy_reviser(loop, monkeypatch, spec_alias="agy_dev")
+    for vendor in ("claude", "codex"):
+        Path(sess.config.paths.state, f"{vendor}-cooldown-until").write_text(str(int(time.time()) + 86400))
+    loop.gh.comments = [{"author": {"login": "owner"},
+                         "body": "<!-- baton-spec-review round=1 by=agy -->\nx"}]
+    Path(loop.env["LOGS"], "runner.log").write_text(
+        f"2026-10-27 10:00:00 [owner/app] end issue-{N}-spec-1 rc=0 SPEC: changes model=gemini-3.8-flash-high\n")
+    context = Path(loop.env["CTX"], "issue.md")
+    context.write_text("issue")
+    loop.script = [reviser(body="Goal\nNew step\n", model="gemini-4-neon-medium")]
+    s = spec.Spec(sess, spec.telemetry.from_env(sess, issue=N), N)
+    assert s.worktree()
+    assert s.revise_round(1, context, s.issue_payload()) == "revised"
+    assert [r["vendor"] for r in loop.runs] == ["agy"]
+    reply, = loop.gh.posted("<!-- baton-spec-reply round=1 by=agy -->")
+    assert "same-vendor-different-model (agy/gemini-4-neon-medium after agy/gemini-3.8-flash-high)" in reply
+
+
+def test_agy_is_not_chosen_to_revise_its_own_review_on_an_equal_model(loop, monkeypatch):
+    sess = install_agy_reviser(loop, monkeypatch, spec_alias="agy_review")
+    for vendor in ("claude", "codex"):
+        Path(sess.config.paths.state, f"{vendor}-cooldown-until").write_text(str(int(time.time()) + 86400))
+    loop.gh.comments = [{"author": {"login": "owner"},
+                         "body": "<!-- baton-spec-review round=1 by=agy -->\nx"}]
+    Path(loop.env["LOGS"], "runner.log").write_text(
+        f"2026-10-27 10:00:00 [owner/app] end issue-{N}-spec-1 rc=0 SPEC: changes model=gemini-3.8-flash-high\n")
+    context = Path(loop.env["CTX"], "issue.md")
+    context.write_text("issue")
+    s = spec.Spec(sess, spec.telemetry.from_env(sess, issue=N), N)
+    assert s.worktree()
+    with pytest.raises(Deferred):
+        s.revise_round(1, context, s.issue_payload())
+    assert not loop.runs
+
+
+def test_agy_is_not_chosen_to_revise_its_own_review_with_an_unknown_model(loop, monkeypatch):
+    sess = install_agy_reviser(loop, monkeypatch, spec_alias="agy_dev")
+    for vendor in ("claude", "codex"):
+        Path(sess.config.paths.state, f"{vendor}-cooldown-until").write_text(str(int(time.time()) + 86400))
+    loop.gh.comments = [{"author": {"login": "owner"},
+                         "body": "<!-- baton-spec-review round=1 by=agy -->\nx"}]
+    # No runner.log model evidence: other_model is empty / unknown.
+    context = Path(loop.env["CTX"], "issue.md")
+    context.write_text("issue")
+    s = spec.Spec(sess, spec.telemetry.from_env(sess, issue=N), N)
+    assert s.worktree()
+    with pytest.raises(Deferred):
+        s.revise_round(1, context, s.issue_payload())
+    assert not loop.runs
+
+
+def test_an_extra_vendor_without_reviser_is_never_picked_to_revise(loop, monkeypatch):
+    sess = install_agy_reviser(loop, monkeypatch)
+    # Drop reviser from agy; cursor already lacks it. Only pool vendors remain eligible.
+    from dataclasses import replace
+    vendors = tuple(replace(v, roles=tuple(r for r in v.roles if r != "reviser")) if v.id == "agy" else v
+                    for v in sess.config.vendors)
+    sess = replace(sess, config=replace(sess.config, vendors=vendors))
+    monkeypatch.setattr(session, "_active", ContextVar("test_session", default=sess))
+    for vendor in ("claude", "codex"):
+        Path(sess.config.paths.state, f"{vendor}-cooldown-until").write_text(str(int(time.time()) + 86400))
+    loop.gh.comments = [{"author": {"login": "owner"},
+                         "body": "<!-- baton-spec-review round=1 by=claude -->\nx"}]
+    context = Path(loop.env["CTX"], "issue.md")
+    context.write_text("issue")
+    s = spec.Spec(sess, spec.telemetry.from_env(sess, issue=N), N)
+    assert s.worktree()
+    with pytest.raises(Deferred):
+        s.revise_round(1, context, s.issue_payload())
+    assert not loop.runs
+
+
+def test_revision_retry_offers_agy(loop, monkeypatch):
+    from baton import recovery
+    sess = install_agy_reviser(loop, monkeypatch)
+    for vendor in ("claude", "codex"):
+        Path(sess.config.paths.state, f"{vendor}-cooldown-until").write_text(str(int(time.time()) + 86400))
+    s = spec.Spec(sess, spec.telemetry.from_env(sess, issue=N), N)
+    picker = s.retry_picker("reviser", "gemini-3.8-flash-high", False)
+    assert "agy" in picker["candidates"]
+    offered = recovery.retry_candidates(sess, "reviser", picker["candidates"], mode="contrib",
+                                        issue=N, exclusions=["claude"])
+    assert "agy" in offered and "claude" not in offered

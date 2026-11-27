@@ -15,6 +15,7 @@ import pytest
 
 from baton import capacity, dev, fix, handoff, merge, notify, pick, review, scan, spec, tick
 from baton.common import Deferred, MAINTENANCE_PREFIX
+from baton.session import resolve as resolve_session
 from conftest import issue_snapshot_pages, sh
 
 REAL_VERDICT_PLAN = spec.verdict_plan   # the devrun fixture stubs it
@@ -1370,7 +1371,7 @@ def test_a_forced_blocked_issue_warns_and_runs(ctx, capsys):
     assert "#7: still blocked by #62; running it as asked" in capsys.readouterr().err
 
 
-def test_a_spec_in_review_needs_a_pool_vendor(ctx, monkeypatch):
+def test_a_spec_in_review_considers_all_vendors(ctx, monkeypatch):
     issues(ctx, ready=[issue(12)])
     ctx.gh.answers["issue view"] = {"title": "T", "body": "B", "comments": [
         {"author": {"login": "owner"}, "body": "<!-- baton-spec-review round=1 by=claude -->"}
@@ -1378,7 +1379,37 @@ def test_a_spec_in_review_needs_a_pool_vendor(ctx, monkeypatch):
     seen = []
     monkeypatch.setattr(tick.Tick, "pick_vendor", lambda self, role, mode, cands, **k: seen.append(cands) or "claude")
     assert ctx.make().next_issue() == "12"
-    assert seen == [["claude", "codex"]]
+    assert seen == [["claude", "codex", "cursor"]]
+
+
+def test_revision_admission_yields_when_agy_is_free_and_pool_is_blocked(ctx, monkeypatch):
+    """Tick.runnable: pool revisers blocked, agy (extra) holds reviser and is free (#324)."""
+    from contextvars import ContextVar
+    from dataclasses import replace
+    from baton import config, session
+    from conftest import full_text
+    from test_agy import with_agy_reviser
+
+    issues(ctx, ready=[issue(12)])
+    ctx.gh.answers["issue view"] = {"title": "T", "body": "B", "comments": [
+        {"author": {"login": "owner"}, "body": "<!-- baton-spec-review round=1 by=claude -->"}
+    ]}
+    t = ctx.make()
+    path = Path(ctx.env["CTX"], "agy-reviser.toml")
+    path.write_text(with_agy_reviser(full_text()))
+    loaded = config.load(path, home=Path(ctx.env["HOME"]))
+    cfg = replace(t.env.config, vendors=loaded.vendors, models=loaded.models,
+                  quota=replace(t.env.config.quota, vendor_pool=loaded.quota.vendor_pool,
+                                vendor_extra=loaded.quota.vendor_extra, caps=loaded.quota.caps,
+                                five_hour_maxes=loaded.quota.five_hour_maxes))
+    t.env = replace(t.env, config=cfg)
+    monkeypatch.setattr(session, "resolve", resolve_session)
+    monkeypatch.setattr(session, "_active", ContextVar("test_session", default=t.env))
+    for vendor in ("claude", "codex"):
+        (t.runner_state / f"{vendor}-cooldown-until").write_text(str(t.now + 3600))
+    monkeypatch.setattr(pick.settle, "probe", lambda *a, **k: None)
+    assert t.next_issue() == "12"
+    assert "DEFERRED" not in ctx.log()
 
 
 @pytest.mark.parametrize("labels, pr, ok", [
@@ -1546,7 +1577,7 @@ def test_scan_fallback_skips_when_no_vendor_has_scan_role(ctx, monkeypatch):
     from baton.config import Config
     real = Config.for_role
     monkeypatch.setattr(Config, "for_role",
-                        lambda self, role, pool_only=False: () if role == "scan" else real(self, role, pool_only=pool_only))
+                        lambda self, role: () if role == "scan" else real(self, role))
     t = fallback(ctx)
     ctx.path("scan-area").write_text("1\n")
     assert t.scan_fallback() is None

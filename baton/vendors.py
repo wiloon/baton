@@ -199,22 +199,22 @@ def _vendor_role(role):
     return ROUTE_ROLE.get(role, role)
 
 
-def _role_eligible(role, pool_only=False, env=None):
+def _role_eligible(role, env=None):
     """Declared vendors allowed for ROLE, with screenshot image input when needed."""
     role = _vendor_role(role)
     config = session.resolve(env).config
     if role not in ROLES:
         return set(config.declared())
-    allowed = set(config.for_role(role, pool_only=pool_only))
+    allowed = set(config.for_role(role))
     if role == "screenshot_reviewer":
         allowed = {vendor for vendor in allowed if agents.ADAPTERS[vendor].IMAGES}
     return allowed
 
 
-def _filter_preference(role, prefer, *, pool_only=False, env=None):
+def _filter_preference(role, prefer, *, env=None):
     if not prefer:
         return []
-    eligible = _role_eligible(role, pool_only=pool_only, env=env)
+    eligible = _role_eligible(role, env=env)
     filtered = [vendor for vendor in prefer if vendor in eligible]
     return filtered if filtered else []
 
@@ -222,11 +222,10 @@ def _filter_preference(role, prefer, *, pool_only=False, env=None):
 @session.scoped
 def preference(role, area="", env=None):
     preferences = dict(session.resolve(env).config.preferences)
-    pool_only = role == "reviser"
     for name in (role, *PREFERENCE_FALLBACK.get(role, ())):
         for key, label in ((f'{name}_{area}', f'{name}/{area}'), (name, name)):
             if preferences.get(key):
-                return _filter_preference(role, list(preferences[key]), pool_only=pool_only, env=env), label
+                return _filter_preference(role, list(preferences[key]), env=env), label
     return [], ''
 
 
@@ -408,8 +407,7 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
     pr_state = state if pr_state is None else pr_state
     config = session.resolve().config
     vendor_role = _vendor_role(role)
-    pool_only = vendor_role == "reviser"
-    eligible = _role_eligible(role, pool_only=pool_only)
+    eligible = _role_eligible(role)
     candidates = [vendor for vendor in candidates if vendor in eligible]
     if current and current in config.declared() and current not in eligible:
         current = ""
