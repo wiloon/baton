@@ -1495,7 +1495,8 @@ class Runner:
                 adapter.FIX_TEMPLATE, PR=str(pr), ISSUE=self.env.runtime.issue or "unknown", GH_REPO=self.repo,
                 WORKTREE=str(wt), BRANCH=branch, SOURCE=source, FEEDBACK_FILE=str(feedback_file),
                 FIX_SCOPE=fix_scope(fixer, owner_triggered),
-                SHOTS_DIR=str(shots), PR_BODY_FILE=str(request)), f"pr-{pr}-{fixer}-fix", wt)
+                SHOTS_DIR=str(shots), PR_BODY_FILE=str(request)), f"pr-{pr}-{fixer}-fix", wt,
+                env=self.env.with_runtime(shots_dir=str(shots), pr_body_file=str(request)))
             outcome, reply_raw = out["outcome"], out["reply"] or ""
             self.reply = reply_raw
             want = pr_helpers.task_wanted(reply_raw)

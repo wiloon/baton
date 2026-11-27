@@ -63,6 +63,7 @@ class RunResult:
     cooldown_until: int | None
     summary: str            # the runner.log end line after "rc=N"
     model: str = ""         # Codex rollout's actual model, never inferred from a requested alias
+    denial: list | None = None  # adapter signal: denial-ended SUCCESS; see common.Run (#315)
 
     @property
     def exit_code(self):
@@ -175,7 +176,7 @@ def run(req, cooldown_hours=COOLDOWN_HOURS):
         r = adapter.run(req)
         status, until = classify(req.vendor, r.rc, read(req.log), r.outcome, cooldown_hours)
     return RunResult(status, r.outcome, r.reply, r.usage, str(req.log), r.rc, r.rc in (124, 137), until,
-                     r.summary, adapter.reported_model(r))
+                     r.summary, adapter.reported_model(r), getattr(r, "denial", None))
 
 
 def main(argv=None):

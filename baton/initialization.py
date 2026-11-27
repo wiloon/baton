@@ -21,6 +21,7 @@ class Runtime:
     round: str = ""
     fixed_by: str = ""
     shots_dir: str = ""
+    pr_body_file: str = ""   # outside-worktree PR-description request; denial retry cleans new files (#315)
     telemetry_item: str = ""
     chain: int = 0
     manual: bool = False
