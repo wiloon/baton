@@ -296,7 +296,10 @@ no role. The call is a tool-less, isolated one-shot (`[advisor] claude = { model
 rejections are accounted like any Claude run. Claude is skipped when it is undeclared, at its cap or
 five-hour limit, in cooldown, or its credential has expired. The next backend is tried once when one
 is skipped, fails or returns an unusable reply, never after a valid `handoff` or other well-formed
-outcome. Records, handoff notes and answer comments name the backend that answered. In `mode = "live"` the
+outcome. Records, handoff notes and answer comments name the backend that answered. An evidence
+quote must be in the sent snapshot (runs of whitespace aside): mismatching quotes are dropped while
+at least one matches, and the record and `runner.log` keep the first one, redacted and cut, as
+`evidence_miss` (except for a snapshot with opted-in excerpts). In `mode = "live"` the
 runner revalidates the state and grants at most one extra round per task episode. Failed
 review, fix, spec, implementation, local verification and worktree steps can also send a
 redacted step snapshot. Where the role and task allow it, `retry_step` repeats the failed step
