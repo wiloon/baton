@@ -14,7 +14,7 @@ import subprocess
 import time
 
 from . import advisor, after_merge, agents, checks as check_section, dispatch, fix, handoff as owner_handoff, md, names, pr as pr_helpers, pr_contract, prompts, recovery, restart, spec, tiers, vendors
-from .common import Deferred, git, push, strip_markers
+from .common import Deferred, MAINTENANCE_PREFIX, git, push, strip_markers
 
 REPLY_CAP = 60000
 RESUME_NOTE = ("This worktree already holds earlier work on this issue (an earlier run stopped early). "
@@ -619,6 +619,8 @@ def run(tick, issue):
             return 1
     if (verdict := spec.VERDICT.match(plan)) and verdict[1] == "accept":
         advisor.finish_episode(env, "issue", issue, "accept")
+    if reason := tick.draining():
+        raise Deferred("maintenance", f"{MAINTENANCE_PREFIX}{reason}")
     resume_note, ok = setup_worktree(tick, wt, branch, issue)
     if not ok:
         return 1

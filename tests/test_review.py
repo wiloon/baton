@@ -324,6 +324,25 @@ def test_a_deferred_fixer_leaves_a_checkpoint_and_the_resume_goes_straight_to_th
     assert loop.fixes[1]["head"] == loop.fixes[0]["head"]
 
 
+def test_a_fix_deferred_for_maintenance_keeps_the_checkpoint_and_lends_no_slot(loop, monkeypatch):
+    """#337: review returned changes while the flag is set; the fix agent is not run and no slot is lent."""
+    from baton.common import MAINTENANCE_PREFIX
+    Path(loop.env["STATE"], "maintenance").write_text(
+        json.dumps({"expires": time.time() + 600, "reason": "reboot", "id": "t"}))
+
+    def blocked(runner, pr, wt, fixer, source, feedback, head=""):
+        raise Deferred(fixer, f"{MAINTENANCE_PREFIX}reboot")
+
+    monkeypatch.setattr(review.fix, "fix_pr", blocked)
+    with pytest.raises(Deferred) as waiting:
+        loop.run(fixer="cursor", reviewer="codex")
+    assert waiting.value.reason.startswith(MAINTENANCE_PREFIX)
+    assert waiting.value.lends_slot is False
+    saved = loop.checkpoint()
+    assert saved and saved["step"] == "fix"
+    assert not Path(loop.env["STATE"], f"slot-deferred-{PR}").exists()
+
+
 def save_waiting_fix_push(loop, fixer, ci_head=""):
     from baton import handoff
     binding = {"commit": "d" * 40, "branch": "cursor/issue-297", "ref": "HEAD", "remote": "e" * 40,

@@ -125,7 +125,7 @@ def fix_worktree(gh, tmp_path, monkeypatch):
 
     state = Run()
 
-    def stub(vendor, role, prompt, tag, cwd, settings="", output="", env=None, hooks=None):
+    def stub(vendor, role, prompt, tag, cwd, settings="", output="", env=None, hooks=None, **_):
         state.agent_calls.append((vendor, role, tag, output))
         state.prompts.append(prompt)
         plan = {"outcome": "RESULT: fixed", "reply": "", "commit": True, "rc": 0, "model": "",

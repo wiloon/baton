@@ -436,6 +436,40 @@ def test_a_busy_repository_lock_is_not_a_maintenance_skip_for_nightly(host):
     held.close()
 
 
+def test_wait_finishes_within_one_step_of_a_busy_tick(host):
+    """#337: a tick double that would start a second step stops after draining; --wait then returns."""
+    from types import SimpleNamespace
+    from baton import tick as tick_mod
+    steps = []
+    lock = host.hold(APP_LOCK)
+
+    def tick_body():
+        steps.append("step1")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not (host.state / "maintenance").exists():
+            time.sleep(0.02)
+        stand = SimpleNamespace(runner_state=host.state)
+        stand.log = lambda msg: steps.append(msg)
+        stand.draining = lambda: tick_mod.Tick.draining(stand)
+        if tick_mod.Tick.stop_if_draining(stand) is not None:
+            steps.append("drained")
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            lock.close()
+            return
+        steps.append("step2")
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+
+    worker = threading.Thread(target=tick_body)
+    worker.start()
+    deadline = time.monotonic() + 5
+    while "step1" not in steps and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert host.maint("on", "--wait", "--timeout", "5s", "--ttl", "1m", "--reason", "reboot") == 0
+    worker.join(5)
+    assert steps == ["step1", "maintenance (reboot): tick stops before the next item", "drained"]
+
+
 def lines(capsys):
     return [json.loads(line) for line in capsys.readouterr().out.splitlines() if line]
 

@@ -20,8 +20,8 @@ from pathlib import Path
 import sys
 import time
 
-from . import agents, capacity, claude_cli, gitcontrol, hooks as telemetry, notify, settle, tiers, vendors
-from .common import LEASE_REASON, Request
+from . import agents, capacity, claude_cli, gitcontrol, hooks as telemetry, maintenance, notify, settle, tiers, vendors
+from .common import LEASE_REASON, MAINTENANCE_PREFIX, Request
 
 
 
@@ -143,7 +143,8 @@ def _run_log_path(logs, tag, suffix, retry=""):
 
 
 @session.scoped
-def dispatch(vendor, role, prompt, tag, cwd, settings="", output="", env=None, hooks=None):
+def dispatch(vendor, role, prompt, tag, cwd, settings="", output="", env=None, hooks=None,
+             continues_step=False):
     env = session.resolve(env)
     why = (f"unknown vendor {vendor}" if vendor not in agents.ADAPTERS
            else env.config.admission_error(vendor, role))
@@ -156,10 +157,11 @@ def dispatch(vendor, role, prompt, tag, cwd, settings="", output="", env=None, h
         if not available:
             return {"rc": 75, "status": "deferred", "outcome": "", "reply": None,
                     "model": "", "defer": LEASE_REASON}
-        return _dispatch(vendor, role, prompt, tag, cwd, settings, output, env, hooks)
+        return _dispatch(vendor, role, prompt, tag, cwd, settings, output, env, hooks,
+                         continues_step=continues_step)
 
 
-def _dispatch(vendor, role, prompt, tag, cwd, settings, output, env, hooks):
+def _dispatch(vendor, role, prompt, tag, cwd, settings, output, env, hooks, *, continues_step=False):
     # Cooldowns and run counts are the machine's; the run's log is its repository's.
     state, logs = str(env.config.paths.state), str(env.dirs.logs)
     cooldown_hours = int(env.config.scheduling.cooldown_hours or agents.COOLDOWN_HOURS)
@@ -169,6 +171,9 @@ def _dispatch(vendor, role, prompt, tag, cwd, settings, output, env, hooks):
 
     if why := vendors.vendor_blocked(state, vendor):
         return result(75, "deferred", "", defer=why)
+    if not continues_step:
+        if reason := maintenance.admit(env.config.paths.state, None, acquire=False).reason:
+            return result(75, "deferred", "", defer=f"{MAINTENANCE_PREFIX}{reason}")
     settle.count_run(state, vendor)
     adapter = agents.ADAPTERS[vendor]
     # Read once, from the caller's hooks too when only they name the PR; configure sees the same tier.

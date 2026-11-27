@@ -812,6 +812,36 @@ def test_a_reply_fixer_blocked_by_its_vendor_hands_the_head_off_without_marking_
     assert not Path(repair.env["STATE"], f"ci-fix-{PR}-{HEAD}").exists()
 
 
+def test_a_ci_repair_deferred_for_maintenance_keeps_the_merge_step(repair, monkeypatch):
+    """#337: maintenance during CI repair re-raises; finish_review returns 75 and keeps the checkpoint."""
+    import json, time
+    from baton.common import MAINTENANCE_PREFIX
+    from baton import checkpoint as cp, review as review_mod
+
+    Path(repair.env["STATE"], "maintenance").write_text(
+        json.dumps({"expires": time.time() + 600, "reason": "reboot", "id": "t"}))
+    monkeypatch.setattr(merge.fix, "fix_pr",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            merge.Deferred("codex", f"{MAINTENANCE_PREFIX}reboot")))
+    with pytest.raises(merge.Deferred) as waiting:
+        repair.merger().ci_fix_round(str(repair.wt))
+    assert waiting.value.reason.startswith(MAINTENANCE_PREFIX)
+    assert not Path(repair.env["STATE"], f"ci-fix-{PR}-{HEAD}").exists()
+
+    pending = Path(repair.env["STATE"], f"review-pending-{PR}")
+    head = sh(repair.wt, "git", "rev-parse", "HEAD")
+    repair.gh.set(headRefOid=head, state="OPEN")
+    cp.write(pending, {"pr": str(PR), "wt": str(repair.wt), "note": "n", "fixer": "codex",
+                       "reviewer": "claude", "round": 1, "step": "merge", "fix_head": "",
+                       "ISSUE": "297", "merge_head": head})
+    repair.greens[:] = [False]
+    hooks = merge.telemetry.from_env(repair.env, issue=297, pr=PR)
+    loop = review_mod.Review(repair.env, hooks, str(PR), str(repair.wt), "297", "")
+    assert loop.finish_review(cp.read(pending)) == 75
+    assert pending.exists()
+    assert not repair.labelled("ready-for-human")
+
+
 def test_a_reply_fixers_refused_description_edit_keeps_the_repair_and_writes_no_marker(repair, monkeypatch):
     """A validated description GitHub refuses waits for its retry: the Deferred passes through, unmarked."""
     import subprocess

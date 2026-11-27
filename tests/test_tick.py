@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from baton import capacity, dev, fix, handoff, merge, notify, pick, review, scan, spec, tick
-from baton.common import Deferred
+from baton.common import Deferred, MAINTENANCE_PREFIX
 from conftest import issue_snapshot_pages, sh
 
 REAL_VERDICT_PLAN = spec.verdict_plan   # the devrun fixture stubs it
@@ -22,6 +22,7 @@ REAL_VERDICT_PLAN = spec.verdict_plan   # the devrun fixture stubs it
 BIN = Path(__file__).resolve().parents[1] / "bin"
 LOGIN = r"^cursor$"
 DONE = {"rc": 0, "status": "success", "outcome": "RESULT: ready", "reply": "done\nRESULT: ready", "model": "gpt-x", "defer": ""}
+REAL_VERIFY = fix.Runner.verify
 
 
 class FakeGH:
@@ -3654,5 +3655,153 @@ def test_tick_resumes_a_saved_review_in_a_detached_worktree_and_pushes_to_head_b
     assert new_head != base_head, log
     assert sh(origin, "git", "rev-parse", branch) == new_head, log
     assert not any(c[:2] == ["pr", "edit"] and "ready-for-human" in c for c in gh.calls()), log
+
+
+# --- maintenance drain while a tick holds its lock (#337) ---------------------------------------------
+
+def set_maintenance(ctx, reason="reboot", expires=None):
+    Path(ctx.env["STATE"], "maintenance").write_text(
+        json.dumps({"expires": expires if expires is not None else time.time() + 600,
+                    "reason": reason, "id": "t"}))
+
+
+def test_a_tick_stops_before_the_next_issue_when_maintenance_turns_on(ctx, monkeypatch):
+    """Two runnable issues: the flag is set while the first runs; the second never starts."""
+    issues(ctx, ready=[issue(12), issue(13)])
+    no_vendor_blocked(monkeypatch)
+    quiet_tick(monkeypatch)
+    started, next_calls = [], []
+    original_next = tick.Tick.next_issue
+
+    def run(t, n):
+        started.append(n)
+        set_maintenance(ctx, "owner reboot")
+        raise Deferred("pool", "quota exhausted")
+
+    def next_issue(self):
+        found = original_next(self)
+        next_calls.append(found)
+        return found
+
+    monkeypatch.setattr(dev, "run", run)
+    monkeypatch.setattr(tick.Tick, "next_issue", next_issue)
+    assert ctx.make().work() == 0
+    assert started == ["12"]
+    assert next_calls == ["12"]
+    assert "maintenance (owner reboot): tick stops before the next item" in ctx.log()
+
+
+def test_pass_returns_0_when_the_items_next_step_defers_for_maintenance(ctx, monkeypatch):
+    issues(ctx, ready=[issue(12)])
+    no_vendor_blocked(monkeypatch)
+    quiet_tick(monkeypatch)
+    scans = []
+
+    def run(t, n):
+        set_maintenance(ctx, "deploy")
+        raise Deferred("codex", f"{MAINTENANCE_PREFIX}deploy")
+
+    monkeypatch.setattr(dev, "run", run)
+    monkeypatch.setattr(tick.Tick, "scan_fallback", lambda self: scans.append("scan") or 0)
+    t = ctx.make()
+    assert t.pass_() == 0
+    assert scans == []
+    assert "maintenance (deploy): tick stops before the next item" in ctx.log()
+
+
+def test_an_assigned_serve_child_returns_0_not_81_when_maintenance_defers(ctx, monkeypatch):
+    issues(ctx, ready=[issue(12)])
+    no_vendor_blocked(monkeypatch)
+    quiet_tick(monkeypatch)
+
+    def run(t, n):
+        set_maintenance(ctx, "deploy")
+        raise Deferred("codex", f"{MAINTENANCE_PREFIX}deploy")
+
+    monkeypatch.setattr(dev, "run", run)
+    t = ctx.make()
+    t.env.runtime.assign_issue = "12"
+    t.env.runtime.serve_child = True
+    assert t.pass_() == 0
+
+
+def test_pick_review_does_nothing_while_draining(ctx, monkeypatch):
+    set_maintenance(ctx, "reboot")
+    ctx.gh.answers["pr list"] = [{"number": 4}]
+    ctx.gh.answers["pr view"] = pr_json()
+    notified = []
+    monkeypatch.setattr(tick.Tick, "notify", lambda self, *a, **k: notified.append(a))
+    assert ctx.make().pick_review() == 0
+    assert not ctx.gh.ran("pr", "edit") and notified == [] and not ctx.loops
+    assert "maintenance (reboot): tick stops before the next item" in ctx.log()
+
+
+def test_dev_run_defers_for_maintenance_before_a_worktree_or_started_notice(devrun, monkeypatch):
+    set_maintenance(devrun, "reboot")
+    monkeypatch.setattr(spec, "verdict_plan", lambda env, n, listed=None: "<!-- baton-verdict: accept by=codex -->\nplan")
+    setups, picks, notices = [], [], []
+    monkeypatch.setattr(dev, "setup_worktree", lambda *a, **k: setups.append(a) or ("", True))
+    monkeypatch.setattr(tick.Tick, "pick_vendor", lambda self, *a, **k: picks.append(a) or "codex")
+    monkeypatch.setattr(tick.Tick, "notify", lambda self, *a, **k: notices.append(a))
+    t, rc = devrun.go()
+    assert rc == 75
+    assert setups == [] and picks == [] and notices == []
+    assert not Path(devrun.env["WT_ROOT"], "agent-300").exists()
+    assert not devrun.gh.ran("issue", "edit", "300", "-R", "owner/app", "--add-label", "agent-wip")
+    assert f"DEFERRED: maintenance {MAINTENANCE_PREFIX}reboot" in devrun.log()
+
+
+def test_a_maintenance_deferral_of_a_fix_does_not_lend_a_slot(ctx, monkeypatch):
+    pr_state(ctx)
+    flight(ctx, wip=[5], ready=[], prs={5: 11})
+    set_maintenance(ctx, "reboot")
+    defer_loop(monkeypatch, reason=f"{MAINTENANCE_PREFIX}reboot", vendor="codex")
+    deferred_review(ctx, [11])
+    assert not ctx.path("slot-deferred-11").exists()
+    assert "lends its agent-wip slot" not in ctx.log()
+
+
+def test_verify_repair_still_dispatches_during_maintenance(devrun, monkeypatch):
+    """#337: verify.sh repair runs finish the step; continues_step skips the maintenance gate."""
+    set_maintenance(devrun, "reboot")
+    monkeypatch.setattr(fix.Runner, "verify", REAL_VERIFY)
+    seen = []
+
+    def capture(vendor, role, prompt, tag, cwd, settings="", output="", env=None, hooks=None,
+                continues_step=False):
+        seen.append((role, continues_step))
+        Path(output).write_text("RESULT: fixed\n")
+        return {**DONE, "outcome": "RESULT: fixed", "reply": "RESULT: fixed"}
+
+    monkeypatch.setattr(fix.dispatch, "dispatch", capture)
+    attempts = {"n": 0}
+
+    def verify_sh(cmd, **kwargs):
+        if cmd and Path(str(cmd[0])).name == "verify.sh":
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                return subprocess.CompletedProcess(cmd, 1, "", "tests failed")
+            return subprocess.CompletedProcess(cmd, 0, "Verification passed\n", "")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(fix.session, "run_process", verify_sh)
+    monkeypatch.setattr(fix.Runner, "e2e_gate", lambda self, kind, number: "")
+    t = devrun.make()
+    wt = Path(devrun.env["WT_ROOT"], "agent-300")
+    sh(devrun.repo, "git", "worktree", "add", "-q", str(wt), "HEAD")
+    runner = fix.Runner(t.env, t.hooks("300"))
+    rc, failure, rounds = runner.verify(str(wt), "origin/main", "codex", "issue", "300", repairs=1)
+    assert (rc, seen, rounds) == (0, [("fix", True)], 1)
+    assert not getattr(runner, "_continues_step", False)
+
+
+def test_an_expired_maintenance_flag_does_not_stop_the_tick(ctx, monkeypatch):
+    issues(ctx, ready=[issue(12)])
+    no_vendor_blocked(monkeypatch)
+    quiet_tick(monkeypatch)
+    set_maintenance(ctx, "old", expires=time.time() - 10)
+    monkeypatch.setattr(dev, "run", lambda t, n: 80)
+    assert ctx.make().work() == 0
+    assert "tick stops before the next item" not in ctx.log()
 
 

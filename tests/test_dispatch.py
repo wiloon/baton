@@ -475,3 +475,41 @@ def test_an_adapter_error_still_names_the_tier(runner, monkeypatch):
     monkeypatch.setattr(dispatch.agents, "run", boom)
     runner.run()
     assert "end t adapter rc=1, no result tier=standard" in runner.runner_log()
+
+
+# --- maintenance drain (#337) -----------------------------------------------------------------
+
+def test_maintenance_deferral_does_not_lend_a_slot():
+    from baton.common import Deferred, LEASE_REASON, MAINTENANCE_PREFIX
+    assert Deferred("codex", f"{MAINTENANCE_PREFIX}reboot").lends_slot is False
+    assert Deferred("codex", LEASE_REASON).lends_slot is False
+    assert Deferred("codex", "quota exhausted").lends_slot is True
+    assert Deferred("codex", f"{MAINTENANCE_PREFIX}x", lends_slot=True).lends_slot is True
+
+
+def test_dispatch_defers_for_maintenance_without_starting_or_counting(runner):
+    import json, time
+    from baton.common import MAINTENANCE_PREFIX
+    (runner.state_dir / "maintenance").write_text(json.dumps({"expires": time.time() + 600, "reason": "reboot", "id": "t"}))
+    out = runner.run()
+    assert (out["rc"], out["status"], out["defer"]) == (75, "deferred", f"{MAINTENANCE_PREFIX}reboot")
+    assert not (runner.root / "fake" / "calls").exists()
+    assert not list(runner.state_dir.glob("runs-*"))
+    assert runner.runner_log() == []
+
+
+def test_dispatch_continues_a_step_during_maintenance(runner):
+    import json, time
+    (runner.state_dir / "maintenance").write_text(json.dumps({"expires": time.time() + 600, "reason": "reboot", "id": "t"}))
+    runner.plan(stream=claude_stream("fine\nREVIEW: pass"))
+    out = runner.run(continues_step=True)
+    assert (out["rc"], out["status"], out["outcome"]) == (0, "success", "REVIEW: pass")
+    assert (runner.state_dir / f"runs-{__import__('time').strftime('%F')}").read_text() == "1\n"
+
+
+def test_an_expired_maintenance_flag_does_not_defer_dispatch(runner):
+    import json, time
+    (runner.state_dir / "maintenance").write_text(json.dumps({"expires": time.time() - 10, "reason": "old", "id": "t"}))
+    runner.plan(stream=claude_stream("fine\nREVIEW: pass"))
+    out = runner.run()
+    assert (out["rc"], out["status"]) == (0, "success")

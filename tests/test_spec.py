@@ -213,7 +213,7 @@ def loop(worktree, tmp_path, monkeypatch):
     state = SimpleNamespace(env=env, gh=fake, repo=worktree.repo, runs=[], script=[], ci=True, merged=[])
     monkeypatch.setattr(merge.Merger, "ci_green", lambda self, minutes: state.ci)
 
-    def agent(vendor, role, prompt, tag, cwd, settings="", output="", env=None, hooks=None):
+    def agent(vendor, role, prompt, tag, cwd, settings="", output="", env=None, hooks=None, **_):
         state.runs.append({"vendor": vendor, "role": role, "tag": tag, "prompt": prompt, "settings": settings, "output": output,
                            "followup": session.resolve(env).runtime.spec_followup if env else False})
         step = state.script.pop(0)

@@ -483,8 +483,9 @@ class Runner:
 
     def agent(self, vendor, role, prompt, tag, wt, output="", env=None):
         """One agent run; Deferred when the vendor cannot run now."""
+        extra = {"continues_step": True} if getattr(self, "_continues_step", False) else {}
         out = dispatch.dispatch(vendor, role, prompt, tag, str(wt), str(self.self_dir / "settings.json"), output,
-                                env or self.env, self.hooks)
+                                env or self.env, self.hooks, **extra)
         if out["rc"] == 75:
             raise Deferred(vendor, out["defer"])
         return out
@@ -574,8 +575,13 @@ class Runner:
             if self.verification_progress:
                 self.verification_progress(total_rounds + local_repairs, budget - local_repairs, head)
             try:
-                out = self.agent(vendor, "fix", prompt, f"{kind}-{number}-verify-fix-{total_rounds + local_repairs}",
-                                 wt, str(reply_file), self.env.with_runtime(fix_followup=False))
+                self._continues_step = True
+                try:
+                    out = self.agent(vendor, "fix", prompt,
+                                     f"{kind}-{number}-verify-fix-{total_rounds + local_repairs}",
+                                     wt, str(reply_file), self.env.with_runtime(fix_followup=False))
+                finally:
+                    self._continues_step = False
             except Deferred:
                 if self.verification_progress and not dirty() and git(wt, "rev-parse", "HEAD") == head:
                     self.verification_progress(total_rounds + local_repairs - 1, budget - local_repairs + 1, head)
