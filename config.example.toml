@@ -239,6 +239,17 @@ codex = { model = "codex_fast", effort = "low" }
 [models.routes.spec_followup]
 claude = { model = "claude_fast", effort = "low" }
 
+# Optional route tiers (ADR 0009) for dev, fix, review, spec_review and spec: <role> is the standard
+# tier, <role>_light and <role>_heavy replace a vendor's whole base entry for a step of that tier.
+# Omitted vendors inherit the base. Follow-up runs ignore the tier. Same-vendor review eligibility
+# is judged on the tier's model, and agy review models must differ from its write models in every
+# tier. Nothing sets a non-standard tier yet. Examples:
+# [models.routes.dev_light]
+# claude = { model = "claude_fast", effort = "low" }
+#
+# [models.routes.fix_heavy]
+# claude = { model = "claude_strong", effort = "high" }
+
 [vendors.claude]
 adapter = "claude"
 roles = ["dev", "fixer", "reviewer", "screenshot_reviewer", "spec_reviewer", "reviser", "retrospective", "scan"]
@@ -250,6 +261,10 @@ quota_probe_model = "claude_probe"
 # Optional override of [quota] quota_five_hour_max for this vendor's 5-hour window (same fraction
 # rules as cap). Omit to use the global default. Only vendors that report a 5-hour window are gated.
 # five_hour_max = 1.0
+# Optional unattended login: CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`) comes from the
+# runner's environment, else this file, which only its owner may read (chmod 600). Only the claude
+# processes baton starts get it; without it Claude uses its stored /login credential.
+# env_file = "~/.config/baton/claude.env"   # CLAUDE_CODE_OAUTH_TOKEN
 
 [vendors.codex]
 adapter = "codex"
@@ -319,7 +334,8 @@ claude_code_auto_compact_window = 200000
 enable_claudeai_mcp_servers = false
 
 # Optional integrations, none by default. Each key comes from the runner's environment or from
-# env_file, which only its owner may read (chmod 600); no tool inherits them.
+# env_file, which only its owner may read (chmod 600); no tool inherits them. Claude's setup-token
+# file is [vendors.claude] env_file above.
 #
 # [linear]                  owner actions ("## Before release") become Linear issues, else a GitHub issue
 # env_file = "~/.config/baton/linear.env"     # LINEAR_API_KEY
@@ -363,12 +379,16 @@ budget_usd = 1.0
 # recommendations for implementation and ADR PRs stay in observation in either enabled mode.
 # Complete, cited grounded answers to SPEC: human questions may resume revision in live mode.
 # Decisions go to STATE/advisor/decisions.jsonl and a daily digest. A [[repos]] entry with
-# advisor = false keeps that repository's text off the provider. Per-repository excerpt flags
+# advisor = false keeps that repository's text off both providers. Per-repository excerpt flags
 # (advisor_diff_excerpts, advisor_ci_log_excerpts, advisor_local_documents) default off.
 [advisor]
 env_file = "~/.config/baton/deepseek.env"     # DEEPSEEK_API_KEY
+# Backends, tried in order: "claude" (Claude Code, the grant for the advisor; Claude must be
+# declared under [vendors]) and "deepseek". ["deepseek"] uses DeepSeek only.
+backend_order = ["claude", "deepseek"]
+claude = { model = "claude_strong", effort = "medium" }   # model alias and effort for Claude
 mode = "off"
-model = "deepseek-flash"
+model = "deepseek-flash"                      # the DeepSeek model
 base_url = "https://api.deepseek.com"
 timeout_seconds = 60
 snapshot_chars = 24000

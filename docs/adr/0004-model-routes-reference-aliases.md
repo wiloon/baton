@@ -10,7 +10,7 @@ only for Codex and only per role, not per round. Several modules also read `mode
 directly. A model generation change (6.1 → 6.2, #61) touched the baseline, a config default and a
 family regex, and found a telemetry allowlist that had silently drifted. We decided that model
 identifiers appear once, as **aliases**. Dispatch takes its model and effort from a
-**route**: role × phase × vendor → model choice + effort. Probes and retrospectives use
+**route**: role × tier × phase × vendor → model choice + effort (the tier dimension is ADR 0009's). Probes and retrospectives use
 the same alias catalog. Updating a model identifier means changing its alias definition.
 
 ```toml
@@ -49,6 +49,13 @@ codex  = { model = "codex_fast", effort = "low" }
   If the entry or table is absent, inherit the complete base entry for that vendor, including
   effort and subagent model. A present entry replaces the complete base entry. An omitted or
   empty effort or subagent field uses the CLI default for that field.
+- `dev`, `fix`, `review`, `spec_review` and `spec` have optional tier tables `ROLE_light` and
+  `ROLE_heavy` (ADR 0009); `ROLE` itself is the standard tier. Without follow-up, use the
+  step's tier entry for that vendor, else the `ROLE` entry. A present tier entry replaces the
+  complete `ROLE` entry, as a follow-up entry does. When follow-up is selected the tier is
+  ignored: `ROLE_followup`, else the `ROLE` entry, never a tier entry. Tier entries need the
+  same fields, aliases and vendor roles as other entries. There are no other tier tables
+  (none for `scan` or `screenshot_review`, no `ROLE_standard`, no tiered follow-up).
 - The adapter declares whether effort and subagent fields are supported. Codex receives effort
   via `-c model_reasoning_effort` and Claude Code via `--effort`. A Cursor model identifier
   carries the effort level. Claude supports subagent models.
@@ -142,3 +149,5 @@ The config remains valid and normal cross-vendor selection applies.
   `cli.log` entry, agy is not enabled.
 - ADR 0009 (owner, 2026-11-24): routes gain a tier dimension chosen by the task profile;
   an absent tier entry inherits the standard entry, and follow-up rounds keep `ROLE_followup`.
+- Issue #237, spec round 1: wrote the tier rules into Rules. "Base entry" for an absent
+  follow-up stays the `ROLE` table whatever the tier, so follow-up rounds resolve as before.

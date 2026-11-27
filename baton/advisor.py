@@ -1,4 +1,5 @@
-"""The routine advisor (ADR 0008, #17): one fresh DeepSeek call at a decision point.
+"""The routine advisor (ADR 0008, #17): one fresh model call at a decision point, to Claude Code first
+and DeepSeek as the fallback backend (#236, `[advisor] backend_order`).
 
 The runner builds a bounded snapshot and the set of actions it allows; the advisor returns one of
 them with a reason and evidence. The runner revalidates and acts; on any failure, an action outside
@@ -11,20 +12,25 @@ one extra round per task episode: the grant is a state file, so a second limit h
 another call.
 """
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import http.client
 import json
 import os
 from pathlib import Path
 import re
+import tempfile
 import time
 import urllib.error
 import urllib.request
 from uuid import uuid4
 
-from . import credentials, notify, session, statefile
+from . import (agents, claude_cli, credentials, notify, quota, retrospective_analyst, session, statefile,
+               vendor_policy)
+from .common import analyst_result
 
+LABELS = {"claude": "Claude", "deepseek": "DeepSeek"}
+CLAUDE_OUTPUT_BYTES = 512 * 1024
 PROMPT_VERSION = "3"
 OBSERVATION_PROMPT_VERSION = "4"
 QUESTIONS_PROMPT_VERSION = "6"
@@ -94,6 +100,7 @@ class Decision:
     called: bool = False
     previous: bool = False
     answers: tuple = ()    # grounded answer set for answer_spec_questions, else ()
+    backend: str = ""      # "claude" or "deepseek"; "" when no record names one
 
     @property
     def extra_round(self):
@@ -244,6 +251,14 @@ def secret_values(env):
             values.update(credentials.load(path, tuple(keys), environ={}).values())
         except credentials.CredentialError:
             pass
+    # Claude's setup-token may come only from its env file (#255).
+    for vendor in getattr(getattr(env, "config", None), "vendors", ()):
+        if vendor.adapter == claude_cli.ID and vendor.env_file:
+            try:
+                token = credentials.load(vendor.env_file, (claude_cli.OAUTH_KEY,), environ={})
+            except credentials.CredentialError:
+                continue
+            values.update(v for v in token.values() if len(v) >= 8)
     for name, value in os.environ.items():
         if (SECRET_NAME.search(name) or name in keys or name in credentials.RUNNER_KEYS) and len(value) >= 8:
             values.add(value)
@@ -336,7 +351,8 @@ def previous_attempt(env, item, point, pending):
     for record in reversed(pending):
         if record["point"] == point and record["executed"] != record["rule"]:
             return Decision(HANDOFF, record["reason"], advised=record["executed"],
-                            failure="recovery already attempted in this episode", previous=True)
+                            failure="recovery already attempted in this episode", previous=True,
+                            backend=record.get("backend") or "deepseek")
     if granted(env, point, item):
         return Decision(HANDOFF, failure="recovery already granted in this episode", previous=True)
     return None
@@ -361,8 +377,8 @@ def enabled(env):
     return cfg.mode in ("observe", "live") and getattr(env.repo, "advisor", True)
 
 
-def call_deepseek(cfg, key, snapshot, actions, *, category=None):
-    """(parsed reply dict, usage dict); raises on transport, HTTP or format failure."""
+def instructions(actions, category=None):
+    """The system text, the same for both backends."""
     system = SYSTEM
     if "answer_spec_questions" in actions:
         system += "\n" + QUESTIONS_SYSTEM
@@ -378,13 +394,21 @@ def call_deepseek(cfg, key, snapshot, actions, *, category=None):
                    "\nFor a local investigation, retry_step means one more attempt of the failed local step "
                    "(author seeding, verification, or worktree preparation) without resetting its budget. "
                    "Preserve local work; do not force destructive cleanup.")
+    return system
+
+
+def user_message(snapshot, actions):
+    return f"Allowed actions: {json.dumps(list(actions))}\n\n<snapshot>\n{snapshot}\n</snapshot>"
+
+
+def call_deepseek(cfg, key, snapshot, actions, *, category=None):
+    """(parsed reply dict, usage dict); raises on transport, HTTP or format failure."""
     body = json.dumps({
         "model": cfg.model,
         "temperature": 0,
         "response_format": {"type": "json_object"},
-        "messages": [{"role": "system", "content": system},
-                     {"role": "user", "content": f"Allowed actions: {json.dumps(list(actions))}\n\n"
-                                                 f"<snapshot>\n{snapshot}\n</snapshot>"}],
+        "messages": [{"role": "system", "content": instructions(actions, category)},
+                     {"role": "user", "content": user_message(snapshot, actions)}],
     }).encode()
     request = urllib.request.Request(cfg.base_url.rstrip("/") + "/chat/completions", data=body, method="POST",
                                      headers={"Content-Type": "application/json",
@@ -397,6 +421,205 @@ def call_deepseek(cfg, key, snapshot, actions, *, category=None):
         return json.loads(content), usage
     except (ValueError, KeyError, IndexError, TypeError) as error:
         raise MalformedReply(error, usage) from error
+
+
+class BackendError(RuntimeError):
+    """A backend call that gave no usable reply; its usage still counts."""
+
+    def __init__(self, failure, usage=None):
+        super().__init__(failure)
+        self.usage = usage or {}
+
+
+def claude_unavailable(env):
+    """Why Claude is not called, or "". Stale or missing quota means try: a failed call falls back."""
+    state, now = env.config.paths.state, time.time()
+    if "claude" not in env.config.declared():
+        return "claude is not declared"
+    try:
+        claude_cli.oauth_env(env.config.vendor("claude"))
+    except credentials.CredentialError as error:
+        return str(error)
+    try:
+        until = vendor_policy.cooldown_until(state, "claude", now)
+    except ValueError:
+        until = None
+    if until:
+        return f"claude cooldown until epoch {int(until)}"
+    if quota.credential_expired(state, "claude"):
+        return "claude credential expired"
+    try:
+        _, blocked = quota.assess(quota.load(state, "claude"), env.config.quota.cap_of("claude"),
+                                  env.config.quota.five_hour_max_of("claude"), now)
+    except (ValueError, KeyError, TypeError, AttributeError, OverflowError):
+        return ""   # an unreadable snapshot says nothing about the quota left
+    return f"claude at its limit: {blocked}" if blocked else ""
+
+
+def account_claude(env, status, rc, output, error_text, valid):
+    """Quota windows, credential and cooldown from one Claude call, as baton/retrospectives.py does.
+    A write that fails never discards the reply."""
+    state = env.config.paths.state
+    errors = (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError)
+    try:
+        windows = claude_cli.parse_quota_log(output.splitlines())
+        if windows:
+            quota.record(state, "claude", windows, time.time())
+        if status == "success" and rc == 0:
+            quota.credential(state, "claude", "authenticated", time.time())
+    except errors as error:
+        notify.log(f"advisor: could not record claude quota ({type(error).__name__})")
+    if status != "success" or (not rc and valid):
+        return
+    try:
+        classified, until = agents.classify("claude", rc, output + "\n" + error_text,
+                                            cooldown_hours=env.config.scheduling.cooldown_hours)
+        if classified == "busy":
+            until = int(time.time()) + env.config.models.busy_minutes * 60
+        if classified in ("auth", "quota", "busy"):
+            vendor_policy.observe_failure(state, "claude", {"state": classified, "cooldown_until": until},
+                                          time.time())
+    except errors as error:
+        notify.log(f"advisor: could not record the claude failure ({type(error).__name__})")
+
+
+def claude_usage(spent):
+    """The stream's usage under the keys DeepSeek reports."""
+    if not isinstance(spent, dict) or not spent:
+        return {}
+
+    def count(key):
+        return spent[key] if isinstance(spent.get(key), int) else 0
+    prompt = sum(map(count, ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")))
+    completion = count("output_tokens")
+    return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
+
+
+def call_claude(cfg, env, snapshot, actions, *, category=None):
+    """(parsed reply, usage dict) from one tool-less, isolated Claude Code call. No vendor lease."""
+    command = claude_cli.advisor_command(cfg.claude.model, cfg.claude.effort, instructions(actions, category))
+    try:
+        child = retrospective_analyst.environment(env.config, env.config.vendor("claude"))
+    except credentials.CredentialError as error:
+        raise BackendError(str(error)) from None
+    child["BATON_INVOCATION_KIND"] = "advisor"
+    with tempfile.TemporaryDirectory(prefix="baton-advisor-") as workspace:
+        status, raw, rc, diagnostics = retrospective_analyst.bounded_process(
+            command, user_message(snapshot, actions), Path(workspace), child, cfg.timeout_seconds,
+            CLAUDE_OUTPUT_BYTES)
+    output = raw.decode(errors="replace")
+    rows, reply, valid, actual, _, tool_use = claude_cli.analyst_response(output)
+    account_claude(env, status, rc, output, diagnostics.get("error_text", ""), valid)
+    usage = claude_usage(analyst_result(rows).get("usage"))
+    if actual != "unknown":
+        usage["actual_model"] = actual
+    failure = {"unavailable": "unavailable: could not start claude", "timeout": "unavailable: timeout",
+               "output_limit": "claude exceeded the output limit"}.get(status)
+    if not failure and rc:
+        failure = f"claude exit {rc}"
+    if not failure and tool_use:
+        failure = "claude used a tool"
+    if not failure and not valid:
+        failure = "claude error result"
+    if failure:
+        raise BackendError(failure, usage)
+    try:
+        return json.loads(retrospective_analyst.unfenced(reply)), usage
+    except (ValueError, TypeError) as error:
+        raise MalformedReply(error, usage) from error
+
+
+@dataclass
+class Attempt:
+    """One backend's turn at a decision."""
+    backend: str
+    model: str
+    called: bool = False
+    failure: str = ""
+    latency_ms: int = 0
+    usage: dict = field(default_factory=dict)
+    actual_model: str = ""
+    advised: str = ""
+    reason: str = ""
+    evidence: list = field(default_factory=list)
+    answers: tuple = ()
+    observed_only: bool = False   # a well-formed answer set with a non-grounded case: recorded, never executed
+
+
+def attempt_backend(env, cfg, backend, key, key_failure, text, actions, *, category, values, sources, cut_rows,
+                    recordable):
+    """One call to BACKEND and the validation every reply gets. Never raises."""
+    claude = backend == "claude"
+    result = Attempt(backend, cfg.claude.model if claude else cfg.model)
+    try:
+        result.failure = claude_unavailable(env) if claude else "" if key else key_failure
+    except OSError as error:
+        result.failure = f"claude availability unknown: {type(error).__name__}"
+    if result.failure:
+        return result
+    result.called = True
+    started = time.monotonic()
+
+    def consumed(metadata):
+        if isinstance(metadata, dict):
+            result.usage = {k: count for k, count in metadata.items()
+                            if k in ("prompt_tokens", "completion_tokens", "total_tokens") and isinstance(count, int)}
+            result.actual_model = metadata.get("actual_model", "") if claude else ""
+    try:
+        options = {"category": category} if category else {}
+        reply, metadata = (call_claude(cfg, env, text, actions, **options) if claude
+                           else call_deepseek(cfg, key, text, actions, **options))
+        consumed(metadata)   # the call consumed these tokens even if the reply is rejected
+        if category:
+            if (not isinstance(reply, dict) or not isinstance(reply.get("action"), str)
+                    or not isinstance(reply.get("reason"), str)
+                    or not isinstance(reply.get("evidence"), list)):
+                raise ValueError("expected action and reason strings and an evidence array")
+        raw_action = str(reply.get("action", ""))
+        raw_reason = reply.get("reason")
+        raw_evidence = reply.get("evidence", [])
+        if not category and (not isinstance(raw_reason, str) or not raw_reason.strip()):
+            raise ValueError("expected a nonblank reason string")
+        if not isinstance(raw_evidence, list):
+            raise ValueError("expected an evidence array")
+        if any(not isinstance(quote, str) for quote in raw_evidence):
+            raise ValueError("evidence is outside the sent snapshot")
+        # JSON escapes can decode to lone surrogates. Reject them before keeping any provider text.
+        for value in (raw_action, raw_reason, *raw_evidence):
+            value.encode("utf-8")
+        if any(not quote or quote not in text for quote in raw_evidence):
+            raise ValueError("evidence is outside the sent snapshot")
+        result.advised = raw_action
+        if raw_action not in actions:
+            result.advised = redact(raw_action, values)
+            result.failure = f"action outside the allowed set: {result.advised[:60]!r}"
+        result.reason = redact(raw_reason, values)[:600]
+        # Keep opted-in raw excerpts out of the decision record (#125).
+        result.evidence = [redact(quote, values)[:300] for quote in raw_evidence[:5] if quote in recordable]
+        if not result.failure and raw_action == "answer_spec_questions":
+            answers = normalize_answers(reply.get("answers"), text, sources, cut_rows)
+            for row in answers:
+                clean = redact(row["text"], values)
+                if row["case"] == "grounded" and (clean != row["text"] or len(clean) > 600):
+                    raise ValueError("answer text was changed by redaction or exceeds the length limit")
+            result.observed_only = any(row["case"] != "grounded" for row in answers)
+            result.answers = tuple({**row, "text": redact(row["text"], values)[:600]} for row in answers)
+    except urllib.error.HTTPError as error:
+        result.failure = f"HTTP {error.code}"
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as error:
+        result.failure = f"unavailable: {type(error).__name__}"
+    except BackendError as error:
+        consumed(error.usage)
+        result.failure = str(error)
+    except MalformedReply as error:   # the envelope arrived, so its usage still counts
+        consumed(error.usage)
+        result.failure = f"malformed reply: {type(error.cause).__name__}: {redact(str(error), values)[:120]}"
+    except UnicodeEncodeError:
+        result.failure = "malformed reply: invalid Unicode text"
+    except (ValueError, KeyError, IndexError, TypeError, AttributeError, RuntimeError) as error:
+        result.failure = f"malformed reply: {type(error).__name__}: {redact(str(error), values)[:120]}"
+    result.latency_ms = int((time.monotonic() - started) * 1000)
+    return result
 
 
 def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=None, rule=HANDOFF, mode=None,
@@ -422,9 +645,9 @@ def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=No
     started = time.monotonic()
     try:
         key = credentials.load(cfg.env_file, (KEY,)).get(KEY, "")
-        failure = "" if key else "no DEEPSEEK_API_KEY"
+        key_failure = "" if key else "no DEEPSEEK_API_KEY"
     except credentials.CredentialError as error:
-        key, failure = "", str(error)
+        key, key_failure = "", str(error)
     values = secret_values(env)
     if key:
         values.add(key)
@@ -438,75 +661,38 @@ def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=No
     for record in reversed(pending):
         if record["point"] == point and record["snapshot_sha"] == digest and record["actions"] == list(actions):
             return Decision(rule, record.get("reason", ""), tuple(record.get("evidence") or ()),
-                            record.get("advised", ""), "duplicate snapshot", previous=True)
+                            record.get("advised", ""), "duplicate snapshot", previous=True,
+                            backend=record.get("backend") or "deepseek")
     decision_id = uuid4().hex
     answering = "answer_spec_questions" in actions
     version = (QUESTIONS_PROMPT_VERSION if answering
                else OBSERVATION_PROMPT_VERSION if category else PROMPT_VERSION)
     record = {"kind": "decision", "ts": int(time.time()), "point": point, "repo": env.repo.gh_repo, "item": str(item),
               "task_kind": task_kind, "episode": pending[0]["episode"] if pending else decision_id,
-              "decision_id": decision_id, "snapshot_sha": digest, "actions": list(actions), "backend": "deepseek",
-              "model": cfg.model, "prompt_version": version, "mode": effective, "rule": rule}
-    advised, reason, evidence, answers, usage = "", "", [], (), {}
-    observed_only = False   # a well-formed answer set with a non-grounded case: recorded, never executed
-
-    def counted(metadata):
-        return {k: count for k, count in metadata.items()
-                if k in ("prompt_tokens", "completion_tokens", "total_tokens") and isinstance(count, int)}
-    try:
-        if key:
-            options = {"category": category} if category else {}
-            reply, metadata = call_deepseek(cfg, key, text, actions, **options)
-            if isinstance(metadata, dict):   # the call consumed these tokens even if the reply is rejected
-                usage = counted(metadata)
-            if category:
-                if (not isinstance(reply, dict) or not isinstance(reply.get("action"), str)
-                        or not isinstance(reply.get("reason"), str)
-                        or not isinstance(reply.get("evidence"), list)):
-                    raise ValueError("expected action and reason strings and an evidence array")
-            raw_action = str(reply.get("action", ""))
-            raw_reason = reply.get("reason")
-            raw_evidence = reply.get("evidence", [])
-            if not category and (not isinstance(raw_reason, str) or not raw_reason.strip()):
-                raise ValueError("expected a nonblank reason string")
-            if not isinstance(raw_evidence, list):
-                raise ValueError("expected an evidence array")
-            if any(not isinstance(quote, str) for quote in raw_evidence):
-                raise ValueError("evidence is outside the sent snapshot")
-            # JSON escapes can decode to lone surrogates. Reject them before keeping any provider text.
-            for value in (raw_action, raw_reason, *raw_evidence):
-                value.encode("utf-8")
-            if any(not quote or quote not in text for quote in raw_evidence):
-                raise ValueError("evidence is outside the sent snapshot")
-            advised = raw_action
-            if advised not in actions:
-                advised = redact(advised, values)
-                failure = f"action outside the allowed set: {advised[:60]!r}"
-            reason = redact(raw_reason, values)[:600]
-            # Keep opted-in raw excerpts out of the decision record (#125).
-            evidence = [redact(quote, values)[:300] for quote in raw_evidence[:5]
-                        if quote in recordable]
-            if not failure and advised == "answer_spec_questions":
-                answers = normalize_answers(reply.get("answers"), text, sources, cut_rows)
-                observed_only = any(row["case"] != "grounded" for row in answers)
-                for row in answers:
-                    clean = redact(row["text"], values)
-                    if row["case"] == "grounded" and (clean != row["text"] or len(clean) > 600):
-                        raise ValueError("answer text was changed by redaction or exceeds the length limit")
-                answers = tuple({**row, "text": redact(row["text"], values)[:600]} for row in answers)
-    except urllib.error.HTTPError as error:
-        failure = f"HTTP {error.code}"
-    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as error:
-        failure = f"unavailable: {type(error).__name__}"
-    except MalformedReply as error:   # the envelope arrived, so its usage still counts
-        if isinstance(error.usage, dict):
-            usage = counted(error.usage)
-        failure = f"malformed reply: {type(error.cause).__name__}: {redact(str(error), values)[:120]}"
-    except UnicodeEncodeError:
-        failure = "malformed reply: invalid Unicode text"
-    except (ValueError, KeyError, IndexError, TypeError, AttributeError, RuntimeError) as error:
-        failure = f"malformed reply: {type(error).__name__}: {redact(str(error), values)[:120]}"
-        answers, observed_only = (), False
+              "decision_id": decision_id, "snapshot_sha": digest, "actions": list(actions),
+              "prompt_version": version, "mode": effective, "rule": rule}
+    tries = []
+    for backend in cfg.backend_order:
+        tries.append(attempt_backend(env, cfg, backend, key, key_failure, text, actions, category=category,
+                                     values=values, sources=sources, cut_rows=cut_rows, recordable=recordable))
+        if not tries[-1].failure:
+            break
+    # The backend that answered; else the last one actually called; else the first in order.
+    first, last = tries[0], tries[-1]
+    called = [tried for tried in tries if tried.called]
+    chosen = last if not last.failure else called[-1] if called else first
+    failure = chosen.failure
+    record.update(backend=chosen.backend, model=chosen.model)
+    if chosen.actual_model:
+        record["actual_model"] = chosen.actual_model
+    if len(tries) > 1:
+        if last.failure and not last.called:
+            failure = f"{first.failure}; fallback unavailable: {last.failure}"
+        else:
+            record["fallback_from"] = {name: getattr(first, name)
+                                       for name in ("backend", "model", "failure", "latency_ms", "usage")}
+    advised, reason, evidence, answers = chosen.advised, chosen.reason, chosen.evidence, chosen.answers
+    observed_only, usage = chosen.observed_only, chosen.usage
     executed = rule
     if not failure and advised != rule and effective == "live":
         try:
@@ -541,7 +727,8 @@ def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=No
         executed, failure, answers = rule, f"could not persist advisor decision: {type(error).__name__}", ()
     notify.log(f"advisor {point} #{item}: advised={advised or '-'} executed={executed}"
                + (f" failure={failure}" if failure else ""))
-    return Decision(executed, reason, tuple(evidence), advised, failure, True, answers=answers)
+    return Decision(executed, reason, tuple(evidence), advised, failure, True, answers=answers,
+                    backend=chosen.backend)
 
 
 def pending_items(env, task_kind):
@@ -609,12 +796,14 @@ def handoff_note(decision):
     """One line for the handoff text: what the advisor chose and why."""
     if not (decision.called or decision.previous):
         return ""
+    label = LABELS.get(decision.backend)
+    who = f"Advisor ({label})" if label else "Advisor"
     if decision.failure and not decision.advised:
-        return f" Advisor (DeepSeek): no decision ({decision.failure})."
+        return f" {who}: no decision ({decision.failure})."
     if decision.advised not in ("", HANDOFF) and not decision.failure:
-        note = f" Advisor (DeepSeek) recommended {decision.advised}, not executed (observation)"
+        note = f" {who} recommended {decision.advised}, not executed (observation)"
         return note + (f": {decision.reason}." if decision.reason else ".")
-    note = f" Advisor (DeepSeek) chose {decision.advised or 'nothing'}"
+    note = f" {who} chose {decision.advised or 'nothing'}"
     if decision.reason:
         note += f": {decision.reason}"
     if decision.failure:
@@ -690,8 +879,15 @@ def digest(env, now=None):
         any(a.get("case") == "reversible_default" for a in r.get("answers") or ()) for r in decisions)
     if observed_defaults:
         counts.append(f"observed reversible-default recommendations: {observed_defaults}")
-    tokens = sum((r.get("usage") or {}).get("total_tokens", 0) for r in decisions)
-    text = (f"{len(decisions)} decision(s), {tokens} total tokens. "
+    tokens, claude_used = Counter(), False
+    for r in decisions:
+        for tried in filter(None, (r, r.get("fallback_from"))):
+            backend, usage = tried.get("backend") or "deepseek", tried.get("usage") or {}
+            tokens[backend] += usage.get("total_tokens", 0)
+            claude_used = claude_used or (backend == "claude" and bool(usage))
+    by_backend = ("Tokens by backend: " + ", ".join(f"{name} {count}" for name, count in sorted(tokens.items()))
+                  + ". " if claude_used else "")
+    text = (f"{len(decisions)} decision(s), {tokens.total()} total tokens. {by_backend}"
             f"Extra rounds granted {len(extra)}, ended merged/accepted {won}. "
             f"{earlier} earlier decision(s) closed in this window.\n" + "\n".join(counts + lines))
     notify.notify("Advisor digest", text[:3500])

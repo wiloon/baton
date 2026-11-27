@@ -55,6 +55,10 @@ The real telemetry integration tests run when `alloy` is on PATH (or `ALLOY_BIN`
 otherwise they are skipped. They use ephemeral loopback listeners and need permission to start
 Alloy and bind local ports. Other offline checks need no vendor subscription or live credentials.
 
+Agent files (descriptions, replies, drafts) live in each repository's scratch directory under the
+state directory ([README](README.md#agent-scratch-files)); take the path from `baton/scratch.py`
+instead of naming a file under `/tmp`, and point the state directory at a temporary one in tests.
+
 CI runs the offline suite on Linux. Live provider compatibility and a fresh-host installation
 must be checked separately; the offline suite does not call the coding-agent services.
 

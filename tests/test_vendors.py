@@ -1,5 +1,6 @@
 """Vendor policy tests; the shell test only checks runner wiring."""
 
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -342,6 +343,32 @@ class VendorTests(unittest.TestCase):
             Path(self.state, f"{vendor}-cooldown-until").write_text(str(NOW + LONG_REST))
         result, rc = vendors.pick(self.state, POOL, "review", [*POOL, "cursor"],
                                   pr="17", by="contrib", now=NOW, review=True)
+        self.assertEqual((result["vendor"], rc), ("claude", 0))
+        self.assertEqual(result["review_mode"], "same-vendor-different-model")
+
+    def test_fable_is_its_own_claude_family(self):
+        for first, second, distinct in (
+                ("fable", "sonnet", True),
+                ("claude-fable-5-2", "claude-opus-5-5", True),
+                ("claude-fable-5-2", "haiku", True),
+                ("fable", "claude-fable-5-2", False),
+                ("claude-fable-5-2", "claude-fable-5-2-20261101", False),
+                ("claude-fable-5-2", "claude-fable-5-3", True)):
+            self.assertIs(vendors.models_distinct("claude", first, second), distinct, (first, second))
+            self.assertIs(vendors.models_distinct("claude", second, first), distinct, (second, first))
+
+    def test_fable_reviews_claude_code_written_on_sonnet(self):
+        vendors.record_author(self.state, "19", "claude")
+        vendors.record_author_model(self.state, "19", "claude", "claude-sonnet-5-5")
+        for vendor in ("codex", "cursor"):
+            Path(self.state, f"{vendor}-cooldown-until").write_text(str(NOW + LONG_REST))
+        env = vendors.session.resolve()
+        routes = tuple((name, vendor, replace(route, model="fable") if (name, vendor) == ("review", "claude") else route)
+                       for name, vendor, route in env.config.models.routes)
+        env.config = replace(env.config, models=replace(env.config.models, routes=routes))
+        with patch.object(vendors.session, "resolve", return_value=env):
+            result, rc = vendors.pick(self.state, POOL, "review", [*POOL, "cursor"],
+                                      pr="19", by="contrib", now=NOW, review=True)
         self.assertEqual((result["vendor"], rc), ("claude", 0))
         self.assertEqual(result["review_mode"], "same-vendor-different-model")
 

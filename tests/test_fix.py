@@ -19,6 +19,10 @@ BODY = ("<!-- baton-task issue=419 completion=partial -->\n\nRefs #419\n\n## Wha
         "## Checks to verify\nnone\n\n## Before release\nnone\n\n## Follow-ups\n- [nit] tidy copy\n")
 
 
+def scratch_file(name):
+    return Path(os.environ["STATE"], "scratch", name)
+
+
 def env_ctx():
     return os.environ["CTX"]
 
@@ -37,11 +41,11 @@ def fix_worktree(gh, tmp_path, monkeypatch):
     sh(tmp_path, "git", "clone", "-q", str(origin), str(wt))
     for key, value in (("user.name", "t"), ("user.email", "t@example.invalid")):
         sh(wt, "git", "config", key, value)
-    sh(wt, "git", "checkout", "-q", "-b", "cursor/issue-1")
+    sh(wt, "git", "checkout", "-q", "-b", "cursor/issue-419")
     (wt / "a.txt").write_text("a\n")
     sh(wt, "git", "add", "-A")
     sh(wt, "git", "commit", "-q", "-m", "base")
-    sh(wt, "git", "push", "-q", "-u", "origin", "cursor/issue-1")
+    sh(wt, "git", "push", "-q", "-u", "origin", "cursor/issue-419")
     selfdir.mkdir()
     for path in BIN.iterdir():
         if path.is_file():
@@ -109,7 +113,7 @@ def fix_worktree(gh, tmp_path, monkeypatch):
             return not self.pushed()
 
         def pushed(self):
-            return sh(wt, "git", "rev-parse", "HEAD") == sh(origin, "git", "rev-parse", "cursor/issue-1")
+            return sh(wt, "git", "rev-parse", "HEAD") == sh(origin, "git", "rev-parse", "cursor/issue-419")
 
         def watch_pushes(self):
             hook = wt / ".git" / "hooks" / "pre-push"
@@ -121,7 +125,7 @@ def fix_worktree(gh, tmp_path, monkeypatch):
             return log.read_text().splitlines() if log.exists() else []
 
         def remote_head(self):
-            return sh(origin, "git", "rev-parse", "cursor/issue-1")
+            return sh(origin, "git", "rev-parse", "cursor/issue-419")
 
     state = Run()
 
@@ -163,8 +167,6 @@ def fix_worktree(gh, tmp_path, monkeypatch):
     state.dispatch_agent = stub
     state.verify_script("pass")
     yield state
-    Path(f"/tmp/baton-fix-{PR}.md").unlink(missing_ok=True)
-    Path(f"/tmp/baton-fix-{PR}.md.body").unlink(missing_ok=True)
 
 
 @pytest.fixture
@@ -747,11 +749,11 @@ def test_a_remote_change_during_fix_push_wait_hands_off(run, monkeypatch):
     sh(run.root, "git", "clone", "-q", str(run.root / "origin.git"), str(other))
     for key, value in (("user.name", "t"), ("user.email", "t@example.invalid")):
         sh(other, "git", "config", key, value)
-    sh(other, "git", "checkout", "-q", "cursor/issue-1")
+    sh(other, "git", "checkout", "-q", "cursor/issue-419")
     (other / "remote-change.txt").write_text("x\n")
     sh(other, "git", "add", "-A")
     sh(other, "git", "commit", "-q", "-m", "remote")
-    sh(other, "git", "push", "-q", "origin", "HEAD:cursor/issue-1")
+    sh(other, "git", "push", "-q", "origin", "HEAD:cursor/issue-419")
     clock["now"] = 1_060
     assert run.fix()["rc"] == 1 and run.labelled() and not run.pushed()
     assert len(run.agent_calls) == 1
@@ -783,7 +785,7 @@ CHECKED = {"file": "## Must fix\n1. adopted\n\n## Checks to verify\n- /billing: 
 def test_a_claude_fixer_can_submit_a_description_only_replacement(run):
     # #75: Claude gets the same snapshot + replacement channel as Codex; no commit is progress.
     head = sh(run.worktree, "git", "rev-parse", "HEAD")
-    remote = sh(run.root / "origin.git", "git", "rev-parse", "cursor/issue-1")
+    remote = sh(run.root / "origin.git", "git", "rev-parse", "cursor/issue-419")
     run.agent({"commit": False, "file": "## Must fix\n1. adopted — listed the commit\n\n"
                                         "## Checks to verify\nnone\n\nRESULT: fixed\n",
                "description": NEW_DESCRIPTION})
@@ -795,7 +797,7 @@ def test_a_claude_fixer_can_submit_a_description_only_replacement(run):
     assert "<!-- baton-task issue=419 completion=partial -->" in run.body() and "Refs #419" in run.body()
     assert section(run.body(), "Checks to verify") == "none"
     assert sh(run.worktree, "git", "rev-parse", "HEAD") == head
-    assert sh(run.root / "origin.git", "git", "rev-parse", "cursor/issue-1") == remote == head
+    assert sh(run.root / "origin.git", "git", "rev-parse", "cursor/issue-419") == remote == head
 
 
 def test_a_codex_fixer_can_read_the_current_description(run):
@@ -925,10 +927,14 @@ def test_a_rejected_request_reports_the_exact_reason(run, gh, fixer, directory, 
         gh.set(body=COMPLETE)
     else:
         reason = "cannot determine the PR's issue and task completion"
+        sh(run.worktree, "git", "checkout", "-q", "-b", "feature/no-issue")
+        sh(run.worktree, "git", "push", "-q", "origin", "HEAD:refs/heads/feature/no-issue")
         gh.set(body="Original description.", headRefName="feature/no-issue")
     plan = cursor_plan(reply, request=BODY) if fixer == "cursor" else {**CHECKED, "reply": reply, "description": BODY}
     run.agent({**plan, "request_directory": directory})
-    assert run.fix(fixer)["rc"] == 0 and run.pushed() and not run.labelled()
+    assert run.fix(fixer)["rc"] == 0 and not run.labelled()
+    branch = "cursor/issue-419" if directory else "feature/no-issue"
+    assert sh(run.root / "origin.git", "git", "rev-parse", branch) == sh(run.worktree, "git", "rev-parse", "HEAD")
     assert any(f"description request not applied ({fixer})" in line and reason in line for line in run.runner_log())
     assert f"Discarded the PR description request from {fixer}.\n\n{reason}" in [
         comment.split("\n", 1)[-1] for comment in run.comments()
@@ -1181,13 +1187,13 @@ def test_a_permanent_task_write_failure_hands_off_without_a_deferral(run, gh):
     assert any("task completion change failed" in line for line in run.runner_log())
 
 
-def test_cursor_discards_a_request_it_cannot_read_the_body_for_then_hands_off_no_commit(run, gh):
+def test_cursor_discards_a_request_it_cannot_read_the_body_for_then_hands_off_no_commit(run, gh, monkeypatch):
     # Section 5: nothing was captured to replay, so the request is discarded and the
     # no-commit fix hands off under its own reason, not a description reason.
     run.agent(cursor_plan("RESULT: fixed", request=BODY, commit=False))
-    gh.fail("view")
+    real_view = fix.pr_helpers.view
+    monkeypatch.setattr(fix.pr_helpers, "view", lambda pr, fields: None if "body" in fields else real_view(pr, fields))
     assert run.fix("cursor")["rc"] == 1 and len(run.agent_calls) == 1 and run.labelled()
-    gh.fail("view", False)
     assert run.body() == BODY
     assert any("made no commit" in line for line in run.runner_log())
 
@@ -1287,7 +1293,9 @@ def test_a_transient_description_edit_defers_then_recovers_without_a_second_work
 
 
 def test_a_description_request_from_an_earlier_run_is_not_applied(run):
-    Path(f"/tmp/baton-fix-{PR}.md.body").write_text(NEW_DESCRIPTION)
+    stale = scratch_file(f"fix-{PR}.md.body")
+    stale.parent.mkdir(exist_ok=True)
+    stale.write_text(NEW_DESCRIPTION)
     run.agent(dict(CHECKED))
     assert run.fix("codex")["rc"] == 0
     assert "Disabled buttons." in run.body()
@@ -1319,14 +1327,14 @@ def test_a_failing_check_gets_a_repair_run_by_the_same_vendor(run):
     assert run.agent_calls[-1][:3] == ("claude", "fix", f"pr-{PR}-verify-fix-1")
 
 
-def test_a_repair_run_gets_the_failure_in_its_prompt_and_writes_its_reply_under_tmp(run):
+def test_a_repair_run_gets_the_failure_in_its_prompt_and_writes_its_reply_in_scratch(run):
     # #38: Claude's shell could not read the ctx dir, and guard.sh denies writes there.
     run.verify_script("e2e timeout in {{REPLY_FILE}} spec", "pass")
     run.agent({"commit": True})
     assert run.verify()["rc"] == 0
     prompt, output = run.prompts[-1], run.agent_calls[-1][3]
     assert "<failure>\ne2e timeout in {{REPLY_FILE}} spec\n</failure>" in prompt   # data stays data
-    assert output.startswith("/tmp/baton-") and output.endswith(f"-pr-{PR}-verify-fix.md")
+    assert output == str(scratch_file(f"verify-fix-pr-{PR}.md"))
     assert f"to {output} with the Write tool" in prompt
 
 
@@ -1623,7 +1631,7 @@ def advised_fix(run, monkeypatch):
     from baton import advisor
     from baton.config import Advisor
     monkeypatch.setenv(advisor.KEY, "sk-" + "f" * 24)
-    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="live"))
+    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, backend_order=("deepseek",), mode="live"))
     run.fake_gh.set(state="OPEN", baseRefName="main", headRefOid=run.remote_head(), comments=[], labels=[], reviews=[])
     run.advice, run.advice_calls = [], []
 
@@ -1909,7 +1917,7 @@ def test_observe_records_a_recommendation_without_rerunning(advised_fix, monkeyp
     from baton import advisor
     from baton.config import Advisor
 
-    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="observe"))
+    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, backend_order=("deepseek",), mode="observe"))
     if not enabled:
         from dataclasses import replace
 
@@ -2422,7 +2430,7 @@ def _admit_stub_fixer(run, monkeypatch):
     sess = session.create(cfg, repo=cfg.repos[0])
     sess = replace(sess, dirs=replace(
         sess.dirs, state=Path(os.environ["STATE"]), logs=Path(os.environ["LOGS"]),
-        ctx=Path(os.environ["CTX"])))
+        ctx=Path(os.environ["CTX"]), scratch=scratch_file("")))
 
     def resolve(value=None):
         if isinstance(value, session.Session):
@@ -2434,9 +2442,9 @@ def _admit_stub_fixer(run, monkeypatch):
 
 
 @pytest.mark.parametrize("fixer,template_line", [
-    ("claude", f"4. Write one reply to `/tmp/baton-fix-{PR}.md` with the Write tool; do not post it."
+    ("claude", "4. Write one reply to `REPLY` with the Write tool; do not post it."
                " The runner posts it. Include no `<!-- baton-` markers."),
-    ("codex", f"4. Write one reply to `/tmp/baton-fix-{PR}.md`; do not post it."
+    ("codex", "4. Write one reply to `REPLY`; do not post it."
               " The runner posts it. Include no `<!-- baton-` markers."),
     ("cursor", "5. The runner posts your final message on the PR."
                " Put the checks section above the `TASK:`/`RESULT:` lines."),
@@ -2449,18 +2457,19 @@ def test_fix_templates_come_from_the_adapter(run, monkeypatch, fixer, template_l
     run.agent(cursor_plan(reply) if fixer in ("cursor", "stub") else {"file": reply})
     assert run.fix(fixer)["rc"] == 0
     prompt = run.prompts[0]
-    assert template_line in prompt.splitlines()
+    output = str(scratch_file(f"fix-{PR}.md"))
+    assert template_line.replace("REPLY", output) in prompt.splitlines()
     if fixer in ("cursor", "stub"):
         assert f"pr-{PR}-body.md" in prompt
         assert not run.agent_calls[0][3]
     else:
-        assert run.agent_calls[0][3] == f"/tmp/baton-fix-{PR}.md"
+        assert run.agent_calls[0][3] == output
         assert f"pr-{PR}-description.md" in prompt
-        assert f"/tmp/baton-fix-{PR}.md.body" in prompt
+        assert f"{output}.body" in prompt
     assert run.comments()[0].startswith(f"<!-- baton-fix by={fixer} -->")
 
 
-@pytest.mark.parametrize("fixer,ref,prefix", [("cursor", "cursor/issue-1", "Cursor "), ("claude", "HEAD", "")])
+@pytest.mark.parametrize("fixer,ref,prefix", [("cursor", "HEAD", "Cursor "), ("claude", "HEAD", "")])
 def test_verification_resume_uses_the_fixer_protocol_and_clears_cursor_state(
     advised_fix, monkeypatch, gh, fixer, ref, prefix,
 ):
@@ -2758,3 +2767,170 @@ def test_a_fixer_switch_over_a_pending_cursor_request_applies_none_of_it_and_pus
     for name in (f"cursor-fix-base-{PR}", f"cursor-fix-task-{PR}", f"pr-body-base-{PR}"):
         assert not (state / name).exists(), name
     assert not (ctx / f"pr-{PR}-body.md").exists() and not (ctx / f"pr-{PR}-fix-checks.json").exists()
+
+
+# --- fix push to PR headRefName, including detached worktrees (#304) --------------------------
+
+def _detach_on_pr_branch(run, branch="cursor/issue-419"):
+    """Seed origin with BRANCH at current HEAD, set PR headRefName, and detach the worktree."""
+    sh(run.worktree, "git", "push", "-q", "origin", f"HEAD:refs/heads/{branch}")
+    run.fake_gh.set(headRefName=branch)
+    sh(run.worktree, "git", "checkout", "-q", "--detach")
+    return branch
+
+
+@pytest.mark.parametrize("fixer", ["claude", "cursor"])
+def test_detached_worktree_verified_fix_pushes_to_pr_head_branch(run, fixer):
+    branch = _detach_on_pr_branch(run)
+    run.agent(cursor_plan("## Checks to verify\nnone\n\nRESULT: fixed") if fixer == "cursor" else {})
+    assert run.fix(fixer)["rc"] == 0 and not run.labelled()
+    head = sh(run.worktree, "git", "rev-parse", "HEAD")
+    assert sh(run.root / "origin.git", "git", "rev-parse", branch) == head
+    if fixer == "cursor":
+        assert branch in run.prompts[0]
+
+
+@pytest.mark.parametrize("fixer", ["claude", "cursor"])
+def test_detached_worktree_partial_fix_pushes_then_hands_off_fix_run_failed(run, fixer):
+    branch = _detach_on_pr_branch(run)
+    run.agent({"outcome": "RESULT: failed ran out of time", "commit": True})
+    assert run.fix(fixer)["rc"] == 1 and run.labelled()
+    head = sh(run.worktree, "git", "rev-parse", "HEAD")
+    assert sh(run.root / "origin.git", "git", "rev-parse", branch) == head
+    log = run.runner_log()
+    assert any("handoff fix_run_failed" in line for line in log)
+    assert not any("handoff fix_push_failed" in line for line in log)
+
+
+@pytest.mark.parametrize("fixer", ["claude", "cursor"])
+def test_detached_worktree_needs_info_fix_with_commit_pushes_then_hands_off_fix_needs_info(run, fixer):
+    branch = _detach_on_pr_branch(run)
+    run.agent({"outcome": "RESULT: needs-info clarify spec", "commit": True})
+    assert run.fix(fixer)["rc"] == 1 and run.labelled()
+    head = sh(run.worktree, "git", "rev-parse", "HEAD")
+    assert sh(run.root / "origin.git", "git", "rev-parse", branch) == head
+    log = run.runner_log()
+    assert any("handoff fix_needs_info" in line for line in log)
+    assert not any("handoff fix_push_failed" in line for line in log)
+
+
+def test_detached_worktree_non_fast_forward_push_is_rejected(run, monkeypatch):
+    from baton import handoff
+    branch = _detach_on_pr_branch(run)
+    other = run.root / "other"
+    sh(run.root, "git", "clone", "-q", str(run.root / "origin.git"), str(other))
+    for k, v in (("user.name", "t"), ("user.email", "t@example.invalid")):
+        sh(other, "git", "config", k, v)
+    sh(other, "git", "checkout", "-q", branch)
+    (other / "diverge.txt").write_text("diverge\n")
+    sh(other, "git", "add", "-A")
+    sh(other, "git", "commit", "-q", "-m", "diverge")
+    sh(other, "git", "push", "-q", "origin", f"HEAD:refs/heads/{branch}")
+    diverged = sh(run.root / "origin.git", "git", "rev-parse", branch)
+
+    sent = []
+    monkeypatch.setattr(handoff.notify, "notify", lambda title, text="": sent.append((title, text)))
+    run.watch_pushes()
+    run.agent({})
+    assert run.fix("claude")["rc"] == 1 and run.labelled()
+    assert len(run.push_attempts()) == 1
+    assert sh(run.root / "origin.git", "git", "rev-parse", branch) == diverged
+    assert any("handoff fix_push_failed" in line for line in run.runner_log())
+    assert sent and "fast-forward" in sent[0][1]
+
+
+@pytest.mark.parametrize("fixer", ["claude", "cursor"])
+def test_unreadable_head_branch_hands_off_without_push_or_reply_agent(run, monkeypatch, fixer):
+    branch = "cursor/issue-419"
+    before = sh(run.root / "origin.git", "git", "rev-parse", branch)
+    run.watch_pushes()
+    real_view = fix.pr_helpers.view
+    monkeypatch.setattr(fix.pr_helpers, "view", lambda pr, fields: None if fields == "headRefName" else real_view(pr, fields))
+    run.agent(cursor_plan("## Checks to verify\nnone\n\nRESULT: fixed") if fixer == "cursor" else {})
+    assert run.fix(fixer)["rc"] == 1 and run.labelled()
+    assert run.push_attempts() == []
+    assert sh(run.root / "origin.git", "git", "rev-parse", branch) == before
+    assert any("handoff fix_push_failed" in line for line in run.runner_log())
+    if fixer == "cursor":
+        assert run.agent_calls == []
+
+
+def test_worktree_on_wrong_branch_refuses_push_and_leaves_origin_unchanged(run):
+    branch = "cursor/issue-419"
+    sh(run.worktree, "git", "push", "-q", "origin", f"HEAD:refs/heads/{branch}")
+    run.fake_gh.set(headRefName=branch)
+    sh(run.worktree, "git", "checkout", "-q", "-b", "other/branch")
+    sh(run.worktree, "git", "push", "-q", "origin", "HEAD:refs/heads/other/branch")
+    before_head = sh(run.root / "origin.git", "git", "rev-parse", branch)
+    before_other = sh(run.root / "origin.git", "git", "rev-parse", "other/branch")
+    run.watch_pushes()
+
+    run.agent({})
+    assert run.fix("claude")["rc"] == 1 and run.labelled()
+    assert run.push_attempts() == []
+    assert sh(run.root / "origin.git", "git", "rev-parse", branch) == before_head
+    assert sh(run.root / "origin.git", "git", "rev-parse", "other/branch") == before_other
+    assert any("handoff fix_push_failed" in line for line in run.runner_log())
+
+
+def test_replay_on_detached_worktree_whose_head_moved_hands_off_without_push(run, monkeypatch):
+    from baton import common, handoff
+    branch = _detach_on_pr_branch(run)
+    before = sh(run.root / "origin.git", "git", "rev-parse", branch)
+    clock = {"now": 1_000}
+    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
+    pushes = []
+
+    def flaky(*args, **kwargs):
+        pushes.append(clock["now"])
+        return common.PushResult(False, transient=True, detail="connection refused")
+
+    monkeypatch.setattr(fix, "push", flaky)
+    run.agent({})
+    assert run.fix("claude")["rc"] == 75 and not run.labelled()
+    assert pushes == [1_000]
+
+    # Replay must not re-read headRefName, and must hand off without pushing when HEAD moved.
+    real_view = fix.pr_helpers.view
+    head_reads = []
+
+    def watch_view(pr, fields):
+        if fields == "headRefName":
+            head_reads.append(pr)
+        return real_view(pr, fields)
+
+    monkeypatch.setattr(fix.pr_helpers, "view", watch_view)
+    (run.worktree / "extra.txt").write_text("moved\n")
+    sh(run.worktree, "git", "add", "-A")
+    sh(run.worktree, "git", "commit", "-q", "-m", "moved head")
+    clock["now"] = 1_060
+    assert run.fix("claude")["rc"] == 1 and run.labelled()
+    assert head_reads == []
+    assert pushes == [1_000]
+    assert sh(run.root / "origin.git", "git", "rev-parse", branch) == before
+    assert any("handoff fix_push_failed" in line for line in run.runner_log())
+
+
+def test_replay_on_detached_worktree_succeeds_without_rereading_head_branch(run, monkeypatch):
+    from baton import common, handoff
+    branch = _detach_on_pr_branch(run)
+    clock = {"now": 1_000}
+    monkeypatch.setattr(handoff, "clock", lambda: clock["now"])
+    pushes = []
+
+    def flaky(*args, **kwargs):
+        pushes.append(clock["now"])
+        if clock["now"] == 1_000:
+            return common.PushResult(False, transient=True, detail="connection refused")
+        return common.push(*args, **kwargs)
+
+    monkeypatch.setattr(fix, "push", flaky)
+    run.agent({})
+    assert run.fix("claude")["rc"] == 75 and not run.labelled()
+    real_view = fix.pr_helpers.view
+    monkeypatch.setattr(fix.pr_helpers, "view", lambda pr, fields: None if fields == "headRefName" else real_view(pr, fields))
+    clock["now"] = 1_060
+    assert run.fix("claude")["rc"] == 0 and not run.labelled()
+    assert pushes == [1_000, 1_060]
+    assert sh(run.root / "origin.git", "git", "rev-parse", branch) == sh(run.worktree, "git", "rev-parse", "HEAD")
+

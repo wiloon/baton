@@ -2,13 +2,17 @@
 # Keep the agent's files from filling /tmp (#248): a tmpfs with a per-user quota fills up,
 # and then every run and deploy fails with "Disk quota exceeded". systemd-tmpfiles ages
 # /tmp only after 10 days.
-#   tmp-sweep.sh N...  remove what finished issue/PR N left: the runner's own files
-#                      (baton-dev-N.pr.md, baton-review-N-R.md, ...) and the test databases,
-#                      caches and binaries agents name after the task (PREFIX-N-*, PREFIX-prN-*)
+#   tmp-sweep.sh N...  remove what finished issue/PR N left: the test databases, caches and
+#                      binaries agents name after the task (PREFIX-N-*, PREFIX-prN-*) and
+#                      agent files from older runners (baton-dev-N.pr.md, ...)
 #   tmp-sweep.sh       (baton-tmp-sweep.timer) remove the agent's entries with
 #                      nothing written in the last day; jest's shared cache is trimmed
 #                      per entry
-# Only this user's top-level entries matching the names below are touched.
+# In /tmp, only this user's top-level entries matching the names below are touched.
+#
+# Each repository's scratch directory (BATON_SCRATCH_DIRS, one absolute path per line) holds
+# only agent files: N removes the files of task N in the directories given, and the timer
+# removes every entry idle for a day, whatever its name. The directory itself stays.
 set -u
 TMP_ROOT=${BATON_TMP_ROOT:-/tmp}
 STALE_MINUTES=${BATON_TMP_STALE_MINUTES:-1440}
@@ -26,6 +30,10 @@ for prefix in ${extra[@]+"${extra[@]}"}; do
 done
 STALE_NAMES=('cgo-gcc-input-*' 'go-build*' .pnpm-store node-compile-cache)
 for prefix in "${PREFIXES[@]}"; do STALE_NAMES+=("$prefix-*"); done
+SCRATCH_DIRS=()
+while IFS= read -r dir; do
+  [[ "$dir" == /*/scratch ]] && SCRATCH_DIRS+=("$dir")
+done <<< "${BATON_SCRATCH_DIRS:-}"
 
 remove() { rm -rf -- "$@" 2>/dev/null; }
 
@@ -35,7 +43,7 @@ stale() {
 }
 
 sweep_task() {
-  local n p names
+  local n p names dir
   for n; do
     [[ "$n" =~ ^[0-9]+$ ]] || continue
     names=()
@@ -45,11 +53,16 @@ sweep_task() {
     done
     find "$TMP_ROOT" -mindepth 1 -maxdepth 1 -user "$me" \( "${names[@]:1}" \) \
       -exec rm -rf -- {} + 2>/dev/null
+    for dir in ${SCRATCH_DIRS[@]+"${SCRATCH_DIRS[@]}"}; do
+      find "$dir" -mindepth 1 -maxdepth 1 -user "$me" \( -name "dev-$n.*" -o -name "review-$n-*" \
+        -o -name "screenshot-review-$n-*" -o -name "fix-$n.md*" -o -name "spec-$n-*" \
+        -o -name "verify-fix-pr-$n.md*" -o -name "verify-fix-issue-$n.md*" \) -exec rm -rf -- {} + 2>/dev/null
+    done
   done
 }
 
 sweep_stale() {
-  local name p
+  local name p dir
   local args=()
   for name in "${STALE_NAMES[@]}"; do args+=(-o -name "$name"); done
   while IFS= read -r -d '' p; do
@@ -59,6 +72,11 @@ sweep_stale() {
   # adds its own haste maps.
   for p in "$TMP_ROOT"/jest_*/*; do
     [[ -e "$p" && -O "$p" ]] && stale "$p" && remove "$p"
+  done
+  for dir in ${SCRATCH_DIRS[@]+"${SCRATCH_DIRS[@]}"}; do
+    while IFS= read -r -d '' p; do
+      stale "$p" && remove "$p"
+    done < <(find "$dir" -mindepth 1 -maxdepth 1 -user "$me" -print0 2>/dev/null)
   done
 }
 

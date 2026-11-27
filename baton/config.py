@@ -113,12 +113,14 @@ class RepoDirs:
     state: Path
     logs: Path
     ctx: Path
+    scratch: Path   # agents' output files (baton.scratch); the only part of state they may write (#306)
 
 
 def repo_dirs(paths, repo):
     slug = Path(*repo.gh_repo.split('/'))
-    return RepoDirs(clone=paths.clones / slug, worktrees=paths.wt_root / slug, state=paths.state / 'repos' / slug,
-                    logs=paths.logs / slug, ctx=paths.ctx / slug)
+    state = paths.state / 'repos' / slug
+    return RepoDirs(clone=paths.clones / slug, worktrees=paths.wt_root / slug, state=state,
+                    logs=paths.logs / slug, ctx=paths.ctx / slug, scratch=state / 'scratch')
 
 
 ROUTE_ROLES = ("dev", "fix", "review", "screenshot_review", "spec_review", "spec", "scan")
@@ -132,7 +134,12 @@ ROLE_ROUTE = {
     "scan": "scan",
 }
 ROUTE_ROLE = {route: role for role, route in ROLE_ROUTE.items()}
+# Route tiers (ADR 0009): a tiered route's own table is `standard`, `<route>_<tier>` the other tiers.
+TIERS = ("light", "standard", "heavy")
+TIERED_ROUTES = ("dev", "fix", "review", "spec_review", "spec")
 COVERAGE_ROLES = ("dev", "fixer", "reviewer", "spec_reviewer", "reviser")
+ADVISOR_BACKENDS = ("claude", "deepseek")
+EFFORTS = ("", "low", "medium", "high", "xhigh", "max")
 BUILTIN_ALIASES = {
     "claude_strong": "opus",
     "codex_fast": "gpt-6.2-sol",
@@ -159,6 +166,7 @@ class Vendor:
     fallback_models: tuple[str, ...] = ()
     cache_dirs: tuple[Path, ...] = ()
     quota_probe_model: str = ""
+    env_file: Path | None = None   # claude: CLAUDE_CODE_OAUTH_TOKEN for its runs only (#255)
 
 
 @dataclass(frozen=True)
@@ -177,11 +185,12 @@ class ModelSettings:
 class Models(ModelSettings):
     routes: tuple[tuple[str, str, ModelRoute], ...]
 
-    def route(self, role, vendor, *, followup=False):
-        if followup:
-            for name, provider, route in self.routes:
-                if (name, provider) == (f"{role}_followup", vendor):
-                    return route
+    def route(self, role, vendor, *, followup=False, tier="standard"):
+        """A follow-up run ignores the tier (ADR 0004); a missing entry inherits the base one."""
+        wanted = f"{role}_followup" if followup else f"{role}_{tier}"
+        for name, provider, route in self.routes:
+            if (name, provider) == (wanted, vendor):
+                return route
         return next(route for name, provider, route in self.routes if (name, provider) == (role, vendor))
 
 
@@ -252,6 +261,8 @@ class Advisor:
     base_url: str = "https://api.deepseek.com"
     timeout_seconds: int = 60
     snapshot_chars: int = 24000
+    backend_order: tuple[str, ...] = ADVISOR_BACKENDS   # tried in order; "claude" is the owner's grant
+    claude: ModelRoute = ModelRoute("opus", "medium")   # resolved from [advisor] claude (`_advisor_claude`)
 
 
 @dataclass(frozen=True)
@@ -518,7 +529,7 @@ def _load_vendors(raw, directory, home, aliases):
         if quota == "pool" and "seven_day" not in agents.ADAPTERS[adapter].QUOTA_WINDOWS:
             raise ConfigError(f"{label}.quota: pool vendors need a weekly quota window")
         extra = set(entry) - {"adapter", "roles", "quota", "cap", "max_minutes", "five_hour_max",
-                              "fallback_models", "cache_dirs", "quota_probe_model"}
+                              "fallback_models", "cache_dirs", "quota_probe_model", "env_file"}
         if extra:
             raise ConfigError(f"{label}: unknown fields: {', '.join(sorted(extra))}")
         cli = agents.ADAPTERS[adapter]
@@ -526,6 +537,7 @@ def _load_vendors(raw, directory, home, aliases):
             "fallback_models": "fallback_models" in cli.CONFIG_FIELDS,
             "cache_dirs": "cache_dirs" in cli.CONFIG_FIELDS,
             "quota_probe_model": "quota_probe_model" in cli.CONFIG_FIELDS,
+            "env_file": "env_file" in cli.CONFIG_FIELDS,
         }
         for field, supported in adapter_fields.items():
             if field in entry and not supported:
@@ -541,8 +553,13 @@ def _load_vendors(raw, directory, home, aliases):
         probe = entry.get("quota_probe_model", "")
         if cli.PROBE_SENDS_MODEL or probe:
             probe = _model_alias(probe, aliases, f"{label}.quota_probe_model")
+        env_file = entry.get("env_file")
+        if env_file is not None:
+            if type(env_file) is not str or not env_file.strip():
+                raise ConfigError(f"{label}.env_file: expected a path")
+            env_file = _path(env_file, directory, home)
         vendors.append(Vendor(vendor_id, adapter, tuple(roles), quota, float(cap), max_minutes,
-                              five_hour_max, fallback, cache, probe))
+                              five_hour_max, fallback, cache, probe, env_file))
     if len({v.id for v in vendors}) != len(vendors):
         raise ConfigError("vendors: each vendor id may be configured once")
     return tuple(vendors)
@@ -551,8 +568,10 @@ def _load_vendors(raw, directory, home, aliases):
 def _model_routes(raw, aliases, vendors):
     by_id = {v.id: v for v in vendors}
     declared = set(by_id)
-    names = set(ROUTE_ROLES) | {f"{role}_followup" for role in ROUTE_ROLES if role != "screenshot_review"}
-    if not isinstance(raw, dict) or raw.keys() - names:
+    names = {route: route for route in ROUTE_ROLES}   # table name -> the route it belongs to
+    names |= {f"{route}_followup": route for route in ROUTE_ROLES if route != "screenshot_review"}
+    names |= {f"{route}_{tier}": route for route in TIERED_ROUTES for tier in TIERS if tier != "standard"}
+    if not isinstance(raw, dict) or raw.keys() - names.keys():
         raise ConfigError("models.routes: expected tables for known roles")
     routes = []
     for name in sorted(names):
@@ -560,7 +579,7 @@ def _model_routes(raw, aliases, vendors):
         table = raw.get(name, {})
         if not isinstance(table, dict) or table.keys() - set(VENDORS):
             raise ConfigError(f"models.routes.{name}: expected entries for known vendors")
-        role = ROUTE_ROLE.get(name.rsplit("_followup", 1)[0])
+        role = ROUTE_ROLE.get(names[name])
         for vendor in sorted(table):
             if vendor not in declared:
                 raise ConfigError(f"models.routes.{name}.{vendor}: undeclared vendor")
@@ -583,13 +602,25 @@ def _model_routes(raw, aliases, vendors):
             if model != "" or not agents.ADAPTERS[vendor].EMPTY_MODEL_OK:
                 model = _model_alias(model, aliases, f"{field}.model")
             effort = entry.get("effort", "")
-            if effort not in ("", "low", "medium", "high", "xhigh", "max"):
+            if effort not in EFFORTS:
                 raise ConfigError(f"{field}.effort: unsupported effort")
             subagent = entry.get("subagent_model", "")
             if subagent != "":
                 subagent = _model_alias(subagent, aliases, f"{field}.subagent_model")
             routes.append((name, vendor, ModelRoute(model, effort, subagent)))
     return tuple(routes)
+
+
+def _advisor_claude(table, aliases):
+    """[advisor] claude = { model = <alias>, effort = <route effort> }; either key may be omitted."""
+    if not isinstance(table, dict):
+        raise ConfigError("advisor.claude: expected a table")
+    if table.keys() - {"model", "effort"}:
+        raise ConfigError("advisor.claude: unknown fields")
+    effort = table.get("effort", "medium")
+    if effort not in EFFORTS:
+        raise ConfigError("advisor.claude.effort: unsupported effort")
+    return ModelRoute(_model_alias(table.get("model", "claude_strong"), aliases, "advisor.claude.model"), effort)
 
 
 def _check_adapter_models(vendors, routes):
@@ -610,9 +641,13 @@ def _check_adapter_models(vendors, routes):
                 raise ConfigError(f"{field}: {vendor.id} does not accept model {model}")
         if getattr(adapter, "DISTINCT_REVIEW_MODEL", False) and "reviewer" in vendor.roles:
             by_name = {name: route.model for name, provider, route in routes if provider == vendor.id}
-            for review in ("review", "review_followup"):
-                for write in ("dev", "fix", "fix_followup"):
-                    if review in by_name and write in by_name and not adapter.distinct_models(by_name[review], by_name[write]):
+            def entries(route):
+                return [name for name in (route, f"{route}_light", f"{route}_heavy", f"{route}_followup")
+                        if name in by_name]
+
+            for review in entries("review"):
+                for write in entries("dev") + entries("fix"):
+                    if not adapter.distinct_models(by_name[review], by_name[write]):
                         raise ConfigError(f"models.routes.{review}.{vendor.id}: model {by_name[review]} must be "
                                           f"distinct from the {write} route's {by_name[write]} (effort alone is not distinct)")
 
@@ -666,6 +701,10 @@ def load(path: str | Path, *, home: Path | None = None) -> Config:
     vendors = _load_vendors(data["vendors"], source.parent, home, aliases)
     routes = _model_routes(models.pop("routes", None), aliases, vendors)
     _check_adapter_models(vendors, routes)
+    advisor_claude = {}
+    if isinstance(data.get("advisor"), dict):
+        advisor_claude = data["advisor"].pop("claude", {})
+    advisor_claude = _advisor_claude(advisor_claude, aliases)
     sections = {name: _section(name, cls, data[name], source.parent, home)
                 for name, cls in SECTIONS.items()}
     sections.update({name: _section(name, cls, data[name], source.parent, home)
@@ -736,7 +775,11 @@ def load(path: str | Path, *, home: Path | None = None) -> Config:
     config = Config(**sections, vendors=vendors, repos=repos,
                     preferences=tuple((k, tuple(v)) for k, v in sorted(preferences.items())), source=source,
                     analyst_models=tuple(alias_models))
+    config = replace(config, advisor=replace(config.advisor, claude=advisor_claude))
     adv = config.advisor
+    order = adv.backend_order
+    if not order or len(set(order)) != len(order) or set(order) - set(ADVISOR_BACKENDS):
+        raise ConfigError('advisor.backend_order: expected distinct entries from "claude" and "deepseek"')
     if adv.mode not in ('off', 'observe', 'live'):
         raise ConfigError('advisor.mode: expected "off", "observe" or "live"')
     if not adv.base_url.startswith('https://'):

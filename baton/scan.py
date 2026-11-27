@@ -1,7 +1,7 @@
 """The scan for the bash runner (migration slice 4d, #282): `scan_area` and `file_scan`
 of run.sh.
 
-The agent only writes a title and a body under /tmp; the runner keeps them as a draft in
+The agent only writes a title and a body in its scratch directory; the runner keeps them as a draft in
 $STATE/scan-drafts (`.title`, `.md`, `.area`) and files the issue with fixed labels, so the
 scanner never needs GitHub write access.
 
@@ -19,7 +19,7 @@ import subprocess
 import sys
 import time
 
-from . import agents, dispatch, fix, notify, pr as pr_helpers, prompts, vendors
+from . import agents, dispatch, fix, notify, pr as pr_helpers, prompts, scratch, vendors
 from .common import Deferred, format_author_marker, prepend_author_marker, strip_markers
 
 
@@ -55,7 +55,7 @@ def scan_area(env, index, area):
     if not refresh_worktree(str(env.dirs.clone), wt):
         notify.log("scan worktree failed")
         return None, ""
-    out = f"/tmp/baton-scan-{time.strftime('%Y%m%d-%H%M%S')}"
+    out = str(scratch.path(env.dirs, "scan", time.strftime('%Y%m%d-%H%M%S')))
     prompt = prompts.render(Path(str(env.config.paths.self_dir), "scan-prompt.md"),
                             [("AREA", area), ("GH_REPO", env.repo.gh_repo), ("WORKTREE", str(wt)), ("OUT", out)], env=env)
     run = dispatch.dispatch(vendor, "scan", prompt, f"scan-{index}", str(wt),

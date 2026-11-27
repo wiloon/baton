@@ -364,7 +364,9 @@ def _fix_push_binding_valid(item, binding):
 
 def _dev_push_binding_valid(item, binding):
     attempts = binding.get("attempts")
+    lease = binding.get("lease", "")   # the closed PR head a replacement may overwrite (#303)
     return (binding.get("issue") == item
+            and isinstance(lease, str) and (lease == "" or lease == binding.get("remote"))
             and binding.get("vendor") in agents.ADAPTERS
             and isinstance(binding.get("title"), str) and bool(binding["title"])
             and isinstance(binding.get("body_text"), str)
@@ -597,12 +599,13 @@ def load_retry(env, episode, reason, item=""):
     if any(data.get(key) != value for key, value in expected.items()):
         raise RetryUnreadable(f"mismatched retry operation {path.name}")
     if waiting != expected:
-        # A due fix push can learn its baseline before the retry copy is replaced.
+        # A due fix push can learn its baseline (and a dev push its lease) before the retry copy is replaced.
         observed = waiting.get("continuation")
+        learned = {key: observed[key] for key in ("remote", "lease") if isinstance(observed, dict) and key in observed}
         if (reason not in PUSH_REASONS or not isinstance(binding, dict) or not isinstance(observed, dict)
                 or "remote" not in binding or binding["remote"] is not None or observed.get("remote") is None
                 or type(data.get("attempts")) is not int or data["attempts"] < 1
-                or waiting != {**expected, "continuation": {**binding, "remote": observed["remote"]}}):
+                or waiting != {**expected, "continuation": {**binding, **learned}}):
             raise RetryUnreadable(f"mismatched retry operation {path.name}")
         binding = observed
         data = {**data, "continuation": binding}
@@ -638,9 +641,10 @@ def restore_retry(env, episode, reason, item, pending):
     atomic_json(retry_path(env, episode, reason, item), pending)
 
 
-def save_push_baseline(env, episode, item, pending, remote, reason=FIX_PUSH):
-    """Record the first observed remote in both copies before issuing any push."""
-    binding = {**pending["continuation"], "remote": remote}
+def save_push_baseline(env, episode, item, pending, remote, reason=FIX_PUSH, lease=None):
+    """Record the first observed remote (and a dev push's lease on it) in both copies before
+    issuing any push."""
+    binding = {**pending["continuation"], "remote": remote, **({} if lease is None else {"lease": lease})}
     waiting = {"episode": episode, "item": item, "reason": reason, "continuation": binding}
     atomic_json(waiting_path(env, episode, reason, item), waiting)
     restore_retry(env, episode, reason, item, {**pending, "continuation": binding})
@@ -657,7 +661,10 @@ def prepare_retry(env, episode, reason, item, binding):
     pending = {**waiting, "attempts": 0, "scheduled": now, "due": now + DELAYS[0]}
     atomic_json(waiting_path(env, episode, reason, item), waiting)
     restore_retry(env, episode, reason, item, pending)
-    notify.log(f"handoff-retry {reason} scheduled in {DELAYS[0]}s attempt=0/{MAX_ATTEMPTS} episode={episode}")
+    # Logged before every guarded write, not after a failure: REASON names the failure this record
+    # would recover from. Real retries log "handoff-retry REASON attempt=N/MAX" (retry_due).
+    notify.log(f"write-intent {reason.removesuffix('_failed')} recorded episode={episode} "
+               f"(replayed after {DELAYS[0]}s only if the write fails)")
     return pending
 
 
@@ -700,16 +707,20 @@ def push_destination(wt, ref):
     return ref
 
 
-def check_push_local(binding):
+def check_push_local(binding, *, allow_detached=False):
     from .common import git
     wt = binding["wt"]
-    return (git(wt, "rev-parse", "HEAD") == binding["commit"]
-            and git(wt, "branch", "--show-current") == binding["branch"])
+    if git(wt, "rev-parse", "HEAD") != binding["commit"]:
+        return False
+    current = git(wt, "branch", "--show-current")
+    if current is None:
+        return False
+    return current == binding["branch"] or (allow_detached and current == "")
 
 
-def check_push_landed(binding):
+def check_push_landed(binding, *, allow_detached=False):
     """Whether origin already holds the saved post-sign-off commit (#151)."""
-    if not check_push_local(binding):
+    if not check_push_local(binding, allow_detached=allow_detached):
         return "changed"
     current, transient = observe_remote(binding["wt"], binding["branch"])
     if current is None:

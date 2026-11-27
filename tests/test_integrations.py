@@ -269,7 +269,10 @@ def test_a_minimal_config_runs_a_tick_end_to_end(bound, monkeypatch, tmp_path):
                    {"id": 1, "event": "labeled", "actor": {"login": "acme-owner"}, "label": {"name": "ready-for-agent"}}]],
                "api graphql": issue_snapshot_pages({"title": "A title", "body": "A body", "comments": [
                    {"author": {"login": "acme-owner"}, "body": "<!-- baton-verdict: accept -->\nThe plan"}]}),
-               "pr create": "https://github.com/acme/app/pull/13\n"})
+               "pr create": "https://github.com/acme/app/pull/13\n",
+               # no earlier PR: the push reads the issue's PR history for closed heads (#303)
+               **{f"api repos/acme/app/pulls?state=all&head=acme:{branch}/issue-12&per_page=100": [[]]
+                  for branch in ("agent", "cursor")}})
     monkeypatch.setattr(tick.pr_helpers, "gh", fake)
     for module in (notify, after_merge):
         monkeypatch.setattr(module.urllib.request, "urlopen", no_network)
@@ -288,7 +291,6 @@ def test_a_minimal_config_runs_a_tick_end_to_end(bound, monkeypatch, tmp_path):
         Path(output).write_text("Add the thing\n\nRefs #12\n")
         return {"rc": 0, "status": "success", "outcome": "RESULT: ready", "reply": "RESULT: ready", "model": "m", "defer": ""}
     monkeypatch.setattr(dev.dispatch, "dispatch", agent)
-    Path("/tmp/baton-dev-12.pr.md").unlink(missing_ok=True)
 
     t = tick.Tick(session.resolve(), ())
     t.exec = lambda path, args: None

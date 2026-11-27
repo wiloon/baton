@@ -311,7 +311,8 @@ def same_vendor_review_mode(state, pr, vendor, model):
     resort, with the same model in a fresh session (every review run starts one). "" when the
     adapter does not allow it or a model is not proven: unknown authors are never review eligible.
     An adapter's distinct_models(a, b) compares aliases and IDs (Claude's "sonnet" is
-    claude-sonnet-*); SAME_VENDOR_SAME_MODEL says whether the fresh-session last resort is allowed."""
+    claude-sonnet-*, and its Opus, Sonnet, Haiku and Fable families differ);
+    SAME_VENDOR_SAME_MODEL says whether the fresh-session last resort is allowed."""
     if not same_vendor_review(vendor):
         return ""
     written = [row.split(maxsplit=1)[1] for row in _lines(state_path(state, pr, "author-models"))
@@ -399,8 +400,9 @@ def selection_details(state, pool, candidates, chosen, role, *, area="", now=Non
 
 def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool",
          now=None, probe_only=False, review=False, fixed_by="", area="", other_model="", pr_state=None,
-         spec_followup=False, pinned=False, avoid_author=""):
-    """STATE: the machine's cooldowns and quota; PR_STATE (default STATE): the repository's PR
+         spec_followup=False, pinned=False, tier="standard", avoid_author=""):
+    """TIER: the step's route tier, which sets the model same-vendor eligibility is judged on.
+    STATE: the machine's cooldowns and quota; PR_STATE (default STATE): the repository's PR
     records (authors, contributions)."""
     now = int(time.time()) if now is None else now
     pr_state = state if pr_state is None else pr_state
@@ -423,7 +425,7 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
             if same not in excluded or not same_vendor_review(same):
                 continue
             mode = same_vendor_review_mode(pr_state, pr, same, config.models.route(
-                "screenshot_review" if shots else "review", same).model)
+                "screenshot_review" if shots else "review", same, tier=tier).model)
             if mode and (not shots or mode == "same-vendor-different-model"):
                 fallbacks[same] = mode
         review_pool = [v for v in (candidates if shots else all_vendors(pool, extra=extra)) if v in eligible]
@@ -439,7 +441,7 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
             # "alternating-phase": the caller picks the route that differs from OTHER_MODEL (owner rule
             # 2026-11-24: never stall on independence); "known-distinct-model": the base route.
             followup = spec_followup if policy == "alternating-phase" else False
-            model = session.resolve().config.models.route(route_role, same, followup=followup).model
+            model = session.resolve().config.models.route(route_role, same, followup=followup, tier=tier).model
             if models_distinct(same, model, other_model):
                 fallbacks[same] = "same-vendor-different-model"
         if role == "spec_reviewer" and avoid_author and avoid_author in candidates and avoid_author not in excluded:

@@ -6,9 +6,9 @@ and rests the item (Deferred) when no vendor can run."""
 from . import session
 import os
 
-from . import notify, settle, vendors
+from . import notify, settle, tiers, vendors
 from .common import Deferred, Exhausted
-from .config import ROLES, ROUTE_ROLE
+from .config import ROLES, ROLE_ROUTE, ROUTE_ROLE
 
 
 @session.scoped
@@ -23,6 +23,8 @@ def choose(env, role, current, mode, candidates, *, pr="", exclude="", issue="",
                   pinned=pinned, avoid_author=avoid_author)
     kwargs["pr_state"] = str(env.dirs.state)   # the repository's PR records; cooldowns and quota are global
     vendor_role = ROUTE_ROLE.get(role, role)
+    kwargs["tier"] = tiers.step(env, ROLE_ROUTE.get(vendor_role, vendor_role),
+                                issue or env.runtime.issue, pr or env.runtime.pr)
     allowed = set(env.config.for_role(vendor_role, pool_only=vendor_role == "reviser"))
     if not allowed and vendor_role not in ROLES:
         allowed = set(env.config.declared())

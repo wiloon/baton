@@ -222,9 +222,14 @@ def main(argv):
         mark_probed(state, args[0], now)
         return 0
     if command == "refresh":
-        # Documented CLI form takes a vendor argument that is ignored (refresh with no args matches):
-        # the vendor refreshed is the adapter whose quota comes from an API.
-        vendor = next(v for v, adapter in agents.ADAPTERS.items() if adapter.QUOTA_SOURCE == "api")
+        # The named vendor only, and only an adapter whose quota comes from an API (#252).
+        vendor = args[0] if args else ""
+        adapter = agents.ADAPTERS.get(vendor)
+        if adapter is None or adapter.QUOTA_SOURCE != "api":
+            api = " ".join(v for v, a in agents.ADAPTERS.items() if a.QUOTA_SOURCE == "api")
+            print(f"quota refresh: expected an API-sourced vendor ({api}), got {vendor or 'none'}",
+                  file=sys.stderr)
+            return 2
         if reason := cfg.admission_error(vendor):
             print(reason, file=sys.stderr)
             return 1

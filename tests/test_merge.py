@@ -119,7 +119,7 @@ REAL_DEEPSEEK = advisor.call_deepseek
 @pytest.fixture
 def observing(run, monkeypatch):
     monkeypatch.setattr(merge.Merger, "ci_green", REAL_CI_GREEN)
-    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="live", snapshot_chars=1000))
+    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, backend_order=("deepseek",), mode="live", snapshot_chars=1000))
     monkeypatch.setenv(advisor.KEY, "fake-advisor-key")
     calls = []
 
@@ -214,7 +214,7 @@ def test_a_ci_repair_that_fails_without_a_handoff_is_handed_off_by_the_merge_gat
 
 
 def grant_extra_round(run, monkeypatch):
-    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="live"))
+    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, backend_order=("deepseek",), mode="live"))
     monkeypatch.setenv(advisor.KEY, "fake-advisor-key")
     monkeypatch.setattr(advisor, "call_deepseek", lambda *a, **k: (
         {"action": "extra_round", "reason": "r", "evidence": []}, {}))
@@ -1118,7 +1118,7 @@ def test_a_pr_touching_an_owner_review_path_goes_to_the_owner_after_ci(run):
 
 def test_a_live_owner_path_handoff_makes_no_provider_call(run, monkeypatch):
     observing = []
-    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, mode="live", snapshot_chars=1000))
+    monkeypatch.setattr(advisor, "settings", lambda env: Advisor(env_file=None, backend_order=("deepseek",), mode="live", snapshot_chars=1000))
     monkeypatch.setenv(advisor.KEY, "fake-advisor-key")
     monkeypatch.setattr(advisor, "call_deepseek", lambda *a, **k: observing.append(1) or ({}, {}))
     run.gh.set(files_api=[{"filename": "bin/guard.sh"}])

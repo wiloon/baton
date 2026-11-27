@@ -59,7 +59,7 @@ def test_a_category_4_reason_hands_off_with_no_advisor_call(env, monkeypatch):
                         lambda env, kind, number, remove=(): labelled.append((kind, number, remove)) or MagicMock(returncode=0))
     monkeypatch.setattr(handoff.notify, "notify", lambda title, text="": notes.append((title, text)))
     monkeypatch.setattr(handoff.advisor, "advise", lambda *a, **k: calls.append(1) or handoff.advisor.Decision("handoff"))
-    monkeypatch.setattr(handoff.advisor, "settings", lambda e: Advisor(env_file=None, mode="live"))
+    monkeypatch.setattr(handoff.advisor, "settings", lambda e: Advisor(env_file=None, backend_order=("deepseek",), mode="live"))
     result = handoff.perform(env, "auto_merge_off", kind="pr", number="1",
                              title="PR #1 review passed", text="auto-merge is off", hooks=Hooks())
     assert result.action == handoff.HANDOFF and result.handed_off
@@ -127,7 +127,7 @@ def test_a_live_worker_reason_without_offered_actions_still_hands_off(env, monke
                         lambda *a, **k: labelled.append(1) or MagicMock(returncode=0))
     monkeypatch.setattr(handoff.notify, "notify", lambda *a, **k: None)
     monkeypatch.setattr(handoff.advisor, "advise", lambda *a, **k: calls.append(1) or handoff.advisor.Decision("handoff"))
-    monkeypatch.setattr(handoff.advisor, "settings", lambda e: Advisor(env_file=None, mode="live"))
+    monkeypatch.setattr(handoff.advisor, "settings", lambda e: Advisor(env_file=None, backend_order=("deepseek",), mode="live"))
     result = handoff.perform(env, "review_run_failed", kind="pr", number="1",
                              title="t", text="failed", hooks=Hooks())
     assert result.handed_off and labelled == [1] and calls == []
@@ -142,7 +142,7 @@ def test_a_live_retry_step_is_returned_when_the_caller_offers_it(env, monkeypatc
 
     monkeypatch.setattr(handoff, "label_ready", lambda *a, **k: labelled.append(1))
     monkeypatch.setattr(handoff.notify, "notify", lambda *a, **k: None)
-    monkeypatch.setattr(handoff.advisor, "settings", lambda e: Advisor(env_file=None, mode="live"))
+    monkeypatch.setattr(handoff.advisor, "settings", lambda e: Advisor(env_file=None, backend_order=("deepseek",), mode="live"))
     monkeypatch.setattr(handoff.advisor, "enabled", lambda e: True)
 
     def advise(env, reason, number, snapshot, actions, **kw):
@@ -569,6 +569,15 @@ def test_an_issue_push_record_accepts_landed_but_never_finished(env, monkeypatch
         handoff.load_retry(env, "1", reason)
 
 
+def test_preparing_a_retry_logs_an_intent_not_a_failure(env, monkeypatch):
+    """The record is written before every guarded write; its log line must not read as a failure."""
+    lines = []
+    monkeypatch.setattr(handoff, "clock", lambda: 1_000)
+    monkeypatch.setattr(handoff.notify, "log", lines.append)
+    assert handoff.prepare_retry(env, "1", "dev_push_failed", "1", issue_push_binding("1")) is not None
+    assert lines == ["write-intent dev_push recorded episode=1 (replayed after 60s only if the write fails)"]
+
+
 def test_a_dev_push_record_for_a_non_built_in_vendor_is_resumed(env, monkeypatch):
     from types import SimpleNamespace
     from baton import dev
@@ -668,3 +677,27 @@ def test_clearing_a_retry_unlinks_a_symlink_to_a_directory_as_a_link(env, tmp_pa
     handoff.clear_retry(env, "7", "spec_comments_read_failed")
     assert not path.is_symlink() and not list(path.parent.glob("damaged-*"))
     assert (target / "child").read_text() == "kept"
+
+
+def test_check_push_local_allows_detached_only_when_opted_in(tmp_path):
+    import subprocess
+    wt = tmp_path / "wt"
+    subprocess.run(["git", "init", "-q", "-b", "agent/issue-125", str(wt)], check=True)
+    for k, v in (("user.name", "t"), ("user.email", "t@example.invalid")):
+        subprocess.run(["git", "-C", str(wt), "config", k, v], check=True)
+    (wt / "a.txt").write_text("a\n")
+    subprocess.run(["git", "-C", str(wt), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(wt), "commit", "-q", "-m", "base"], check=True)
+    sha = subprocess.run(["git", "-C", str(wt), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+    binding = {"wt": str(wt), "commit": sha, "branch": "agent/issue-125"}
+
+    assert handoff.check_push_local(binding) is True
+    assert handoff.check_push_local(binding, allow_detached=True) is True
+
+    subprocess.run(["git", "-C", str(wt), "checkout", "-q", "--detach"], check=True)
+    assert handoff.check_push_local(binding) is False
+    assert handoff.check_push_local(binding, allow_detached=True) is True
+
+    subprocess.run(["git", "-C", str(wt), "checkout", "-q", "-b", "other/branch"], check=True)
+    assert handoff.check_push_local(binding, allow_detached=True) is False
+

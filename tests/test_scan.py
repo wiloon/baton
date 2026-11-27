@@ -31,7 +31,7 @@ def agent(monkeypatch, outcome, files=None, rc=0):
         if rc == 75:
             return {"rc": 75, "outcome": "", "reply": None, "defer": "quota exhausted"}
         for suffix, text in (files or {}).items():
-            base = re.search(r"/tmp/baton-scan-\d{8}-\d{6}", prompt).group(0)
+            base = re.search(r"[^\s`]+/scratch/scan-\d{8}-\d{6}", prompt).group(0)
             Path(f"{base}{suffix}").write_text(text)
         return {"rc": 0, "outcome": outcome, "reply": outcome, "defer": ""}
     monkeypatch.setattr(scan.dispatch, "dispatch", run)
@@ -121,7 +121,7 @@ def test_a_failed_filing_keeps_the_draft(env, monkeypatch):
 
 def test_scan_saves_author_file_and_file_scan_writes_author_marker(env, monkeypatch):
     def run(vendor, role, prompt, tag, cwd, settings="", output="", env=None, hooks=None):
-        base = re.search(r"/tmp/baton-scan-\d{8}-\d{6}", prompt).group(0)
+        base = re.search(r"[^\s`]+/scratch/scan-\d{8}-\d{6}", prompt).group(0)
         Path(f"{base}.title").write_text("billing: double charge\n")
         Path(f"{base}.md").write_text("<!-- baton-author: vendor=codex model=fake -->\n## Problem\nx\n")
         return {"rc": 0, "outcome": "SCAN: found", "reply": "SCAN: found", "model": "claude-opus-5-5", "defer": ""}

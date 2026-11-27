@@ -3,7 +3,7 @@
 The scheduler is switched only after its consumers accept Config/Runtime explicitly.
 Loading Config is read-only; prepare is the explicit filesystem side-effect boundary.
 """
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from collections.abc import Mapping
 import os
@@ -21,13 +21,17 @@ class Runtime:
     round: str = ""
     fixed_by: str = ""
     shots_dir: str = ""
+    pr_body_file: str = ""   # outside-worktree PR-description request; denial retry cleans new files (#315)
     telemetry_item: str = ""
     chain: int = 0
     manual: bool = False
     serve_child: bool = False
+    assign_issue: str = ""       # serve child: --issue N (scheduled, not manual)
+    no_new_issue: bool = False   # serve child: --no-new-issue
     spec_followup: bool = False
     review_followup: bool = False
     fix_followup: bool = False
+    tiers: dict = field(default_factory=dict)   # route -> the tier this step read (baton.tiers)
 
 
 def skills_directory(root: Path) -> Path | None:

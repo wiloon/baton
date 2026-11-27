@@ -102,6 +102,25 @@ def test_a_serve_child_without_a_merged_slice_exits_0(walked):
     assert walked.worked == [('acme/shop', False)]
 
 
+def test_an_assigned_serve_child_that_runs_no_item_exits_81(walked):
+    walked.flag = False
+    assert walked.run('--repo', 'acme/shop', '--serve-child', '--issue', '12') == 81
+    assert walked.worked == [('acme/shop', False)]
+    assert walked.events == [False]
+
+
+def test_a_no_new_issue_child_that_runs_no_item_exits_81(walked):
+    walked.flag = False
+    assert walked.run('--repo', 'acme/shop', '--serve-child', '--no-new-issue') == 81
+    assert walked.worked == [('acme/shop', False)]
+
+
+def test_an_assigned_serve_child_that_runs_an_item_keeps_scheduled_semantics(walked):
+    assert walked.run('--repo', 'acme/shop', '--serve-child', '--issue', '9') == 80
+    assert walked.worked == [('acme/shop', False)]
+    assert walked.events == [False]
+
+
 def test_a_serve_child_honours_paused(walked):
     walked.source.write_text(walked.source.read_text().replace('paused = false', 'paused = true'))
     assert walked.run('--repo', 'acme/shop', '--serve-child') == 0

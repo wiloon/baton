@@ -94,7 +94,7 @@ def test_admission_rejects_before_vendor_calls_or_state_changes(pool_env, monkey
     if vendor == "codex":
         preflight += ["--role", role]
     assert agents.main(preflight) == 1
-    assert quota.main(["refresh"]) == 1
+    assert quota.main(["refresh", "cursor"]) == 1
     assert "cursor" in capsys.readouterr().err
     assert sorted(cfg.paths.state.glob("**/*")) == before
 

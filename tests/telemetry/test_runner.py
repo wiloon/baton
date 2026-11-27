@@ -27,10 +27,24 @@ class RunnerTests(unittest.TestCase):
         with patch.object(t, 'identity', return_value=OWNER):
             return self.ledger.begin(vendor, 'review', 123, 60, 142, 168, 1, repo='test/repo')
 
+    def live_owner(self):
+        """This process as a run's owner: its real /proc identity on Linux; where there is no
+        /proc (macOS), a fixed identity per pid, so the test runs there too."""
+        if Path('/proc/self/stat').exists():
+            return contextlib.nullcontext()
+        return patch.object(t, 'identity', lambda pid, proc=None: {'pid': int(pid), 'start': '1', 'boot': 'no-proc'})
+
     def log(self, events):
         path = self.state / 'run.jsonl'
         path.write_text('\n'.join(json.dumps(e) for e in events))
         return path
+
+    def test_begin_records_a_denied_retry(self):
+        with patch.object(t, 'identity', return_value=OWNER):
+            run = self.ledger.begin('codex', 'review', 123, 60, repo='test/repo', retry='denied')
+            plain = self.ledger.begin('codex', 'review', 123, 60, repo='test/repo')
+        self.assertEqual(run['retry'], 'denied')
+        self.assertNotIn('retry', plain)
 
     def test_pid_reuse_boot_heartbeat_deadline_and_zombie(self):
         run = self.begin()
@@ -112,15 +126,16 @@ class RunnerTests(unittest.TestCase):
         config.write_text((Path(__file__).resolve().parents[2] / 'config.example.toml').read_text())
         output = self.state / 'metrics.prom'
         holders = []
-        for repo, vendor, issue in (('acme/app', 'claude', 1), ('acme/shop', 'codex', 2)):
-            lock = self.state / 'repos' / repo / 'lock'
-            lock.parent.mkdir(parents=True)
-            holders.append(lock.open('a'))
-            self.addCleanup(holders[-1].close)
-            fcntl.flock(holders[-1], fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self.ledger.begin(vendor, 'dev', os.getpid(), 600, issue, repo=repo)   # a live owner
-        with patch.object(t, 'unit_state', return_value=(1, 1, 0)):
-            t.collect(self.ledger, config, output)
+        with self.live_owner():
+            for repo, vendor, issue in (('acme/app', 'claude', 1), ('acme/shop', 'codex', 2)):
+                lock = self.state / 'repos' / repo / 'lock'
+                lock.parent.mkdir(parents=True)
+                holders.append(lock.open('a'))
+                self.addCleanup(holders[-1].close)
+                fcntl.flock(holders[-1], fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.ledger.begin(vendor, 'dev', os.getpid(), 600, issue, repo=repo)   # a live owner
+            with patch.object(t, 'unit_state', return_value=(1, 1, 0)):
+                t.collect(self.ledger, config, output)
         metrics = output.read_text()
         for line in ('baton_running 2', 'baton_lock_held 1', 'baton_execution_healthy 1', 'baton_state_collect_success 1'):
             self.assertIn(line + '\n', metrics)

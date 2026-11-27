@@ -3,6 +3,7 @@ and guard.sh (a PreToolUse hook that reads BATON_AGENT_*), not from this adapter
 import json
 import re
 
+from . import credentials, scratch
 from .common import (MODEL_CODE, Run, analyst_result, analyst_rows, analyst_tool_use, child_env, events,
                      last_result, outcome_line, read, run_cli)
 
@@ -32,7 +33,8 @@ VERSION_EXECUTABLE = "claude"
 PROBE_SENDS_MODEL = True
 RUNS_STEM = "runs"
 LOG_SUFFIX = ""
-CONFIG_FIELDS = frozenset({"fallback_models", "quota_probe_model"})
+CONFIG_FIELDS = frozenset({"fallback_models", "quota_probe_model", "env_file"})
+OAUTH_KEY = "CLAUDE_CODE_OAUTH_TOKEN"
 BUSY_RERUN = False
 REQUIRES_CACHE_DIRS = False
 COMMIT_MARKERS = ()
@@ -70,8 +72,27 @@ ANALYST_ENV_KEEP = ("CLAUDE_CONFIG_DIR",)
 ANALYST_ENV_STRIP = ("CLAUDE_CODE_", "ENABLE_CLAUDE")
 ANALYST_ENV_SET = {"CLAUDE_CODE_ENABLE_TELEMETRY": "0", "ENABLE_CLAUDEAI_MCP_SERVERS": "false"}
 MODEL = re.compile(
-    r"(?P<prefix>claude-)?(?P<family>opus|sonnet|haiku)(?P<version>(?:-[0-9]+)*?)(?:-(?P<snapshot>[0-9]{8}))?"
+    r"(?P<prefix>claude-)?(?P<family>opus|sonnet|haiku|fable)(?P<version>(?:-[0-9]+)*?)(?:-(?P<snapshot>[0-9]{8}))?"
 )
+
+
+def oauth_env(vendor):
+    """The setup-token for one `claude` child (#255): {} without `env_file` (the stored /login
+    credential), else the runner's CLAUDE_CODE_OAUTH_TOKEN or the file's. Raises CredentialError,
+    naming the file and never its contents, for a file that must not be used. Starts no process."""
+    path = getattr(vendor, "env_file", None)
+    if path is None or getattr(vendor, "adapter", ID) != ID:
+        return {}
+    return credentials.load(path, (OAUTH_KEY,))
+
+
+def preflight(vendor=None):
+    """None when the configured env file can be used, else the failed outcome (status auth)."""
+    try:
+        oauth_env(vendor)
+    except credentials.CredentialError as error:
+        return f"RESULT: failed {error}"
+    return None
 
 
 def configure(role, route, settings, env):
@@ -80,6 +101,7 @@ def configure(role, route, settings, env):
         "budget": str(getattr(env.config.models, "budget_" + role)),
         "repo": str(env.dirs.clone), "subagent_model": route.subagent_model,
         "context_dir": str(env.dirs.ctx), "effort": route.effort,
+        "scratch": str(scratch.directory(env.dirs)),  # where guard.sh lets the run write files
     }
 
 
@@ -184,13 +206,14 @@ def usage(result):
 
 def run(req):
     env = child_env(BATON_AGENT="1", BATON_AGENT_ROLE=req.role, BATON_AGENT_WORKTREE=str(req.cwd),
+                    BATON_AGENT_SCRATCH=req.scratch,
                     BATON_AGENT_REPO=req.repo, BATON_AGENT_LOGS=str(req.log.parent), **req.env)
     if req.subagent_model:
         env["CLAUDE_CODE_SUBAGENT_MODEL"] = req.subagent_model
     fallback = ["--fallback-model", req.fallback] if req.fallback else []
     # Without it dontAsk denies shell commands on the context files the prompt names, which sit
     # outside the worktree (`wc -l <ctx>/...md`, #53); Read was never affected. guard.sh still
-    # limits writes to the worktree and /tmp.
+    # limits writes to the worktree and the repository's scratch directory.
     context = ["--add-dir", req.context_dir] if req.context_dir else []
     effort = ["--effort", req.effort] if req.effort else []
     rc = run_cli(["claude", "-p", req.prompt,
@@ -237,6 +260,15 @@ def analyst_command(settings, analyst, workspace, env):
             "--setting-sources", "", "--settings", '{"disableAllHooks":true}',
             "--permission-mode", "dontAsk", "--no-session-persistence", "--max-turns", "1",
             "--max-budget-usd", str(settings.budget_usd)]
+
+
+def advisor_command(model, effort, instructions):
+    """One isolated, tool-less advisor call (#236); the snapshot goes on stdin, never argv."""
+    return ["claude", "--safe-mode", "-p", "--model", model, *(["--effort", effort] if effort else []),
+            "--system-prompt", instructions, "--output-format", "stream-json", "--verbose", "--tools", "",
+            "--disallowedTools", "*", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+            "--disable-slash-commands", "--setting-sources", "", "--settings", '{"disableAllHooks":true}',
+            "--permission-mode", "dontAsk", "--no-session-persistence", "--max-turns", "1"]
 
 
 def _tool_event(node):
