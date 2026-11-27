@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from baton import agents, agy_cli, config, dispatch, quota, session, settle, vendors
+from baton import agents, agy_cli, config, dispatch, quota, scratch, session, settle, vendors
 from conftest import full_text
 from test_agents import lines
 
@@ -266,7 +266,7 @@ def test_dev_run_reports_the_init_model_and_builds_the_command(agy_runner):
     allow = json.loads(args[args.index("--settings") + 1])["permissions"]["allow"]
     assert "command(git)" in allow and "command(task ci:changed)" in allow
     added = [args[i + 1] for i, a in enumerate(args) if a == "--add-dir"]
-    assert "/tmp" in added
+    assert "/tmp" not in added and str(agy_runner.env.dirs.ctx) in added   # #306: no shared /tmp grant for dev
     git_dirs = [subprocess.run(["git", "-C", str(agy_runner.worktree), "rev-parse", *flag], capture_output=True,
                                text=True).stdout.strip()
                 for flag in (["--path-format=absolute", "--git-common-dir"], ["--absolute-git-dir"])]
@@ -282,14 +282,15 @@ def test_linked_worktree_run_gets_both_git_dirs(agy_runner, role, model, reply):
     linked = agy_runner.root / "linked"
     subprocess.run(["git", "-C", str(clone), "worktree", "add", "-q", "-b", "agent", str(linked)], check=True)
     agy_runner.plan(stream=stream(reply, model=model))
-    dispatch.dispatch("agy", role, "p", "t", str(linked), env=agy_runner.env, output="/tmp/baton-out.md")
+    output = scratch.path(agy_runner.env.dirs, role, 9)
+    dispatch.dispatch("agy", role, "p", "t", str(linked), env=agy_runner.env, output=str(output))
     args = agy_runner.args()
     added = [args[i + 1] for i, a in enumerate(args) if a == "--add-dir"]
     common, own = str(clone.resolve() / ".git"), str(clone.resolve() / ".git" / "worktrees" / "linked")
     assert common in added and own in added, added
     assert str(linked / ".git") not in added
-    configured = [str(agy_runner.env.dirs.ctx), "/tmp"] if role == "dev" else [str(agy_runner.env.dirs.ctx)]
-    assert added[:len(configured)] == configured and "/tmp" in added   # ctx dir and the output's dir stay
+    assert added[0] == str(agy_runner.env.dirs.ctx) and str(agy_runner.env.dirs.scratch) in added   # ctx and output dirs
+    assert "/tmp" not in added
 
 
 def test_cli_log_label_is_the_model_evidence_when_init_has_none(agy_runner):
@@ -950,7 +951,7 @@ def test_dev_opening_attributes_the_pr_to_agy_with_the_verified_model(agy_runner
     out = agy_runner.run()
     assert out["model"] == MODEL
     tick = SimpleNamespace(ctx=ctx, state=state, active={"issue": "9"}, gh_repo="o/r", log=lambda *a: None,
-                           notify=lambda *a: None)
+                           notify=lambda *a: None, env=agy_runner.env)
     intent = {"issue": "9", "pr": "30", "vendor": "agy", "model": out["model"], "wt": str(agy_runner.worktree),
               "base": base}
     path = ctx / "opening.json"

@@ -23,7 +23,7 @@ import sys
 import tempfile
 import time
 
-from . import agents, design_findings, dispatch, e2e_gate, hooks as telemetry, notify, pick, pr as pr_helpers, pr_contract, prompts, recovery, tiers, vendors
+from . import agents, design_findings, dispatch, e2e_gate, hooks as telemetry, notify, pick, pr as pr_helpers, pr_contract, prompts, recovery, scratch, tiers, vendors
 from .common import Deferred, Exhausted, child_env, git, push, strip_markers
 
 REPLY_CAP = 60000
@@ -524,8 +524,8 @@ class Runner:
             notify.log(f"{kind} #{number}: {failure}")
             return 1, failure, 0
         failure_file = Path(self.ctx, f"{kind}-{number}-verify-failure.txt")
-        # Under /tmp, the one place outside the worktree guard.sh lets a fixer write (#38).
-        reply_file = Path("/tmp", f"baton-{self.repo.replace('/', '-')}-{kind}-{number}-verify-fix.md")
+        # In scratch, the one place outside the worktree guard.sh lets a fixer write (#38).
+        reply_file = scratch.path(self.env.dirs, f"verify-fix-{kind}", number)
         local_repairs, failure = 0, ""
         budget = self.max_verify if repairs is None else int(repairs)
         total_rounds = int(repairs_before)
@@ -1202,7 +1202,7 @@ class Runner:
         self.last_fixer = fixer
         url = f"https://github.com/{self.repo}/pull/{pr}"
         self.push_feedback = self.capture_push_feedback(pr)
-        fix_file = Path(f"/tmp/baton-fix-{pr}.md")
+        fix_file = scratch.path(self.env.dirs, "fix", pr)
         agent_head = self.head(wt)
         head = self.claim_fix(pr, fixer, head, agent_head)
         cursor_base = head if self.prior_author else ""   # the earlier reply producer's commits
@@ -1216,7 +1216,7 @@ class Runner:
         adapter = agents.ADAPTERS[fixer]
         template = adapter.FIX_TEMPLATE
         description = Path(self.ctx, f"pr-{pr}-description.md")
-        # Artifact fixers edit the description through /tmp; the runner applies it (#75).
+        # Artifact fixers edit the description through a scratch file; the runner applies it (#75).
         # The adapter's FIX_TEMPLATE tells it how to reach that file.
         description.write_text(pr_helpers.body(pr) or "")
         shots_note, env = "", None
@@ -1231,6 +1231,7 @@ class Runner:
             env = self.env.with_runtime(shots_dir=str(shots))
         out = self.agent(fixer, "fix", self.render(template, PR=str(pr), ISSUE=self.env.runtime.issue or "unknown",
                                                    GH_REPO=self.repo, WORKTREE=str(wt), SOURCE=source,
+                                                   REPLY_FILE=str(fix_file),
                                                    FIX_SCOPE=fix_scope(fixer, owner_triggered), FEEDBACK=feedback,
                                                    PR_DESCRIPTION_FILE=str(description), SHOTS_NOTE=shots_note),
                          f"pr-{pr}-fix{f'-{self.round}' if self.round else ''}", wt, str(fix_file), env)

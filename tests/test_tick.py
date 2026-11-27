@@ -1621,11 +1621,9 @@ def devrun(ctx, worktree, monkeypatch):
     monkeypatch.setattr(dev.dispatch, "dispatch", agent)
     state.filed = []
     monkeypatch.setattr(dev.after_merge, "file_pr_bugs", lambda pr, issue: state.filed.append((pr, issue)))
-    state.body = Path("/tmp/baton-dev-300.pr.md")
-    state.body.unlink(missing_ok=True)
+    state.body = Path(ctx.env["STATE"], "scratch", "dev-300.pr.md")
     state.go = lambda **extra: (lambda t: (t, t.item(lambda: dev.run(t, issue))))(ctx.make(**extra))
     yield state
-    state.body.unlink(missing_ok=True)
 
 
 def body_of(call):
@@ -1660,6 +1658,7 @@ def test_the_dev_run_opens_a_pr_and_starts_the_review(devrun, monkeypatch):
     run, = devrun.runs
     assert run["vendor"] == "codex" and run["role"] == "dev" and run["tag"] == "issue-300-dev"
     assert run["env"].runtime.shots_dir == str(Path(devrun.env["CTX"]) / "issue-300-shots")
+    assert run["output"] == str(devrun.body) and f"`{devrun.body}`" in run["prompt"]   # the same string: Codex rewrites it
     assert "the plan" in Path(re_context(run["prompt"])).read_text()
     create, = devrun.gh.ran("pr", "create")
     assert create[create.index("--title") + 1] == "Add the thing" and create[create.index("--head") + 1] == "agent/issue-300"

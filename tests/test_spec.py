@@ -1355,10 +1355,10 @@ def test_same_vendor_denial_retry_publishes_only_the_verified_attempt(loop, monk
         model, outcome, rc = next(attempts)
         result = {"type": "result", "result": outcome}
         if rc:
-            Path(f"/tmp/baton-spec-{N}-1.body").write_text("Goal\nUnverified revision\n")
+            Path(loop.env["STATE"], "scratch", f"spec-{N}-1.body").write_text("Goal\nUnverified revision\n")
             result["permission_denials"] = [{"tool_name": "Bash", "tool_input": {"command": "wc -l /ctx/issue.md"}}]
         if outcome == "SPEC: revised":
-            Path(f"/tmp/baton-spec-{N}-1.comment").write_text("Verified reply")
+            Path(loop.env["STATE"], "scratch", f"spec-{N}-1.comment").write_text("Verified reply")
         message = {"type": "assistant", "parent_tool_use_id": None, "message": {"model": model}}
         log.write_text("\n".join(map(json.dumps, [message, result])))
         return rc
@@ -1412,8 +1412,8 @@ def test_claude_spec_revision_verifies_main_session_models(loop, monkeypatch, sp
         if not review and scenario == "ambiguous":
             events.append({**message, "message": {"model": review_model}})
         if not review:
-            Path(f"/tmp/baton-spec-{N}-{round}.body").write_text("Goal\nRevised step\n")
-            Path(f"/tmp/baton-spec-{N}-{round}.comment").write_text("done")
+            Path(loop.env["STATE"], "scratch", f"spec-{N}-{round}.body").write_text("Goal\nRevised step\n")
+            Path(loop.env["STATE"], "scratch", f"spec-{N}-{round}.comment").write_text("done")
         events.append({"type": "result", "result": "SPEC: changes" if review else "SPEC: revised",
                        "modelUsage": {model: {}, "claude-haiku-4-5": {}}})
         log.write_text("\n".join(map(json.dumps, events)))
@@ -1447,8 +1447,6 @@ def test_claude_spec_revision_verifies_main_session_models(loop, monkeypatch, sp
     else:
         assert not replies
         assert loop.gh.body == "Goal\nOld step\n"
-        for artifact in Path("/tmp").glob(f"baton-spec-{N}-{round}.*"):
-            artifact.unlink()
     refused = scenario in ("fallback", "fallback snapshot", "unknown", "ambiguous")
     spec_handoffs("spec_reviser_model_unverified" if refused else None)
 
@@ -1521,8 +1519,8 @@ def test_a_revision_after_a_retried_review_runs_on_the_reviewers_other_model(loo
         review = len(calls) == 1
         model = opus if review else sonnet
         if not review:
-            Path(f"/tmp/baton-spec-{N}-1.body").write_text("Goal\nRevised step\n")
-            Path(f"/tmp/baton-spec-{N}-1.comment").write_text("done")
+            Path(loop.env["STATE"], "scratch", f"spec-{N}-1.body").write_text("Goal\nRevised step\n")
+            Path(loop.env["STATE"], "scratch", f"spec-{N}-1.comment").write_text("done")
         log.write_text("\n".join(map(json.dumps, [
             {"type": "system", "subtype": "init", "model": model},
             {"type": "assistant", "parent_tool_use_id": None, "message": {"model": model}},
@@ -1588,7 +1586,7 @@ def test_codex_spec_fallback_verifies_actual_model_at_cli(loop, monkeypatch, spe
                 {"type": "turn_context", "payload": {"model": model}}))
         if revision:
             work = next(s.wt.glob(".baton-codex-*"))
-            (work / f"baton-spec-{N}-2.comment").write_text("done")
+            (work / f"spec-{N}-2.comment").write_text("done")
         Path(args[args.index("--output-last-message") + 1]).write_text(
             "SPEC: revised" if revision else "SPEC: changes")
         return 0
@@ -1607,8 +1605,6 @@ def test_codex_spec_fallback_verifies_actual_model_at_cli(loop, monkeypatch, spe
         assert f"same-vendor-different-model (codex/{base} after codex/{other})" in posted[0]
     else:
         assert not posted
-        for artifact in Path("/tmp").glob(f"baton-spec-{N}-2.*"):
-            artifact.unlink()
     refused = scenario in ("reported unknown", "fallback identical")
     unverified = "spec_reviser_model_unverified" if revision else "spec_reviewer_model_unverified"
     spec_handoffs(unverified if refused else None)
@@ -2757,7 +2753,7 @@ def test_a_deferred_reply_keeps_the_loops_limit_and_leaves_no_temp_files(loop, m
     limit = max(int(session.resolve(loop.env).config.scheduling.max_spec_rounds or 3), 2)
     saved = handoff.load_retry(session.resolve(loop.env), N, "spec_reply_post_failed")
     assert saved["continuation"]["max_rounds"] == limit
-    assert not list(Path("/tmp").glob(f"baton-spec-{N}-1.*"))
+    assert not list(Path(loop.env["STATE"], "scratch").glob(f"spec-{N}-1.*"))
 
 
 @pytest.mark.parametrize("action", ["handoff", "extra_round"])
