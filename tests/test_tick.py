@@ -1587,6 +1587,8 @@ def devrun(ctx, worktree, monkeypatch):
     state.issue, state.runs, state.verify, state.script = issue, [], (0, "", 0), []
     state.gh.answers["issue view"] = {"title": "A title", "body": "A body", "comments": []}
     state.gh.answers["pr create"] = "https://github.com/owner/app/pull/301\n"
+    for branch in ("agent/issue-300", "cursor/issue-300"):   # no closed PR: the push and resume read it (#303)
+        state.gh.answers[f"api repos/owner/app/pulls?state=all&head=owner:{branch}&per_page=100"] = [[]]
     monkeypatch.setattr(spec, "verdict_plan", lambda env, n, listed=None: "the plan")
     monkeypatch.setattr(tick.Tick, "pick_vendor", lambda self, role, mode, cands, **k: "codex")
     verify = fix.Runner.verify
