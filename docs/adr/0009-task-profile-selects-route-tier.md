@@ -49,9 +49,10 @@ codex  = { model = "codex_strong", effort = "xhigh" }
   the standard entry), because a follow-up round re-checks earlier findings whatever the task's
   size.
 - Same-vendor rules (ADR 0002, ADR 0004's distinct-model policies) judge the resolved model of
-  the chosen tier by the adapter's existing policy, so a tier adds no new way to review a
-  model's own work: where a same-model review is refused it stays refused, and where ADR 0004
-  allows one in a fresh session (the writer-model policy) it is recorded as such.
+  the chosen tier by the adapter's existing policy. For code review, a tier that resolves to a
+  writer's model leads to another configured model and otherwise to a fresh session recorded as
+  `same-model-fresh-context` (ADR 0004). The spec and screenshot policies still require a
+  distinct model.
 - The profile does not choose the vendor. Vendor selection stays with code: quota caps and
   cooldowns, the owner's `[preferences]` order, and review independence (the reviewer of an
   issue or a PR is a different vendor from its author whenever one can run; ADR 0002). Judgement
@@ -91,6 +92,8 @@ codex  = { model = "codex_strong", effort = "xhigh" }
 - Issue #237, spec round 1: named the tiered roles and why the others have none; stated that
   follow-up never uses a tier entry; and corrected the same-vendor rule, which had claimed
   more than ADR 0004's writer-model policy allows (a same model in a fresh session).
+- Issue #221: a tier that resolves to the writer's model no longer rules out same-vendor code
+  review, because the owner decided the pipeline never stalls on review independence.
 - Issue #238, spec round 1: said how a structured profile fits the one-action advisor contract,
   kept its comment out of owner input and linked ADRs behind the opt-in, applied the floor to
   `spec_review` too (its review is as much a gate as code review), and defined the floor's input
