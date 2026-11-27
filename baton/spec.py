@@ -246,16 +246,27 @@ def last_by(listed, owner, kind):
 
 @session.scoped
 def last_model(env, issue, kind, round, vendor=""):
-    """The actual model in the latest successful run of that round, from runner.log."""
+    """The actual model in the latest successful run of that round, from runner.log. A retry
+    (-retryK) or rerun of the round is the same round. A run is successful when it ends rc=0
+    without RESULT: failed (agy ends a denied run rc=0). With VENDOR, a run another vendor started
+    does not count. The latest successful run decides, also when its model is missing or unknown:
+    an older run is never the evidence (ADR 0004)."""
     env = session.resolve(env)
     tag = f"issue-{issue}-spec-{round}" if kind != "reply" else f"issue-{issue}-spec-reply-{round}"
+    tags = re.compile(re.escape(tag) + r"(-retry\d+)?(-rerun)?")
     log, found, repo = Path(str(env.config.paths.logs), "runner.log"), "", notify.label(env)
     if not log.is_file():
         return ""
+    started = {}
     for line in log.read_text(errors="replace").splitlines():
         fields = line.split()
-        if (len(fields) >= 6 and fields[2:4] == [repo, "end"]
-                and fields[4] in (tag, f"{tag}-rerun") and fields[5] == "rc=0"):
+        if len(fields) < 6 or fields[2] != repo or not tags.fullmatch(fields[4]):
+            continue
+        if fields[3] == "start":
+            started[fields[4]] = fields[5].lstrip("(")
+        elif fields[3] == "end" and fields[5] == "rc=0" and " RESULT: failed" not in line:
+            if vendor and started.get(fields[4], vendor) != vendor:
+                continue
             adapter = agents.ADAPTERS.get(vendor)
             found = adapter.end_line_model(fields[6:]) if adapter else next(
                 (model for other in agents.ADAPTERS.values() if (model := other.end_line_model(fields[6:]))), "")

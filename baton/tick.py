@@ -1042,10 +1042,16 @@ class Tick:
             return done
         if self.force_issue and self.force_issue in pending:
             return None
-        issue = self.forced_issue() if self.force_issue else self.next_issue()
-        if not issue:
-            return None
-        return self.start(issue)
+        if self.force_issue:
+            issue = self.forced_issue()
+            return self.start(issue) if issue else None
+        # A deferred issue waits alone (ADR 0002): the tick goes on to the next candidate, through
+        # the whole admission check again, since the deferred one may have opened a PR (#323).
+        while issue := self.next_issue():
+            done = self.start(issue)
+            if done is not None:
+                return done
+        return None
 
     def resume_specs(self, only=None):
         """The pending_specs() entries that are due; ONLY restricts them to these issues."""
