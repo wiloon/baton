@@ -1365,7 +1365,7 @@ class Spec:
 
         def review_followup(vendor):
             return alt_followup if vendor == alternating else self.followup(round, vendor, last_vendor)
-        pending = self.resume_worker("spec_reviewer", "spec_review_run_failed", round, other_model)
+        pending = self.resume_worker("spec_reviewer", "spec_review_run_failed", round, other_model, alt_followup)
         if pending is False:
             return "stop"
         reviewer = pending[1] if pending else self.pick("spec_reviewer", pick.all_vendors(env),
@@ -1422,7 +1422,7 @@ class Spec:
             retry = self.recover_worker(
                 f"{reviewer}'s spec review failed: {outcome}", "spec_review_run_failed", reviewer, outcome,
                 round_s=str(round), issue_body=issue_body, listed=listed, last_vendor=last_vendor,
-                other_model=other_model, spec_followup=review_followup(reviewer))
+                other_model=other_model, spec_followup=alt_followup)
             if not retry:
                 return "stop"
             _, reviewer = retry
