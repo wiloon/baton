@@ -677,3 +677,27 @@ def test_clearing_a_retry_unlinks_a_symlink_to_a_directory_as_a_link(env, tmp_pa
     handoff.clear_retry(env, "7", "spec_comments_read_failed")
     assert not path.is_symlink() and not list(path.parent.glob("damaged-*"))
     assert (target / "child").read_text() == "kept"
+
+
+def test_check_push_local_allows_detached_only_when_opted_in(tmp_path):
+    import subprocess
+    wt = tmp_path / "wt"
+    subprocess.run(["git", "init", "-q", "-b", "agent/issue-125", str(wt)], check=True)
+    for k, v in (("user.name", "t"), ("user.email", "t@example.invalid")):
+        subprocess.run(["git", "-C", str(wt), "config", k, v], check=True)
+    (wt / "a.txt").write_text("a\n")
+    subprocess.run(["git", "-C", str(wt), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(wt), "commit", "-q", "-m", "base"], check=True)
+    sha = subprocess.run(["git", "-C", str(wt), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+    binding = {"wt": str(wt), "commit": sha, "branch": "agent/issue-125"}
+
+    assert handoff.check_push_local(binding) is True
+    assert handoff.check_push_local(binding, allow_detached=True) is True
+
+    subprocess.run(["git", "-C", str(wt), "checkout", "-q", "--detach"], check=True)
+    assert handoff.check_push_local(binding) is False
+    assert handoff.check_push_local(binding, allow_detached=True) is True
+
+    subprocess.run(["git", "-C", str(wt), "checkout", "-q", "-b", "other/branch"], check=True)
+    assert handoff.check_push_local(binding, allow_detached=True) is False
+

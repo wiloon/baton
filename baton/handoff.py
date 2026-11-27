@@ -707,16 +707,20 @@ def push_destination(wt, ref):
     return ref
 
 
-def check_push_local(binding):
+def check_push_local(binding, *, allow_detached=False):
     from .common import git
     wt = binding["wt"]
-    return (git(wt, "rev-parse", "HEAD") == binding["commit"]
-            and git(wt, "branch", "--show-current") == binding["branch"])
+    if git(wt, "rev-parse", "HEAD") != binding["commit"]:
+        return False
+    current = git(wt, "branch", "--show-current")
+    if current is None:
+        return False
+    return current == binding["branch"] or (allow_detached and current == "")
 
 
-def check_push_landed(binding):
+def check_push_landed(binding, *, allow_detached=False):
     """Whether origin already holds the saved post-sign-off commit (#151)."""
-    if not check_push_local(binding):
+    if not check_push_local(binding, allow_detached=allow_detached):
         return "changed"
     current, transient = observe_remote(binding["wt"], binding["branch"])
     if current is None:
