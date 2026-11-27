@@ -2,8 +2,8 @@
 
 Repositories run concurrently and number their issues and PRs alike, so a shared directory would
 let one repository read another's reply. guard.sh and the vendor grants name exactly this
-directory, never its parent, which holds the runner's own records. bin/tmp-sweep.sh removes
-what finished tasks left, by the names below.
+directory, never its parent, which holds the runner's own records. The sweep script in bin
+removes what finished tasks left, by the names below.
 """
 
 # What follows "<kind>-<number>[-<round>]". A spec or scan path is a base the agent adds suffixes to.
