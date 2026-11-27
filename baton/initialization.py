@@ -25,6 +25,8 @@ class Runtime:
     chain: int = 0
     manual: bool = False
     serve_child: bool = False
+    assign_issue: str = ""       # serve child: --issue N (scheduled, not manual)
+    no_new_issue: bool = False   # serve child: --no-new-issue
     spec_followup: bool = False
     review_followup: bool = False
     fix_followup: bool = False

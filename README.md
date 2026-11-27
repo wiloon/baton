@@ -50,8 +50,12 @@ new issue, and `max_pending_prs` limits new issues, with one exception: `P0`, fo
 `P0` issue goes before the resumed work of lower-priority issues and is not limited by
 `max_pending_prs`, however many `P0` issues there are (their PRs count toward it as usual). A
 running step is never interrupted, and a `P0` that cannot run now does not hold up other work.
-Priority is per repository: the turns across repositories do not change, so a `P0` may wait while
-another repository takes its turn. A run by hand on one issue or PR has no `P0` step
+Under `baton serve`, priority is global across repositories: when free slots are contended the
+supervisor lists each due repository and starts the best ready work first (`P0` anywhere before
+`P1`, and so on; equal priority keeps rotation). In-flight work of a repository keeps its slot
+ahead of any new issue elsewhere
+([ADR 0012](docs/adr/0012-supervisor-orders-work-by-priority-across-repositories.md)). The legacy
+timer path still turns per repository. A run by hand on one issue or PR has no `P0` step
 ([ADR 0010](docs/adr/0010-priority-labels-order-the-queue-and-p0-preempts.md)).
 
 When a step ends, the tick can go straight on to the next one, up to `chain_max`. With
@@ -235,16 +239,21 @@ beside the supervisor: the repository lock keeps them apart.
 ### Supervisor
 
 `python -m baton serve` is a resident process that replaces the timer
-([ADR 0011](docs/adr/0011-resident-supervisor-runs-one-tick-child-per-repository.md)). It only
-schedules: it never calls GitHub or an agent CLI. Each tick is a child process for one repository,
-which honours maintenance and `scheduling.paused`, takes its own locks and scans when its
-repository is idle and a scan is due.
+([ADR 0011](docs/adr/0011-resident-supervisor-runs-one-tick-child-per-repository.md),
+[ADR 0012](docs/adr/0012-supervisor-orders-work-by-priority-across-repositories.md)). It schedules
+children and, when more due repositories compete than free slots, lists GitHub read-only to order
+work by priority across repositories. It never writes to GitHub or a repository's state and never
+calls an agent CLI. Each tick is a child process for one repository, which honours maintenance and
+`scheduling.paused`, takes its own locks and scans when its repository is idle and a scan is due
+(an assigned `--issue` / `--no-new-issue` child does not scan).
 
 - **`[scheduling] max_parallel`** (default 1): children running at once, across all repositories,
-  never two for one repository. Repositories take turns in the configured order.
+  never two for one repository. Under contention the supervisor prefers in-flight work, then an
+  hour-idle housekeeping turn, then the best candidate by priority, then plain rotation.
 - **`[serve] poll_seconds`** (default 60, at least 10): how often it looks, and how long a
   repository waits after its tick exits. After a merged partial slice the next tick starts at once,
-  at most `chain_max` times in a row.
+  at most `chain_max` times in a row. An assigned child that ran no item exits 81: due at once, and
+  that assignment is skipped for one poll so another repository can take the slot.
 - A failing tick doubles its repository's wait each time, up to one hour; success resets it.
 - `config.toml` is read again on every loop; while it is invalid nothing starts. Lowering
   `max_parallel` or removing a repository never stops a running tick.

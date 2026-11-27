@@ -3504,6 +3504,33 @@ def test_a_forced_issue_has_no_p0_pass_and_logs_its_priority(ctx, queue):
     assert not [c for c in ctx.gh.ran("issue", "list") if "P0" in c]
 
 
+def test_a_serve_assigned_issue_starts_only_that_issue(ctx, queue):
+    queue.setup(ready=numbered((12,), (20, "P1")))
+    t = ctx.make()
+    t.env.runtime.assign_issue = "20"
+    t.env.runtime.serve_child = True
+    assert t.work() == 0
+    assert queue.ran == ["dev 20"]
+
+
+def test_a_serve_no_new_issue_child_starts_no_new_issue(ctx, queue):
+    queue.setup(ready=numbered((12,), (20, "P1")))
+    t = ctx.make()
+    t.env.runtime.no_new_issue = True
+    t.env.runtime.serve_child = True
+    assert t.work() is None
+    assert queue.ran == []
+
+
+def test_an_ineligible_serve_assignment_starts_nothing(ctx, queue):
+    queue.setup(ready=numbered((12,)))
+    t = ctx.make()
+    t.env.runtime.assign_issue = "99"
+    t.env.runtime.serve_child = True
+    assert t.work() is None
+    assert queue.ran == []
+
+
 def test_tick_resumes_a_saved_review_in_a_detached_worktree_and_pushes_to_head_branch(
     gh, worktree, tmp_path, monkeypatch,
 ):
