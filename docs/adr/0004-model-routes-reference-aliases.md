@@ -49,6 +49,13 @@ codex  = { model = "codex_fast", effort = "low" }
   If the entry or table is absent, inherit the complete base entry for that vendor, including
   effort and subagent model. A present entry replaces the complete base entry. An omitted or
   empty effort or subagent field uses the CLI default for that field.
+- `dev`, `fix`, `review`, `spec_review` and `spec` have optional tier tables `ROLE_light` and
+  `ROLE_heavy` (ADR 0009); `ROLE` itself is the standard tier. Without follow-up, use the
+  step's tier entry for that vendor, else the `ROLE` entry. A present tier entry replaces the
+  complete `ROLE` entry, as a follow-up entry does. When follow-up is selected the tier is
+  ignored: `ROLE_followup`, else the `ROLE` entry, never a tier entry. Tier entries need the
+  same fields, aliases and vendor roles as other entries. There are no other tier tables
+  (none for `scan` or `screenshot_review`, no `ROLE_standard`, no tiered follow-up).
 - The adapter declares whether effort and subagent fields are supported. Codex receives effort
   via `-c model_reasoning_effort` and Claude Code via `--effort`. A Cursor model identifier
   carries the effort level. Claude supports subagent models.
