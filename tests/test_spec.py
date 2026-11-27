@@ -4679,9 +4679,10 @@ def test_claude_reviewed_revision_goes_to_agy_when_pool_is_blocked(loop, monkeyp
                          "body": "<!-- baton-spec-review round=1 by=claude -->\nx"}]
     context = Path(loop.env["CTX"], "issue.md")
     context.write_text("issue")
-    loop.script = [reviser(body="Goal\nNew step\n", model="gemini-4-neon-medium")]
+    loop.script = [reviser(body="Goal\nNew step\n", commit=True, model="gemini-4-neon-medium")]
     s = spec.Spec(sess, spec.telemetry.from_env(sess, issue=N), N)
     assert s.worktree()
+    base = spec.git(s.wt, "rev-parse", "HEAD")
     assert s.revise_round(1, context, s.issue_payload()) == "revised"
     assert [r["vendor"] for r in loop.runs if r["role"] == "spec"] == ["agy"]
     prompt = loop.runs[0]["prompt"]
@@ -4689,6 +4690,8 @@ def test_claude_reviewed_revision_goes_to_agy_when_pool_is_blocked(loop, monkeyp
     assert "`git`" in prompt and "file tools" in prompt
     reply, = loop.gh.posted("<!-- baton-spec-reply round=1 by=agy -->")
     assert "same-vendor" not in reply
+    assert spec.git(s.wt, "diff", "--name-only", f"{base}..HEAD") == "adr.md"
+    assert loop.gh.adr_pr == "77" and "ADR revisions: #77" in reply
 
 
 def test_agy_revises_its_own_review_only_with_a_distinct_spec_model(loop, monkeypatch):
