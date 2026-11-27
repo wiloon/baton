@@ -409,11 +409,11 @@ def run(req):
     settings = permissions_settings(req.role, repo.ci_command, repo.verify_hook)
     mode = "plan" if req.readonly else "accept-edits"
     seconds = max(req.minutes * 60 - 60, 60)
-    dirs = [req.shots_dir, os.path.dirname(req.output) if req.output else ""]
-    if not req.readonly:
-        # A linked worktree keeps its objects and refs outside the checkout; commits need both.
-        dirs = [git(req.cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"),
-                git(req.cwd, "rev-parse", "--absolute-git-dir"), *dirs]
+    # A linked worktree keeps its objects and refs outside the checkout: commits need both, and so do
+    # reads of .git and git commands in a read-only run (#259). changed() and gitcontrol guard the writes.
+    dirs = [git(req.cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"),
+            git(req.cwd, "rev-parse", "--absolute-git-dir"),
+            req.shots_dir, os.path.dirname(req.output) if req.output else ""]
     dirs = [d for d in dict.fromkeys([*req.add_dirs, *dirs]) if d]
     env = child_env(**req.env, GH_TOKEN="no-github-for-agy", GITHUB_TOKEN="", GIT_SSH_COMMAND="/bin/false",
                     GIT_TERMINAL_PROMPT="0")
