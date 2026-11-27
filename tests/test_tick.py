@@ -1922,6 +1922,8 @@ def advised_dev(devrun, monkeypatch):
     devrun.advice_calls, devrun.action = [], "retry_step_other_vendor"
 
     def advise(cfg, key, snapshot, actions, **kwargs):
+        if "record_profile" in actions:   # the intake profile (#238) is not a recovery decision
+            return {"action": "handoff", "reason": "no profile", "evidence": []}, {}
         devrun.advice_calls.append((snapshot, actions))
         reason = snapshot.splitlines()[0].split(".")[0]
         return {"action": devrun.action, "reason": "try again", "evidence": [reason]}, {}

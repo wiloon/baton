@@ -2286,8 +2286,10 @@ def test_dev_reconciles_an_interrupted_spec_acceptance_after_worktree_removal(ad
     assert dev.run(tick.Tick(env), N) == 1
     assert dev.run(tick.Tick(env), N) == 1
 
-    decision, outcome = advisor.read_records(env)
+    # The accept dev.run finds also gets one intake profile (#238), which stays open.
+    decision, outcome, intake = advisor.read_records(env)
     assert outcome["decision_id"] == decision["decision_id"] and outcome["result"] == "accept"
+    assert (intake["point"], intake["stage"]) == ("intake", "accept")
     assert not advisor.granted(env, "spec_limit", N)
 
 

@@ -313,6 +313,13 @@ providers. Decisions go to `<state>/advisor/decisions.jsonl`; once a day a "Advi
 notification lists them with how the extra rounds ended (merged or accepted). `DEEPSEEK_API_KEY` comes from the
 environment or `[advisor] env_file` (mode 0600) and is never passed to agents.
 
+When the runner picks up an issue, and again once its spec is accepted, the advisor also records a
+task profile ([ADR 0009](docs/adr/0009-task-profile-selects-route-tier.md): size, kind, risk and a
+tier per route) and comments it on the issue. This is observation only in either enabled mode: every
+role still runs at the standard tier. The snapshot adds main's commit count and last-change date for
+paths the issue names; `[[repos]] advisor_commit_subjects = true` also sends their recent commit
+subjects.
+
 ### Maintenance mode
 
 Drain the pipeline before a deploy ([ADR 0003](docs/adr/0003-maintenance-mode-is-a-local-flag.md)):

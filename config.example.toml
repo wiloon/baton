@@ -151,6 +151,9 @@ advisor = true
 advisor_diff_excerpts = false
 advisor_ci_log_excerpts = false
 advisor_local_documents = false
+# Intake task profiles (ADR 0009): subject lines of main's newest commits for the paths an issue
+# names, redacted and capped. Never authors, committers, message bodies or trailers.
+advisor_commit_subjects = false
 
 [repos.areas]
 # Top-level directory -> area, for per-area vendor preferences (`dev_ui = [...]`). Anything else is "other".
@@ -383,7 +386,9 @@ budget_usd = 1.0
 # Complete, cited grounded answers to SPEC: human questions may resume revision in live mode.
 # Decisions go to STATE/advisor/decisions.jsonl and a daily digest. A [[repos]] entry with
 # advisor = false keeps that repository's text off both providers. Per-repository excerpt flags
-# (advisor_diff_excerpts, advisor_ci_log_excerpts, advisor_local_documents) default off.
+# (advisor_diff_excerpts, advisor_ci_log_excerpts, advisor_local_documents,
+# advisor_commit_subjects) default off. Either enabled mode also records an intake task profile
+# per issue, in observation only (ADR 0009).
 [advisor]
 env_file = "~/.config/baton/deepseek.env"     # DEEPSEEK_API_KEY
 # Backends, tried in order: "claude" (Claude Code, the grant for the advisor; Claude must be

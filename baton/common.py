@@ -90,6 +90,11 @@ class Run:
     denial: list | None = None
 
 
+# First line of an intake task profile (#238): advisor text posted from the owner's account, so no
+# reader of owner input, evidence or issue text may take it (ADR 0008 provenance).
+PROFILE_MARKER = "<!-- baton-profile "
+
+
 def strip_markers(text):
     """Drop every line carrying an baton marker; only the runner adds trusted ones."""
     return "\n".join(line for line in text.split("\n") if "<!-- baton-" not in line)

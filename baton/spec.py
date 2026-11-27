@@ -32,7 +32,8 @@ import sys
 import time
 
 from . import advisor, agents, checks as check_section, dispatch, e2e_gate, fix, handoff as owner_handoff, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, recovery, review, scratch, tiers, vendors
-from .common import Deferred, changed, child_env, git, permission_denials, push, restore, strip_markers
+from .common import (Deferred, PROFILE_MARKER, changed, child_env, git, permission_denials, push, restore,
+                     strip_markers)
 from .quota import atomic_json
 
 REPLY_CAP = 60000
@@ -284,9 +285,45 @@ def trusted_comment_digest(listed, owner, login_re):
     bodies = []
     for comment in listed or []:
         login = (comment.get("author") or {}).get("login") or ""
-        if login == owner or re.search(login_re, login):
-            bodies.append(comment.get("body") or "")
+        body = comment.get("body") or ""
+        if (login == owner or re.search(login_re, login)) and not body.startswith(PROFILE_MARKER):
+            bodies.append(body)
     return recovery.feedback_digest(json.dumps(bodies))
+
+
+def referenced_documents(cwd, texts, revision, limit, chars):
+    """Read referenced ADR blobs from a commit, retaining whether the raw excerpt was cut."""
+    if not revision:
+        return []
+    tree = git(cwd, "ls-tree", "--format=%(objectmode) %(objectname) %(path)", revision, "--", "docs/adr/")
+    documents = {}
+    for row in (tree or "").splitlines():
+        mode, oid, name = row.split(" ", 2)
+        if mode in ("100644", "100755") and re.fullmatch(r"docs/adr/[A-Za-z0-9][A-Za-z0-9._-]*\.md", name):
+            documents[name.removeprefix("docs/adr/")] = oid
+    names = []
+    for text in texts:
+        for match in re.finditer(r"docs/adr/([A-Za-z0-9][A-Za-z0-9._-]*\.md)|\bADR[ -]?0*(\d{1,4})\b",
+                                 text or "", re.IGNORECASE):
+            if match.group(1):
+                names.append(match.group(1))
+            else:
+                prefix = f"{int(match.group(2)):04d}-"
+                names.extend(name for name in documents if name.startswith(prefix))
+    found = []
+    for name in dict.fromkeys(names):
+        if len(found) >= limit:
+            break
+        if name not in documents:
+            continue
+        try:
+            blob = subprocess.run(["git", "-C", str(cwd), "cat-file", "blob", documents[name]],
+                                  capture_output=True, env=child_env(), check=True)
+            text = blob.stdout.decode("utf-8")
+        except (subprocess.CalledProcessError, UnicodeError, OSError):
+            continue
+        found.append((f"docs/adr/{name}", text[:chars], len(text) > chars))
+    return found
 
 
 class Spec:
@@ -821,38 +858,8 @@ class Spec:
         return data
 
     def referenced_documents(self, texts, revision, limit, chars):
-        """Read referenced ADR blobs from a commit, retaining whether the raw excerpt was cut."""
-        if not revision:
-            return []
-        tree = git(self.wt, "ls-tree", "--format=%(objectmode) %(objectname) %(path)", revision, "--", "docs/adr/")
-        documents = {}
-        for row in (tree or "").splitlines():
-            mode, oid, name = row.split(" ", 2)
-            if mode in ("100644", "100755") and re.fullmatch(r"docs/adr/[A-Za-z0-9][A-Za-z0-9._-]*\.md", name):
-                documents[name.removeprefix("docs/adr/")] = oid
-        names = []
-        for text in texts:
-            for match in re.finditer(r"docs/adr/([A-Za-z0-9][A-Za-z0-9._-]*\.md)|\bADR[ -]?0*(\d{1,4})\b",
-                                     text or "", re.IGNORECASE):
-                if match.group(1):
-                    names.append(match.group(1))
-                else:
-                    prefix = f"{int(match.group(2)):04d}-"
-                    names.extend(name for name in documents if name.startswith(prefix))
-        found = []
-        for name in dict.fromkeys(names):
-            if len(found) >= limit:
-                break
-            if name not in documents:
-                continue
-            try:
-                blob = subprocess.run(["git", "-C", str(self.wt), "cat-file", "blob", documents[name]],
-                                      capture_output=True, env=child_env(), check=True)
-                text = blob.stdout.decode("utf-8")
-            except (subprocess.CalledProcessError, UnicodeError, OSError):
-                continue
-            found.append((f"docs/adr/{name}", text[:chars], len(text) > chars))
-        return found
+        """The referenced ADRs as this worktree's repository has them at REVISION."""
+        return referenced_documents(self.wt, texts, revision, limit, chars)
 
     def questions_citation_entries(self, issue_body, comments, reply, document_head):
         """Baseline citation rows from the issue body and genuine owner comments."""

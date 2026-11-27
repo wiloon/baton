@@ -103,6 +103,7 @@ class Repo:
     advisor_diff_excerpts: bool = False
     advisor_ci_log_excerpts: bool = False
     advisor_local_documents: bool = False
+    advisor_commit_subjects: bool = False   # intake (#238): main's commit subjects for named paths
 
 
 @dataclass(frozen=True)
