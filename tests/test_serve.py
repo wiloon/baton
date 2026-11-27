@@ -393,6 +393,32 @@ def test_hour_idle_repository_gets_no_new_issue_ahead_of_new_candidates(tmp_path
     assert world.spawned[1] == (3601, APP, None, True)
 
 
+def test_the_owner_check_is_cached_across_passes_and_a_failed_read_is_retried(tmp_path):
+    from functools import partial
+    from baton import eligibility
+    events, failures = [], [None]   # the first events read fails
+
+    def gh(*args):
+        if args[0] == 'api':
+            events.append(args[1])
+            return failures.pop() if failures else [[]]
+        if args[:2] == ('issue', 'list') and 'ready-for-agent' in args and APP in args:
+            return [{'number': 1, 'labels': [{'name': 'claude-found'}], 'updatedAt': 't1'}]
+        return []
+
+    world = World(tmp_path, TWO, max_parallel=1)
+    world.supervisor.list_repos = partial(eligibility.list_due, gh_json=gh)
+    seen = []
+    for _ in range(3):   # each pass: both repositories due, one slot
+        world.supervisor.eligible.clear()
+        world.supervisor.step()
+        seen.append(len(events))
+        for child in world.supervisor.children.values():
+            child.poll = lambda: 0
+        world.supervisor.reap()
+    assert seen == [1, 2, 2]
+
+
 CHILD = '''import pathlib, signal, sys, time
 box = pathlib.Path(sys.argv[1])
 name = sys.argv[2].replace('/', '-')

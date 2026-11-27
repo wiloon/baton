@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 import json
 from pathlib import Path
 import re
+import time
+from typing import NamedTuple
 
 from . import handoff, names
 
@@ -56,7 +58,8 @@ def priority_of(labels):
 
 
 def owner_ready(gh_json, repo, issue, owner, *, cache=None, updated_at=None):
-    """Whether the owner's latest ready-for-agent label event authorizes ISSUE."""
+    """Whether the owner's latest ready-for-agent label event authorizes ISSUE. CACHE keeps only
+    answers read from a whole history: an unreadable one is asked again."""
     key = (repo, str(issue), updated_at)
     if cache is not None and key in cache:
         return cache[key]
@@ -82,19 +85,20 @@ def owner_ready(gh_json, repo, issue, owner, *, cache=None, updated_at=None):
         if valid:
             ready = bool(latest and latest["event"] == "labeled"
                          and ((latest.get("actor") or {}).get("login") or "").casefold() == owner.casefold())
-    if cache is not None:
-        cache[key] = ready
+            if cache is not None:
+                cache[key] = ready
     return ready
 
 
-def pending_spec_issues(state: Path):
-    found = set()
+def pending_specs(state: Path):
+    """{issue: reason} of the saved spec reads, comment posts and issue-scoped pushes."""
+    found = {}
     for reason in SPEC_PENDING:
         for prefix in ("waiting", "retry"):
             for path in state.glob(f"handoff-{prefix}-*-{reason}.json"):
                 issue = path.name.removeprefix(f"handoff-{prefix}-").removesuffix(f"-{reason}.json")
                 if issue.isdecimal():
-                    found.add(issue)
+                    found[issue] = reason
     return found
 
 
@@ -119,29 +123,43 @@ def github_in_flight(prs) -> bool:
     return False
 
 
-def slot_markers(state: Path):
+def slot_markers(state: Path, unreadable=None):
+    """{PR number: "vendor reason"} of the PRs that lend their slots. UNREADABLE gets each marker
+    that cannot be read: only the child, which writes the state, removes it."""
     found = {}
     for path in state.glob("slot-deferred-*"):
         try:
             data = json.loads(path.read_text())
             found[path.name.removeprefix("slot-deferred-")] = f"{data['vendor']} {data['reason']}"
         except (OSError, ValueError, KeyError, TypeError):
-            pass
+            if unreadable:
+                unreadable(path)
     return found
 
 
-def counted_wip(prs, wip_numbers, state: Path):
-    """agent-wip issues that hold a max_pending_prs slot (same formula as Tick.next_issue)."""
+def with_owner_issues(prs):
+    """Issues whose PR waits for the owner (ready-for-human)."""
+    return {names.issue_of(p["headRefName"]) for p in prs
+            if any(label.get("name") == "ready-for-human" for label in p.get("labels") or [])}
+
+
+class Slots(NamedTuple):
+    pending: list    # agent-wip issues that hold a max_pending_prs slot
+    deferred: set    # of those, the ones whose PR lends its slot
+    held: dict       # pending issue -> its PR number
+    markers: dict    # slot_markers()
+
+
+def counted_wip(prs, wip_numbers, markers, with_owner=None):
+    """The max_pending_prs count: agent-wip issues with an open PR that does not wait for the owner."""
+    with_owner = with_owner_issues(prs) if with_owner is None else with_owner
     branches = {p["headRefName"] for p in prs}
-    with_pr = {n for n in wip_numbers if branches.intersection(names.branches(n))}
-    with_owner = {names.issue_of(p["headRefName"]) for p in prs
-                  if any(label.get("name") == "ready-for-human" for label in p.get("labels") or [])}
-    pending = with_pr - with_owner
+    pending = [n for n in wip_numbers if n not in with_owner and branches.intersection(names.branches(n))]
     pr_of = {names.issue_of(p["headRefName"]): str(p.get("number", "")) for p in prs
              if names.issue_of(p["headRefName"]) not in with_owner}
-    markers = slot_markers(state)
-    deferred = {n for n in pending if pr_of.get(n) and pr_of[n] in markers}
-    return pending, deferred
+    held = {n: pr_of.get(n) for n in pending}
+    deferred = {n for n, pr in held.items() if pr and pr in markers}
+    return Slots(pending, deferred, held, markers)
 
 
 def cap_allows(priority, pending, deferred, cap):
@@ -181,18 +199,35 @@ def ready_candidates(gh_json, repo, *, milestone, owner, only=None, cache=None, 
     return [Candidate(n, found[n]) for n in sorted(found, key=lambda n: (found[n], n))]
 
 
+def every_page(gh_json, repo, query):
+    """Every item of a REST list, for an admission list that reached its limit; None on failure."""
+    pages = gh_json("api", f"repos/{repo}/{query}&per_page=100", "--paginate", "--slurp")
+    if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+        return None
+    return [item for page in pages for item in page]
+
+
 def list_open_prs(gh_json, repo):
+    """Every open PR (number, headRefName, labels), or None when they cannot be listed."""
     prs = gh_json("pr", "list", "-R", repo, "--state", "open", "--limit", "100",
                   "--json", "number,headRefName,labels")
+    if isinstance(prs, list) and len(prs) == 100:
+        pulls = every_page(gh_json, repo, "pulls?state=open")
+        prs = None if pulls is None else [
+            {"number": pr["number"], "headRefName": pr["head"]["ref"], "labels": pr["labels"]} for pr in pulls]
     return prs if isinstance(prs, list) else None
 
 
 def list_wip_numbers(gh_json, repo):
+    """Every open agent-wip issue number, as strings, or None when they cannot be listed."""
     listed = gh_json("issue", "list", "-R", repo, "--state", "open", "--label", "agent-wip",
                      "--limit", "100", "--json", "number")
+    if isinstance(listed, list) and len(listed) == 100:
+        issues = every_page(gh_json, repo, "issues?state=open&labels=agent-wip")
+        listed = None if issues is None else [item for item in issues if "pull_request" not in item]
     if not isinstance(listed, list):
         return None
-    return {str(item["number"]) for item in listed}
+    return [str(item["number"]) for item in listed]
 
 
 def eligible_candidates(gh_json, repo, state: Path, *, milestone, owner, cap, only=None, cache=None, log=None):
@@ -207,14 +242,14 @@ def eligible_candidates(gh_json, repo, state: Path, *, milestone, owner, cap, on
     if wip is None:
         return None
     branches = {p["headRefName"] for p in prs}
-    waiting = pending_spec_issues(state)
-    pending, deferred = counted_wip(prs, wip, state)
+    waiting = pending_specs(state)
+    slots = counted_wip(prs, wip, slot_markers(state))
     out = []
     for candidate in ready:
         issue = str(candidate.number)
         if issue in waiting or any(names.issue_of(b) == issue for b in branches):
             continue
-        if not cap_allows(candidate.priority, pending, deferred, cap):
+        if not cap_allows(candidate.priority, slots.pending, slots.deferred, cap):
             continue
         out.append(candidate)
     return out, github_in_flight(prs)
@@ -243,7 +278,8 @@ def rank(due, listings, *, order, last_child, born, now, suppress=(), hour=HOUR)
     def take(name, issue=None, no_new=False):
         if name in used:
             return
-        key = (name, "issue", str(issue)) if issue else (name, "no-new", "")
+        # Only the exact assignment is suppressed: a plain turn is its own.
+        key = (name, "issue", str(issue)) if issue else (name, "no-new" if no_new else "plain", "")
         if key in suppress:
             return
         chosen.append((name, str(issue) if issue else None, no_new))
@@ -274,10 +310,11 @@ def rank(due, listings, *, order, last_child, born, now, suppress=(), hour=HOUR)
     return chosen
 
 
-def default_gh_json(*args, limit=CALL_LIMIT):
-    """GitHub JSON via baton.pr.gh with a per-call timeout; None on failure."""
+def default_gh_json(*args, limit=CALL_LIMIT, until=None):
+    """GitHub JSON via baton.pr.gh; None on failure. The call and its retries end by UNTIL
+    (`time.time()`)."""
     from . import pr as pr_helpers
-    result = pr_helpers.gh(*args, limit=limit)
+    result = pr_helpers.gh(*args, limit=limit, until=until)
     if result.returncode != 0:
         return None
     try:
@@ -288,13 +325,22 @@ def default_gh_json(*args, limit=CALL_LIMIT):
 
 def list_due(config, names, *, gh_json=None, clock=None, stop=None, cache=None, log=None,
              call_limit=CALL_LIMIT, budget=PASS_BUDGET):
-    """List each due repository. Stop between calls; bound the pass; never write."""
-    import time
-    gh_json = gh_json or default_gh_json
+    """List each due repository. Stop between calls; bound each call and the pass; never write.
+    A repository not listed in time, or after a stop, comes back failed."""
     clock = clock or time.monotonic
     cache = {} if cache is None else cache
     deadline = clock() + budget
     found = {}
+    if gh_json is None:
+        def gh_json(*args):   # one call and its retries get what is left of both bounds
+            until = time.time() + min(call_limit, deadline - clock())
+            return default_gh_json(*args, limit=call_limit, until=until)
+
+    def bounded(*args):
+        if clock() >= deadline or stop and stop():
+            return None
+        return gh_json(*args)
+
     cap = int(config.scheduling.max_pending_prs or 1)
     for name in names:
         if stop and stop():
@@ -305,12 +351,6 @@ def list_due(config, names, *, gh_json=None, clock=None, stop=None, cache=None, 
         from .config import repo_dirs
         repo = config.repo(name)
         state = repo_dirs(config.paths, repo).state
-
-        def bounded(*args):
-            if clock() >= deadline:
-                return None
-            return gh_json(*args)
-
         listing = list_repository(bounded, name, state, milestone=repo.agent_milestone, owner=repo.owner,
                                   cap=cap, cache=cache, log=log)
         found[name] = listing

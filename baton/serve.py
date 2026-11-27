@@ -58,6 +58,7 @@ class Supervisor:
         self.last_child = {}  # repository -> clock when a child last started
         self.assignment = {}  # repository -> ('issue', N) | ('no-new', '') of the running child
         self.suppress = {}    # (repo, kind, value) -> clock until which it is left out of ranking
+        self.owner_cache = {}   # (repo, issue, updatedAt) -> the owner check, across listing passes
         self.stopping = self.drain_logged = False
         self.problem = ''
 
@@ -169,7 +170,7 @@ class Supervisor:
             starts = [(name, None, False) for name in due]
         else:
             listings = self.list_repos(config, due, clock=self.clock, stop=lambda: self.stopping,
-                                       log=lambda m: self.log(m))
+                                       cache=self.owner_cache, log=self.log)
             # Children that finished while we listed are reaped so slots stay accurate.
             self.reap()
             free = config.scheduling.max_parallel - len(self.children)

@@ -3507,10 +3507,40 @@ def test_a_forced_issue_has_no_p0_pass_and_logs_its_priority(ctx, queue):
 def test_a_serve_assigned_issue_starts_only_that_issue(ctx, queue):
     queue.setup(ready=numbered((12,), (20, "P1")))
     t = ctx.make()
-    t.env.runtime.assign_issue = "20"
+    t.env.runtime.assign_issue = "12"   # not the one the tick would pick itself
     t.env.runtime.serve_child = True
     assert t.work() == 0
-    assert queue.ran == ["dev 20"]
+    assert queue.ran == ["dev 12"]
+
+
+def test_a_vendor_deferred_serve_assignment_starts_no_other_issue_and_exits_81(ctx, queue, monkeypatch):
+    queue.setup(ready=numbered((12,), (20, "P1")))
+
+    def pick_vendor(self, *args, issue="", **kwargs):
+        if str(issue) == "12":
+            raise Deferred("pool", QUOTA)
+        return "codex"
+    monkeypatch.setattr(tick.Tick, "pick_vendor", pick_vendor)
+    t = ctx.make()
+    t.env.runtime.assign_issue = "12"
+    t.env.runtime.serve_child = True
+    assert t.pass_() == 81
+    assert queue.ran == []
+
+
+@pytest.mark.parametrize("mode", ["assign", "no-new"])
+def test_a_serve_assigned_child_removes_stale_slot_markers(ctx, queue, mode):
+    queue.setup(ready=numbered((12,)))
+    marker = ctx.path("slot-deferred-99")
+    marker.write_text('{"vendor": "codex", "reason": "cooldown"}')
+    t = ctx.make()
+    if mode == "assign":
+        t.env.runtime.assign_issue = "12"
+    else:
+        t.env.runtime.no_new_issue = True
+    t.env.runtime.serve_child = True
+    t.work()
+    assert not marker.exists()
 
 
 def test_a_serve_no_new_issue_child_starts_no_new_issue(ctx, queue):

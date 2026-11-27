@@ -224,14 +224,7 @@ class Tick:
 
     def slot_markers(self):
         """{PR number: "vendor reason"} of the PRs that lend their slots."""
-        found = {}
-        for path in self.state.glob("slot-deferred-*"):
-            try:
-                data = json.loads(path.read_text())
-                found[path.name.removeprefix("slot-deferred-")] = f"{data['vendor']} {data['reason']}"
-            except (OSError, ValueError, KeyError, TypeError):
-                path.unlink(missing_ok=True)
-        return found
+        return eligibility.slot_markers(self.state, unreadable=lambda path: path.unlink(missing_ok=True))
 
     def after_item(self, rc):
         """What the tick does with an item's exit code: None to go on, else the exit code."""
@@ -1007,15 +1000,7 @@ class Tick:
     # --- pick work: an issue for the pipeline ------------------------------------------------------
     def pending_specs(self):
         """Resume durable spec reads, comment posts and issue-scoped pushes before new work can be blocked."""
-        found = {}
-        for reason in ("spec_comments_read_failed", "spec_pending_adr_read_failed",
-                       *owner_handoff.SPEC_WRITE_POSTS, *owner_handoff.ISSUE_PUSHES, owner_handoff.SPEC_ADR_MERGE):
-            for prefix in ("waiting", "retry"):
-                for path in self.state.glob(f"handoff-{prefix}-*-{reason}.json"):
-                    issue = path.name.removeprefix(f"handoff-{prefix}-").removesuffix(f"-{reason}.json")
-                    if issue.isdecimal():
-                        found[issue] = reason
-        return found
+        return eligibility.pending_specs(self.state)
 
     def resume_spec(self, issue):
         if self.spec_loop(issue):
@@ -1054,25 +1039,29 @@ class Tick:
         return None
 
     def housekeep_admission(self):
-        """next_issue()'s side effects (release stale agent-wip, hand off stalled PRs) without starting."""
-        listed = self.gh_json("issue", "list", "-R", self.gh_repo, "--state", "open", "--label", "agent-wip", "--limit", "100",
-                              "--json", "number")
-        if isinstance(listed, list) and len(listed) == 100:
-            issues = self.admission_items("issues?state=open&labels=agent-wip")
-            listed = None if issues is None else [item for item in issues if "pull_request" not in item]
-        if not isinstance(listed, list):
-            return
+        """The writes that come before a new issue: release stale agent-wip, hand off stalled PRs,
+        drop stale slot markers. Returns (the cap count, the open PRs' branches), or None, logged,
+        when GitHub cannot be listed."""
+        wip = eligibility.list_wip_numbers(self.gh_json, self.gh_repo)
+        if wip is None:
+            self.log("could not list open agent-wip issues; not starting new work")
+            return None
         prs = self.open_prs()
         if prs is None:
-            return
+            return None
         branches = {p["headRefName"] for p in prs}
-        for p in listed:
-            if not branches.intersection(names.branches(str(p["number"]))):
-                self.release_stale(str(p["number"]))
-        listed = [p for p in listed if branches.intersection(names.branches(str(p["number"])))]
-        with_owner = {names.issue_of(p["headRefName"]) for p in prs
-                      if any(label.get("name") == "ready-for-human" for label in p.get("labels") or [])}
-        self.hand_off_stalled({str(p["number"]) for p in listed}, prs, with_owner)
+        # An agent-wip issue without an open PR holds no slot: release it, or leave it uncounted.
+        for issue in wip:
+            if not branches.intersection(names.branches(issue)):
+                self.release_stale(issue)
+        wip = [issue for issue in wip if branches.intersection(names.branches(issue))]
+        # A PR waiting for the owner uses no agent capacity; it must not hold up the queue.
+        with_owner = eligibility.with_owner_issues(prs)
+        with_owner |= self.hand_off_stalled(set(wip), prs, with_owner)
+        slots = eligibility.counted_wip(prs, wip, self.slot_markers(), with_owner)
+        for pr in set(slots.markers) - {slots.held[n] for n in slots.deferred}:
+            (self.state / f"slot-deferred-{pr}").unlink(missing_ok=True)
+        return slots, branches
 
     def assigned_ready(self, issue):
         """Whether the serve-assigned ISSUE may start now (eligibility + vendor), else False."""
@@ -1178,13 +1167,6 @@ class Tick:
         unreadable history is not approval; all pages count, including later removals/relabels."""
         return eligibility.owner_ready(self.gh_json, self.gh_repo, issue, self.owner)
 
-    def admission_items(self, query):
-        """Fetch every page when an admission list reaches its limit."""
-        pages = self.gh_json("api", f"repos/{self.gh_repo}/{query}&per_page=100", "--paginate", "--slurp")
-        if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
-            return None
-        return [item for page in pages for item in page]
-
     def pr_history(self, issue):
         """Every PR of the issue's agent branches (same repository, base main), any state, or None
         when any lookup fails: a partial history is never used."""
@@ -1212,40 +1194,15 @@ class Tick:
         self.log(f"#{issue}: released agent-wip (no open PR)")
 
     def next_issue(self):
-        listed = self.gh_json("issue", "list", "-R", self.gh_repo, "--state", "open", "--label", "agent-wip", "--limit", "100",
-                              "--json", "number")
-        if isinstance(listed, list) and len(listed) == 100:
-            issues = self.admission_items("issues?state=open&labels=agent-wip")
-            listed = None if issues is None else [item for item in issues if "pull_request" not in item]
-        if not isinstance(listed, list):
-            self.log("could not list open agent-wip issues; not starting new work")
+        admission = self.housekeep_admission()
+        if admission is None:
             return ""
+        (pending, deferred, held, markers), branches = admission
         cap = int(self.env.config.scheduling.max_pending_prs or 1)
-        prs = self.open_prs()
-        if prs is None:
-            return ""
-        branches = {p["headRefName"] for p in prs}
-        # An agent-wip issue without an open PR holds no slot: release it, or leave it uncounted.
-        for p in listed:
-            if not branches.intersection(names.branches(str(p["number"]))):
-                self.release_stale(str(p["number"]))
-        listed = [p for p in listed if branches.intersection(names.branches(str(p["number"])))]
-        # A PR waiting for the owner uses no agent capacity; it must not hold up the queue.
-        with_owner = {names.issue_of(p["headRefName"]) for p in prs
-                      if any(label.get("name") == "ready-for-human" for label in p.get("labels") or [])}
-        with_owner |= self.hand_off_stalled({str(p["number"]) for p in listed}, prs, with_owner)
-        pending = [p for p in listed if str(p["number"]) not in with_owner]
-        pr_of = {names.issue_of(p["headRefName"]): str(p.get("number", "")) for p in prs
-                 if names.issue_of(p["headRefName"]) not in with_owner}
-        markers = self.slot_markers()
-        held = {str(p["number"]): pr_of.get(str(p["number"])) for p in pending}
-        deferred = {n for n, pr in held.items() if pr and pr in markers}
-        for pr in set(markers) - {held[n] for n in deferred}:
-            (self.state / f"slot-deferred-{pr}").unlink(missing_ok=True)
-        if len(pending) - len(deferred) >= cap or len(pending) >= cap + 1:
+        # P0 skips the cap through p0_pass; here every new issue counts as unprioritised (4).
+        if not eligibility.cap_allows(4, pending, deferred, cap):
             why = []
-            for p in pending:
-                n = str(p["number"])
+            for n in pending:
                 if n in deferred:
                     why.append(f"#{n}: PR #{held[n]} deferred ({markers[held[n]]})")
                 else:
@@ -1258,15 +1215,9 @@ class Tick:
 
     def open_prs(self):
         """Every open PR (number, headRefName, labels), or None, logged, when they cannot be listed."""
-        prs = self.gh_json("pr", "list", "-R", self.gh_repo, "--state", "open", "--limit", "100",
-                           "--json", "number,headRefName,labels")
-        if isinstance(prs, list) and len(prs) == 100:
-            pulls = self.admission_items("pulls?state=open")
-            prs = None if pulls is None else [
-                {"number": pr["number"], "headRefName": pr["head"]["ref"], "labels": pr["labels"]} for pr in pulls]
-        if not isinstance(prs, list):
+        prs = eligibility.list_open_prs(self.gh_json, self.gh_repo)
+        if prs is None:
             self.log("could not list open PRs; not starting new work")
-            return None
         return prs
 
     def runnable(self, candidates, branches):

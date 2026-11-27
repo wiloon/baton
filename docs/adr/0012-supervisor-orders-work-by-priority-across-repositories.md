@@ -41,8 +41,8 @@ blockers, owner check, no open PR on the issue's agent branches, no pending spec
 `max_pending_prs` count with the same formula as `next_issue()`, including the `P0` exemption)
 lives in `baton.eligibility` and is called by both the supervisor and the child. The child alone
 runs writes, agent CLIs, vendor quota, cooldowns and work locks. Owner authorization is cached in
-memory per (repository, issue, `updatedAt`) for the supervisor pass; the child always checks
-again. Listings are never cached across passes.
+memory by the supervisor per (repository, issue, `updatedAt`), across passes; an unreadable
+history is not cached. The child always checks again. Listings are never cached across passes.
 
 ## The child
 
@@ -60,7 +60,7 @@ for a vendor.
 
 ## Budget and failure
 
-Listing calls time out at 20 s each and the pass is bounded at 60 s; repositories not listed in
+Each listing call, retries included, ends within 20 s and the pass within 60 s; repositories not listed in
 time count as failed (group 4). A stop is checked between calls; children are reaped after the
 pass. About three calls per repository per listing pass plus one per new or changed candidate;
 passes happen only under contention. A failed listing for one repository does not stop the others.
