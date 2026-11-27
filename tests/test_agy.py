@@ -210,6 +210,25 @@ def test_config_rejects_a_review_model_not_distinct_from_dev_or_fix(tmp_path):
         write(tmp_path, fix)
 
 
+@pytest.mark.parametrize("table, alias", [("review_light", "agy_dev"), ("spec_review_heavy", None),
+                                          ("dev_heavy", "agy_review"), ("fix_light", "agy_review")])
+def test_agy_tier_entries_keep_review_and_write_models_distinct(tmp_path, table, alias):
+    text = with_agy(full_text())
+    if alias is None:   # spec_review is not a `review` entry: no distinct rule
+        assert write(tmp_path, f'{text}\n[models.routes.{table}]\nagy = {{ model = "agy_dev" }}\n')
+        return
+    with pytest.raises(config.ConfigError, match="distinct"):
+        write(tmp_path, f'{text}\n[models.routes.{table}]\nagy = {{ model = "{alias}" }}\n')
+
+
+def test_agy_tier_review_entries_differ_from_tier_write_entries(tmp_path):
+    text = with_agy(full_text()).replace('agy_review = ', 'agy_other = "gemini-4-pro-high"\nagy_review = ')
+    tables = ('\n[models.routes.dev_light]\nagy = { model = "agy_other" }\n'
+              '\n[models.routes.review_heavy]\nagy = { model = "agy_other" }\n')
+    with pytest.raises(config.ConfigError, match="distinct"):
+        write(tmp_path, text + tables)
+
+
 # --- recorded streams through dispatch ---------------------------------------------------------
 
 def test_dev_run_reports_the_init_model_and_builds_the_command(agy_runner):

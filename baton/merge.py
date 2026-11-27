@@ -193,7 +193,7 @@ class Merger:
                 fixer = waiting["continuation"].get("fixer") or "agent"
                 rc = fix.fix_pr(runner, pr, wt, fixer, "CI code checks", "")
             else:
-                fixer = pick.choose(self.env, "fixer", "agent", "contrib", pick.all_vendors(self.env),
+                fixer = pick.choose(runner.env, "fixer", "agent", "contrib", pick.all_vendors(self.env),
                                     pr=str(pr), issue=self.issue)
                 notify.log(f"PR #{pr}: code-only CI failure on {head}; one repair round by {fixer}")
                 rc = fix.fix_pr(runner, pr, wt, fixer, "CI code checks", found["feedback"])

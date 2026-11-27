@@ -494,6 +494,26 @@ def test_an_agent_fix_review_excludes_every_attempt_author(ctx, worktree, monkey
     assert set(args[5].split()) == {"claude", "codex"}
 
 
+def test_an_agent_fix_picks_and_fixes_on_one_read_of_the_tier(ctx, worktree, monkeypatch):
+    from baton import tiers
+    real_fix_pr, seen = tick.Tick.fix_pr, []
+    fix_ctx(ctx, worktree, monkeypatch)
+
+    def pick(self, *args, env=None, **kwargs):
+        seen.append(tiers.step(env or self.env, "fix", "297", "20"))
+        tiers.write(self.env, "297", {"fix": "light"})   # a record that changes after the step read it
+        return "codex"
+
+    monkeypatch.setattr(tick.Tick, "pick_vendor", pick)
+    monkeypatch.setattr(tick.Tick, "fix_pr", real_fix_pr)
+    monkeypatch.setattr(tick.fix, "fix_pr",
+                        lambda runner, *a, **k: seen.append(tiers.step(runner.env, "fix", "297", "20")) or 1)
+    t = ctx.make()
+    tiers.write(t.env, "297", {"fix": "heavy"})
+    assert t.pick_fix() == 0
+    assert seen == ["heavy", "heavy"]
+
+
 def test_no_feedback_means_nothing_to_fix(ctx, worktree, monkeypatch):
     fix_ctx(ctx, worktree, monkeypatch, feedback=" \n")
     assert ctx.make().pick_fix() == 0

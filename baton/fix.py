@@ -23,7 +23,7 @@ import sys
 import tempfile
 import time
 
-from . import agents, design_findings, dispatch, e2e_gate, hooks as telemetry, notify, pick, pr as pr_helpers, pr_contract, prompts, recovery, vendors
+from . import agents, design_findings, dispatch, e2e_gate, hooks as telemetry, notify, pick, pr as pr_helpers, pr_contract, prompts, recovery, tiers, vendors
 from .common import Deferred, Exhausted, child_env, git, push, strip_markers
 
 REPLY_CAP = 60000
@@ -50,6 +50,7 @@ class Runner:
     @session.scoped
     def __init__(self, env=None, hooks=None, pr=0, round=""):
         env = session.resolve(env)
+        env = tiers.carry(env, "fix", env.runtime.issue, pr or env.runtime.pr)
         self.env, self.round = env, round
         self.state, self.ctx = str(env.dirs.state), str(env.dirs.ctx)
         self.repo, self.self_dir = env.repo.gh_repo, Path(str(env.config.paths.self_dir))

@@ -188,6 +188,33 @@ def test_model_route_config_rejects_invalid_references_and_entries(tmp_path, old
         config.load(write(tmp_path, TEXT.replace(old, new, 1)))
 
 
+def test_tier_route_tables_load_and_resolve_per_vendor(tmp_path):
+    tables = ''.join(f'\n[models.routes.{role}_{tier}]\nclaude = {{ model = "claude_probe" }}\n'
+                     for role in ('dev', 'fix', 'review', 'spec_review', 'spec') for tier in ('light', 'heavy'))
+    routes = config.load(write(tmp_path, TEXT + tables), home=tmp_path).models
+    assert routes.route('dev', 'claude', tier='light').model == 'haiku'
+    assert routes.route('dev', 'claude').model == 'sonnet'
+    assert routes.route('dev', 'codex', tier='light') == routes.route('dev', 'codex')   # no entry: base
+    # A present entry replaces the whole entry; a follow-up ignores the tier.
+    assert routes.route('review', 'claude', tier='heavy') == config.ModelRoute('haiku')
+    assert routes.route('review', 'claude', followup=True, tier='heavy') == routes.route('review', 'claude',
+                                                                                        followup=True)
+    assert routes.route('dev', 'claude', followup=True, tier='light').model == 'sonnet'
+
+
+@pytest.mark.parametrize('table, entry, field', [
+    (name, 'claude = { model = "claude_fast" }', 'models.routes')
+    for name in ('scan_light', 'screenshot_review_heavy', 'dev_standard', 'review_light_followup')
+] + [
+    ('dev_light', 'claude = { model = "missing" }', 'models.routes.dev_light.claude.model'),
+    ('dev_light', 'claude = {}', 'models.routes.dev_light.claude.model'),
+    ('spec_heavy', 'cursor = { model = "cursor_auto" }', 'models.routes.spec_heavy.cursor'),
+])
+def test_invalid_tier_route_tables_are_rejected(tmp_path, table, entry, field):
+    with pytest.raises(config.ConfigError, match=field):
+        config.load(write(tmp_path, f'{TEXT}\n[models.routes.{table}]\n{entry}\n'), home=tmp_path)
+
+
 def test_claude_route_accepts_a_fable_alias(tmp_path):
     old = 'claude = { model = "claude_strong", subagent_model = "claude_fast", effort = "high" }'
     assert old in TEXT

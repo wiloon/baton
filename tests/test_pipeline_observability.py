@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from baton import audit, config, session, timing, vendors
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -49,6 +51,16 @@ def test_model_request_is_not_substituted_for_actual_model_and_probe_is_global(t
     assert 'cursor' in report and 'unknown' in report and 'auto' in report
     attrs = telemetry.summary_payload(ended)['resourceLogs'][0]['scopeLogs'][0]['logRecords'][0]['attributes']
     assert {'requested_model', 'actual_model'} <= {a['key'] for a in attrs}
+
+
+@pytest.mark.parametrize('tier, sent', [('light', 'light'), ('heavy', 'heavy'), ('', None), ('huge', None)])
+def test_run_summary_carries_the_runs_tier(tmp_path, tier, sent):
+    ledger = telemetry.Ledger(tmp_path)
+    with patch.object(telemetry, 'identity', return_value={}), patch.object(telemetry.subprocess, 'run', side_effect=OSError):
+        run = ledger.begin('cursor', 'probe', 1, 2, repo='test/repo', tier=tier)
+    ended = ledger.end(run['run_id'], 'success', tmp_path / 'missing.jsonl')
+    attrs = telemetry.summary_payload(ended)['resourceLogs'][0]['scopeLogs'][0]['logRecords'][0]['attributes']
+    assert {a['key']: a['value'] for a in attrs}.get('tier') == (sent and {'stringValue': sent})
 
 
 def test_cursor_records_only_a_model_disclosed_by_its_log(tmp_path):

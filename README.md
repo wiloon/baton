@@ -363,6 +363,9 @@ choose whether `[scheduling].auto_merge` should be enabled. The optional
 Define model identifiers in `[models.aliases]` and reference those aliases in
 `[models.routes.<role>]` for each vendor. An optional `<role>_followup` entry replaces the
 vendor's whole base entry. If the vendor is omitted, its base entry carries over.
+`dev`, `fix`, `review`, `spec_review` and `spec` also take optional `<role>_light` and
+`<role>_heavy` entries ([route tiers](docs/adr/0009-task-profile-selects-route-tier.md)); `<role>` is the standard
+tier, and follow-up runs ignore the tier.
 Screenshot review is base-only. Every round uses `[models.routes.screenshot_review]`.
 Set `[preferences].screenshot_reviewer` to order Claude and Codex for that run. The picker
 checks `screenshot_reviewer_<area>`, `screenshot_reviewer`, `reviewer_<area>`, and

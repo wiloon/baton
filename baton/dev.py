@@ -13,7 +13,7 @@ import re
 import subprocess
 import time
 
-from . import advisor, after_merge, agents, checks as check_section, dispatch, fix, handoff as owner_handoff, md, names, pr as pr_helpers, pr_contract, prompts, recovery, restart, spec, vendors
+from . import advisor, after_merge, agents, checks as check_section, dispatch, fix, handoff as owner_handoff, md, names, pr as pr_helpers, pr_contract, prompts, recovery, restart, spec, tiers, vendors
 from .common import Deferred, git, push, strip_markers
 
 REPLY_CAP = 60000
@@ -574,7 +574,7 @@ def waiting_dev_push(tick, env, issue):
 
 
 def run(tick, issue):
-    env, repo = tick.env.with_runtime(issue=str(issue)), tick.gh_repo
+    env, repo = tiers.carry(tick.env.with_runtime(issue=str(issue)), "dev", issue), tick.gh_repo
     branch, wt = names.for_issue(tick.wt_root, issue)
     body = f"/tmp/baton-dev-{issue}.pr.md"
     shots = str(tick.ctx / f"issue-{issue}-shots")
@@ -637,7 +637,8 @@ def run(tick, issue):
     attempts = load_attempts(tick, issue)
     if pending and pending[0]["remaining_budget"].get("base_sha"):
         base = pending[0]["remaining_budget"]["base_sha"]   # a verification retry checks the same base
-    dev_vendor = pending[1] if pending else tick.pick_vendor("dev", "contrib", tick.all_vendors(), issue=issue)
+    dev_vendor = pending[1] if pending else tick.pick_vendor("dev", "contrib", tick.all_vendors(),
+                                                            issue=issue, env=env)
 
     def ask(reason, title, detail, *, budget=None, local=False, before_labels=None):
         return recovery.request(
