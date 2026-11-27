@@ -8,9 +8,13 @@ evidence all make a failed run here, and a failed write run is reset to its star
 Like Cursor it gets no GitHub access: the runner pushes and posts for it.
 """
 import json
+import math
 import os
 import re
 import shlex
+import subprocess
+import tempfile
+from datetime import datetime
 from pathlib import Path
 
 from .common import Run, changed, child_env, events, git, outcome_line, read, restore, run_cli
@@ -27,9 +31,10 @@ ANALYST_ENV_KEEP = ()
 ANALYST_ENV_STRIP = ()
 ANALYST_ENV_SET = {}
 SUPPORTED_ROLES = frozenset({"dev", "fixer", "reviewer", "spec_reviewer"})
-QUOTA_SOURCE = "none"
-QUOTA_WINDOWS = frozenset()
-# The CLI's output carries no quota data; limits show as a failed result (RESOURCE_EXHAUSTED / 429).
+QUOTA_SOURCE = "api"
+QUOTA_WINDOWS = frozenset({"five_hour", "seven_day"})
+# A run's output carries no quota data (refresh_quota asks `agy -p /quota`); a limit a run hits
+# shows as a failed result (RESOURCE_EXHAUSTED / 429).
 QUOTA_ERROR = r"RESOURCE_EXHAUSTED|\b429\b"
 IMAGES = False
 SCAN = False
@@ -150,8 +155,98 @@ def parse_quota_log(lines):
     return {}
 
 
-def refresh_quota(state, now, **kwargs):
-    return {}
+# `agy -p /quota --output-format json` answers from the account's usage without a model turn
+# (#252). baton runs agy on Gemini models only, so only that group's windows count.
+QUOTA_COMMAND = ("agy", "-p", "/quota", "--output-format", "json")
+QUOTA_TIMEOUT = 30
+QUOTA_GROUP = "Gemini Models"
+QUOTA_BUCKETS = {"5h": "five_hour", "weekly": "seven_day"}
+# The reset time of a window nothing has used yet: no reset is pending.
+NO_RESET = 0
+
+
+class QuotaError(RuntimeError):
+    """`agy -p /quota` gave no usable answer."""
+
+
+def _run_quota(command, *, cwd, env, timeout):
+    return subprocess.run(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL, capture_output=True,
+                          text=True, timeout=timeout, check=False)
+
+
+def _reset_epoch(value):
+    if not isinstance(value, str):
+        raise QuotaError(f"agy quota: reset_time {value!r} is not a time")
+    try:
+        moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise QuotaError(f"agy quota: reset_time {value!r} is not a time") from None
+    if moment.tzinfo is None:
+        raise QuotaError(f"agy quota: reset_time {value!r} has no time zone")
+    return int(moment.timestamp())
+
+
+def parse_quota(answer, now):
+    """{five_hour, seven_day} of the Gemini group of a `/quota` JSON answer; raises QuotaError
+    unless both windows parse. A never-used window resets one window length from NOW."""
+    from . import quota
+    try:
+        groups = answer["command"]["data"]["groups"]
+        group = next(g for g in groups if isinstance(g, dict) and g.get("name") == QUOTA_GROUP)
+        buckets = {b.get("window"): b for b in group["buckets"] if isinstance(b, dict)}
+    except (KeyError, TypeError, StopIteration):
+        raise QuotaError(f"agy quota: no {QUOTA_GROUP} group in the answer") from None
+    windows = {}
+    for window, name in QUOTA_BUCKETS.items():
+        if window not in buckets:
+            raise QuotaError(f"agy quota: no {window} bucket in {QUOTA_GROUP}")
+        bucket = buckets[window]
+        remaining = bucket.get("remaining_fraction")
+        if (isinstance(remaining, bool) or not isinstance(remaining, (int, float)) or not math.isfinite(remaining)
+                or not 0 <= remaining <= 1):
+            raise QuotaError(f"agy quota: {window} remaining_fraction {remaining!r} is not a fraction")
+        reset = _reset_epoch(bucket.get("reset_time"))
+        if reset == NO_RESET:
+            reset = int(now) + quota.WINDOW_SECONDS[name]
+        windows[name] = {"used": 1 - remaining, "resets_at": reset}
+    return windows
+
+
+def _auth_text(stderr, answer):
+    """What may show a logout: stderr and the answer's status/error/message, never its response."""
+    keep = {}
+    if isinstance(answer, dict):
+        keep = {key: answer[key] for key in ("status", "error", "message") if key in answer}
+    return f"{stderr or ''}\n{json.dumps(keep, ensure_ascii=False)}"
+
+
+def refresh_quota(state, now, run=_run_quota):
+    """Record agy's Gemini five-hour and weekly windows from `agy -p /quota`. Raises when the CLI
+    gives no usable answer, recording nothing (auth_expired when the failure reads as a logout).
+    RUN takes (command, cwd=, env=, timeout=) and returns a CompletedProcess."""
+    from . import agents, quota
+    env = child_env(GH_TOKEN="no-github-for-agy", GITHUB_TOKEN="", GIT_SSH_COMMAND="/bin/false",
+                    GIT_TERMINAL_PROMPT="0")
+    with tempfile.TemporaryDirectory() as directory:
+        done = run(list(QUOTA_COMMAND), cwd=directory, env=env, timeout=QUOTA_TIMEOUT)
+    try:
+        answer = json.loads(done.stdout or "")
+    except ValueError:
+        answer = None
+    status = answer.get("status") if isinstance(answer, dict) else None
+    if done.returncode != 0 or status != "SUCCESS":
+        if re.search(agents.AUTH, _auth_text(done.stderr, answer), re.I):
+            quota.credential(state, ID, "auth_expired", now)
+            raise QuotaError("agy quota: not logged in")
+        if done.returncode != 0:
+            raise QuotaError(f"agy quota: rc={done.returncode}")
+        if answer is None:
+            raise QuotaError("agy quota: the answer is not JSON")
+        raise QuotaError(f"agy quota: status {status or 'missing'}")
+    windows = parse_quota(answer, now)
+    quota.record(state, ID, windows, now)
+    quota.credential(state, ID, "authenticated", now)
+    return windows
 
 
 # No preflight: agy keeps its login in the keyring when it runs outside an SSH session (the runner's
@@ -314,11 +409,11 @@ def run(req):
     settings = permissions_settings(req.role, repo.ci_command, repo.verify_hook)
     mode = "plan" if req.readonly else "accept-edits"
     seconds = max(req.minutes * 60 - 60, 60)
-    dirs = [req.shots_dir, os.path.dirname(req.output) if req.output else ""]
-    if not req.readonly:
-        # A linked worktree keeps its objects and refs outside the checkout; commits need both.
-        dirs = [git(req.cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"),
-                git(req.cwd, "rev-parse", "--absolute-git-dir"), *dirs]
+    # A linked worktree keeps its objects and refs outside the checkout: commits need both, and so do
+    # reads of .git and git commands in a read-only run (#259). changed() and gitcontrol guard the writes.
+    dirs = [git(req.cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"),
+            git(req.cwd, "rev-parse", "--absolute-git-dir"),
+            req.shots_dir, os.path.dirname(req.output) if req.output else ""]
     dirs = [d for d in dict.fromkeys([*req.add_dirs, *dirs]) if d]
     env = child_env(**req.env, GH_TOKEN="no-github-for-agy", GITHUB_TOKEN="", GIT_SSH_COMMAND="/bin/false",
                     GIT_TERMINAL_PROMPT="0")

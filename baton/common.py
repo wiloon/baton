@@ -220,19 +220,28 @@ def push_transient(stderr):
     return bool(PUSH_TRANSIENT.search(text))
 
 
-def push(wt, ref, *, upstream=False, signoff=False):
+def push(wt, ref, *, upstream=False, signoff=False, lease=None):
     """Push an agent's work: `git push origin REF` from worktree WT.
 
     Returns a PushResult (truthy on success). Every rule about what may leave the host lives
     here (#44). With SIGNOFF (the repository's DCO), the unpushed commits first get a
-    Signed-off-by for their author where they lack it. Failures report enough for category-1
-    classification (#151): transport and 5xx are transient; a rejected ref, authentication,
-    hook, sign-off or unclassified failure is permanent.
+    Signed-off-by for their author where they lack it. With LEASE (a SHA), REF (`SRC:refs/heads/B`)
+    may replace B only while origin still has it at LEASE: `--force-with-lease=refs/heads/B:LEASE`,
+    the closed PR head a replacement overwrites (#303). A bare --force is never used. Failures
+    report enough for category-1 classification (#151): transport and 5xx are transient; a
+    rejected ref (also a lost lease), authentication, hook, sign-off or unclassified failure is
+    permanent.
     """
     from . import session
+    options = ["-u"] if upstream else []
+    if lease is not None:
+        dest = ref.partition(":")[2]
+        if not re.fullmatch(r"[0-9a-f]{40}", lease or "") or not dest.startswith("refs/heads/"):
+            return PushResult(False, detail="invalid push lease")
+        options.append(f"--force-with-lease={dest}:{lease}")
     if signoff and not sign_off(wt):
         return PushResult(False, detail="sign-off failed")
-    cmd = ["git", "-C", str(wt), "push", "-q", *(["-u"] if upstream else []), "origin", ref]
+    cmd = ["git", "-C", str(wt), "push", "-q", *options, "origin", ref]
     done = session.run_process(cmd, capture_output=True, text=True)
     if done.returncode == 0:
         return PushResult(True)
