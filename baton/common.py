@@ -81,6 +81,9 @@ class Run:
     usage: str = ""
     summary: str = ""       # the runner.log end line after "rc=N"
     model: str = ""
+    # None: not a denial-ended SUCCESS run. A list (possibly empty of quotable detail) means the
+    # CLI exited 0 with status SUCCESS and non-empty denied_actions; dispatch may retry once (#315).
+    denial: list | None = None
 
 
 def strip_markers(text):

@@ -294,7 +294,7 @@ def run_dev_worker(tick, issue, dev_vendor, wt, branch, body, base, plan, payloa
         ("VENDOR", dev_vendor), ("ISSUE", issue), ("GH_REPO", tick.gh_repo), ("WORKTREE", str(wt)), ("BRANCH", branch),
         ("PR_BODY_FILE", body), ("RESUME_NOTE", resume_note), ("CONTEXT_FILE", str(ctx)), ("SHOTS_DIR", shots)], env=env)
     out = dispatch.dispatch(dev_vendor, "dev", prompt, f"issue-{issue}-dev", str(wt), str(tick.self_dir / "settings.json"), body,
-                            env.with_runtime(shots_dir=shots), hooks)
+                            env.with_runtime(shots_dir=shots, pr_body_file=body), hooks)
     if out["rc"] == 75:
         raise Deferred(dev_vendor, out["defer"])
     outcome = out["outcome"]
