@@ -2954,6 +2954,35 @@ def test_same_vendor_reply_review_checks_and_reports_actual_model(loop, monkeypa
                                              "Review mode: same-model-fresh-context (stub/stub-1).\n\n")
 
 
+@pytest.mark.parametrize("tier, allowed", [("standard", True), ("light", False)])
+def test_run_review_judges_the_review_tiers_model(loop, monkeypatch, tmp_path, tier, allowed):
+    """#237: a light review tier on the model that wrote the PR is no same-vendor review."""
+    from dataclasses import replace
+    from baton import config, tiers
+    env = session.resolve(loop.env)
+    path = tmp_path / "tiered.toml"
+    path.write_text(env.config.source.read_text()
+                    + '\n[models.routes.review_light]\nclaude = { model = "claude_fast" }\n')
+    env.config = replace(env.config, models=config.load(path, home=tmp_path / "home").models)
+    vendors.record_author(loop.env["STATE"], PR, "claude")
+    vendors.record_author_model(loop.env["STATE"], PR, "claude", "claude-sonnet-5-5")
+    tiers.write(env, "297", {"review": tier})
+    ran = []
+
+    def agent(vendor, role, prompt, tag, cwd, settings="", output="", env=None, hooks=None):
+        ran.append(env.runtime.tiers.get("review"))
+        return {"rc": 1, "status": "failure", "outcome": "RESULT: failed stopped here", "reply": "",
+                "model": "", "defer": ""}
+
+    monkeypatch.setattr(review.dispatch, "dispatch", agent)
+    rv = review.Review(env, review.telemetry.from_env(env, issue="297", pr=PR), PR, loop.wt, "297", "")
+    outcome = rv.run_review(1, "", "claude")
+    if allowed:
+        assert ran and set(ran) == {tier}   # dispatch gets the tier the eligibility check used
+    else:
+        assert outcome == "RESULT: failed reviewer model may be a PR author" and not ran
+
+
 def test_stub_dirty_reply_review_restores_and_posts_no_verdict(loop, monkeypatch):
     admit_stub(loop, monkeypatch)
     loop.gh.set(headRefName="owner/issue-1", author={"login": "owner"})

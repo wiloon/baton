@@ -70,12 +70,12 @@ class Telemetry:
                 pass
 
     # --- hooks ---
-    def begin(self, vendor, role, minutes, requested_model=""):
+    def begin(self, vendor, role, minutes, requested_model="", tier=""):
         """Open a run record owned by this process; None when disabled or refused."""
         if not self.enabled:
             return None
         out = self._call("begin", vendor, role, os.getpid(), minutes, self.issue, self.pr, self.round,
-                         "--requested-model", requested_model,
+                         "--requested-model", requested_model, "--tier", tier,
                          "--repo", self.repo)
         fields = (out or "").split()
         if len(fields) < 3:

@@ -4265,13 +4265,34 @@ def test_claude_after_claude_takes_the_route_whose_model_differs(tmp_path, monke
     from types import SimpleNamespace
     routes = {("spec_review", False): "opus", ("spec_review", True): "sonnet",
               ("spec", False): "opus", ("spec", True): "sonnet"}
-    models = SimpleNamespace(route=lambda role, vendor, followup=False: SimpleNamespace(model=routes[(role, followup)]))
-    fake = SimpleNamespace(env=SimpleNamespace(config=SimpleNamespace(models=models)))
+    models = SimpleNamespace(route=lambda role, vendor, followup=False, tier="standard":
+                             SimpleNamespace(model=routes[(role, followup)]))
+    fake = SimpleNamespace(env=SimpleNamespace(config=SimpleNamespace(models=models),
+                                               runtime=SimpleNamespace(tiers={"spec_review": "standard",
+                                                                              "spec": "standard"})), issue=N)
     pick_route = lambda *args: spec.Spec.alternating_followup(fake, "claude", *args)
     assert pick_route("spec_review", True, "claude-sonnet-5-5") is False   # Sonnet wrote it: review on Opus
     assert pick_route("spec_review", False, "claude-sonnet-5-5") is False
     assert pick_route("spec", False, "claude-opus-5-5") is True             # Opus reviewed: revise on Sonnet
     assert pick_route("spec", True, "claude-opus-5-5") is True
+
+
+def test_alternating_followup_compares_the_tier_route_with_the_follow_up_route():
+    """#237: a Sonnet tier route counts as Sonnet, whatever the standard route runs."""
+    from types import SimpleNamespace
+
+    def route(role, vendor, followup=False, tier="standard"):
+        return SimpleNamespace(model="sonnet" if followup else {"light": "sonnet", "standard": "opus"}[tier])
+
+    def pick_route(tier, other_model):
+        fake = SimpleNamespace(env=SimpleNamespace(config=SimpleNamespace(models=SimpleNamespace(route=route)),
+                                                   runtime=SimpleNamespace(tiers={"spec_review": tier})), issue=N)
+        return spec.Spec.alternating_followup(fake, "claude", "spec_review", False, other_model)
+
+    assert pick_route("standard", "claude-sonnet-5-5") is False   # Opus differs: the preferred route
+    assert pick_route("light", "claude-sonnet-5-5") is False      # both candidates are Sonnet
+    assert pick_route("light", "claude-opus-5-5") is False
+    assert pick_route("standard", "claude-opus-5-5") is True
 
 
 # --- spec same-vendor policy and Stub on the spec path (#114) -------------------------------

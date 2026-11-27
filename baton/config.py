@@ -132,6 +132,9 @@ ROLE_ROUTE = {
     "scan": "scan",
 }
 ROUTE_ROLE = {route: role for role, route in ROLE_ROUTE.items()}
+# Route tiers (ADR 0009): a tiered route's own table is `standard`, `<route>_<tier>` the other tiers.
+TIERS = ("light", "standard", "heavy")
+TIERED_ROUTES = ("dev", "fix", "review", "spec_review", "spec")
 COVERAGE_ROLES = ("dev", "fixer", "reviewer", "spec_reviewer", "reviser")
 ADVISOR_BACKENDS = ("claude", "deepseek")
 EFFORTS = ("", "low", "medium", "high", "xhigh", "max")
@@ -179,11 +182,12 @@ class ModelSettings:
 class Models(ModelSettings):
     routes: tuple[tuple[str, str, ModelRoute], ...]
 
-    def route(self, role, vendor, *, followup=False):
-        if followup:
-            for name, provider, route in self.routes:
-                if (name, provider) == (f"{role}_followup", vendor):
-                    return route
+    def route(self, role, vendor, *, followup=False, tier="standard"):
+        """A follow-up run ignores the tier (ADR 0004); a missing entry inherits the base one."""
+        wanted = f"{role}_followup" if followup else f"{role}_{tier}"
+        for name, provider, route in self.routes:
+            if (name, provider) == (wanted, vendor):
+                return route
         return next(route for name, provider, route in self.routes if (name, provider) == (role, vendor))
 
 
@@ -555,8 +559,10 @@ def _load_vendors(raw, directory, home, aliases):
 def _model_routes(raw, aliases, vendors):
     by_id = {v.id: v for v in vendors}
     declared = set(by_id)
-    names = set(ROUTE_ROLES) | {f"{role}_followup" for role in ROUTE_ROLES if role != "screenshot_review"}
-    if not isinstance(raw, dict) or raw.keys() - names:
+    names = {route: route for route in ROUTE_ROLES}   # table name -> the route it belongs to
+    names |= {f"{route}_followup": route for route in ROUTE_ROLES if route != "screenshot_review"}
+    names |= {f"{route}_{tier}": route for route in TIERED_ROUTES for tier in TIERS if tier != "standard"}
+    if not isinstance(raw, dict) or raw.keys() - names.keys():
         raise ConfigError("models.routes: expected tables for known roles")
     routes = []
     for name in sorted(names):
@@ -564,7 +570,7 @@ def _model_routes(raw, aliases, vendors):
         table = raw.get(name, {})
         if not isinstance(table, dict) or table.keys() - set(VENDORS):
             raise ConfigError(f"models.routes.{name}: expected entries for known vendors")
-        role = ROUTE_ROLE.get(name.rsplit("_followup", 1)[0])
+        role = ROUTE_ROLE.get(names[name])
         for vendor in sorted(table):
             if vendor not in declared:
                 raise ConfigError(f"models.routes.{name}.{vendor}: undeclared vendor")
@@ -626,9 +632,13 @@ def _check_adapter_models(vendors, routes):
                 raise ConfigError(f"{field}: {vendor.id} does not accept model {model}")
         if getattr(adapter, "DISTINCT_REVIEW_MODEL", False) and "reviewer" in vendor.roles:
             by_name = {name: route.model for name, provider, route in routes if provider == vendor.id}
-            for review in ("review", "review_followup"):
-                for write in ("dev", "fix", "fix_followup"):
-                    if review in by_name and write in by_name and not adapter.distinct_models(by_name[review], by_name[write]):
+            def entries(route):
+                return [name for name in (route, f"{route}_light", f"{route}_heavy", f"{route}_followup")
+                        if name in by_name]
+
+            for review in entries("review"):
+                for write in entries("dev") + entries("fix"):
+                    if not adapter.distinct_models(by_name[review], by_name[write]):
                         raise ConfigError(f"models.routes.{review}.{vendor.id}: model {by_name[review]} must be "
                                           f"distinct from the {write} route's {by_name[write]} (effort alone is not distinct)")
 

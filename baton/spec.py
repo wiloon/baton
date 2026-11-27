@@ -31,7 +31,7 @@ import subprocess
 import sys
 import time
 
-from . import advisor, agents, checks as check_section, dispatch, e2e_gate, fix, handoff as owner_handoff, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, recovery, review, vendors
+from . import advisor, agents, checks as check_section, dispatch, e2e_gate, fix, handoff as owner_handoff, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, recovery, review, tiers, vendors
 from .common import Deferred, changed, child_env, git, permission_denials, push, restore, strip_markers
 from .quota import atomic_json
 
@@ -331,8 +331,10 @@ class Spec:
         OTHER_MODEL, else the other route (e.g. Opus and Sonnet swap), so a same-vendor round never
         runs on the writer's model."""
         routes = self.env.config.models
+        tier = tiers.step(self.env, route_role, self.issue)
         for followup in (preferred, not preferred):
-            if vendors.models_distinct(vendor, routes.route(route_role, vendor, followup=followup).model, other_model):
+            model = routes.route(route_role, vendor, followup=followup, tier=tier).model
+            if vendors.models_distinct(vendor, model, other_model):
                 return followup
         return preferred
 
@@ -1346,6 +1348,7 @@ class Spec:
 
     def review_round(self, round, max_rounds, context, inputs):
         """"accept", "changes" or "stop" (the owner or a failure took over)."""
+        self.env = tiers.carry(self.env, "spec_review", self.issue)
         n, wt, env = self.issue, self.wt, self.env
         listed, issue_body = inputs["comments"], inputs["body"]
         adr_note = "No ADR has been revised yet."
@@ -2227,6 +2230,7 @@ class Spec:
     # --- the reviser's round ---
     def revise_round(self, round, context, inputs, max_rounds=None, *, answer_intent=None):
         """"revised", "answered" (advisor posted grounded answers) or "stop"."""
+        self.env = tiers.carry(self.env, "spec", self.issue)
         n, wt, env = self.issue, self.wt, self.env
         listed, issue_body = inputs["comments"], inputs["body"]
         if max_rounds is None:

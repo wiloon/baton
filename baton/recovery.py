@@ -10,9 +10,10 @@ import json
 from pathlib import Path
 import re
 
-from . import notify, pick, vendors
+from . import notify, pick, tiers, vendors
 from . import pr as pr_helpers
 from .common import Deferred, Exhausted, git
+from .config import ROLE_ROUTE
 from .quota import atomic_json
 
 REQUIRED = frozenset({
@@ -198,15 +199,16 @@ def verify_status(*, repairs_used, max_repairs, failure=""):
             f"outcome failed; summary: {summary or 'unknown'}")
 
 
-def retry_candidates(env, role, candidates, *, mode, pr="", fixed_by="", exclusions=()):
+def retry_candidates(env, role, candidates, *, mode, pr="", issue="", fixed_by="", exclusions=()):
     """Static eligibility; temporary quota and cooldown blocks belong to the picker."""
     allowed = vendors._role_eligible(role, pool_only=role == "reviser", env=env)
     eligible = [v for v in candidates if v in allowed and v not in exclusions]
     if mode == "review":
         check = vendors.screenshot_allowed if role == "screenshot_reviewer" else vendors.review_allowed
         route = "screenshot_review" if role == "screenshot_reviewer" else "review"
+        tier = tiers.step(env, route, issue or env.runtime.issue, pr or env.runtime.pr)
         eligible = [v for v in eligible if check(str(env.dirs.state), pr, v,
-                                                env.config.models.route(route, v).model, fixed_by)]
+                                                env.config.models.route(route, v, tier=tier).model, fixed_by)]
     return eligible
 
 
@@ -260,7 +262,9 @@ def select_vendor(env, record, *, mode, candidates, pr="", issue="", fixed_by=""
     same = record["action"] == "retry_step"
     if not same:
         exclusions.append(failed)
-    eligible = retry_candidates(env, role, candidates, mode=mode, pr=pr,
+    # One read of the step's tier for the eligibility check and the pick.
+    env = tiers.carry(env, ROLE_ROUTE.get(role, role), issue or env.runtime.issue, pr or env.runtime.pr)
+    eligible = retry_candidates(env, role, candidates, mode=mode, pr=pr, issue=issue,
                                 fixed_by=fixed_by, exclusions=exclusions)
     state = str(env.dirs.state)
     fallback = same and mode == "review" and failed in vendors.review_excluded(state, pr, fixed_by)
@@ -430,7 +434,7 @@ def request(env, episode, item, reason, role, vendor, detail, fingerprint, bindi
         handoff()
         return None
     candidates = [] if local else retry_candidates(
-        env, role, picker["candidates"], mode=picker["mode"], pr=picker.get("pr", ""),
+        env, role, picker["candidates"], mode=picker["mode"], pr=picker.get("pr", ""), issue=picker.get("issue", ""),
         fixed_by=picker.get("fixed_by", ""), exclusions=exclusions)
     actions = offered_actions(owner_handoff.REASONS.get(reason), vendor, candidates,
                               pinned=picker.get("pinned", False), local=local)

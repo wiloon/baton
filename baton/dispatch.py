@@ -21,7 +21,7 @@ from pathlib import Path
 import sys
 import time
 
-from . import agents, capacity, gitcontrol, hooks as telemetry, notify, settle, vendors
+from . import agents, capacity, gitcontrol, hooks as telemetry, notify, settle, tiers, vendors
 from .common import LEASE_REASON, Request
 
 
@@ -40,7 +40,8 @@ def configure(vendor, role, env):
         or (role == "review" and runtime.review_followup)
         or (role == "fix" and runtime.fix_followup)
     )
-    route = models.route(role, vendor, followup=followup)
+    tier = tiers.step(env, role, runtime.issue, runtime.pr)
+    route = models.route(role, vendor, followup=followup, tier=tier)
     settings = env.config.vendor(vendor)
     return agents.ADAPTERS[vendor].configure(role, route, settings, env)
 
@@ -92,6 +93,10 @@ def _dispatch(vendor, role, prompt, tag, cwd, settings, output, env, hooks):
         return result(75, "deferred", "", defer=why)
     settle.count_run(state, vendor)
     adapter = agents.ADAPTERS[vendor]
+    # Read once, from the caller's hooks too when only they name the PR; configure sees the same tier.
+    pr = env.runtime.pr or str(getattr(hooks, "pr", "") or "")
+    env = tiers.carry(env, role, env.runtime.issue, pr)
+    tier = tiers.step(env, role, env.runtime.issue, pr)
     model, minutes, suffix, options = configure(vendor, role, env)
     options = adapter.attach_dispatch_inputs(options, settings=settings, output=output)
     if outcome := agents.preflight(vendor):
@@ -101,7 +106,7 @@ def _dispatch(vendor, role, prompt, tag, cwd, settings, output, env, hooks):
     run_log = Path(logs, f"{time.strftime('%F-%H%M%S')}-{tag}{suffix}.jsonl")
     notify.log(f"start {tag} ({vendor} {role}, {model or 'default'}) in {cwd} (log {run_log})")
     hooks = hooks or telemetry.from_env(env, issue=env.runtime.issue, pr=env.runtime.pr, round=env.runtime.round)
-    run = hooks.begin(vendor, role, minutes, requested_model=model)
+    run = hooks.begin(vendor, role, minutes, requested_model=model, tier=tier)
     child_overrides = hooks.child_env(vendor, role, run)
     child_overrides.update(adapter.run_env(role, run))
     child_overrides.update(secret_overrides(env, role))
@@ -114,7 +119,7 @@ def _dispatch(vendor, role, prompt, tag, cwd, settings, output, env, hooks):
     except Exception as error:
         if tampered := gitcontrol.restore(git_control):
             notify.log(f"{tag}: {vendor} changed git control files; restored: {', '.join(tampered)}")
-        notify.log(f"end {tag} adapter rc=1, no result")
+        notify.log(f"end {tag} adapter rc=1, no result tier={tier}")
         outcome = f"RESULT: failed baton rc=1 (log {run_log})"
         rc, outcome, defer = settle.settle(state, vendor, "failure", 1, str(run_log), tag, "", outcome)
         hooks.end(run, "failure", str(run_log))
@@ -130,7 +135,7 @@ def _dispatch(vendor, role, prompt, tag, cwd, settings, output, env, hooks):
     if ran.killed:
         notify.log(f"killed {tag} after {minutes} min")
     identity = adapter.end_line_identity(ran.model)
-    notify.log(f"end {tag} rc={ran.rc} {identity}{ran.summary}")
+    notify.log(f"end {tag} rc={ran.rc} {identity}{ran.summary} tier={tier}")
     rc, outcome, defer = settle.settle(state, vendor, ran.status, ran.rc, str(run_log), tag,
                                        "" if ran.cooldown_until is None else str(ran.cooldown_until),
                                        ran.outcome, credential=True)

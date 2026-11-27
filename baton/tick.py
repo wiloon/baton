@@ -301,8 +301,9 @@ class Tick:
         return spec.Spec(self.env.with_runtime(issue=str(issue)), self.hooks(issue), str(issue)).loop(
             issue_payload=payload)
 
-    def pick_vendor(self, role, mode, candidates, pr="", issue="", exclude="", current="agent"):
-        return pick.choose(self.env, role, current, mode, candidates, pr=str(pr), issue=str(issue), exclude=exclude)
+    def pick_vendor(self, role, mode, candidates, pr="", issue="", exclude="", current="agent", env=None):
+        return pick.choose(env or self.env, role, current, mode, candidates, pr=str(pr), issue=str(issue),
+                           exclude=exclude)
 
     def all_vendors(self):
         return pick.all_vendors(self.env)
