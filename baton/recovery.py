@@ -201,7 +201,7 @@ def verify_status(*, repairs_used, max_repairs, failure=""):
 
 def retry_candidates(env, role, candidates, *, mode, pr="", issue="", fixed_by="", exclusions=()):
     """Static eligibility; temporary quota and cooldown blocks belong to the picker."""
-    allowed = vendors._role_eligible(role, pool_only=role == "reviser", env=env)
+    allowed = vendors._role_eligible(role, env=env)
     eligible = [v for v in candidates if v in allowed and v not in exclusions]
     if mode == "review":
         check = vendors.screenshot_allowed if role == "screenshot_reviewer" else vendors.review_allowed
@@ -255,17 +255,26 @@ def persist_grant(env, result, *, role, failed_vendor, exclusions, budget, finge
 
 def select_vendor(env, record, *, mode, candidates, pr="", issue="", fixed_by="", other_model="",
                   spec_followup=False, pinned=False):
-    """Select from the role's candidates with strict recovery constraints."""
+    """Select from the role's candidates with strict recovery constraints.
+
+    A spec role's saved exclusions are its independence preference (the other phase's vendor): in an
+    other-vendor retry they stay candidates, and the picker applies the first pick's last-resort rule."""
     role, failed = record["role"], record["failed_vendor"]
     pinned = record["pinned"]   # the first pick's constraint, not the saved alternate's
     exclusions = [v for v in record["exclusions"] if v]
     same = record["action"] == "retry_step"
+    soft = []
     if not same:
+        if role in ("spec_reviewer", "reviser"):
+            soft = [v for v in exclusions if v != failed]
         exclusions.append(failed)
     # One read of the step's tier for the eligibility check and the pick.
     env = tiers.carry(env, ROLE_ROUTE.get(role, role), issue or env.runtime.issue, pr or env.runtime.pr)
     eligible = retry_candidates(env, role, candidates, mode=mode, pr=pr, issue=issue,
                                 fixed_by=fixed_by, exclusions=exclusions)
+    if soft and eligible:   # with no independent vendor at all, the retry hands off
+        eligible = retry_candidates(env, role, candidates, mode=mode, pr=pr, issue=issue, fixed_by=fixed_by,
+                                    exclusions=[v for v in exclusions if v not in soft])
     state = str(env.dirs.state)
     fallback = same and mode == "review" and failed in vendors.review_excluded(state, pr, fixed_by)
     selected = record.get("selected_vendor")

@@ -26,7 +26,10 @@ There is no single runner lock (#270). The work locks are:
 - the retrospectives worker's lock.
 
 A tick takes each lock without waiting, through the admission lock, so the flag is checked again
-before every repository it moves to. The nightly run and `baton.migrate` exclude all ticks by
+before every repository it moves to. Holding a lock does not exempt a tick from the flag (#337):
+it checks the flag again before each further item it would start (issue, PR, spec, P0) and before
+each new step of the item it is working on, and stops with the checkpoint and labels kept, as
+after a quota deferral. The nightly run and `baton.migrate` exclude all ticks by
 taking every repository lock, all or none; `baton.migrate` also takes the housekeeping and scan
 locks. The repository locks in question are those of the configured repositories plus any lock
 file already under `<state>/repos`, so a repository dropped from the configuration mid-run is
@@ -64,7 +67,14 @@ keeps the re-exec while it remains.
 - The first deploy of the version that ships this still talks to the old version, which has no
   `baton.maintenance`. The deployment playbook follow-up covers stopping the relevant timers,
   waiting for their services to finish, and restoring the timers on exit.
-- Draining waits for the running item, which can take a long time (one agent call can run for
+- "Work already running" is the step in progress: its agent run, the runs that finish that same
+  step (the same-lease denial retry, the spec reviser's denied-command rerun, the local `verify.sh`
+  repair runs of a dev or fix step) and its bookkeeping (reply, push, checkpoint). It is not the
+  rest of the task or the rest of the tick: the next step (spec revision, dev, review, fix, CI
+  repair, merge) and the next item wait until maintenance ends. A maintenance deferral is not a
+  vendor failure: no cooldown, vendor switch, advisor call, owner notification or handoff, and it
+  lends no PR slot.
+- Draining waits for the step in progress, which can take a long time (one agent call can run for
   tens of minutes); the deploy's wait timeout must allow for that and fails rather than
   interrupting work. During a drain, the flag covers the wait budget plus the TTL. A successful
   drain restarts the TTL so the deploy has a full window for checkout and migrate.
@@ -82,3 +92,7 @@ keeps the re-exec while it remains.
   migrate and `status` cover the whole set.
 - Issue #271, round 1. Noted that ADR 0011 amends "no resident process" and the chained re-exec,
   because `baton serve` replaces the timer; the "no API" decision is unchanged.
+- Issue #337, round 1. A tick that already holds its repository lock still honours the flag before
+  each further item and each new step; defined "work already running" as the step in progress
+  (with its denial retry, denied-command rerun and verify repairs), because a tick that took its
+  lock before `maintenance on` kept starting candidates and steps for 81 minutes.

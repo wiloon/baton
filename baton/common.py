@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 LEASE_REASON = "vendor capacity reserved"
+MAINTENANCE_PREFIX = "maintenance: "
 
 
 class Deferred(Exception):
@@ -17,7 +18,9 @@ class Deferred(Exception):
     def __init__(self, vendor, reason, *, lends_slot=None):
         super().__init__(f"{vendor}: {reason}")
         self.vendor, self.reason = vendor, reason
-        self.lends_slot = reason != LEASE_REASON if lends_slot is None else lends_slot
+        if lends_slot is None:
+            lends_slot = reason != LEASE_REASON and not reason.startswith(MAINTENANCE_PREFIX)
+        self.lends_slot = lends_slot
 
 
 class Exhausted(Exception):
@@ -53,6 +56,7 @@ class Request:
     add_dirs: list[str] = field(default_factory=list)   # Codex dev/fix: shared caches
     shots_dir: str = ""     # Codex dev: screenshots outside the worktree
     context_dir: str = ""   # Claude: the runner's ctx directory, where prompts point at context files (#53)
+    scratch: str = ""       # Claude: the repository's scratch directory, for guard.sh
     skills_dir: str = ""    # Codex: the Matt skills as plain files
     otel: bool = False      # a telemetry run is open: Codex exports to the loopback collector
     env: dict = field(default_factory=dict)   # extra environment for this CLI child only
@@ -81,6 +85,9 @@ class Run:
     usage: str = ""
     summary: str = ""       # the runner.log end line after "rc=N"
     model: str = ""
+    # None: not a denial-ended SUCCESS run. A list (possibly empty of quotable detail) means the
+    # CLI exited 0 with status SUCCESS and non-empty denied_actions; dispatch may retry once (#315).
+    denial: list | None = None
 
 
 def strip_markers(text):

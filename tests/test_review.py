@@ -1,6 +1,7 @@
 """baton.review: the review loop around a real git worktree, the fake `gh` of conftest and
 stubs for the agent runs and the fix run (its own tests: tests/test_fix.py). Ported from the
 review-loop parts of tests/roles.sh and tests/cooldown.sh."""
+from dataclasses import replace
 import hashlib
 import json
 import os
@@ -21,6 +22,7 @@ from test_adapter_capabilities import with_stub
 
 REAL_MERGE = merge.Merger.merge_or_handoff
 REAL_FIX = review.fix.fix_pr
+REAL_DISPATCH = review.dispatch.dispatch
 
 BIN = Path(__file__).resolve().parents[1] / "bin"
 PR = 987654
@@ -118,6 +120,40 @@ def loop(gh, worktree, tmp_path, monkeypatch):
         return review.Review({**env, **env_overrides}, hooks, PR, str(worktree.wt), issue, fixed_by).loop(note, fixer, reviewer)
     state.run = run
     return state
+
+
+# --- scratch files per repository (#306) ----------------------------------------------------
+
+def test_two_repositories_reviewing_the_same_pr_number_each_read_their_own_reply(loop, monkeypatch):
+    base = session.resolve(loop.env)
+
+    def in_repo(name):
+        repo = replace(base.config.repos[0], gh_repo=name)
+        dirs = config.repo_dirs(base.config.paths, repo)
+        for path in (dirs.state, dirs.ctx, dirs.logs):
+            path.mkdir(parents=True, exist_ok=True)
+        return replace(base, repo=repo, dirs=dirs)
+
+    def review_in(name):
+        hooks = review.telemetry.from_env(loop.env, issue="297", pr=PR)
+        return review.Review(in_repo(name), hooks, PR, str(loop.wt), "297").run_review(1, "", "claude")
+
+    def agent(vendor, role, prompt, tag, cwd, settings="", output="", env=None, hooks=None):
+        name = env.repo.gh_repo
+        assert f"`{output}`" in prompt, name
+        Path(output).write_text(f"reply for {name}")
+        if name == "owner/app":   # the other repository's run of #PR starts before this one reads its file
+            review_in("acme/shop")
+        return {"rc": 0, "status": "success", "outcome": "REVIEW: pass", "reply": "", "model": "", "defer": ""}
+
+    posted = {}
+    monkeypatch.setattr(review.dispatch, "dispatch", agent)
+    monkeypatch.setattr(review.Review, "comment_post_binding",
+                        lambda self, body, *args: posted.setdefault(self.repo, body))
+    monkeypatch.setattr(review.Review, "post_review_comment", lambda self, *args: "REVIEW: pass")
+    review_in("owner/app")
+    assert posted["owner/app"].endswith("reply for owner/app")
+    assert posted["acme/shop"].endswith("reply for acme/shop")
 
 
 # --- both PR directions ---------------------------------------------------------------------
@@ -322,6 +358,33 @@ def test_a_deferred_fixer_leaves_a_checkpoint_and_the_resume_goes_straight_to_th
     assert loop.run(note="ignored", fixer="agent", reviewer="pool") == 0
     assert [f["fixer"] for f in loop.fixes] == ["cursor", "cursor"] and len(loop.agents) == 1
     assert loop.fixes[1]["head"] == loop.fixes[0]["head"]
+
+
+def test_a_fix_waits_for_maintenance_to_end_and_then_runs(loop, monkeypatch):
+    """#337: the review returns changes while the flag is set; dispatch does not start the fix."""
+    from baton.common import MAINTENANCE_PREFIX
+    flag = Path(loop.env["STATE"], "maintenance")
+    reviewer, fake_fix = review.dispatch.dispatch, review.fix.fix_pr
+
+    def dispatch(vendor, role, *args, **kwargs):
+        return (reviewer if role == "review" else REAL_DISPATCH)(vendor, role, *args, **kwargs)
+
+    loop.after["review"] = lambda: flag.write_text(
+        json.dumps({"expires": time.time() + 600, "reason": "reboot", "id": "t"}))
+    monkeypatch.setattr(review.dispatch, "dispatch", dispatch)
+    monkeypatch.setattr(review.fix, "fix_pr", REAL_FIX)
+    monkeypatch.setattr(review.fix.Runner, "fetch_main", lambda *_: None)
+    with pytest.raises(Deferred) as waiting:
+        loop.run(fixer="cursor", reviewer="codex")
+    assert waiting.value.reason == f"{MAINTENANCE_PREFIX}reboot" and not waiting.value.lends_slot
+    assert loop.checkpoint()["step"] == "fix"
+    assert not Path(loop.env["STATE"], f"slot-deferred-{PR}").exists()
+
+    flag.unlink()
+    loop.after.clear()
+    monkeypatch.setattr(review.fix, "fix_pr", fake_fix)
+    assert loop.run(fixer="cursor", reviewer="codex") == 0
+    assert len(loop.fixes) == 1
 
 
 def save_waiting_fix_push(loop, fixer, ci_head=""):
@@ -868,7 +931,7 @@ def test_the_screenshot_review_runs_on_its_base_route_in_every_round(loop, monke
         else:
             assert "with the Write tool" in prompt
             round = len(calls)
-            Path(f"/tmp/baton-screenshot-review-{PR}-{round}.md").write_text(comment)
+            Path(loop.env["STATE"], "scratch", f"screenshot-review-{PR}-{round}.md").write_text(comment)
             log.write_text(json.dumps({"type": "result", "result": "REVIEW: pass"}) + "\n")
         return 0
 
@@ -1040,7 +1103,9 @@ def test_a_screenshot_review_that_fails_goes_to_the_owner_with_neither_fix_nor_m
         loop.screens = ["RESULT: failed boom"]
     elif case == "missing artifact":
         loop.skip_screen_artifact = True
-        Path(f"/tmp/baton-screenshot-review-{PR}-1.md").write_text("stale review from an earlier run")
+        stale = Path(loop.env["STATE"], "scratch", f"screenshot-review-{PR}-1.md")
+        stale.parent.mkdir(exist_ok=True)
+        stale.write_text("stale review from an earlier run")
     elif case == "comment not posted":
         loop.after["screenshot_review"] = lambda: loop.gh.fail("comment")
     else:
@@ -3039,7 +3104,7 @@ def test_review_templates_and_skill_policy_come_from_the_adapter(loop, monkeypat
         if adapter.REVIEW_DELIVERY == "reply":
             assert not output
         else:
-            assert output.endswith(f"baton-review-{PR}-1.md")
+            assert output.endswith(f"/scratch/review-{PR}-1.md")
             assert settings.endswith("review-settings.json")
 
 

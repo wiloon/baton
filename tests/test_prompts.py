@@ -30,7 +30,7 @@ def test_fix_prompts_answer_the_tdd_seam_confirmation():
 
 def test_spec_reviewer_asks_for_test_seams_and_authors_add_them_as_decidable():
     assert "**Test seams:**" in text("spec-review-prompt.md")
-    for name in ("spec-prompt.md", "codex-spec-prompt.md"):
+    for name in ("spec-prompt.md", "codex-spec-prompt.md", "agy-spec-prompt.md"):
         assert "**Test seams** point is `decidable`" in text(name), name
 
 
@@ -48,7 +48,7 @@ def test_fix_prompts_route_description_fixes_through_the_runner():
     for name in ("fix-prompt.md", "codex-fix-prompt.md"):
         prompt = text(name)
         assert "`{{PR_DESCRIPTION_FILE}}`" in prompt, name
-        assert "`/tmp/baton-fix-{{PR}}.md.body`" in prompt, name
+        assert "`{{REPLY_FILE}}.body`" in prompt, name
         assert "adopt a description review point" in prompt, name
         assert "make that description inaccurate" in prompt, name
         assert "keeping the task relation" in prompt, name
@@ -157,7 +157,8 @@ def test_reviewers_flag_an_unproven_limitation(name):
     assert UNPROVEN in text(name)
 
 
-@pytest.mark.parametrize("name", ["spec-prompt.md", "codex-spec-prompt.md", "spec-review-prompt.md"])
+@pytest.mark.parametrize("name", ["spec-prompt.md", "codex-spec-prompt.md", "agy-spec-prompt.md",
+                                  "spec-review-prompt.md"])
 def test_spec_prompts_keep_the_gate_line_and_the_owners_manual_checks(name):
     prompt = text(name)
     assert "`## E2E gate` is exactly one line" in prompt or "`## E2E gate` must be exactly one line" in prompt
@@ -195,6 +196,7 @@ def first_line(name):
     ("review-prompt.md", "checks-review"), ("codex-review-prompt.md", "checks-review"),
     ("cursor-review-prompt.md", "checks-review"),
     ("spec-prompt.md", "checks-keep"), ("codex-spec-prompt.md", "checks-keep"),
+    ("agy-spec-prompt.md", "checks-keep"),
 ])
 def test_every_vendors_prompt_carries_the_shared_rules_under_the_new_heading(tmp_path, name, role_partial):
     out = prompts.render(BIN / name, [], env=other_repo(tmp_path))

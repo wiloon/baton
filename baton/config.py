@@ -113,12 +113,14 @@ class RepoDirs:
     state: Path
     logs: Path
     ctx: Path
+    scratch: Path   # agents' output files (baton.scratch); the only part of state they may write (#306)
 
 
 def repo_dirs(paths, repo):
     slug = Path(*repo.gh_repo.split('/'))
-    return RepoDirs(clone=paths.clones / slug, worktrees=paths.wt_root / slug, state=paths.state / 'repos' / slug,
-                    logs=paths.logs / slug, ctx=paths.ctx / slug)
+    state = paths.state / 'repos' / slug
+    return RepoDirs(clone=paths.clones / slug, worktrees=paths.wt_root / slug, state=state,
+                    logs=paths.logs / slug, ctx=paths.ctx / slug, scratch=state / 'scratch')
 
 
 ROUTE_ROLES = ("dev", "fix", "review", "screenshot_review", "spec_review", "spec", "scan")
@@ -164,6 +166,7 @@ class Vendor:
     fallback_models: tuple[str, ...] = ()
     cache_dirs: tuple[Path, ...] = ()
     quota_probe_model: str = ""
+    env_file: Path | None = None   # claude: CLAUDE_CODE_OAUTH_TOKEN for its runs only (#255)
 
 
 @dataclass(frozen=True)
@@ -354,9 +357,8 @@ class Config:
     def extra(self):
         return tuple(v.id for v in self.vendors if v.quota == "extra")
 
-    def for_role(self, role, *, pool_only=False):
-        ids = tuple(v.id for v in self.vendors if role in v.roles and (not pool_only or v.quota == "pool"))
-        return ids
+    def for_role(self, role):
+        return tuple(v.id for v in self.vendors if role in v.roles)
 
     def allows(self, vendor_id, role):
         try:
@@ -371,7 +373,7 @@ class Config:
             role = ROUTE_ROLE.get(route)
             if role is None:
                 return f"unknown agent role {route}"
-            if vendor_id not in self.for_role(role, pool_only=role == "reviser"):
+            if vendor_id not in self.for_role(role):
                 return f"vendor {vendor_id} cannot run {role}"
         return ""
 
@@ -526,7 +528,7 @@ def _load_vendors(raw, directory, home, aliases):
         if quota == "pool" and "seven_day" not in agents.ADAPTERS[adapter].QUOTA_WINDOWS:
             raise ConfigError(f"{label}.quota: pool vendors need a weekly quota window")
         extra = set(entry) - {"adapter", "roles", "quota", "cap", "max_minutes", "five_hour_max",
-                              "fallback_models", "cache_dirs", "quota_probe_model"}
+                              "fallback_models", "cache_dirs", "quota_probe_model", "env_file"}
         if extra:
             raise ConfigError(f"{label}: unknown fields: {', '.join(sorted(extra))}")
         cli = agents.ADAPTERS[adapter]
@@ -534,6 +536,7 @@ def _load_vendors(raw, directory, home, aliases):
             "fallback_models": "fallback_models" in cli.CONFIG_FIELDS,
             "cache_dirs": "cache_dirs" in cli.CONFIG_FIELDS,
             "quota_probe_model": "quota_probe_model" in cli.CONFIG_FIELDS,
+            "env_file": "env_file" in cli.CONFIG_FIELDS,
         }
         for field, supported in adapter_fields.items():
             if field in entry and not supported:
@@ -549,8 +552,13 @@ def _load_vendors(raw, directory, home, aliases):
         probe = entry.get("quota_probe_model", "")
         if cli.PROBE_SENDS_MODEL or probe:
             probe = _model_alias(probe, aliases, f"{label}.quota_probe_model")
+        env_file = entry.get("env_file")
+        if env_file is not None:
+            if type(env_file) is not str or not env_file.strip():
+                raise ConfigError(f"{label}.env_file: expected a path")
+            env_file = _path(env_file, directory, home)
         vendors.append(Vendor(vendor_id, adapter, tuple(roles), quota, float(cap), max_minutes,
-                              five_hour_max, fallback, cache, probe))
+                              five_hour_max, fallback, cache, probe, env_file))
     if len({v.id for v in vendors}) != len(vendors):
         raise ConfigError("vendors: each vendor id may be configured once")
     return tuple(vendors)
@@ -647,8 +655,7 @@ def _validate_coverage(config):
     if not config.pool():
         raise ConfigError("vendors: at least one vendor with quota = pool is required")
     for role in COVERAGE_ROLES:
-        pool_only = role == "reviser"
-        if not config.for_role(role, pool_only=pool_only):
+        if not config.for_role(role):
             raise ConfigError(f"vendors: no eligible vendor for role {role}")
     if any(repo.screenshot_review for repo in config.repos):
         if not any(config.allows(v, "screenshot_reviewer") and agents.ADAPTERS[v].IMAGES

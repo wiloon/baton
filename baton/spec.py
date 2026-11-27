@@ -31,7 +31,7 @@ import subprocess
 import sys
 import time
 
-from . import advisor, agents, checks as check_section, dispatch, e2e_gate, fix, handoff as owner_handoff, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, recovery, review, tiers, vendors
+from . import advisor, agents, checks as check_section, dispatch, e2e_gate, fix, handoff as owner_handoff, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, recovery, review, scratch, tiers, vendors
 from .common import Deferred, changed, child_env, git, permission_denials, push, restore, strip_markers
 from .quota import atomic_json
 
@@ -338,14 +338,16 @@ class Spec:
                 return followup
         return preferred
 
-    def agent(self, vendor, role, prompt, tag, settings, output="", followup=False, round_s=""):
+    def agent(self, vendor, role, prompt, tag, settings, output="", followup=False, round_s="",
+              *, continues_step=False):
         env = self.env.with_runtime(spec_followup=followup)
         saved_role = {"spec_review": "spec_reviewer", "spec": "reviser"}.get(role)
         # A saved grant is consumed before the step runs; a short block settles it (recovery.dispatching).
         with recovery.dispatching(self.env, self.issue, self.issue, lambda: self.retry_binding(round_s),
                                   role=saved_role):
+            extra = {"continues_step": True} if continues_step else {}
             out = dispatch.dispatch(vendor, role, prompt, tag, str(self.wt), str(self.self_dir / settings), output,
-                                    env, self.hooks)
+                                    env, self.hooks, **extra)
             if out["rc"] == 75:
                 raise Deferred(vendor, out["defer"])
         return out
@@ -473,9 +475,8 @@ class Spec:
         return result
 
     def retry_picker(self, role, other_model, spec_followup):
-        candidates = list(self.env.config.quota.vendor_pool) if role == "reviser" else pick.all_vendors(self.env)
-        return dict(mode="contrib", candidates=candidates, issue=self.issue, other_model=other_model,
-                    spec_followup=spec_followup)
+        return dict(mode="contrib", candidates=pick.all_vendors(self.env), issue=self.issue,
+                    other_model=other_model, spec_followup=spec_followup)
 
     def resume_worker(self, role, reason, round, other_model, spec_followup=False):
         return recovery.resume(
@@ -1365,7 +1366,7 @@ class Spec:
 
         def review_followup(vendor):
             return alt_followup if vendor == alternating else self.followup(round, vendor, last_vendor)
-        pending = self.resume_worker("spec_reviewer", "spec_review_run_failed", round, other_model)
+        pending = self.resume_worker("spec_reviewer", "spec_review_run_failed", round, other_model, alt_followup)
         if pending is False:
             return "stop"
         reviewer = pending[1] if pending else self.pick("spec_reviewer", pick.all_vendors(env),
@@ -1422,7 +1423,7 @@ class Spec:
             retry = self.recover_worker(
                 f"{reviewer}'s spec review failed: {outcome}", "spec_review_run_failed", reviewer, outcome,
                 round_s=str(round), issue_body=issue_body, listed=listed, last_vendor=last_vendor,
-                other_model=other_model, spec_followup=review_followup(reviewer))
+                other_model=other_model, spec_followup=alt_followup)
             if not retry:
                 return "stop"
             _, reviewer = retry
@@ -1677,7 +1678,12 @@ class Spec:
             return "changed"
         return "ok"
 
-    def finish_revision_reply(self, reviser, model, round, human, reply, mode_note, max_rounds, inputs, applied,
+    def remove_reply_files(self, round):
+        """This repository's reply and body files of one revision round."""
+        for leftover in scratch.directory(self.env.dirs).glob(f"spec-{self.issue}-{round}.*"):
+            leftover.unlink()
+
+    def finish_revision_reply(self, reviser,model, round, human, reply, mode_note, max_rounds, inputs, applied,
                               after_save=None):
         """Post the reply after ADR work (or when there was none) and clear the worker grant."""
         n = self.issue
@@ -1693,8 +1699,7 @@ class Spec:
         try:
             return self.post_comment(owner_handoff.SPEC_REPLY_POST, binding, initial=True, after_save=after_save)
         finally:
-            for leftover in Path("/tmp").glob(f"baton-spec-{n}-{round}.*"):
-                leftover.unlink()
+            self.remove_reply_files(round)
 
     def body_edit_binding(self, intended, original, round, reviser, model, human, reply, mode_note,
                           max_rounds, inputs):
@@ -2235,9 +2240,8 @@ class Spec:
         listed, issue_body = inputs["comments"], inputs["body"]
         if max_rounds is None:
             max_rounds = max(int(env.config.scheduling.max_spec_rounds or 3), round + 1)
-        out_base = f"/tmp/baton-spec-{n}-{round}"
-        for stale in Path("/tmp").glob(f"baton-spec-{n}-{round}.*"):
-            stale.unlink()
+        out_base = str(scratch.path(env.dirs, "spec", n, round))
+        self.remove_reply_files(round)
         last_vendor = last_by(listed, env.owner, "review")
         other_model = last_model(env, n, "review", round, last_vendor)
         alternating = vendors.alternating_spec_vendor()
@@ -2248,7 +2252,7 @@ class Spec:
         if pending is False:
             return "stop"
         reviser = pending[1] if pending else self.pick(
-            "reviser", list(env.config.quota.vendor_pool), last_vendor, other_model, spec_followup=alt_followup)
+            "reviser", pick.all_vendors(env), last_vendor, other_model, spec_followup=alt_followup)
         self.mark_base(round)
         budget = pending[0]["remaining_budget"] if pending else {}
         saved_answer = answer_intent or {}
@@ -2284,7 +2288,8 @@ class Spec:
                 for suffix in (".body", ".comment"):
                     Path(f"{out_base}{suffix}").unlink(missing_ok=True)
                 out = self.agent(reviser, "spec", prompt + DENIED_NOTE.format(command=denied[0]), f"{tag}-rerun",
-                                 "spec-settings.json", out_base, followup=followup, round_s=str(round))
+                                 "spec-settings.json", out_base, followup=followup, round_s=str(round),
+                                 continues_step=True)
                 denied = permission_denials(out.get("log", "")) if out["outcome"].startswith("RESULT: failed") else []
             self.settle_answer_intent()
             outcome, model = out["outcome"], out["model"] or ""
@@ -2326,8 +2331,7 @@ class Spec:
             try:
                 return self.edit_body(binding, initial=True)
             finally:
-                for leftover in Path("/tmp").glob(f"baton-spec-{n}-{round}.*"):
-                    leftover.unlink()
+                self.remove_reply_files(round)
         if git(wt, "rev-list", f"{self.base}..HEAD"):
             try:
                 self.record(reviser, model)
@@ -2339,8 +2343,7 @@ class Spec:
             try:
                 return self.push_adr(binding, initial=True)
             finally:
-                for leftover in Path("/tmp").glob(f"baton-spec-{n}-{round}.*"):
-                    leftover.unlink()
+                self.remove_reply_files(round)
         try:
             self.record(reviser, model)
         except OSError:

@@ -45,13 +45,20 @@ class World:
         self.config = config.load(self.path)
         self.state = self.config.paths.state
         self.t, self.until, self.plan, self.events = 0.0, 0, {}, []
-        self.starts, self.children = [], []
-        self.supervisor = serve.Supervisor(self.path, spawn=self.spawn, clock=lambda: self.t, sleep=self.sleep)
+        self.starts, self.spawned, self.children = [], [], []
+        self.listings = {}   # repo -> eligibility.RepoListing for the injected lister
+        self.supervisor = serve.Supervisor(
+            self.path, spawn=self.spawn, clock=lambda: self.t, sleep=self.sleep, list_repos=self.list_repos)
 
-    def spawn(self, path, name):
+    def list_repos(self, config, names, **kwargs):
+        from baton.eligibility import RepoListing
+        return {name: self.listings.get(name, RepoListing(name=name, failed=True)) for name in names}
+
+    def spawn(self, path, name, *, issue=None, no_new_issue=False):
         assert path == self.path
         assert not [c for c in self.live() if c.name == name], f'two children of {name}'
         self.starts.append((self.t, name))
+        self.spawned.append((self.t, name, issue, no_new_issue))
         planned = self.plan.get(name)
         step = planned.pop(0) if planned else (10, 0)
         if step is None:
@@ -223,10 +230,18 @@ def test_a_child_is_the_same_interpreter_with_the_same_config(monkeypatch):
     (argv, kwargs), = calls
     assert argv == [sys.executable, '-m', 'baton', '--config', '/etc/baton.toml', '--repo', APP, '--serve-child']
     assert not {'start_new_session', 'cwd', 'env'} & kwargs.keys()
+    calls.clear()
+    serve.spawn_child(Path('/etc/baton.toml'), APP, issue='12')
+    assert calls[0][0][-2:] == ['--issue', '12']
+    calls.clear()
+    serve.spawn_child(Path('/etc/baton.toml'), APP, no_new_issue=True)
+    assert calls[0][0][-1] == '--no-new-issue'
 
 
 @pytest.mark.parametrize('argv', [['serve', 'now'], ['--repo', APP, 'serve'], ['--serve-child'],
-                                  ['--repo', APP, '--serve-child', '7'], ['--serve-child', 'serve']])
+                                  ['--repo', APP, '--serve-child', '7'], ['--serve-child', 'serve'],
+                                  ['--issue', '1'], ['--repo', APP, '--serve-child', '--issue', 'x'],
+                                  ['--repo', APP, '--serve-child', '--issue', '1', '--no-new-issue']])
 def test_serve_usage_errors_exit_2(tmp_path, monkeypatch, capsys, argv):
     path = tmp_path / 'config.toml'
     path.write_text(TWO.replace('~/', f'{tmp_path}/home/'))
@@ -251,6 +266,159 @@ def test_scheduling_settings_are_optional_and_bounded(tmp_path):
     assert config.load(path).serve.poll_seconds == 10
 
 
+# --- global priority across repositories (#291, ADR 0012) -----------------------------------------
+def _listing(name, *, priority_issue=None, priority=4, in_flight=False, failed=False):
+    from baton.eligibility import Candidate, RepoListing
+    candidates = [Candidate(priority_issue, priority)] if priority_issue is not None else []
+    return RepoListing(name=name, in_flight=in_flight, candidates=candidates, failed=failed)
+
+
+def test_under_contention_a_p0_elsewhere_starts_before_a_p3_next_in_rotation(tmp_path):
+    world = World(tmp_path, THREE, max_parallel=1)
+    world.listings = {
+        APP: _listing(APP, priority_issue=1, priority=3),
+        SHOP_: _listing(SHOP_, priority_issue=2, priority=2),
+        SITE_: _listing(SITE_, priority_issue=9, priority=0),
+    }
+    world.plan = {SITE_: [(10, 0)]}
+    assert world.run(1) == [(0, SITE_)]
+    assert world.spawned == [(0, SITE_, '9', False)]
+
+
+def test_with_two_slots_a_p0_is_always_one_of_the_two_started(tmp_path):
+    world = World(tmp_path, THREE, max_parallel=2)
+    world.listings = {
+        APP: _listing(APP, priority_issue=1, priority=1),
+        SHOP_: _listing(SHOP_, priority_issue=2, priority=1),
+        SITE_: _listing(SITE_, priority_issue=9, priority=0),
+    }
+    world.plan = {n: [(100, 0)] for n in (APP, SHOP_, SITE_)}
+    world.run(1)
+    assert len(world.spawned) == 2
+    assert (SITE_, '9') in {(name, issue) for _, name, issue, _ in world.spawned}
+
+
+def test_equal_priority_breaks_ties_by_rotation(tmp_path):
+    world = World(tmp_path, THREE, max_parallel=1)
+    world.listings = {
+        APP: _listing(APP, priority_issue=3, priority=1),
+        SHOP_: _listing(SHOP_, priority_issue=1, priority=1),
+        SITE_: _listing(SITE_, priority_issue=2, priority=1),
+    }
+    world.plan = {APP: [(10, 0)]}
+    world.run(1)
+    # Same priority: rotation (APP, SHOP, SITE) then issue number — APP's #3 before SHOP's #1.
+    assert world.spawned == [(0, APP, '3', False)]
+
+
+def test_in_flight_work_takes_a_free_slot_before_any_new_issue(tmp_path):
+    world = World(tmp_path, THREE, max_parallel=1)
+    world.listings = {
+        APP: _listing(APP, in_flight=True),
+        SHOP_: _listing(SHOP_, priority_issue=2, priority=1),
+        SITE_: _listing(SITE_, priority_issue=9, priority=0),
+    }
+    world.plan = {APP: [(10, 0)]}
+    world.run(1)
+    assert world.spawned == [(0, APP, None, True)]
+
+
+def test_failed_listing_ranks_after_candidates(tmp_path):
+    world = World(tmp_path, THREE, max_parallel=1)
+    world.listings = {
+        APP: _listing(APP, failed=True),
+        SHOP_: _listing(SHOP_, priority_issue=2, priority=2),
+        SITE_: _listing(SITE_, failed=True),
+    }
+    world.plan = {SHOP_: [(10, 0)]}
+    world.run(1)
+    assert world.spawned == [(0, SHOP_, '2', False)]
+
+
+def test_exit_81_is_due_at_once_and_suppresses_that_assignment_for_a_poll(tmp_path):
+    world = World(tmp_path, THREE, max_parallel=1)
+    world.listings = {
+        APP: _listing(APP, priority_issue=1, priority=3),
+        SHOP_: _listing(SHOP_),
+        SITE_: _listing(SITE_, priority_issue=9, priority=0),
+    }
+    world.plan = {SITE_: [(5, 81)], APP: [(5, 0)]}
+    starts = world.run(11)
+    assert world.spawned[0] == (0, SITE_, '9', False)
+    # SITE's P0 is suppressed; APP's P3 takes the slot at once (exit 81 wait is 0).
+    assert starts[1] == (5, APP)
+    assert world.spawned[1] == (5, APP, '1', False)
+
+
+def test_exit_0_from_in_flight_waits_a_poll_then_group_1_again(tmp_path):
+    world = World(tmp_path, THREE, max_parallel=1)
+    world.listings = {
+        APP: _listing(APP, in_flight=True),
+        SHOP_: _listing(SHOP_, priority_issue=2, priority=0),
+        SITE_: _listing(SITE_),
+    }
+    world.plan = {APP: [(10, 0), (10, 0)], SHOP_: [(10, 80), (50, 0)], SITE_: [(10, 0)]}
+    starts = world.run(81)
+    assert world.spawned[0] == (0, APP, None, True)
+    # During APP's poll wait a P0 elsewhere may run; when APP is due again it is still group 1.
+    assert starts[1] == (10, SHOP_)
+    assert world.spawned[1] == (10, SHOP_, '2', False)
+    assert starts[2] == (20, SHOP_)   # exit 80: due at once, still the P0
+    assert starts[3] == (70, APP)
+    assert world.spawned[3] == (70, APP, None, True)
+
+
+def test_exit_80_from_in_flight_is_due_at_once_within_chain_max(tmp_path):
+    world = World(tmp_path, ONE, chain_max=2)
+    world.listings = {APP: _listing(APP, in_flight=True)}
+    world.plan = {APP: [(10, 80)] * 3}
+    # One due repo: no contention, plain --serve-child (not --no-new-issue).
+    assert [t for t, _ in world.run(31)] == [0, 10, 20]
+    assert all(issue is None and not no_new for _, _, issue, no_new in world.spawned)
+
+
+def test_hour_idle_repository_gets_no_new_issue_ahead_of_new_candidates(tmp_path):
+    world = World(tmp_path, THREE, max_parallel=1)
+    world.listings = {
+        APP: _listing(APP, priority_issue=1, priority=3),
+        SHOP_: _listing(SHOP_, priority_issue=2, priority=1),
+        SITE_: _listing(SITE_, priority_issue=9, priority=0),
+    }
+    # SITE runs past one hour; APP and SHOP never started (idle from supervisor birth).
+    world.plan = {SITE_: [(3601, 0)], APP: [(10, 0)], SHOP_: [(10, 0)]}
+    starts = world.run(3612)
+    assert world.spawned[0] == (0, SITE_, '9', False)
+    # SITE waits a poll; APP and SHOP are already due and hour-idle → --no-new-issue ahead of P0/P1.
+    assert starts[1] == (3601, APP)
+    assert world.spawned[1] == (3601, APP, None, True)
+
+
+def test_the_owner_check_is_cached_across_passes_and_a_failed_read_is_retried(tmp_path):
+    from functools import partial
+    from baton import eligibility
+    events, failures = [], [None]   # the first events read fails
+
+    def gh(*args):
+        if args[0] == 'api':
+            events.append(args[1])
+            return failures.pop() if failures else [[]]
+        if args[:2] == ('issue', 'list') and 'ready-for-agent' in args and APP in args:
+            return [{'number': 1, 'labels': [{'name': 'claude-found'}], 'updatedAt': 't1'}]
+        return []
+
+    world = World(tmp_path, TWO, max_parallel=1)
+    world.supervisor.list_repos = partial(eligibility.list_due, gh_json=gh)
+    seen = []
+    for _ in range(3):   # each pass: both repositories due, one slot
+        world.supervisor.eligible.clear()
+        world.supervisor.step()
+        seen.append(len(events))
+        for child in world.supervisor.children.values():
+            child.poll = lambda: 0
+        world.supervisor.reap()
+    assert seen == [1, 2, 2]
+
+
 CHILD = '''import pathlib, signal, sys, time
 box = pathlib.Path(sys.argv[1])
 name = sys.argv[2].replace('/', '-')
@@ -266,7 +434,7 @@ while not (box / 'release').exists() and time.monotonic() < deadline:
 DRIVER = '''import sys
 from baton import bootstrap, serve
 box = sys.argv[1]
-serve.command = lambda config, name: [sys.executable, box + '/child.py', box, name]
+serve.command = lambda config, name, **kwargs: [sys.executable, box + '/child.py', box, name]
 raise SystemExit(bootstrap.main(['--config', box + '/config.toml', 'serve']))
 '''
 

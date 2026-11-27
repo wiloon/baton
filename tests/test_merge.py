@@ -812,6 +812,51 @@ def test_a_reply_fixer_blocked_by_its_vendor_hands_the_head_off_without_marking_
     assert not Path(repair.env["STATE"], f"ci-fix-{PR}-{HEAD}").exists()
 
 
+def test_a_ci_repair_deferred_for_maintenance_keeps_the_merge_step(repair, monkeypatch):
+    """#337: the real fix run and dispatch; maintenance re-raises and finish_review keeps the checkpoint."""
+    import json, time
+    from baton.common import MAINTENANCE_PREFIX
+    from baton import checkpoint as cp, review as review_mod
+
+    Path(repair.env["STATE"], "maintenance").write_text(
+        json.dumps({"expires": time.time() + 600, "reason": "reboot", "id": "t"}))
+    monkeypatch.setattr(merge.fix, "fix_pr", REAL_FIX_PR)
+    told, advised = [], []
+    monkeypatch.setattr(merge.notify, "notify", lambda *a, **k: told.append(a))
+    monkeypatch.setattr(merge.advisor, "advise", lambda *a, **k: advised.append(a))
+    with pytest.raises(merge.Deferred) as waiting:
+        repair.merger().ci_fix_round(str(repair.wt))
+    assert waiting.value.reason == f"{MAINTENANCE_PREFIX}reboot"
+    assert not Path(repair.env["STATE"], f"ci-fix-{PR}-{HEAD}").exists()
+
+    pending = Path(repair.env["STATE"], f"review-pending-{PR}")
+    head = sh(repair.wt, "git", "rev-parse", "HEAD")
+    repair.gh.set(headRefOid=head, state="OPEN")
+    cp.write(pending, {"pr": str(PR), "wt": str(repair.wt), "note": "n", "fixer": "codex",
+                       "reviewer": "claude", "round": 1, "step": "merge", "fix_head": "",
+                       "ISSUE": "297", "merge_head": head})
+    repair.greens[:] = [False]
+    deferrals, real_round = [], merge.Merger.ci_fix_round
+
+    def ci_fix_round(self, wt):
+        try:
+            return real_round(self, wt)
+        except merge.Deferred as deferred:
+            deferrals.append(deferred.reason)
+            raise
+
+    monkeypatch.setattr(merge.Merger, "ci_fix_round", ci_fix_round)
+    # The classification must name the approved head.
+    monkeypatch.setattr(merge.ci, "classify", lambda *a: {"head": head, "feedback": "unused helper"})
+    hooks = merge.telemetry.from_env(repair.env, issue=297, pr=PR)
+    loop = review_mod.Review(repair.env, hooks, str(PR), str(repair.wt), "297", "")
+    assert loop.finish_review(cp.read(pending)) == 75
+    assert deferrals == [f"{MAINTENANCE_PREFIX}reboot"]
+    assert pending.exists()
+    assert not repair.labelled("ready-for-human")
+    assert told == [] and advised == []
+
+
 def test_a_reply_fixers_refused_description_edit_keeps_the_repair_and_writes_no_marker(repair, monkeypatch):
     """A validated description GitHub refuses waits for its retry: the Deferred passes through, unmarked."""
     import subprocess

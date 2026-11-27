@@ -130,7 +130,7 @@ def test_adapters_declare_the_spec_same_vendor_policy():
         "agy": "known-distinct-model", "stub": ""}
     assert {name: a.SPEC_TEMPLATE for name, a in agents.ADAPTERS.items()} == {
         "claude": "spec-prompt.md", "codex": "codex-spec-prompt.md", "cursor": "spec-prompt.md",
-        "agy": "spec-prompt.md", "stub": "spec-prompt.md"}
+        "agy": "agy-spec-prompt.md", "stub": "spec-prompt.md"}
     assert {name: a.SPEC_UNMARKED_REVIEWER for name, a in agents.ADAPTERS.items()} == {
         "claude": True, "codex": False, "cursor": False, "agy": False, "stub": False}
 
@@ -179,7 +179,7 @@ def test_stub_quota_error_defers_and_records_cooldown(stub_runner):
 
 def test_stub_auth_failure_records_credential(stub_runner, monkeypatch):
     monkeypatch.setattr(dispatch.agents, "preflight",
-                        lambda vendor: "RESULT: failed Stub login required" if vendor == "stub" else None)
+                        lambda vendor, settings=None: "RESULT: failed Stub login required" if vendor == "stub" else None)
     out = stub_runner.run()
     assert (out["rc"], out["status"]) == (75, "auth")
     assert json.loads((stub_runner.state_dir / "credential-stub.json").read_text())["result"] == "auth_expired"
