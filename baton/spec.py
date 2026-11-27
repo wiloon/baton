@@ -338,14 +338,16 @@ class Spec:
                 return followup
         return preferred
 
-    def agent(self, vendor, role, prompt, tag, settings, output="", followup=False, round_s=""):
+    def agent(self, vendor, role, prompt, tag, settings, output="", followup=False, round_s="",
+              *, continues_step=False):
         env = self.env.with_runtime(spec_followup=followup)
         saved_role = {"spec_review": "spec_reviewer", "spec": "reviser"}.get(role)
         # A saved grant is consumed before the step runs; a short block settles it (recovery.dispatching).
         with recovery.dispatching(self.env, self.issue, self.issue, lambda: self.retry_binding(round_s),
                                   role=saved_role):
+            extra = {"continues_step": True} if continues_step else {}
             out = dispatch.dispatch(vendor, role, prompt, tag, str(self.wt), str(self.self_dir / settings), output,
-                                    env, self.hooks)
+                                    env, self.hooks, **extra)
             if out["rc"] == 75:
                 raise Deferred(vendor, out["defer"])
         return out
@@ -2287,7 +2289,8 @@ class Spec:
                 for suffix in (".body", ".comment"):
                     Path(f"{out_base}{suffix}").unlink(missing_ok=True)
                 out = self.agent(reviser, "spec", prompt + DENIED_NOTE.format(command=denied[0]), f"{tag}-rerun",
-                                 "spec-settings.json", out_base, followup=followup, round_s=str(round))
+                                 "spec-settings.json", out_base, followup=followup, round_s=str(round),
+                                 continues_step=True)
                 denied = permission_denials(out.get("log", "")) if out["outcome"].startswith("RESULT: failed") else []
             self.settle_answer_intent()
             outcome, model = out["outcome"], out["model"] or ""

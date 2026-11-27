@@ -413,6 +413,31 @@ def test_a_denied_run_retries_once_and_the_second_prompt_quotes_the_denial(agy_r
     assert "--retry" not in begins[0]
 
 
+def test_a_denied_run_still_retries_when_maintenance_turns_on_mid_call(agy_runner, monkeypatch):
+    """#337: the same-lease denial retry is inside one dispatch call and does not recheck the flag."""
+    import time
+    from baton import agents
+    denied = [{"tool": "read_file", "path": "/outside/x"}]
+    real, armed = agents.run, []
+
+    def run_then_arm(request, *args, **kwargs):
+        result = real(request, *args, **kwargs)
+        if not armed:
+            armed.append(1)
+            (agy_runner.state_dir / "maintenance").write_text(
+                json.dumps({"expires": time.time() + 600, "reason": "reboot", "id": "t"}))
+        return result
+
+    monkeypatch.setattr(agents, "run", run_then_arm)
+    agy_runner.plans(
+        dict(stream=stream("", model=REVIEW_MODEL, denied=denied)),
+        dict(stream=stream("ok\nREVIEW: pass", model=REVIEW_MODEL)))
+    out = agy_runner.run("review")
+    assert (out["rc"], out["status"], out["outcome"]) == (0, "success", "REVIEW: pass")
+    assert agy_runner.calls() == ["agy", "agy"]
+    assert (agy_runner.state_dir / "maintenance").exists()
+
+
 def test_a_denied_action_is_sanitized_and_capped_in_the_retry_prompt(agy_runner):
     # U+2028 and a nested `<!-- baton` (revealed only after backtick removal) must not survive.
     nasty = ("line1\u2028line2 `code` nested-`<!-- baton` <!-- baton-marker --> " + ("x" * 400))
