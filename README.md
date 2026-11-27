@@ -71,6 +71,16 @@ deferred dev run) and logs `released agent-wip (no open PR)`; an unsettled merge
 is not counted, and a failed lookup leaves the label and retries next tick. When the cap blocks a start, the log lists each in-flight issue, its PR, and the
 saved deferral reason.
 
+**After you close a PR.** Baton never closes a PR, so closing an issue's PR without merging rejects
+that work. The next dev run of the issue (picked, relabelled or `python -m baton N`) starts again from
+`main`: an `agent-N`/`cursor-N` worktree whose HEAD shares a commit outside `main` with a closed PR's
+head is saved and removed. The saved work stays in the runner's clone under
+`refs/baton/backup/issue-N/<sha>`, together with any branch tip baton moves; uncommitted work is a
+commit whose parent holds the staged changes (`git show <sha>:<file>`). Other worktrees are resumed as
+they are. The replacement push may overwrite the remote branch only while it still holds exactly the
+closed PR's head (`--force-with-lease`), or fast-forward it; a remote that diverged, or a replacement that merged
+the closed work back in, is not pushed and the issue is handed to you.
+
 **Picking a vendor.** For each run, baton drops the vendors that are resting after a limit or an
 auth failure, that are over their quota caps, or, for a review, that wrote any of the PR (when
 every vendor did, the same vendor reviews on a different model). That same-vendor fallback waits

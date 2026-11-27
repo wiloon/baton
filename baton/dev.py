@@ -13,7 +13,7 @@ import re
 import subprocess
 import time
 
-from . import advisor, after_merge, agents, checks as check_section, dispatch, fix, handoff as owner_handoff, md, names, pr as pr_helpers, pr_contract, prompts, recovery, spec, vendors
+from . import advisor, after_merge, agents, checks as check_section, dispatch, fix, handoff as owner_handoff, md, names, pr as pr_helpers, pr_contract, prompts, recovery, restart, spec, vendors
 from .common import Deferred, git, push, strip_markers
 
 REPLY_CAP = 60000
@@ -429,6 +429,15 @@ def push_with_retry(tick, env, issue, wt, branch, *, vendor, title, body_text, b
     if initial:
         if found is not None:
             raise Deferred("handoff-retry", reason, lends_slot=False)
+        # The replacement after a closed PR (#303): on the active branch, and not the closed work.
+        try:
+            closed = restart.closed_heads(tick, issue)
+            restart.attach(tick, issue, wt, branch, closed)
+            rejected = restart.built_on(wt, "HEAD", closed)
+        except restart.Failed as exc:
+            return handoff(f"{branch} is committed in {wt}; {exc}.")
+        if rejected:
+            return handoff(f"{branch} is committed in {wt}; its HEAD is built on closed PR #{rejected}, not pushing.")
         if env.repo.signoff:
             from .common import sign_off
             if not sign_off(wt):
@@ -446,7 +455,8 @@ def push_with_retry(tick, env, issue, wt, branch, *, vendor, title, body_text, b
             body_text += f"\n\n## E2E gate\n{gate_result}, on {short}. The runner ran this."
         binding = {
             "issue": str(issue), "commit": commit, "branch": dest, "ref": dest,
-            "remote": remote, "upstream": True, "wt": str(wt), "feedback": feedback,
+            "remote": remote, "lease": restart.lease(wt, remote, commit, closed),
+            "upstream": True, "wt": str(wt), "feedback": feedback,
             "vendor": vendor, "title": title, "body_text": body_text, "base": base,
             "model": model, "gate_result": gate_result or "", "attempts": attempts,
         }
@@ -497,9 +507,14 @@ def push_with_retry(tick, env, issue, wt, branch, *, vendor, title, body_text, b
                 return handoff(f"{binding['branch']} is committed in {binding['wt']}; local inputs changed.")
             remote, unreadable_transient = owner_handoff.observe_remote(binding["wt"], binding["branch"])
             if remote is not None:
+                try:
+                    lease = restart.lease(binding["wt"], remote, binding["commit"],
+                                          restart.closed_heads(tick, issue) if remote else {})
+                except restart.Failed as exc:
+                    return handoff(f"{binding['branch']} is committed in {binding['wt']}; {exc}.")
                 consumed = owner_handoff.load_retry(env, issue, reason)
                 binding = owner_handoff.save_push_baseline(
-                    env, issue, issue, consumed, remote, reason=reason)
+                    env, issue, issue, consumed, remote, reason=reason, lease=lease)
                 pending = {**pending, "continuation": binding}
             elif not unreadable_transient:
                 return handoff(f"{binding['branch']} is committed in {binding['wt']}; could not observe the remote ref.")
@@ -513,8 +528,9 @@ def push_with_retry(tick, env, issue, wt, branch, *, vendor, title, body_text, b
     else:
         status = owner_handoff.check_push_landed(binding)
     if status == "absent" and (initial or pending["attempts"] < owner_handoff.MAX_ATTEMPTS):
+        lease = {"lease": binding["lease"]} if binding.get("lease") else {}
         pushed = push(binding["wt"], f"{binding['commit']}:refs/heads/{binding['branch']}",
-                      upstream=binding["upstream"], signoff=False)
+                      upstream=binding["upstream"], signoff=False, **lease)
         if pushed:
             status = "landed"
         else:
@@ -577,6 +593,11 @@ def run(tick, issue):
                                feedback=waiting["continuation"]["feedback"], pending=waiting)
     if waiting is not None:
         return 80
+    # Work built on a PR the owner closed is saved and set aside before anything else runs (#303).
+    started = restart.fresh_start(tick, issue)
+    if started is None:
+        return 1
+    branch, wt = started
     runner = spec.Spec(env, hooks, issue)
     payload = tick.recovered_issues.pop(str(issue), None)
     if payload is None:
