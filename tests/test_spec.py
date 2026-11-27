@@ -1158,6 +1158,30 @@ def test_a_revision_that_failed_on_a_denied_command_is_rerun_once_and_finishes(l
     assert "rerunning once" in loop.log() and "ready-for-human" not in loop.gh.labels
 
 
+def test_a_denied_revision_is_still_rerun_during_maintenance_and_the_next_step_waits(loop, tmp_path, monkeypatch):
+    """#337: the denied-command rerun finishes the revision; the next review is a new step."""
+    inner = spec.dispatch.dispatch
+    flag = Path(loop.env["STATE"], "maintenance")
+
+    def gated(*args, continues_step=False, **kwargs):
+        if flag.exists() and not continues_step:
+            return {"rc": 75, "status": "deferred", "outcome": "", "reply": None, "model": "",
+                    "defer": "maintenance: reboot"}
+        return inner(*args, **kwargs)
+
+    def denied_then_maintenance(vendor, output, cwd):
+        flag.write_text("{}")
+        return denied_failure(tmp_path)
+
+    monkeypatch.setattr(spec.dispatch, "dispatch", gated)
+    loop.script = [CHANGES, denied_then_maintenance, reviser()]
+    with pytest.raises(spec.Deferred) as waiting:
+        loop.run()
+    assert waiting.value.reason == "maintenance: reboot" and not waiting.value.lends_slot
+    assert [run["tag"] for run in loop.runs][1:] == [f"issue-{N}-spec-reply-1", f"issue-{N}-spec-reply-1-rerun"]
+    assert "ready-for-human" not in loop.gh.labels
+
+
 def test_a_revision_denied_twice_goes_to_the_owner_naming_the_command(loop, tmp_path, monkeypatch):
     told = []
     monkeypatch.setattr(spec.notify, "notify", lambda title, text="": told.append(text))
@@ -4056,6 +4080,27 @@ def test_a_resumed_worker_after_a_deferred_denied_rerun_keeps_the_command_and_is
     resumed = advised.runs[-1]
     assert "`wc -l /ctx/issue.md`" in resumed["prompt"]
     assert [r["role"] for r in advised.runs] == ["spec_review", "spec", "spec", "spec", "spec"]
+
+
+def test_a_resumed_denied_rerun_is_a_new_step_under_maintenance(advised, monkeypatch, tmp_path):
+    """#337: only the rerun right after the denied run finishes a step; a later tick's resume starts one."""
+    advised.gh.body = f"Goal\n{EXCERPT}\n"
+    deferral = {"rc": 75, "status": "quota", "outcome": "", "reply": None, "model": "", "defer": "quota"}
+    advised.script = [CHANGES, reviser(QUESTIONS, outcome="SPEC: human"), denied_failure(tmp_path), deferral,
+                      deferral]
+    advised.advice = advice(grounded())
+    monkeypatch.setattr(dev, "setup_worktree", lambda *a, **k: ("", False))
+    inner, continued = spec.dispatch.dispatch, []
+
+    def record(*args, continues_step=False, **kwargs):
+        continued.append(continues_step)
+        return inner(*args, **kwargs)
+
+    monkeypatch.setattr(spec.dispatch, "dispatch", record)
+    for _ in range(2):
+        assert spec.run(SimpleNamespace(issue=N), session.resolve(advised.env))["rc"] == 75
+    assert advised.runs[-1]["tag"].endswith("-rerun")
+    assert continued == [False, False, False, True, False]
 
 
 EXCERPT = "Manual checks use the existing gate path."

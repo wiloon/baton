@@ -2270,15 +2270,13 @@ class Spec:
             for suffix in (".body", ".comment"):
                 Path(f"{out_base}{suffix}").unlink(missing_ok=True)
             tag = f"issue-{n}-spec-reply-{round}" + (f"-retry{attempt}" if attempt else "")
-            continues = False
             if restored and denied_command:
                 # A resumed worker keeps the denied-command instruction of the rerun it replaces.
                 prompt += DENIED_NOTE.format(command=denied_command)
                 tag += "-rerun"
                 restored = False
-                continues = True
             out = self.agent(reviser, "spec", prompt, tag, "spec-settings.json", out_base, followup=followup,
-                             round_s=str(round), continues_step=continues)
+                             round_s=str(round))
             denied = permission_denials(out.get("log", "")) if out["outcome"].startswith("RESULT: failed") else []
             if denied and not denied_spent:
                 if not self.keep_denied_spent(answer_intent, denied[0]):

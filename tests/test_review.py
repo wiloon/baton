@@ -21,6 +21,7 @@ from test_adapter_capabilities import with_stub
 
 REAL_MERGE = merge.Merger.merge_or_handoff
 REAL_FIX = review.fix.fix_pr
+REAL_DISPATCH = review.dispatch.dispatch
 
 BIN = Path(__file__).resolve().parents[1] / "bin"
 PR = 987654
@@ -324,23 +325,31 @@ def test_a_deferred_fixer_leaves_a_checkpoint_and_the_resume_goes_straight_to_th
     assert loop.fixes[1]["head"] == loop.fixes[0]["head"]
 
 
-def test_a_fix_deferred_for_maintenance_keeps_the_checkpoint_and_lends_no_slot(loop, monkeypatch):
-    """#337: review returned changes while the flag is set; the fix agent is not run and no slot is lent."""
+def test_a_fix_waits_for_maintenance_to_end_and_then_runs(loop, monkeypatch):
+    """#337: the review returns changes while the flag is set; dispatch does not start the fix."""
     from baton.common import MAINTENANCE_PREFIX
-    Path(loop.env["STATE"], "maintenance").write_text(
+    flag = Path(loop.env["STATE"], "maintenance")
+    reviewer, fake_fix = review.dispatch.dispatch, review.fix.fix_pr
+
+    def dispatch(vendor, role, *args, **kwargs):
+        return (reviewer if role == "review" else REAL_DISPATCH)(vendor, role, *args, **kwargs)
+
+    loop.after["review"] = lambda: flag.write_text(
         json.dumps({"expires": time.time() + 600, "reason": "reboot", "id": "t"}))
-
-    def blocked(runner, pr, wt, fixer, source, feedback, head=""):
-        raise Deferred(fixer, f"{MAINTENANCE_PREFIX}reboot")
-
-    monkeypatch.setattr(review.fix, "fix_pr", blocked)
+    monkeypatch.setattr(review.dispatch, "dispatch", dispatch)
+    monkeypatch.setattr(review.fix, "fix_pr", REAL_FIX)
+    monkeypatch.setattr(review.fix.Runner, "fetch_main", lambda *_: None)
     with pytest.raises(Deferred) as waiting:
         loop.run(fixer="cursor", reviewer="codex")
-    assert waiting.value.reason.startswith(MAINTENANCE_PREFIX)
-    assert waiting.value.lends_slot is False
-    saved = loop.checkpoint()
-    assert saved and saved["step"] == "fix"
+    assert waiting.value.reason == f"{MAINTENANCE_PREFIX}reboot" and not waiting.value.lends_slot
+    assert loop.checkpoint()["step"] == "fix"
     assert not Path(loop.env["STATE"], f"slot-deferred-{PR}").exists()
+
+    flag.unlink()
+    loop.after.clear()
+    monkeypatch.setattr(review.fix, "fix_pr", fake_fix)
+    assert loop.run(fixer="cursor", reviewer="codex") == 0
+    assert len(loop.fixes) == 1
 
 
 def save_waiting_fix_push(loop, fixer, ci_head=""):

@@ -405,6 +405,9 @@ class Tick:
             done = self.start(issue, ", ahead of lower-priority work; max_pending_prs not applied")
             if done is not None:
                 return done
+            # Resuming runnable() already picks a vendor for the next candidate.
+            if (stopped := self.stop_if_draining()) is not None:
+                return stopped
         return None
 
     def start(self, issue, note=""):

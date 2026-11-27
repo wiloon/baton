@@ -494,7 +494,7 @@ def test_dispatch_defers_for_maintenance_without_starting_or_counting(runner):
     out = runner.run()
     assert (out["rc"], out["status"], out["defer"]) == (75, "deferred", f"{MAINTENANCE_PREFIX}reboot")
     assert not (runner.root / "fake" / "calls").exists()
-    assert not list(runner.state_dir.glob("runs-*"))
+    assert not list(runner.state_dir.glob("runs-*")) and not list(runner.state_dir.glob("*cooldown*"))
     assert runner.runner_log() == []
 
 

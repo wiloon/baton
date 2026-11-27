@@ -3761,38 +3761,97 @@ def test_a_maintenance_deferral_of_a_fix_does_not_lend_a_slot(ctx, monkeypatch):
     assert "lends its agent-wip slot" not in ctx.log()
 
 
-def test_verify_repair_still_dispatches_during_maintenance(devrun, monkeypatch):
-    """#337: verify.sh repair runs finish the step; continues_step skips the maintenance gate."""
-    set_maintenance(devrun, "reboot")
-    monkeypatch.setattr(fix.Runner, "verify", REAL_VERIFY)
-    seen = []
+def gate_dispatch(devrun, monkeypatch):
+    """The devrun agent stub behind dispatch's maintenance gate; returns the (role, continues_step) calls."""
+    inner, seen = dev.dispatch.dispatch, []
 
-    def capture(vendor, role, prompt, tag, cwd, settings="", output="", env=None, hooks=None,
-                continues_step=False):
+    def gated(vendor, role, *args, continues_step=False, **kwargs):
+        reason = tick.maintenance.admit(devrun.env["STATE"], None, acquire=False).reason
+        if reason and not continues_step:
+            return {"rc": 75, "status": "deferred", "outcome": "", "reply": None, "model": "",
+                    "defer": f"{MAINTENANCE_PREFIX}{reason}"}
         seen.append((role, continues_step))
+        return inner(vendor, role, *args, **kwargs)
+
+    monkeypatch.setattr(dev.dispatch, "dispatch", gated)
+    return seen
+
+
+def test_verify_repair_still_dispatches_during_maintenance_and_the_pr_opens(devrun, monkeypatch):
+    """#337: the worker finishes as maintenance turns on; its verify.sh repair finishes the step."""
+    seen = gate_dispatch(devrun, monkeypatch)
+    monkeypatch.setattr(fix.Runner, "verify", REAL_VERIFY)
+    monkeypatch.setattr(fix.Runner, "e2e_gate", lambda self, kind, number: "")
+    real_run, attempts = fix.session.run_process, []
+
+    def run_process(cmd, *args, **kwargs):
+        if Path(str(cmd[0])).name == "verify.sh":
+            attempts.append(cmd)
+            if len(attempts) == 1:
+                return subprocess.CompletedProcess(cmd, 1, "", "tests failed")
+            return subprocess.CompletedProcess(cmd, 0, "Verification passed\n", "")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(fix.session, "run_process", run_process)
+    worker = implements()
+
+    def worker_then_maintenance(cwd, output):
+        out = worker(cwd, output)
+        set_maintenance(devrun, "reboot")
+        return out
+
+    def repair(cwd, output):
         Path(output).write_text("RESULT: fixed\n")
         return {**DONE, "outcome": "RESULT: fixed", "reply": "RESULT: fixed"}
 
-    monkeypatch.setattr(fix.dispatch, "dispatch", capture)
-    attempts = {"n": 0}
+    devrun.script = [worker_then_maintenance, repair]
+    devrun.go()
+    assert seen == [("dev", False), ("fix", True)]
+    assert len(attempts) == 2 and devrun.gh.ran("pr", "create")
 
-    def verify_sh(cmd, **kwargs):
-        if cmd and Path(str(cmd[0])).name == "verify.sh":
-            attempts["n"] += 1
-            if attempts["n"] == 1:
-                return subprocess.CompletedProcess(cmd, 1, "", "tests failed")
-            return subprocess.CompletedProcess(cmd, 0, "Verification passed\n", "")
-        return subprocess.CompletedProcess(cmd, 0, "", "")
 
-    monkeypatch.setattr(fix.session, "run_process", verify_sh)
-    monkeypatch.setattr(fix.Runner, "e2e_gate", lambda self, kind, number: "")
-    t = devrun.make()
-    wt = Path(devrun.env["WT_ROOT"], "agent-300")
-    sh(devrun.repo, "git", "worktree", "add", "-q", str(wt), "HEAD")
-    runner = fix.Runner(t.env, t.hooks("300"))
-    rc, failure, rounds = runner.verify(str(wt), "origin/main", "codex", "issue", "300", repairs=1)
-    assert (rc, seen, rounds) == (0, [("fix", True)], 1)
-    assert not getattr(runner, "_continues_step", False)
+def test_a_spec_accepted_during_maintenance_starts_dev_after_it_ends_without_a_resume_note(devrun, monkeypatch):
+    plans, specs, notices = [""], [], []
+    monkeypatch.setattr(spec, "verdict_plan", lambda env, n, listed=None: plans[0])
+    monkeypatch.setattr(tick.Tick, "notify", lambda self, title, *a: notices.append(title))
+
+    def spec_loop(self, issue):
+        specs.append(issue)
+        plans[0] = "the agreed plan"
+        set_maintenance(devrun, "reboot")
+        return True
+
+    monkeypatch.setattr(tick.Tick, "spec_loop", spec_loop)
+    assert devrun.go()[1] == 75
+    assert devrun.runs == [] and notices == []
+    # The usual deferral cleanup may drop agent-wip; ready-for-agent stays and nothing is added.
+    assert all(c[5:] == ["--remove-label", "agent-wip"] for c in devrun.gh.ran("issue", "edit", "300"))
+    assert not Path(devrun.env["WT_ROOT"], "agent-300").exists()
+    Path(devrun.env["STATE"], "maintenance").unlink()
+    devrun.script = [implements()]
+    devrun.go()
+    assert specs == ["300"]
+    assert [run["role"] for run in devrun.runs] == ["dev"]
+    assert dev.RESUME_NOTE not in devrun.runs[0]["prompt"]
+    assert "#300 started (codex)" in notices
+
+
+def test_a_p0_tick_does_not_look_at_the_next_issue_once_maintenance_is_on(ctx, monkeypatch):
+    issues(ctx, ready=[issue(12, labels=["ready-for-agent", "P0"]), issue(13, labels=["ready-for-agent", "P0"])])
+    no_vendor_blocked(monkeypatch)
+    quiet_tick(monkeypatch)
+    picked, started = [], []
+    monkeypatch.setattr(tick.Tick, "pick_vendor", lambda self, *a, **k: picked.append(k.get("issue")) or "codex")
+
+    def run(t, n):
+        started.append(n)
+        set_maintenance(ctx, "reboot")
+        return 0
+
+    monkeypatch.setattr(dev, "run", run)
+    assert ctx.make().work() == 0
+    assert (started, picked) == (["12"], ["12"])
+    assert ctx.log().count("maintenance (reboot): tick stops before the next item") == 1
 
 
 def test_an_expired_maintenance_flag_does_not_stop_the_tick(ctx, monkeypatch):
