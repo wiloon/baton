@@ -357,9 +357,8 @@ class Config:
     def extra(self):
         return tuple(v.id for v in self.vendors if v.quota == "extra")
 
-    def for_role(self, role, *, pool_only=False):
-        ids = tuple(v.id for v in self.vendors if role in v.roles and (not pool_only or v.quota == "pool"))
-        return ids
+    def for_role(self, role):
+        return tuple(v.id for v in self.vendors if role in v.roles)
 
     def allows(self, vendor_id, role):
         try:
@@ -374,7 +373,7 @@ class Config:
             role = ROUTE_ROLE.get(route)
             if role is None:
                 return f"unknown agent role {route}"
-            if vendor_id not in self.for_role(role, pool_only=role == "reviser"):
+            if vendor_id not in self.for_role(role):
                 return f"vendor {vendor_id} cannot run {role}"
         return ""
 
@@ -656,8 +655,7 @@ def _validate_coverage(config):
     if not config.pool():
         raise ConfigError("vendors: at least one vendor with quota = pool is required")
     for role in COVERAGE_ROLES:
-        pool_only = role == "reviser"
-        if not config.for_role(role, pool_only=pool_only):
+        if not config.for_role(role):
             raise ConfigError(f"vendors: no eligible vendor for role {role}")
     if any(repo.screenshot_review for repo in config.repos):
         if not any(config.allows(v, "screenshot_reviewer") and agents.ADAPTERS[v].IMAGES

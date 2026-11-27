@@ -250,6 +250,9 @@ claude = { model = "claude_fast", effort = "low" }
 # [models.routes.fix_heavy]
 # claude = { model = "claude_strong", effort = "high" }
 
+# reviser is open to any declared vendor (pool or extra) whose roles include it; a grant still
+# needs a base [models.routes.spec] entry for that vendor. The baseline leaves cursor without
+# reviser; an optional extra such as agy may add it when its adapter supports the role.
 [vendors.claude]
 adapter = "claude"
 roles = ["dev", "fixer", "reviewer", "screenshot_reviewer", "spec_reviewer", "reviser", "retrospective", "scan"]

@@ -1277,7 +1277,7 @@ class Tick:
             if str(n) in waiting or any(names.issue_of(b) == str(n) for b in branches):
                 continue   # already has a PR
             # These issues can be at different steps: one whose next step no vendor can run now must
-            # not block another (revision needs a pool vendor).
+            # not block another (revision needs an eligible reviser among all vendors).
             issue = str(n)
             if ("issue", issue) in self.tried:
                 continue
@@ -1292,9 +1292,8 @@ class Tick:
             if not (spec.accept_pending(self.env, issue, listed=payload["comments"])
                     or recovery.path(self.env, issue, issue).exists()):
                 role = spec.role_from(payload["comments"], self.env)
-                vendor_candidates = list(self.env.config.pool()) if role == "reviser" else self.all_vendors()
                 try:
-                    self.pick_vendor(role, "contrib", vendor_candidates, issue=issue)
+                    self.pick_vendor(role, "contrib", self.all_vendors(), issue=issue)
                 except Deferred as deferred:
                     self.defer(deferred.vendor, deferred.reason)
                     continue

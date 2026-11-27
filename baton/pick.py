@@ -24,7 +24,7 @@ def choose(env, role, current, mode, candidates, *, pr="", exclude="", issue="",
     vendor_role = ROUTE_ROLE.get(role, role)
     kwargs["tier"] = tiers.step(env, ROLE_ROUTE.get(vendor_role, vendor_role),
                                 issue or env.runtime.issue, pr or env.runtime.pr)
-    allowed = set(env.config.for_role(vendor_role, pool_only=vendor_role == "reviser"))
+    allowed = set(env.config.for_role(vendor_role))
     if not allowed and vendor_role not in ROLES:
         allowed = set(env.config.declared())
     candidates = [vendor for vendor in candidates if vendor in allowed]

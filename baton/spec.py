@@ -475,9 +475,8 @@ class Spec:
         return result
 
     def retry_picker(self, role, other_model, spec_followup):
-        candidates = list(self.env.config.quota.vendor_pool) if role == "reviser" else pick.all_vendors(self.env)
-        return dict(mode="contrib", candidates=candidates, issue=self.issue, other_model=other_model,
-                    spec_followup=spec_followup)
+        return dict(mode="contrib", candidates=pick.all_vendors(self.env), issue=self.issue,
+                    other_model=other_model, spec_followup=spec_followup)
 
     def resume_worker(self, role, reason, round, other_model, spec_followup=False):
         return recovery.resume(
@@ -2253,7 +2252,7 @@ class Spec:
         if pending is False:
             return "stop"
         reviser = pending[1] if pending else self.pick(
-            "reviser", list(env.config.quota.vendor_pool), last_vendor, other_model, spec_followup=alt_followup)
+            "reviser", pick.all_vendors(env), last_vendor, other_model, spec_followup=alt_followup)
         self.mark_base(round)
         budget = pending[0]["remaining_budget"] if pending else {}
         saved_answer = answer_intent or {}
