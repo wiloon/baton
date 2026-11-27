@@ -231,6 +231,24 @@ def test_dev_run_reports_the_init_model_and_builds_the_command(agy_runner):
     assert out["log"].endswith("-agy.jsonl")
 
 
+@pytest.mark.parametrize("role,model,reply", [
+    ("dev", MODEL, "RESULT: ready"), ("fix", MODEL, "RESULT: fixed"),
+    ("review", REVIEW_MODEL, "ok\nREVIEW: pass"), ("spec_review", REVIEW_MODEL, "ok\nSPEC: accept")])
+def test_linked_worktree_run_gets_both_git_dirs(agy_runner, role, model, reply):
+    clone = agy_runner.worktree
+    linked = agy_runner.root / "linked"
+    subprocess.run(["git", "-C", str(clone), "worktree", "add", "-q", "-b", "agent", str(linked)], check=True)
+    agy_runner.plan(stream=stream(reply, model=model))
+    dispatch.dispatch("agy", role, "p", "t", str(linked), env=agy_runner.env, output="/tmp/baton-out.md")
+    args = agy_runner.args()
+    added = [args[i + 1] for i, a in enumerate(args) if a == "--add-dir"]
+    common, own = str(clone.resolve() / ".git"), str(clone.resolve() / ".git" / "worktrees" / "linked")
+    assert common in added and own in added, added
+    assert str(linked / ".git") not in added
+    configured = [str(agy_runner.env.dirs.ctx), "/tmp"] if role == "dev" else [str(agy_runner.env.dirs.ctx)]
+    assert added[:len(configured)] == configured and "/tmp" in added   # ctx dir and the output's dir stay
+
+
 def test_cli_log_label_is_the_model_evidence_when_init_has_none(agy_runner):
     cli_log = agy_runner.home_dir / ".gemini/antigravity-cli/cli.log"
     cli_log.write_text(
