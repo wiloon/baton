@@ -34,6 +34,10 @@ codex  = { model = "codex_strong", effort = "xhigh" }
   reply carries and the runner validates as a whole. The profile comment the runner posts is
   advisor-authored text and never counts as owner input. Linked ADR text is sent only under the
   repository's local-documents opt-in (ADR 0008).
+- Data boundary for git history (owner, #238): for each path an issue names, intake may send the
+  commit count and last-change date on the main branch. Commit subjects, bounded and redacted,
+  are sent only under a separate per-repository opt-in that defaults to off, and decision records
+  don't keep them. Commit authors and message bodies are never sent.
 - The profile maps to one tier per role, for `dev`, `fix`, `review`, `spec_review` and
   `spec`. `screenshot_review` always uses its base route (ADR 0004, ADR 0005), and `scan` is
   not a step of a task, so it has no profile. Code applies floors that judgement cannot lower: a
@@ -91,3 +95,6 @@ codex  = { model = "codex_strong", effort = "xhigh" }
   kept its comment out of owner input and linked ADRs behind the opt-in, applied the floor to
   `spec_review` too (its review is as much a gate as code review), and defined the floor's input
   and what is recorded, so implementations can't differ on authority or the data boundary.
+- Issue #238 (owner answer to spec round 1): set the data boundary for git history, which ADR
+  0008's baseline and opt-ins did not cover: counts and dates, plus commit subjects only by
+  opt-in, so intake can judge size and risk without sending free text by default.
