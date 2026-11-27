@@ -607,6 +607,8 @@ class Runner:
             prior = self.prior_author or agents.LEGACY_REPLY_VENDOR   # a saved legacy base is Cursor's
             if cursor_base and cursor_base != agent_head and prior not in self.attempt_authors:
                 self.add_author(prior)
+                if agents.ADAPTERS[prior].RECORDS_AUTHOR_MODEL:
+                    vendors.record_author_model(self.state, pr, prior, "unknown")
                 vendors.record_author(self.state, pr, prior)
                 vendors.record_contrib(self.state, pr, prior, str(wt), cursor_base, agent_head)
             if self.head(wt) != agent_head:
@@ -1465,6 +1467,7 @@ class Runner:
         baseline_file = Path(self.state, f"pr-body-base-{pr}")
         task_file = Path(self.state, f"{fixer}-fix-task-{pr}")
         design_file = Path(self.state, f"{fixer}-fix-design-{pr}")
+        model = ""   # stays empty when a resume runs no agent
         head = self.claim_fix(pr, fixer, head, agent_head)
         base_file.write_text(head + "\n")
         request = Path(self.ctx, f"pr-{pr}-body.md")
@@ -1500,6 +1503,7 @@ class Runner:
                 SHOTS_DIR=str(shots), PR_BODY_FILE=str(request)), f"pr-{pr}-{fixer}-fix", wt,
                 env=self.env.with_runtime(shots_dir=str(shots), pr_body_file=str(request)))
             outcome, reply_raw = out["outcome"], out["reply"] or ""
+            model = out["model"] or "unknown"
             self.reply = reply_raw
             want = pr_helpers.task_wanted(reply_raw)
             reply = "\n".join(line for line in strip_markers(reply_raw).split("\n") if not line.startswith("RESULT: ")).rstrip("\n")
@@ -1545,7 +1549,7 @@ class Runner:
                 temp.replace(task_file)
         has_request = request.exists() or request.is_symlink()
         resume = {"head": head, "agent_head": agent_head, "description_changed": False,
-                  "model": "", "cursor_base": ""}
+                  "model": model, "cursor_base": ""}
         body_changed, description_reason, task_changed, discarded = False, "", False, False
         if has_request:
             rc, body_changed, description_reason, task_changed, discarded = self.write_description(
@@ -1579,7 +1583,7 @@ class Runner:
                 self.clear_reply_request(pr, fixer, keep_base=True)
                 return self.dispatch_fixer(pr, wt, alt, source, correction(feedback, log), head)
         return self.finish_reply_fix(
-            pr, wt, fixer, "HEAD", url, source, feedback, head, agent_head=agent_head,
+            pr, wt, fixer, "HEAD", url, source, feedback, head, agent_head=agent_head, model=model,
             body_changed=body_changed, task_changed=task_changed, discarded=discarded,
             description_reason=description_reason)
 
@@ -1632,8 +1636,8 @@ class Runner:
             saved = {**saved, "description_changed": bool(body_changed)}
         return self.finish_reply_fix(
             pr, wt, fixer, "HEAD", url, source, feedback, saved["head"], agent_head=saved["agent_head"],
-            body_changed=saved["description_changed"], task_changed=task_changed, discarded=discarded,
-            description_reason=description_reason)
+            model=saved.get("model") or "", body_changed=saved["description_changed"], task_changed=task_changed,
+            discarded=discarded, description_reason=description_reason)
 
     def resume_task_write(self, pr, wt, url, source, feedback, pending):
         from . import handoff as owner_handoff
@@ -1662,7 +1666,7 @@ class Runner:
         return self.finish_reply_fix(
             pr, wt, fixer, "HEAD", url, source, feedback, saved["head"], agent_head=saved["agent_head"],
             body_changed=saved["description_changed"], task_changed=task_changed, discarded=binding["description_rc"] == 2,
-            description_reason=binding["description_reason"])
+            description_reason=binding["description_reason"], model=saved.get("model") or "")
 
     def finish_cursor_fix(self, pr, wt, branch, url, source, feedback, head, *, agent_head,
                           body_changed, task_changed, discarded, description_reason):
@@ -1672,7 +1676,7 @@ class Runner:
             description_reason=description_reason)
 
     def finish_reply_fix(self, pr, wt, fixer, branch, url, source, feedback, head, *, agent_head,
-                         body_changed, task_changed, discarded, description_reason):
+                         body_changed, task_changed, discarded, description_reason, model=""):
         name = agents.ADAPTERS[fixer].DISPLAY_NAME
         who = f"{name} "
         moved = self.head(wt) != head
@@ -1718,8 +1722,13 @@ class Runner:
                     and prior not in self.attempt_authors):
                 # The earlier producer's commits (original base..agent_head) are its own.
                 self.add_author(prior)
+                if agents.ADAPTERS[prior].RECORDS_AUTHOR_MODEL:
+                    vendors.record_author_model(self.state, pr, prior, "unknown")
                 vendors.record_author(self.state, pr, prior)
                 vendors.record_contrib(self.state, pr, prior, str(wt), head, agent_head)
+            if moved and not recorded_before_retry and agents.ADAPTERS[fixer].RECORDS_AUTHOR_MODEL:
+                # Verification repairs may have run on another model.
+                vendors.record_author_model(self.state, pr, fixer, model if rounds == 0 else "unknown")
             vendors.record_author(self.state, pr, fixer)
         except OSError:
             return 1

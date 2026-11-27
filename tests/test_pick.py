@@ -61,8 +61,8 @@ def test_a_contribution_pick_names_the_pr_in_its_log(env):
 
 
 def test_a_codex_pr_may_be_reviewed_by_codex_on_a_proven_model(env, monkeypatch):
-    """Every other vendor is cooling down: Codex reviews its own PR only with a proven model,
-    and the actual model is checked again after the run."""
+    """Every other vendor is cooling down: Codex reviews its own PR, and the mode is judged
+    again on the actual model after the run."""
     monkeypatch.setenv("MODEL_CODEX_REVIEW", "gpt-6.1-sol")
     vendors.record_author(env["STATE"], 15, "codex")
     vendors.record_author_model(env["STATE"], 15, "codex", "gpt-6.1-terra")
@@ -70,7 +70,18 @@ def test_a_codex_pr_may_be_reviewed_by_codex_on_a_proven_model(env, monkeypatch)
         Path(env["STATE"], f"{vendor}-cooldown-until").write_text("1999999999\n")
     assert pick.choose(env, "reviewer", "agent", "review", ["claude", "codex", "cursor"], pr="15") == "codex"
     assert vendors.review_allowed(env["STATE"], 15, "codex", "gpt-6.1-sol")
-    assert not vendors.review_allowed(env["STATE"], 15, "codex", "unknown")
+    assert vendors.same_vendor_review_mode(env["STATE"], 15, "codex", "unknown") == "same-model-fresh-context"
+
+def test_a_same_vendor_pick_names_the_mode_and_model_on_its_selection_line(env):
+    """#221: Claude wrote on Opus, its review route; the line shows what the review will run on."""
+    vendors.record_author(env["STATE"], 17, "claude")
+    vendors.record_author_model(env["STATE"], 17, "claude", "claude-opus-5-5")
+    for vendor in ("codex", "cursor"):
+        Path(env["STATE"], f"{vendor}-cooldown-until").write_text("1999999999\n")
+    assert pick.choose(env, "reviewer", "agent", "review", ["claude", "codex", "cursor"], pr="17") == "claude"
+    line = next(line for line in log(env) if line.startswith("selection:"))
+    assert line.endswith(" review_mode=same-vendor-different-model model=sonnet")
+
 
 def test_same_vendor_review_follows_the_adapter_capability(env, monkeypatch):
     """Writer-model evidence and same-vendor eligibility come from SAME_VENDOR_REVIEW, not the vendor name."""
@@ -80,13 +91,13 @@ def test_same_vendor_review_follows_the_adapter_capability(env, monkeypatch):
     Path(state, "pr-16-author-models").write_text("stub model-a\n")
     assert not vendors.review_allowed(state, 16, "stub", "model-b")
     monkeypatch.setattr(agents.ADAPTERS["stub"], "SAME_VENDOR_REVIEW", True, raising=False)
-    monkeypatch.setattr(agents.ADAPTERS["stub"], "SAME_VENDOR_SAME_MODEL", True, raising=False)
     assert vendors.review_allowed(state, 16, "stub", "model-b")
     assert vendors.review_allowed(state, 16, "stub", "model-a")
     assert vendors.screenshot_allowed(state, 16, "stub", "model-b")
     assert not vendors.screenshot_allowed(state, 16, "stub", "model-a")
-    assert not vendors.review_allowed(state, 16, "stub", "unknown")
+    assert vendors.same_vendor_review_mode(state, 16, "stub", "model-b") == "same-vendor-different-model"
     assert vendors.same_vendor_review_mode(state, 16, "stub", "model-a") == "same-model-fresh-context"
+    assert vendors.same_vendor_review_mode(state, 16, "stub", "unknown") == "same-model-fresh-context"
 
 
 @pytest.mark.parametrize("enabled", [True, False])

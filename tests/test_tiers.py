@@ -86,16 +86,15 @@ def pick_review(env):
     return pick.choose(env, "reviewer", "agent", "review", ["claude"], pr="7", issue="142")
 
 
-def test_a_review_tier_on_the_writers_model_is_not_eligible_for_pick(env, tmp_path, monkeypatch):
+def test_a_review_tier_on_the_writers_model_is_still_eligible_for_pick(env, tmp_path, monkeypatch):
     env = with_routes(env, tmp_path, monkeypatch, LIGHT_REVIEW)
     claude_wrote_on_sonnet(env)
     assert pick_review(env) == "claude"
     tiers.write(env, "142", {"review": "light"})
-    with pytest.raises(Deferred):
-        pick_review(env)
+    assert pick_review(env) == "claude"   # on another configured model (#221)
 
 
-def test_a_saved_retry_judges_the_tier_model(env, tmp_path, monkeypatch):
+def test_a_saved_retry_keeps_a_same_vendor_reviewer_on_any_tier(env, tmp_path, monkeypatch):
     env = with_routes(env, tmp_path, monkeypatch, LIGHT_REVIEW)
     claude_wrote_on_sonnet(env)
     record = {"action": "retry_step", "role": "reviewer", "failed_vendor": "claude", "exclusions": [],
@@ -107,9 +106,8 @@ def test_a_saved_retry_judges_the_tier_model(env, tmp_path, monkeypatch):
     assert recovery.retry_candidates(env, "reviewer", ["claude"], mode="review", pr="7", issue="142") == ["claude"]
     assert select() == "claude"
     tiers.write(env, "142", {"review": "light"})
-    assert recovery.retry_candidates(env, "reviewer", ["claude"], mode="review", pr="7", issue="142") == []
-    with pytest.raises(Exhausted):
-        select()
+    assert recovery.retry_candidates(env, "reviewer", ["claude"], mode="review", pr="7", issue="142") == ["claude"]
+    assert select() == "claude"
 
 
 def test_the_known_distinct_spec_policy_keeps_the_tier_route(env, tmp_path, monkeypatch):

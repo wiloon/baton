@@ -87,7 +87,9 @@ the closed work back in, is not pushed and the issue is handed to you.
 
 **Picking a vendor.** For each run, baton drops the vendors that are resting after a limit or an
 auth failure, that are over their quota caps, or, for a review, that wrote any of the PR (when
-every vendor did, the same vendor reviews on a different model). That same-vendor fallback waits
+no other vendor can review, a vendor reviews its own code: on a different model when one is
+configured, otherwise on the same model in a fresh session; the screenshot review still needs a
+different model). That same-vendor fallback waits
 while another vendor is only briefly blocked, such as a full 5-hour window, and runs only when
 the others are out for the week, logged out, or resting past `same_vendor_wait_max_minutes`
 ([ADR 0002](docs/adr/0002-same-vendor-review-waits-for-short-blocks.md)). From the rest it takes the one
