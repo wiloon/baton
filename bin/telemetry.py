@@ -59,8 +59,9 @@ def identity(pid, proc=Path('/proc')):
             'boot': (proc / 'sys/kernel/random/boot_id').read_text().strip()}
 
 
-def health(record, now=None, identify=identity):
+def health(record, now=None, identify=None):
     now = time.time() if now is None else now
+    identify = identify or identity
     try:
         if identify(record['owner']['pid']) != record['owner']:
             return 'interrupted'
