@@ -138,6 +138,12 @@ screenshot_review = false
 # false: every PR of this repository waits for the owner (ready-for-human), even when
 # [scheduling].auto_merge is true. Use it for a repository whose changes you merge yourself.
 auto_merge = true
+# Integer ≥ 1 (default 1). Under baton serve, when free slots are contended, equal-priority
+# candidates across repositories: higher weight starts first, then rotation. Priority always
+# beats it. It does not expire; set it back to 1 to stop favouring a project. It does not change
+# quota or vendor choice, and has no effect without contention, on the legacy timer path, or
+# inside a child's own next_issue().
+weight = 1
 # Globs relative to the repository root (* also matches /). A PR that touches one, under its old
 # or new name, waits for the owner after review and CI pass, even with auto_merge on; no advisor
 # may release it. List the files that decide what agents may do (guard, quota, merge rules).
