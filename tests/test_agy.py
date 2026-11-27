@@ -413,7 +413,8 @@ def test_a_denied_run_retries_once_and_the_second_prompt_quotes_the_denial(agy_r
 
 
 def test_a_denied_action_is_sanitized_and_capped_in_the_retry_prompt(agy_runner):
-    nasty = ("line1\nline2 `code` <!-- baton-marker --> " + ("x" * 400))
+    # U+2028 and a nested `<!-- baton` (revealed only after backtick removal) must not survive.
+    nasty = ("line1\u2028line2 `code` nested-`<!-- baton` <!-- baton-marker --> " + ("x" * 400))
     step = {"event": "step_update", "step": {"message":
             'jetski: no output produced — a tool required the "read_file" permission that '
             "headless mode cannot prompt for, so it was auto-denied"}}
@@ -429,11 +430,36 @@ def test_a_denied_action_is_sanitized_and_capped_in_the_retry_prompt(agy_runner)
     out = agy_runner.run("review")
     assert out["status"] == "success"
     note = agy_runner.prompts()[1]
-    assert "\nline2" not in note and "`code`" not in note and "<!-- baton" not in note
+    assert "\nline2" not in note and "\u2028" not in note
+    assert "`code`" not in note and "<!-- baton" not in note
     assert "auto-denied" in note
-    quoted = [line[2:] for line in note.splitlines() if line.startswith("- ")]
+    quoted = [line[2:] for line in note.splitlines() if line.startswith("- ") and line[2:].startswith("line1")]
     assert quoted and all(len(line) <= 300 for line in quoted)
     assert "xxx" in quoted[0] and len(quoted[0]) == 300
+    assert "line1 line2" in quoted[0]  # U+2028 collapsed into one bullet line
+
+
+def test_no_retry_when_a_read_only_denied_run_dirtied_the_tree(agy_runner):
+    agy_runner.plans(
+        dict(stream=stream("", model=REVIEW_MODEL, denied=[{"tool": "x"}]), dirty=True),
+        dict(stream=stream("ok\nREVIEW: pass", model=REVIEW_MODEL)))
+    out = agy_runner.run("review")
+    assert out["status"] == "failure" and out["rc"] == 1
+    assert "read-only" in out["outcome"]
+    assert agy_runner.calls() == ["agy"]
+
+
+def test_no_retry_when_a_denied_run_changed_git_control_files(agy_runner):
+    agy_runner.plans(
+        dict(stream=stream("", model=REVIEW_MODEL, denied=[{"tool": "x"}]),
+             write_files=[".git/hooks/pre-push"]),
+        dict(stream=stream("ok\nREVIEW: pass", model=REVIEW_MODEL)))
+    out = agy_runner.run("review")
+    # First failure returned (denial); tamper blocks the retry even when status was already failure.
+    assert out["status"] == "failure" and out["rc"] == 1
+    assert "denied" in out["outcome"].lower()
+    assert agy_runner.calls() == ["agy"]
+    assert not (agy_runner.worktree / ".git" / "hooks" / "pre-push").exists()
 
 
 def test_two_denied_runs_return_todays_outcome_with_no_third_run(agy_runner):

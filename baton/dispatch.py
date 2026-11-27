@@ -70,7 +70,12 @@ def sanitize_denial_quote(item, limit=DENIAL_QUOTE_LIMIT):
     """One line for the retry note / runner.log: compact JSON when needed; strip newlines,
     backticks and `<!-- baton`; cap length. Untrusted data, not instructions (#315)."""
     text = item if isinstance(item, str) else json.dumps(item, separators=(",", ":"), ensure_ascii=False)
-    text = text.replace("\n", " ").replace("\r", " ").replace("`", "").replace("<!-- baton", "")
+    text = " ".join(text.splitlines())
+    while True:
+        cleaned = text.replace("`", "").replace("<!-- baton", "")
+        if cleaned == text:
+            break
+        text = cleaned
     return text[:limit]
 
 
@@ -164,6 +169,7 @@ def _dispatch(vendor, role, prompt, tag, cwd, settings, output, env, hooks):
 
     if why := vendors.vendor_blocked(state, vendor):
         return result(75, "deferred", "", defer=why)
+    settle.count_run(state, vendor)
     adapter = agents.ADAPTERS[vendor]
     # Read once, from the caller's hooks too when only they name the PR; configure sees the same tier.
     pr = env.runtime.pr or str(getattr(hooks, "pr", "") or "")
@@ -185,7 +191,6 @@ def _dispatch(vendor, role, prompt, tag, cwd, settings, output, env, hooks):
     budget_started = time.time()
 
     def one(prompt_text, run_minutes, retry=""):
-        settle.count_run(state, vendor)
         run_log = _run_log_path(logs, tag, suffix, retry=retry)
         mark = f" retry={retry}" if retry else ""
         notify.log(f"start {tag} ({vendor} {role}, {model or 'default'}) in {cwd} (log {run_log}){mark}")
@@ -248,6 +253,7 @@ def _dispatch(vendor, role, prompt, tag, cwd, settings, output, env, hooks):
     _remove_new_paths(output, before_output)
     _remove_new_paths(shots_dir, before_shots)
     _remove_new_paths(pr_body, before_body)
+    settle.count_run(state, vendor)
     second, _, _ = one(denial_retry_note(quotes) + prompt, remaining, retry="denied")
     return second
 
