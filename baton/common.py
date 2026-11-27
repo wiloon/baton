@@ -53,6 +53,7 @@ class Request:
     add_dirs: list[str] = field(default_factory=list)   # Codex dev/fix: shared caches
     shots_dir: str = ""     # Codex dev: screenshots outside the worktree
     context_dir: str = ""   # Claude: the runner's ctx directory, where prompts point at context files (#53)
+    scratch: str = ""       # Claude: the repository's scratch directory, for guard.sh
     skills_dir: str = ""    # Codex: the Matt skills as plain files
     otel: bool = False      # a telemetry run is open: Codex exports to the loopback collector
     env: dict = field(default_factory=dict)   # extra environment for this CLI child only

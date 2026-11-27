@@ -424,7 +424,8 @@ def typed_legacy_test_inputs(request, monkeypatch):
         # Legacy vectors name one directory per kind: the repository's and the runner's coincide.
         paths = config.paths
         dirs = RepoDirs(clone=Path(env['REPO_DIR']) if 'REPO_DIR' in env else repo_dirs(paths, repo).clone,
-                        worktrees=paths.wt_root, state=paths.state, logs=paths.logs, ctx=paths.ctx)
+                        worktrees=paths.wt_root, state=paths.state, logs=paths.logs, ctx=paths.ctx,
+                        scratch=paths.state / 'scratch')
         rt = Runtime(issue=env.get('ISSUE',''), pr=env.get('PR',''), round=env.get('ROUND',''),
                      fixed_by=env.get('FIXED_BY',''), shots_dir=env.get('CODEX_SHOTS_DIR',''),
                      telemetry_item=env.get('BATON_TELEMETRY_ITEM',''), chain=int(env.get('BATON_CHAIN') or 0))

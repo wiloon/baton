@@ -190,7 +190,7 @@ def main(argv=None):
     r.add_argument("--network", choices=("on", "off"), default="")
     r.add_argument("--add-dir", dest="add_dirs", action="append", default=[])
     r.add_argument("--otel", action="store_true")
-    for name in ("model", "effort", "fallback-models", "output", "settings", "budget", "subagent-model", "repo", "shots-dir", "skills-dir"):
+    for name in ("model", "effort", "fallback-models", "output", "settings", "budget", "subagent-model", "repo", "scratch", "shots-dir", "skills-dir"):
         r.add_argument(f"--{name}", default="")
     r.add_argument("--cooldown-hours", type=int, default=COOLDOWN_HOURS)
     f = sub.add_parser("preflight")

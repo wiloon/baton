@@ -19,6 +19,10 @@ BODY = ("<!-- baton-task issue=419 completion=partial -->\n\nRefs #419\n\n## Wha
         "## Checks to verify\nnone\n\n## Before release\nnone\n\n## Follow-ups\n- [nit] tidy copy\n")
 
 
+def scratch_file(name):
+    return Path(os.environ["STATE"], "scratch", name)
+
+
 def env_ctx():
     return os.environ["CTX"]
 
@@ -163,8 +167,6 @@ def fix_worktree(gh, tmp_path, monkeypatch):
     state.dispatch_agent = stub
     state.verify_script("pass")
     yield state
-    Path(f"/tmp/baton-fix-{PR}.md").unlink(missing_ok=True)
-    Path(f"/tmp/baton-fix-{PR}.md.body").unlink(missing_ok=True)
 
 
 @pytest.fixture
@@ -1291,7 +1293,9 @@ def test_a_transient_description_edit_defers_then_recovers_without_a_second_work
 
 
 def test_a_description_request_from_an_earlier_run_is_not_applied(run):
-    Path(f"/tmp/baton-fix-{PR}.md.body").write_text(NEW_DESCRIPTION)
+    stale = scratch_file(f"fix-{PR}.md.body")
+    stale.parent.mkdir(exist_ok=True)
+    stale.write_text(NEW_DESCRIPTION)
     run.agent(dict(CHECKED))
     assert run.fix("codex")["rc"] == 0
     assert "Disabled buttons." in run.body()
@@ -1323,14 +1327,14 @@ def test_a_failing_check_gets_a_repair_run_by_the_same_vendor(run):
     assert run.agent_calls[-1][:3] == ("claude", "fix", f"pr-{PR}-verify-fix-1")
 
 
-def test_a_repair_run_gets_the_failure_in_its_prompt_and_writes_its_reply_under_tmp(run):
+def test_a_repair_run_gets_the_failure_in_its_prompt_and_writes_its_reply_in_scratch(run):
     # #38: Claude's shell could not read the ctx dir, and guard.sh denies writes there.
     run.verify_script("e2e timeout in {{REPLY_FILE}} spec", "pass")
     run.agent({"commit": True})
     assert run.verify()["rc"] == 0
     prompt, output = run.prompts[-1], run.agent_calls[-1][3]
     assert "<failure>\ne2e timeout in {{REPLY_FILE}} spec\n</failure>" in prompt   # data stays data
-    assert output.startswith("/tmp/baton-") and output.endswith(f"-pr-{PR}-verify-fix.md")
+    assert output == str(scratch_file(f"verify-fix-pr-{PR}.md"))
     assert f"to {output} with the Write tool" in prompt
 
 
@@ -2426,7 +2430,7 @@ def _admit_stub_fixer(run, monkeypatch):
     sess = session.create(cfg, repo=cfg.repos[0])
     sess = replace(sess, dirs=replace(
         sess.dirs, state=Path(os.environ["STATE"]), logs=Path(os.environ["LOGS"]),
-        ctx=Path(os.environ["CTX"])))
+        ctx=Path(os.environ["CTX"]), scratch=scratch_file("")))
 
     def resolve(value=None):
         if isinstance(value, session.Session):
@@ -2438,9 +2442,9 @@ def _admit_stub_fixer(run, monkeypatch):
 
 
 @pytest.mark.parametrize("fixer,template_line", [
-    ("claude", f"4. Write one reply to `/tmp/baton-fix-{PR}.md` with the Write tool; do not post it."
+    ("claude", "4. Write one reply to `REPLY` with the Write tool; do not post it."
                " The runner posts it. Include no `<!-- baton-` markers."),
-    ("codex", f"4. Write one reply to `/tmp/baton-fix-{PR}.md`; do not post it."
+    ("codex", "4. Write one reply to `REPLY`; do not post it."
               " The runner posts it. Include no `<!-- baton-` markers."),
     ("cursor", "5. The runner posts your final message on the PR."
                " Put the checks section above the `TASK:`/`RESULT:` lines."),
@@ -2453,14 +2457,15 @@ def test_fix_templates_come_from_the_adapter(run, monkeypatch, fixer, template_l
     run.agent(cursor_plan(reply) if fixer in ("cursor", "stub") else {"file": reply})
     assert run.fix(fixer)["rc"] == 0
     prompt = run.prompts[0]
-    assert template_line in prompt.splitlines()
+    output = str(scratch_file(f"fix-{PR}.md"))
+    assert template_line.replace("REPLY", output) in prompt.splitlines()
     if fixer in ("cursor", "stub"):
         assert f"pr-{PR}-body.md" in prompt
         assert not run.agent_calls[0][3]
     else:
-        assert run.agent_calls[0][3] == f"/tmp/baton-fix-{PR}.md"
+        assert run.agent_calls[0][3] == output
         assert f"pr-{PR}-description.md" in prompt
-        assert f"/tmp/baton-fix-{PR}.md.body" in prompt
+        assert f"{output}.body" in prompt
     assert run.comments()[0].startswith(f"<!-- baton-fix by={fixer} -->")
 
 

@@ -41,10 +41,19 @@ case "$tool" in
     fi
     # The owner's principles change only when the owner asks for it, in an interactive session.
     [[ "$p" == */docs/agents/principles.md ]] && deny "docs/agents/principles.md changes only when the owner asks for it; don't draft entries"
+    # Besides the worktree, a run writes only its repository's scratch directory. /tmp is not
+    # allowed to any role: every repository's runs share it, so one could overwrite another's
+    # reply. This checks only the Edit/Write tools; builds and tests that use /tmp through
+    # Bash are unaffected.
+    in_scratch() {
+      [[ -n "${BATON_AGENT_SCRATCH:-}" ]] || return 1   # unset must not become /*
+      local dir; dir=$(realpath -m -- "$BATON_AGENT_SCRATCH")   # resolved like $p
+      [[ "$p" == "$dir"/* ]]
+    }
     if [[ "$ROLE" == review || "$ROLE" == screenshot_review || "$ROLE" == spec_review || "$ROLE" == scan ]]; then
-      [[ "$p" == /tmp/* ]] || deny "the $ROLE role is read-only; write only under /tmp (got $p)"
+      in_scratch || deny "the $ROLE role is read-only; write only in the scratch directory (got $p)"
     else
-      [[ "$p" == "$WT"/* || "$p" == /tmp/* ]] || deny "writes are limited to the worktree $WT (got $p)"
+      [[ "$p" == "$WT"/* ]] || in_scratch || deny "writes are limited to the worktree $WT and the scratch directory (got $p)"
     fi
     ;;
   Read)
@@ -86,7 +95,7 @@ case "$tool" in
     fi
     if [[ "$ROLE" == fix ]]; then
       has "${S}gh[[:space:]]+pr[[:space:]]+(create|edit)\b" \
-        && deny "the fixer edits the PR description under /tmp; the runner applies it"
+        && deny "the fixer edits the PR description in the scratch directory; the runner applies it"
     fi
     if [[ "$ROLE" == dev ]]; then
       has "${S}gh[[:space:]]+(pr|issue)[[:space:]]+(create|edit|comment|close|reopen|ready|review|merge)\b" \
@@ -98,13 +107,13 @@ case "$tool" in
     fi
     if [[ "$ROLE" == spec ]]; then
       has "${S}gh[[:space:]]+(pr|issue)[[:space:]]+(create|edit|comment|close|reopen|ready|review|merge|lock|unlock|pin|unpin|develop)\b" \
-        && deny "the spec author has no GitHub write access; write the body and reply under /tmp"
+        && deny "the spec author has no GitHub write access; write the body and reply in the scratch directory"
       has "${S}git([[:space:]]+-C[[:space:]]+[^[:space:]]+)?[[:space:]]+(push|rebase|reset|cherry-pick|merge)\b" && deny "the spec author only commits; the runner pushes"
       has 'principles\.md' && has '(>|sed[[:space:]]+-i|tee|mv|cp|rm)' && deny "docs/agents/principles.md changes need the owner's approval"
     fi
     if [[ "$ROLE" == scan ]]; then
       has "${S}gh[[:space:]]+(pr|issue)[[:space:]]+(create|edit|comment|close|reopen|ready|review|merge|lock|unlock|pin|unpin|develop)\b" \
-        && deny "the scanner has no GitHub write access; write the issue under /tmp"
+        && deny "the scanner has no GitHub write access; write the issue in the scratch directory"
     fi
 
     has "${S}(kubectl|helm|argocd|ssh|scp|rsync|nerdctl|docker|podman|tofu|terraform|aws|stripe|systemctl|crontab|wg|wg-quick|ip)([[:space:]]|$)" && deny "infrastructure / host tool not allowed"

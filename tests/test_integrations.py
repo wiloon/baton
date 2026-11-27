@@ -291,7 +291,6 @@ def test_a_minimal_config_runs_a_tick_end_to_end(bound, monkeypatch, tmp_path):
         Path(output).write_text("Add the thing\n\nRefs #12\n")
         return {"rc": 0, "status": "success", "outcome": "RESULT: ready", "reply": "RESULT: ready", "model": "m", "defer": ""}
     monkeypatch.setattr(dev.dispatch, "dispatch", agent)
-    Path("/tmp/baton-dev-12.pr.md").unlink(missing_ok=True)
 
     t = tick.Tick(session.resolve(), ())
     t.exec = lambda path, args: None
