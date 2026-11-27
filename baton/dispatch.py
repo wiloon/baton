@@ -21,7 +21,7 @@ from pathlib import Path
 import sys
 import time
 
-from . import agents, capacity, gitcontrol, hooks as telemetry, notify, settle, tiers, vendors
+from . import agents, capacity, claude_cli, gitcontrol, hooks as telemetry, notify, settle, tiers, vendors
 from .common import LEASE_REASON, Request
 
 
@@ -99,7 +99,8 @@ def _dispatch(vendor, role, prompt, tag, cwd, settings, output, env, hooks):
     tier = tiers.step(env, role, env.runtime.issue, pr)
     model, minutes, suffix, options = configure(vendor, role, env)
     options = adapter.attach_dispatch_inputs(options, settings=settings, output=output)
-    if outcome := agents.preflight(vendor):
+    vendor_settings = env.config.vendor(vendor)
+    if outcome := agents.preflight(vendor, vendor_settings):
         deadline = str(int(time.time()) + cooldown_hours * 3600)
         rc, outcome, defer = settle.settle(state, vendor, "auth", 1, "", tag, deadline, outcome, credential=True)
         return result(rc, "auth", outcome, defer=defer)
@@ -110,6 +111,8 @@ def _dispatch(vendor, role, prompt, tag, cwd, settings, output, env, hooks):
     child_overrides = hooks.child_env(vendor, role, run)
     child_overrides.update(adapter.run_env(role, run))
     child_overrides.update(secret_overrides(env, role))
+    # Claude's setup-token, for this child only (#255); {} for any other adapter.
+    child_overrides.update(claude_cli.oauth_env(vendor_settings))
     request = Request(vendor=vendor, role=role, prompt=prompt, cwd=Path(cwd), log=run_log, minutes=minutes,
                       model=model, otel=adapter.request_otel(run), env=child_overrides, **options)
     # No run may change what git executes for the runner afterwards (config, hooks).

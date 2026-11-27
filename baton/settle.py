@@ -17,8 +17,10 @@ import sys
 import tempfile
 import time
 
-from . import agents, capacity, hooks as telemetry, notify, quota, statefile, vendor_policy
+from . import agents, capacity, claude_cli, hooks as telemetry, notify, quota, statefile, vendor_policy
 from .common import child_env, read
+from .config import ConfigError
+from .credentials import CredentialError
 
 # What an expired or missing login looks like in a probe's output (grep -Ei before).
 PROBE_AUTH = (r'"error"\s*:\s*"authentication_failed"|Failed to authenticate|OAuth session expired|authentication_error'
@@ -106,17 +108,24 @@ def probe_command(vendor, model, directory):
     return agents.ADAPTERS[vendor].probe_command(model, directory)
 
 
-def probe(state, logs, vendor, model, *, needed=None):
+def probe(state, logs, vendor, model, *, needed=None, settings=None):
+    """SETTINGS: the vendor's config entry (Claude's env_file); default: the bound session's
+    (pick.choose and quota_worker.run bind one)."""
     if vendor not in agents.ADAPTERS:
         return
+    if settings is None:
+        try:
+            settings = session.resolve().config.vendor(vendor)
+        except ConfigError:
+            settings = None   # undeclared: no env_file to use
     with capacity.lease(state, vendor) as available:
         if available and (needed is None or needed()):
-            _probe(state, logs, vendor, model)
+            _probe(state, logs, vendor, model, settings)
             return True
     return False
 
 
-def _probe(state, logs, vendor, model):
+def _probe(state, logs, vendor, model, settings=None):
     """One tiny request whose only use is the quota its output reports; the snapshot is
     stale, and the owner's own sessions share the quota. Not counted against the daily
     caps. No repo context or usable credentials; probe-run adapters disable tools or run
@@ -133,7 +142,14 @@ def _probe(state, logs, vendor, model):
         return
     if adapter.QUOTA_SOURCE == "none":
         # No quota data to read and no agent to run: the probe only checks the login is there.
-        record_credential(state, vendor, "auth_expired" if agents.preflight(vendor) else "authenticated")
+        record_credential(state, vendor, "auth_expired" if agents.preflight(vendor, settings) else "authenticated")
+        return
+    try:
+        token = claude_cli.oauth_env(settings)
+    except CredentialError as error:
+        # Like a failed login: no claude starts and no telemetry run is opened.
+        notify.log(f"quota probe {vendor}: {error}")
+        record_credential(state, vendor, "auth_expired")
         return
     log = Path(logs, f"{time.strftime('%F-%H%M%S')}-quota-probe-{vendor}.jsonl")
     hooks = telemetry.from_env()  # Global overhead, never charged to an issue's task totals.
@@ -142,7 +158,7 @@ def _probe(state, logs, vendor, model):
         cmd, env = probe_command(vendor, model, directory)
         with open(log, "w") as out:
             try:
-                rc = session.run_process(["timeout", "--kill-after=10", "2m", *cmd], cwd=directory, env=child_env(**env),
+                rc = session.run_process(["timeout", "--kill-after=10", "2m", *cmd], cwd=directory, env=child_env(**{**env, **token}),
                                     stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT).returncode
             except OSError as e:
                 out.write(f"baton: cannot start {cmd[0]}: {e}\n")
@@ -178,7 +194,7 @@ def main(argv=None):
         count_run(str(env.config.paths.state), args.vendor)
     elif args.command == "probe":
         probe(str(env.config.paths.state), str(env.config.paths.logs), args.vendor,
-              env.config.probe_model(args.vendor))
+              env.config.probe_model(args.vendor), settings=env.config.vendor(args.vendor))
     else:
         rc, outcome, defer = settle(str(env.config.paths.state), args.vendor, args.status, args.rc, args.log, args.tag,
                                     args.cooldown_until, args.outcome, args.credential)

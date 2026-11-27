@@ -201,7 +201,7 @@ UNUSED = ("skills.include_instructions=false", "features.plugins=false", "featur
 AGENTS_NOTE = "\nAGENTS.md is already in your instructions above; don't read it again."
 
 
-def preflight():
+def preflight(vendor=None):
     """None when Codex can run, else the failed outcome (status auth)."""
     try:
         ok = subprocess.run(["codex", "login", "status"], capture_output=True).returncode == 0
