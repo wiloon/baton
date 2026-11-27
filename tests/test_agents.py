@@ -278,6 +278,13 @@ def test_cursor_reply_is_the_last_assistant_message(env):
     assert (child["GH_TOKEN"], child["GITHUB_TOKEN"], child["GIT_SSH_COMMAND"]) == ("no-github-for-cursor", "", "/bin/false")
 
 
+@pytest.mark.parametrize("requested, recorded", [("grok-4.7-high", "grok-4.7-high"), ("auto", "unknown")])
+def test_cursor_run_model_is_the_requested_one(env, requested, recorded):
+    """#221, ADR 0004: cursor-agent names no model, so the request does; `auto` is unknown."""
+    env.plan(stream=cursor_stream("REVIEW: pass"))
+    assert env.run("cursor", "review", model=requested).model == recorded
+
+
 def test_cursor_weekly_limit(env):
     env.plan(stream=lines({"type": "system", "subtype": "init", "apiKeySource": "login", "model": "Auto"},
                           "ActionRequiredError: Weekly usage limit reached. It resets in 4 days. Buy credits to "

@@ -10,6 +10,7 @@ import pytest
 
 from baton import agents, analyst_pool, config, cursor_cli, dispatch, pick, quota, review, scan, session, tick, vendors
 from conftest import full_text, sh
+from test_adapter_capabilities import with_stub
 
 
 def write_config(tmp_path, text):
@@ -111,12 +112,14 @@ def test_pick_clears_current_when_not_role_allowed(pool_env):
     assert chosen != "cursor"
 
 
-def test_review_pick_returns_exhausted_when_all_eligible_are_authors(pool_env):
+def test_review_pick_returns_exhausted_when_all_eligible_are_authors(pool_env, tmp_path):
+    """Only the stub has no same-vendor review (#221)."""
     state = pool_env["state"]
-    pool = ["claude", "codex"]
-    for vendor in ("claude", "codex", "cursor"):
+    cfg = config.load(write_config(tmp_path / "stub", with_stub(full_text())), home=tmp_path / "home")
+    session.bind(session.create(cfg, repo=cfg.repos[0]))
+    for vendor in ("cursor", "stub"):   # cursor: the extra vendor outside the candidates
         vendors.record_author(state, "42", vendor)
-    result, rc = vendors.pick(state, pool, "reviewer", [*pool, "cursor"], pr="42",
+    result, rc = vendors.pick(state, ["stub"], "reviewer", ["stub"], pr="42",
                                by="contrib", now=time.time(), review=True)
     assert rc == 0 and result.get("exhausted") and result["vendor"] == ""
 
