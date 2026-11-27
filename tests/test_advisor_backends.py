@@ -313,6 +313,16 @@ def test_both_backends_get_the_same_instructions(dual):
     assert command[command.index("--system-prompt") + 1] == advisor.SYSTEM + "\n" + advisor.QUESTIONS_SYSTEM
 
 
+def test_a_reply_task_gives_claude_its_own_system_text(dual):
+    dual.claude = [ran(claude_rows({"action": "record_profile", "reason": "r", "evidence": [], "profile": {}}))]
+    task = advisor.ReplyTask("record_profile", "PROFILE THIS", "intake-1", lambda raw, values: {"seen": raw})
+    d = advisor.advise(dual.env, "intake", 12, "a snapshot", ("record_profile",), task_kind="issue",
+                       rule="standard_tier", mode="observe", task=task)
+    command = dual.processes[0]["command"]
+    assert command[command.index("--system-prompt") + 1] == "PROFILE THIS"
+    assert d.backend == "claude" and d.profile == {"seen": {}} and d.action == "standard_tier"
+
+
 def test_the_notes_name_the_backend_that_answered(dual):
     dual.claude = [ran(claude_rows({"action": "handoff", "reason": "needs the owner", "evidence": []}))]
     d = decide(dual)

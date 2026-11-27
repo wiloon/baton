@@ -25,7 +25,7 @@ import time
 from typing import NamedTuple
 
 from . import advisor, agents, check_verdicts, checkpoint, checks as check_section, design_findings, dispatch, fix, handoff as owner_handoff, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, scratch, tiers, vendors
-from .common import Deferred, Exhausted, changed, git, restore, strip_markers
+from .common import Deferred, Exhausted, PROFILE_MARKER, changed, git, restore, strip_markers
 from . import recovery as task_recovery
 
 REPLY_CAP = 60000
@@ -84,6 +84,8 @@ def issue_context_from(issue, data, owner, login_re, limit):
     for comment in data.get("comments") or ():
         login = (comment.get("author") or {}).get("login") or ""
         body = comment.get("body") or ""
+        if body.startswith(PROFILE_MARKER):
+            continue
         # Advisor answers are runner-wrapped owner posts: keep them out of owner context (#125).
         answer = re.match(r"<!-- baton-advisor-answer round=\d+ questions=[0-9a-f]+ by=(claude|deepseek) -->", body)
         if login == owner and answer:

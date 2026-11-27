@@ -22,6 +22,7 @@ import sys
 import time
 
 from . import agents, pr as pr_helpers, quota, vendor_policy
+from .common import PROFILE_MARKER
 from .config import ROLES, ROUTE_ROLE
 
 
@@ -269,7 +270,8 @@ def task_area(repo, pr="", issue=""):
         name = label.get("name", "")
         if name.startswith("area:") and name[5:] in area_names():
             return name[5:]
-    text = "\n".join([data.get("body") or "", *((c.get("body") or "") for c in data.get("comments") or ())])
+    comments = (c.get("body") or "" for c in data.get("comments") or ())
+    text = "\n".join([data.get("body") or "", *(c for c in comments if not c.startswith(PROFILE_MARKER))])
     return mentioned_area(text)
 
 
