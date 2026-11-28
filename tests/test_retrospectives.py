@@ -518,7 +518,11 @@ def test_a_dispatch_blocks_the_analyst_but_an_analysis_does_not_block_a_dispatch
 
     monkeypatch.setattr(dispatch.agents, 'run', mid_run)
     monkeypatch.setattr(dispatch.agents, 'preflight', lambda *_: '')
-    c = replace(host.config, paths=replace(host.config.paths, logs=tmp_path/'logs'))
+    # notify.log calls naked session.resolve(); the autouse fixture builds that from LOGS.
+    logs = tmp_path / 'logs'
+    logs.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv('LOGS', str(logs))
+    c = replace(host.config, paths=replace(host.config.paths, logs=logs))
     env = session.create(c, repo=c.repos[0])
     env.dirs.logs.mkdir(parents=True, exist_ok=True)
 
