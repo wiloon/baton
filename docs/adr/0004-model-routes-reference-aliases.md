@@ -130,8 +130,15 @@ The config remains valid and normal cross-vendor selection applies.
 - Cursor is the exception to the last sentence, for writers and reviewers: `cursor-agent`
   reports only `Auto`, so a run that requested a pinned model records that requested model, and
   a run that requested `auto` records `unknown`. A pinned request served by another model is
-  therefore labelled `same-vendor-different-model` without proof. Cursor takes no images, so
-  the screenshot review never relies on this.
+  therefore labelled `same-vendor-different-model` without proof. The screenshot review is no
+  exception (#383). Its Cursor route is pinned (`grok-4.7-high` as shipped; `auto` is rejected),
+  and the same-vendor screenshot fallback still needs a known model distinct from every recorded
+  writer model. A Cursor writer on `auto` records `unknown`, so while every Cursor `dev` and
+  `fix` route, tier entries included, is `auto`, Cursor does not screenshot-review a PR it wrote.
+  A host that pins a Cursor writer route to a model other than the screenshot route's makes Cursor
+  a last-resort `same-vendor-different-model` screenshot reviewer without proof. Model IDs are
+  compared as written, so a writer on `grok-4.7-xhigh` counts as distinct from `grok-4.7-high`
+  although only the effort differs. There is no Cursor-specific exception.
 - For alternating-phase revision (Claude), carry the actual main-session model from CLI output
   through dispatch and the runner's round record so selection can use the preceding review's
   reported model. Use the adapter's model identity comparison to account for shorthand and
@@ -170,3 +177,7 @@ The config remains valid and normal cross-vendor selection applies.
   vendor's other configured models before the same model, and lets an unknown model fall back to
   a fresh session so review never stalls. Cursor records the requested pinned model because its
   CLI names no other; without that its runs could never count as distinct.
+- Issue #383: Cursor takes images and can screenshot-review, so the statement that the
+  screenshot review never relies on Cursor's requested model no longer holds. Record when it
+  does: only with a pinned Cursor writer route (owner decision: pinned screenshot model, no
+  Cursor-specific exception).
