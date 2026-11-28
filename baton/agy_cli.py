@@ -189,8 +189,9 @@ def _reset_epoch(value):
 
 def parse_quota(answer, now):
     """{five_hour, seven_day} of the Gemini group of a `/quota` JSON answer; raises QuotaError
-    unless both windows parse. A never-used window, or one with reset_time null, resets one
-    window length from NOW. A missing reset_time key is a format error."""
+    unless both windows parse. A never-used window, one with reset_time null, or a disabled one
+    (it does not currently apply; its reset_time is ignored) resets one window length from NOW.
+    Otherwise a missing reset_time key is a format error, as is a non-boolean disabled."""
     from . import quota
     try:
         groups = answer["command"]["data"]["groups"]
@@ -207,9 +208,15 @@ def parse_quota(answer, now):
         if (isinstance(remaining, bool) or not isinstance(remaining, (int, float)) or not math.isfinite(remaining)
                 or not 0 <= remaining <= 1):
             raise QuotaError(f"agy quota: {window} remaining_fraction {remaining!r} is not a fraction")
-        if "reset_time" not in bucket:
+        disabled = bucket.get("disabled", False)
+        if not isinstance(disabled, bool):
+            raise QuotaError(f"agy quota: {window} disabled {disabled!r} is not a boolean")
+        if disabled:
+            reset = NO_RESET
+        elif "reset_time" in bucket:
+            reset = _reset_epoch(bucket["reset_time"])
+        else:
             raise QuotaError(f"agy quota: {window} has no reset_time")
-        reset = _reset_epoch(bucket["reset_time"])
         if reset == NO_RESET:
             reset = int(now) + quota.WINDOW_SECONDS[name]
         windows[name] = {"used": 1 - remaining, "resets_at": reset}
