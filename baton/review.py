@@ -1003,10 +1003,9 @@ class Review:
         return self.post_review_comment(round, reviewer, binding)
 
     # --- the screenshot review (#67): its own run after a successful code review ---
-    def screenshot_enabled(self, reviewer):
-        """Whether to check the PR body for screenshot review after this code review."""
+    def screenshot_enabled(self):
+        """Whether to check the PR body for screenshot review after a successful code review."""
         return (self.env.repo.screenshot_review
-                and not agents.ADAPTERS[reviewer].SKIP_SCREENSHOT_AFTER_REVIEW
                 and "owner" not in vendors.review_excluded(self.state, self.pr))
 
     def screenshot_vendor(self):
@@ -1321,7 +1320,7 @@ class Review:
                     verdict = "pass" if outcome.startswith("REVIEW: pass") else "changes"
                     self.binding_fields["post_outcome"] = self.values["post_outcome"] = ""
                 data = None
-                if not screenshot_post and (step == "screenshot" or self.screenshot_enabled(reviewer)):
+                if not screenshot_post and (step == "screenshot" or self.screenshot_enabled()):
                     data, status = self.read_post_inputs()
                     if status == "paused":
                         self.values.update(step="screenshot", code_verdict=verdict)

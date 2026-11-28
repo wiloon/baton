@@ -19,7 +19,6 @@ QUOTA_WINDOWS = frozenset({"five_hour", "seven_day"})
 QUOTA_ERROR = r"usage limit|session limit|hit your .*limit|limit reached|out of (extra )?usage|rate_limit_error"
 IMAGES = True
 SCAN = True
-SKIP_SCREENSHOT_AFTER_REVIEW = False
 ROUTE_FIELDS = frozenset({"model", "effort", "subagent_model"})
 EMPTY_MODEL_OK = False
 RECORDS_AUTHOR_MODEL = True

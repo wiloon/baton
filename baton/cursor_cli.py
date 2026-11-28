@@ -32,7 +32,6 @@ QUOTA_ERROR = (r"usage limit (reached|exceeded)|(monthly|weekly|daily) (usage |r
                r"(reached|exceeded)|(insufficient|exhausted) quota")
 IMAGES = False
 SCAN = False
-SKIP_SCREENSHOT_AFTER_REVIEW = True
 ROUTE_FIELDS = frozenset({"model"})
 EMPTY_MODEL_OK = False
 RECORDS_AUTHOR_MODEL = True
