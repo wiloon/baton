@@ -179,6 +179,11 @@ def baseline_snapshot(snapshot):
     return text[:cut]
 
 
+def find_quote(quote, snapshot):
+    """QUOTE's span in SNAPSHOT, any run of whitespace matching any other; None when it is not there."""
+    return re.search(r"\s+".join(map(re.escape, quote.split())), snapshot)
+
+
 def question_ids(snapshot):
     """qN ids listed under Questions: in the snapshot, in order."""
     block = re.search(r"(?ms)^Questions:\n(.*?)(?=^Citation evidence:|\Z)", snapshot or "")
@@ -570,6 +575,8 @@ class Attempt:
     advised: str = ""
     reason: str = ""
     evidence: list = field(default_factory=list)
+    evidence_dropped: int = 0   # mismatching quotes left out of a reply that was kept
+    evidence_miss: str = ""   # the first mismatching quote, redacted and cut
     answers: tuple = ()
     observed_only: bool = False   # a well-formed answer set with a non-grounded case: recorded, never executed
     profile: dict = field(default_factory=dict)
@@ -614,20 +621,27 @@ def attempt_backend(env, cfg, backend, key, key_failure, text, actions, *, categ
             raise ValueError("expected a nonblank reason string")
         if not isinstance(raw_evidence, list):
             raise ValueError("expected an evidence array")
-        if any(not isinstance(quote, str) for quote in raw_evidence):
+        if any(not isinstance(quote, str) or not quote.strip() for quote in raw_evidence):
             raise ValueError("evidence is outside the sent snapshot")
         # JSON escapes can decode to lone surrogates. Reject them before keeping any provider text.
         for value in (raw_action, raw_reason, *raw_evidence):
             value.encode("utf-8")
-        if any(not quote or quote not in text for quote in raw_evidence):
+        misses = [quote for quote in raw_evidence if not find_quote(quote, text)]
+        # A near miss of an opted-in excerpt would put its text in the record and the log (#125).
+        if misses and text == recordable:
+            result.evidence_miss = redact(misses[0], values)[:80]
+        if raw_evidence and len(misses) == len(raw_evidence):
             raise ValueError("evidence is outside the sent snapshot")
+        result.evidence_dropped = len(misses)
         result.advised = raw_action
         if raw_action not in actions:
             result.advised = redact(raw_action, values)
             result.failure = f"action outside the allowed set: {result.advised[:60]!r}"
         result.reason = redact(raw_reason, values)[:600]
         # Keep opted-in raw excerpts out of the decision record (#125).
-        result.evidence = [redact(quote, values)[:300] for quote in raw_evidence[:5] if quote in recordable]
+        # The snapshot's own span, never the provider's variant of it.
+        spans = [find_quote(quote, recordable) for quote in raw_evidence[:5] if quote not in misses]
+        result.evidence = [redact(span.group(), values)[:300] for span in spans if span]
         if not result.failure and raw_action == "answer_spec_questions":
             answers = normalize_answers(reply.get("answers"), text, sources, cut_rows)
             for row in answers:
@@ -654,6 +668,11 @@ def attempt_backend(env, cfg, backend, key, key_failure, text, actions, *, categ
         result.failure = f"malformed reply: {type(error).__name__}: {redact(str(error), values)[:120]}"
     result.latency_ms = int((time.monotonic() - started) * 1000)
     return result
+
+
+def evidence_fields(attempt):
+    """ATTEMPT's record fields about mismatching quotes, each only when it exists."""
+    return {name: value for name in ("evidence_dropped", "evidence_miss") if (value := getattr(attempt, name))}
 
 
 def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=None, rule=HANDOFF, mode=None,
@@ -726,6 +745,7 @@ def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=No
         else:
             record["fallback_from"] = {name: getattr(first, name)
                                        for name in ("backend", "model", "failure", "latency_ms", "usage")}
+            record["fallback_from"].update(evidence_fields(first))
     advised, reason, evidence, answers = chosen.advised, chosen.reason, chosen.evidence, chosen.answers
     observed_only, usage = chosen.observed_only, chosen.usage
     profile = {} if failure else chosen.profile
@@ -757,13 +777,18 @@ def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=No
             recorded.append(saved)
         record.update(advised=advised, reason=reason, evidence=evidence, executed=executed, failure=failure,
                       latency_ms=int((time.monotonic() - started) * 1000), usage=usage,
-                      **({"answers": recorded} if recorded else {}), **({"profile": profile} if profile else {}))
+                      **({"answers": recorded} if recorded else {}), **({"profile": profile} if profile else {}),
+                      **evidence_fields(chosen))
         append(env, record)
     except OSError as error:
         executed, failure, answers = rule, f"could not persist advisor decision: {type(error).__name__}", ()
         profile = {}
+    # !r: provider text must not split or forge log lines.
+    misses = (("evidence_miss", chosen.evidence_miss),
+              ("fallback_evidence_miss", record.get("fallback_from", {}).get("evidence_miss")))
     notify.log(f"advisor {point} #{item}: advised={advised or '-'} executed={executed}"
-               + (f" failure={failure}" if failure else ""))
+               + (f" failure={failure}" if failure else "")
+               + "".join(f" {name}={miss!r}" for name, miss in misses if miss))
     return Decision(executed, reason, tuple(evidence), advised, failure, True, answers=answers,
                     backend=chosen.backend, profile=profile, decision_id=decision_id)
 

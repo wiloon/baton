@@ -5,6 +5,7 @@ no test here starts the real `claude`.
 """
 import contextlib
 import json
+import os
 import time
 import urllib.error
 from dataclasses import replace
@@ -363,3 +364,30 @@ def test_the_digest_without_claude_lists_no_backends(dual):
     decide(dual)
     text = advisor.digest(dual.env, now=time.time() + 1)
     assert "15 total tokens" in text and "by backend" not in text
+
+
+@pytest.mark.parametrize("second_quotes, top", [([], None), (["snapshot 12", "second miss"], "second miss")],
+                         ids=["valid-second", "second-drops"])
+def test_a_rejected_first_backend_keeps_its_miss_in_fallback_from(dual, second_quotes, top):
+    dual.claude = [ran(claude_rows({**EXTRA, "evidence": ["first\nmiss"]}))]
+    dual.replies = [{**EXTRA, "evidence": second_quotes}]
+    d = decide(dual)
+    assert d.extra_round and d.backend == "deepseek" and len(dual.calls) == 1
+    [record] = dual.records()
+    assert record["fallback_from"]["evidence_miss"] == "first\nmiss"
+    assert "evidence_dropped" not in record["fallback_from"]
+    assert record.get("evidence_miss") == top and record.get("evidence_dropped") == (1 if top else None)
+    log = Path(os.environ["LOGS"], "runner.log").read_text()
+    assert "fallback_evidence_miss='first\\nmiss'" in log
+    assert (" evidence_miss=" in log) == bool(top)
+
+
+def test_a_first_backend_that_dropped_quotes_and_failed_keeps_the_count_in_fallback_from(dual):
+    reply = {**EXTRA, "action": "merge_now", "evidence": ["snapshot 12", "first miss"]}
+    dual.claude = [ran(claude_rows(reply))]
+    dual.replies = [EXTRA]
+    assert decide(dual).extra_round
+    [record] = dual.records()
+    assert record["fallback_from"]["evidence_dropped"] == 1
+    assert record["fallback_from"]["evidence_miss"] == "first miss"
+    assert "evidence_dropped" not in record and "evidence_miss" not in record
