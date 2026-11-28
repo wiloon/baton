@@ -254,7 +254,7 @@ def persist_grant(env, result, *, role, failed_vendor, exclusions, budget, finge
 
 
 def select_vendor(env, record, *, mode, candidates, pr="", issue="", fixed_by="", other_model="",
-                  spec_followup=False, pinned=False):
+                  spec_followup=False, pinned=False, avoid_author=""):
     """Select from the role's candidates with strict recovery constraints.
 
     A spec role's saved exclusions are its independence preference (the other phase's vendor): in an
@@ -286,7 +286,8 @@ def select_vendor(env, record, *, mode, candidates, pr="", issue="", fixed_by=""
         raise Exhausted(role, "No eligible vendor for the saved retry.")
     vendor = pick.choose(env, role, failed if same else selected or "", mode, eligible, pr=pr, issue=issue,
                            exclude=" ".join(dict.fromkeys(filter(None, exclusions))), fixed_by=fixed_by,
-                           other_model=other_model, spec_followup=spec_followup, pinned=same)
+                           other_model=other_model, spec_followup=spec_followup, pinned=same,
+                           avoid_author=avoid_author)
     if vendor not in eligible or (same and vendor != failed):
         raise Exhausted(role, "Picker returned a vendor outside the saved retry constraints.")
     return vendor

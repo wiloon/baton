@@ -8,6 +8,7 @@ Prompts get the heading through the `{{CHECKS_HEADING}}` template variable. Pure
 import re
 
 from . import check_verdicts
+from .common import is_author_marker_line
 
 HEADING = "Checks to verify"
 LEGACY = "Manual checks"
@@ -41,7 +42,9 @@ def _sections(body):
 
 
 def _text(lines, span):
-    return "\n".join(lines[span[0] + 1:span[1]]).replace("\r", "").strip("\n")
+    return "\n".join(
+        line for line in lines[span[0] + 1:span[1]] if not is_author_marker_line(line)
+    ).replace("\r", "").strip("\n")
 
 
 def well_formed(body):

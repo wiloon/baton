@@ -126,7 +126,7 @@ class Telemetry:
     def last_run_id(self):
         return self._item().get("last_run_id", "")
 
-    def verdict(self, kind, vendor, head, round, outcome, reply, review_file="", *, run_id=None):
+    def verdict(self, kind, vendor, head, round, outcome, reply, review_file="", *, run_id=None, author_agent=""):
         verdict = next((v for prefix, v in (("REVIEW: pass", "pass"), ("REVIEW: changes", "changes"),
                                             ("SPEC: accept", "accept"), ("SPEC: changes", "changes"),
                                             ("SPEC: reject", "reject")) if outcome.startswith(prefix)), "")
@@ -134,6 +134,8 @@ class Telemetry:
             return
         round = number(round)
         options = ["--verdict", verdict, "--agent", vendor, "--round", round, "--head-sha", head]
+        if kind == "spec_review":
+            options += ["--author-agent", author_agent or "unknown"]
         if last := (self.last_run_id() if run_id is None else run_id):
             options += ["--run-id", last]
         if kind in ("review", "screenshot_review"):   # a count only (#227): the review text never leaves this function

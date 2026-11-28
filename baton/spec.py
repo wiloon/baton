@@ -22,6 +22,7 @@ ends deferred (75), and a paused revision resumes with its edits and commits.
 
 from . import session
 import argparse
+from datetime import datetime
 import difflib
 import json
 import os
@@ -32,11 +33,13 @@ import sys
 import time
 
 from . import advisor, agents, checks as check_section, dispatch, e2e_gate, fix, handoff as owner_handoff, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, recovery, review, scratch, tiers, vendors
-from .common import (Deferred, PROFILE_MARKER, changed, child_env, git, permission_denials, push, restore,
+from .common import (Deferred, PROFILE_MARKER, changed, child_env, format_author_marker, git,
+                     parse_author_marker, permission_denials, prepend_author_marker, push, restore,
                      strip_markers)
 from .quota import atomic_json
 
 REPLY_CAP = 60000
+AUTHOR_EDIT_MARKER = "<!-- baton-spec-author-edit -->"
 DENIED_NOTE = ("\n\nA previous attempt at this round ended with `RESULT: failed` after this command was denied: "
                "`{command}`. Only that command was refused. Finish the round with the other allowed commands "
                "and the Read, Edit and Write tools; the worktree keeps whatever that attempt left.\n")
@@ -56,10 +59,10 @@ ISSUE_SNAPSHOT = """
 query($owner: String!, $repo: String!, $issue: Int!, $endCursor: String) {
   repository(owner: $owner, name: $repo) {
     issue(number: $issue) {
-      title body state
+      title body state lastEditedAt
       labels(first: 100) { totalCount nodes { name } }
       comments(first: 100, after: $endCursor) {
-        nodes { fullDatabaseId body author { login } }
+        nodes { fullDatabaseId body createdAt author { login } }
         pageInfo { hasNextPage endCursor }
       }
     }
@@ -87,12 +90,15 @@ def read_issue(env, issue, *, once=False, recovery=False):
                 return None, False
             row = page["data"]["repository"]["issue"]
             labels = row["labels"]["nodes"]
+            last_edited = row.get("lastEditedAt")
             if (row["state"] not in ("OPEN", "CLOSED") or not isinstance(row["title"], str)
                     or not isinstance(row["body"], str) or not isinstance(labels, list)
+                    or (last_edited is not None and not isinstance(last_edited, str))
                     or row["labels"]["totalCount"] != len(labels)
                     or any(not isinstance(label["name"], str) for label in labels)):
                 return None, False
-            issue_fields = {"title": row["title"], "body": row["body"], "state": row["state"], "labels": labels}
+            issue_fields = {"title": row["title"], "body": row["body"], "state": row["state"],
+                            "lastEditedAt": last_edited, "labels": labels}
             if snapshot is not None and snapshot != issue_fields:
                 return None, False
             snapshot = issue_fields
@@ -102,13 +108,15 @@ def read_issue(env, issue, *, once=False, recovery=False):
                 return None, False
             for comment in connection["nodes"]:
                 identity, body, author = comment["fullDatabaseId"], comment["body"], comment["author"]
+                created_at = comment.get("createdAt")
                 if isinstance(identity, str) and identity.isdecimal():
                     identity = int(identity)
                 if (type(identity) is not int or identity <= 0 or identity in ids or not isinstance(body, str)
+                        or (created_at is not None and not isinstance(created_at, str))
                         or author is not None and not isinstance(author["login"], str)):
                     return None, False
                 ids.add(identity)
-                comments.append({"id": identity, "body": body, "author": author})
+                comments.append({"id": identity, "body": body, "createdAt": created_at, "author": author})
     except (AttributeError, KeyError, TypeError, ValueError):
         return None, False
     if recovery and (snapshot["state"] != "OPEN"
@@ -243,6 +251,41 @@ def last_by(listed, owner, kind):
     """The vendor of the latest spec review (KIND review) or reply, or ''."""
     found = [m for body in owner_bodies_from(listed, owner) if (m := re.match(KIND_RE % kind, body))]
     return found[-1]["v"] if found else ""
+
+
+def _iso_after(later, earlier):
+    """True when ISO-8601 timestamp LATER is strictly later than EARLIER."""
+    if not later or not earlier:
+        return False
+    try:
+        return datetime.fromisoformat(later) > datetime.fromisoformat(earlier)
+    except ValueError:
+        return False
+
+
+def _latest_spec_comment(listed, owner, kinds=("review", "reply")):
+    """(kind, body, created_at) of the latest owner-account spec comment in KINDS, or ('', '', '')."""
+    found = ("", "", "")
+    for comment in listed or ():
+        if (comment.get("author") or {}).get("login") != owner:
+            continue
+        body = comment.get("body") or ""
+        match = STATE_RE.match(body)
+        if match and match["k"] in kinds:
+            found = (match["k"], body, comment.get("createdAt") or "")
+    return found
+
+
+def _has_author_edit_marker(body):
+    lines = (body or "").split("\n")
+    return len(lines) >= 2 and lines[1].rstrip("\r") == AUTHOR_EDIT_MARKER
+
+
+def author_note(vendor, model):
+    """Prompt sentence describing the drafting vendor and model, or unknown."""
+    if vendor:
+        return f"The issue was last drafted by {vendor} ({model or 'unknown'})."
+    return "The drafting agent is unknown."
 
 
 @session.scoped
@@ -410,10 +453,10 @@ class Spec:
     def gh(self, *args):
         return pr_helpers.gh(*args, "-R", self.repo)
 
-    def pick(self, role, candidates, last_vendor, other_model, *, spec_followup=False):
+    def pick(self, role, candidates, last_vendor, other_model, *, spec_followup=False, avoid_author=""):
         vendor = pick.choose(self.env, role, "agent" if role == "spec_reviewer" else "pool", "contrib", candidates,
                              exclude=last_vendor, issue=self.issue, other_model=other_model,
-                             spec_followup=spec_followup)
+                             spec_followup=spec_followup, avoid_author=avoid_author)
         self.started()
         return vendor
 
@@ -501,26 +544,26 @@ class Spec:
 
     def recover_worker(self, why, reason, vendor, detail, *, role="spec_reviewer", round_s="",
                        issue_body="", listed=(), last_vendor="", other_model="", spec_followup=False,
-                       budget=None):
+                       budget=None, avoid_author=""):
         fingerprint = self.spec_binding(round_s, issue_body, listed)
         result = recovery.request(
             self.env, self.issue, self.issue, reason, role, vendor, detail, fingerprint,
             lambda: self.retry_binding(round_s),
             lambda text=why, **kw: self.handoff(text, reason, **kw),
             exclusions=[last_vendor] if last_vendor else [], budget=budget,
-            **self.retry_picker(role, other_model, spec_followup))
+            **self.retry_picker(role, other_model, spec_followup, avoid_author=avoid_author))
         return result
 
-    def retry_picker(self, role, other_model, spec_followup):
+    def retry_picker(self, role, other_model, spec_followup, avoid_author=""):
         return dict(mode="contrib", candidates=pick.all_vendors(self.env), issue=self.issue,
-                    other_model=other_model, spec_followup=spec_followup)
+                    other_model=other_model, spec_followup=spec_followup, avoid_author=avoid_author)
 
-    def resume_worker(self, role, reason, round, other_model, spec_followup=False):
+    def resume_worker(self, role, reason, round, other_model, spec_followup=False, avoid_author=""):
         return recovery.resume(
             self.env, self.issue, self.issue, lambda saved: saved.startswith("spec_"),
             lambda: self.retry_binding(round),
             lambda text: self.handoff(text, reason), role=role,
-            **self.retry_picker(role, other_model, spec_followup))
+            **self.retry_picker(role, other_model, spec_followup, avoid_author=avoid_author))
 
     def retry_read(self, read, why, reason, *, continuation=None, keep=False):
         """Consume a waiting attempt before reading; return the value or hand off.
@@ -1264,12 +1307,16 @@ class Spec:
                 and not vendors.models_distinct(vendor, model, other_model))
 
     @staticmethod
-    def mode_note(label, vendor, last_vendor, model, other_model):
+    def mode_note(label, vendor, last_vendor, model, other_model, *, author_vendor="", author_model=""):
         policy = vendors.spec_same_vendor(vendor) if vendor == last_vendor else ""
         if policy == "alternating-phase":
             return f"{label} mode: same-vendor-different-model ({vendor} after {vendor}).\n\n"
         if policy == "known-distinct-model":
             return f"{label} mode: same-vendor-different-model ({vendor}/{model} after {vendor}/{other_model}).\n\n"
+        if author_vendor and vendor == author_vendor:
+            if model and author_model and vendors.models_distinct(vendor, model, author_model):
+                return f"{label} mode: same-vendor-different-model ({vendor}/{model} after author {vendor}/{author_model}).\n\n"
+            return f"{label} mode: author-vendor fallback ({vendor} after author {vendor}).\n\n"
         return ""
 
     def record(self, vendor, model):
@@ -1280,8 +1327,50 @@ class Spec:
         vendors.record_author(self.state, self.pr, vendor)
 
     def finish(self):
-        for name in ("spec-paused", "spec-base", "spec-body", "spec-owner-body"):
+        for name in ("spec-paused", "spec-base", "spec-body", "spec-owner-body", "spec-last-marker"):
             self.path(name).unlink(missing_ok=True)
+
+    def last_seen_marker(self):
+        """(vendor, model) of the marker in the body the loop last saw, or ('', '')."""
+        declared = set(self.env.config.declared())
+        marker_file = self.path("spec-last-marker")
+        if marker_file.is_file():
+            parts = marker_file.read_text().strip().split(None, 1)
+            if len(parts) == 2 and parts[0] in declared:
+                return parts[0], parts[1]
+            return "", ""
+        for name in ("spec-body", "spec-owner-body"):
+            path = self.path(name)
+            if path.is_file():
+                return parse_author_marker(path.read_text(), declared)
+        return "", ""
+
+    def save_last_marker(self, vendor, model):
+        self.path("spec-last-marker").write_text(f"{vendor} {model}\n" if vendor else "")
+
+    def owner_edited(self, inputs):
+        """True when someone other than the reviser edited the body since the loop's earlier turn:
+        an edit after the latest spec comment, or one that reply already carries. A reviser's own
+        body edit lands before its reply is posted."""
+        last_kind, last_body, last_created_at = _latest_spec_comment(inputs["comments"], self.env.owner)
+        return (_iso_after(inputs.get("lastEditedAt"), last_created_at)
+                or (last_kind == "reply" and _has_author_edit_marker(last_body)))
+
+    def review_author_state(self, round, inputs):
+        """(avoid_author, prompt_vendor, prompt_model, telemetry_author, stale, marker_vendor, marker_model)."""
+        declared = set(self.env.config.declared())
+        marker_vendor, marker_model = parse_author_marker(inputs["body"], declared)
+        if round == 1:
+            return (marker_vendor, marker_vendor, marker_model, marker_vendor or "unknown",
+                    False, marker_vendor, marker_model)
+        if not self.owner_edited(inputs):
+            return ("", marker_vendor, marker_model, marker_vendor or "unknown",
+                    False, marker_vendor, marker_model)
+        stale = bool(marker_vendor) and (marker_vendor, marker_model) == self.last_seen_marker()
+        if stale:
+            return (marker_vendor, "", "", "unknown", True, marker_vendor, marker_model)
+        return (marker_vendor, marker_vendor, marker_model, marker_vendor or "unknown",
+                False, marker_vendor, marker_model)
 
     def keep_owner_body(self, body):
         """Before the first spec round: spec-owner-body-N keeps the body the owner wrote."""
@@ -1366,40 +1455,54 @@ class Spec:
         head = git(wt, "rev-parse", "HEAD") or ""
         last_vendor = last_by(listed, env.owner, "reply")
         other_model = last_model(env, n, "reply", round - 1, last_vendor)
+        (avoid_author, prompt_vendor, prompt_model, telemetry_author,
+         stale, marker_vendor, marker_model) = self.review_author_state(round, inputs)
         alternating = vendors.alternating_spec_vendor()
         alt_followup = self.followup(round, alternating, last_vendor)
         if alternating and last_vendor == alternating:
             alt_followup = self.alternating_followup(alternating, "spec_review", alt_followup, other_model)
 
         def review_followup(vendor):
+            if vendor == last_vendor:
+                return alt_followup if vendor == alternating else self.followup(round, vendor, last_vendor)
+            if avoid_author and vendor == avoid_author:
+                preferred = self.followup(round, vendor, last_vendor)
+                return self.alternating_followup(vendor, "spec_review", preferred, "" if stale else marker_model)
             return alt_followup if vendor == alternating else self.followup(round, vendor, last_vendor)
-        pending = self.resume_worker("spec_reviewer", "spec_review_run_failed", round, other_model, alt_followup)
+
+        pending = self.resume_worker("spec_reviewer", "spec_review_run_failed", round, other_model,
+                                     alt_followup, avoid_author=avoid_author)
         if pending is False:
             return "stop"
         reviewer = pending[1] if pending else self.pick("spec_reviewer", pick.all_vendors(env),
-                                                        last_vendor, other_model, spec_followup=alt_followup)
+                                                        last_vendor, other_model, spec_followup=alt_followup,
+                                                        avoid_author=avoid_author)
         attempt = int(bool(pending))
         while True:
             tag = f"issue-{n}-spec-{round}" + (f"-retry{attempt}" if attempt else "")
             out = self.agent(reviewer, "spec_review", self.render(
                 self.self_dir / "spec-review-prompt.md", VENDOR=reviewer, ISSUE=n, GH_REPO=self.repo, WORKTREE=str(wt),
                 BRANCH=self.branch, ROUND=str(round), MAX_ROUNDS=str(max_rounds), CONTEXT_FILE=str(context),
-                ADR_NOTE=adr_note, ROUND_NOTE=self.round_note(round)), tag, "review-settings.json",
+                ADR_NOTE=adr_note, ROUND_NOTE=self.round_note(round),
+                AUTHOR_NOTE=author_note(prompt_vendor, prompt_model)), tag, "review-settings.json",
                 followup=review_followup(reviewer), round_s=str(round))
             outcome, model = out["outcome"], out["model"] or ""
             if self.unverified(reviewer, last_vendor, model, other_model):
                 self.handoff(f"{reviewer.capitalize()} spec reviewer model was not verified as different from the reviser model.",
                              "spec_reviewer_model_unverified")
                 return "stop"
-            mode_note = self.mode_note("Review", reviewer, last_vendor, model, other_model)
+            mode_note = self.mode_note("Review", reviewer, last_vendor, model, other_model,
+                                       author_vendor=avoid_author, author_model="" if stale else marker_model)
             if changed(wt, head):
                 restore(wt, head)
                 outcome = f"RESULT: failed {reviewer} changed files in a read-only spec review"
             reply = reply_text(out["reply"])
-            self.hooks.verdict("spec_review", reviewer, head, round, outcome, out["reply"] or "")
+            self.hooks.verdict("spec_review", reviewer, head, round, outcome, out["reply"] or "",
+                               author_agent=telemetry_author)
             if outcome.startswith("SPEC: accept"):
                 # The worker step is done; the verdict and comment posts keep their own durable retry (#151).
                 recovery.clear(self.env, self.issue, self.issue)
+                self.save_last_marker(marker_vendor, marker_model)
                 problems = self.accept_problems()
                 if not problems:
                     return self.accept(reviewer, round, mode_note, reply, inputs)
@@ -1415,6 +1518,7 @@ class Spec:
                 return self.post_comment(owner_handoff.SPEC_REVIEW_POST, binding, initial=True, context=context)
             if outcome.startswith("SPEC: changes"):
                 recovery.clear(self.env, self.issue, self.issue)
+                self.save_last_marker(marker_vendor, marker_model)
                 body = (f"<!-- baton-spec-review round={round} by={reviewer} -->\n"
                         f"## Spec review ({reviewer}), round {round}\n\n{mode_note}{reply[:REPLY_CAP]}")
                 binding = self.comment_post_binding(
@@ -1423,6 +1527,7 @@ class Spec:
                     limit_why=f"{reviewer} still has points after {round} spec rounds.")
                 return self.post_comment(owner_handoff.SPEC_REVIEW_POST, binding, initial=True, context=context)
             if outcome.startswith("SPEC: reject"):
+                self.save_last_marker(marker_vendor, marker_model)
                 self.gh("issue", "comment", n, "--body", f"<!-- baton-note by={reviewer} -->\n"
                         f"## Spec review ({reviewer}), round {round}: reject\n\n{reply[:REPLY_CAP]}")
                 self.handoff(f"{reviewer} rejects the issue.", "spec_rejected")
@@ -1430,7 +1535,7 @@ class Spec:
             retry = self.recover_worker(
                 f"{reviewer}'s spec review failed: {outcome}", "spec_review_run_failed", reviewer, outcome,
                 round_s=str(round), issue_body=issue_body, listed=listed, last_vendor=last_vendor,
-                other_model=other_model, spec_followup=alt_followup)
+                other_model=other_model, spec_followup=alt_followup, avoid_author=avoid_author)
             if not retry:
                 return "stop"
             _, reviewer = retry
@@ -1651,7 +1756,8 @@ class Spec:
         """Says an ADR push is waiting, so a lost record fails closed instead of rerunning the reviser."""
         return Path(self.state, f"spec-adr-push-waiting-{self.issue}")
 
-    def adr_push_binding(self, reviser, model, round, human, reply, mode_note, max_rounds, inputs, applied):
+    def adr_push_binding(self, reviser, model, round, human, reply, mode_note, max_rounds, inputs, applied,
+                         author_edit=False):
         """Inputs known before the ADR push; commit and remote are filled at save time (#151)."""
         return {
             "issue": self.issue, "reviser": reviser, "model": model or "", "round": round,
@@ -1661,6 +1767,7 @@ class Spec:
             "feedback": self.owner_feedback_digest(inputs["comments"]),
             "comment_ids": [row["id"] for row in inputs["comments"]],
             "author": self.env.owner, "next": "human" if human else "review",
+            "author_edit": bool(author_edit),
         }
 
     def check_adr_push(self, binding):
@@ -1690,14 +1797,15 @@ class Spec:
         for leftover in scratch.directory(self.env.dirs).glob(f"spec-{self.issue}-{round}.*"):
             leftover.unlink()
 
-    def finish_revision_reply(self, reviser,model, round, human, reply, mode_note, max_rounds, inputs, applied,
-                              after_save=None):
+    def finish_revision_reply(self, reviser, model, round, human, reply, mode_note, max_rounds, inputs, applied,
+                              after_save=None, author_edit=False):
         """Post the reply after ADR work (or when there was none) and clear the worker grant."""
         n = self.issue
         adr = f"\nADR revisions: #{self.pr}\n" if self.pr else ""
         if self.pr:
             self.adr_head = git(self.wt, "rev-parse", "HEAD") or self.adr_head
-        body = (f"<!-- baton-spec-reply round={round}{human} by={reviser} -->\n"
+        second = f"\n{AUTHOR_EDIT_MARKER}" if author_edit else ""
+        body = (f"<!-- baton-spec-reply round={round}{human} by={reviser} -->{second}\n"
                 f"## Spec reply ({reviser}), round {round}\n{adr}\n{mode_note}{reply}")
         binding = self.comment_post_binding(
             body, round, reviser, inputs, next_step="human" if human else "review",
@@ -1709,7 +1817,7 @@ class Spec:
             self.remove_reply_files(round)
 
     def body_edit_binding(self, intended, original, round, reviser, model, human, reply, mode_note,
-                          max_rounds, inputs):
+                          max_rounds, inputs, author_edit=False):
         """Inputs known before applying a revised issue body (#151)."""
         return {
             "issue": self.issue, "reviser": reviser, "model": model or "", "round": round,
@@ -1721,6 +1829,7 @@ class Spec:
             "author": self.env.owner, "next": "human" if human else "review",
             "has_commits": bool(git(self.wt, "rev-list", f"{self.base}..HEAD")),
             "wt": str(self.wt),
+            "author_edit": bool(author_edit),
         }
 
     def check_body_edit(self, binding):
@@ -1778,7 +1887,8 @@ class Spec:
                 return "stop"
             push_binding = self.adr_push_binding(
                 binding["reviser"], binding["model"], binding["round"], binding["human"],
-                binding["reply"], binding["mode_note"], binding["max_rounds"], inputs, applied)
+                binding["reply"], binding["mode_note"], binding["max_rounds"], inputs, applied,
+                author_edit=binding.get("author_edit", False))
             self.adr_round = (inputs, applied)
             return self.push_adr(push_binding, initial=True, after_save=clear)
         try:
@@ -1788,7 +1898,7 @@ class Spec:
         return self.finish_revision_reply(
             binding["reviser"], binding["model"], binding["round"], binding["human"],
             binding["reply"], binding["mode_note"], binding["max_rounds"], inputs, applied,
-            after_save=clear)
+            after_save=clear, author_edit=binding.get("author_edit", False))
 
     def edit_body(self, binding, *, initial, pending=None):
         """Save before applying a revised issue body, or consume a due attempt (#151)."""
@@ -1895,6 +2005,7 @@ class Spec:
             "commit": push_binding["commit"], "branch": push_binding["branch"],
             "base": "main", "wt": push_binding["wt"],
             "applied": applied if applied is not None else "",
+            "author_edit": bool(push_binding.get("author_edit", False)),
         }
 
     def check_adr_open(self, binding):
@@ -1956,7 +2067,7 @@ class Spec:
         return self.finish_revision_reply(
             binding["reviser"], binding["model"], binding["round"], binding["human"],
             binding["reply"], binding["mode_note"], binding["max_rounds"], inputs, applied,
-            after_save=after_save)
+            after_save=after_save, author_edit=binding.get("author_edit", False))
 
     def open_adr(self, binding, *, initial, pending=None):
         """Save before opening the ADR docs PR, or consume a due attempt (#151)."""
@@ -2107,7 +2218,7 @@ class Spec:
         return self.finish_revision_reply(
             binding["reviser"], binding["model"], binding["round"], binding["human"],
             binding["reply"], binding["mode_note"], binding["max_rounds"], inputs, applied,
-            after_save=after_save)
+            after_save=after_save, author_edit=binding.get("author_edit", False))
 
     def push_adr(self, binding, *, initial, pending=None, after_save=None):
         """Save before pushing ADR commits, or consume a due attempt before reconciling (#151)."""
@@ -2251,6 +2362,10 @@ class Spec:
         self.remove_reply_files(round)
         last_vendor = last_by(listed, env.owner, "review")
         other_model = last_model(env, n, "review", round, last_vendor)
+        author_edit = self.owner_edited(inputs)
+        marker_vendor, marker_model = parse_author_marker(issue_body, set(env.config.declared()))
+        marker_stale = author_edit and bool(marker_vendor) and (marker_vendor, marker_model) == self.last_seen_marker()
+        prompt_author = author_note("" if marker_stale else marker_vendor, "" if marker_stale else marker_model)
         alternating = vendors.alternating_spec_vendor()
         alt_followup = self.reviser_followup(round, alternating, last_vendor)
         if alternating and last_vendor == alternating:
@@ -2273,8 +2388,8 @@ class Spec:
         while True:
             template = self.self_dir / agents.ADAPTERS[reviser].SPEC_TEMPLATE
             prompt = self.render(
-                template, ISSUE=n, GH_REPO=self.repo, WORKTREE=str(wt), BRANCH=self.branch, ROUND=str(round),
-                CONTEXT_FILE=str(context), OUT=out_base)
+                template, VENDOR=reviser, ISSUE=n, GH_REPO=self.repo, WORKTREE=str(wt), BRANCH=self.branch,
+                ROUND=str(round), CONTEXT_FILE=str(context), OUT=out_base, AUTHOR_NOTE=prompt_author)
             followup = bool(alternating) and reviser == alternating and alt_followup
             for suffix in (".body", ".comment"):
                 Path(f"{out_base}{suffix}").unlink(missing_ok=True)
@@ -2331,10 +2446,14 @@ class Spec:
         text = strip_markers(comment.read_text()).encode()[:REPLY_CAP].decode(errors="ignore").rstrip("\n")
         applied = None
         if body.is_file() and body.stat().st_size:
-            body.write_text(check_section.canonicalize(strip_markers(body.read_text())).rstrip("\n") + "\n")
+            revised_body = check_section.canonicalize(strip_markers(body.read_text())).rstrip("\n") + "\n"
+            if marker_vendor:
+                revised_body = prepend_author_marker(revised_body, format_author_marker(marker_vendor, marker_model))
+            body.write_text(revised_body)
             applied = body.read_text()
             binding = self.body_edit_binding(
-                applied, inputs["body"], round, reviser, model, human, text, mode_note, max_rounds, inputs)
+                applied, inputs["body"], round, reviser, model, human, text, mode_note, max_rounds, inputs,
+                author_edit=author_edit)
             try:
                 return self.edit_body(binding, initial=True)
             finally:
@@ -2345,7 +2464,8 @@ class Spec:
             except OSError:
                 return "stop"
             binding = self.adr_push_binding(
-                reviser, model, round, human, text, mode_note, max_rounds, inputs, applied)
+                reviser, model, round, human, text, mode_note, max_rounds, inputs, applied,
+                author_edit=author_edit)
             self.adr_round = (inputs, applied)
             try:
                 return self.push_adr(binding, initial=True)
@@ -2355,7 +2475,8 @@ class Spec:
             self.record(reviser, model)
         except OSError:
             return "stop"
-        return self.finish_revision_reply(reviser, model, round, human, text, mode_note, max_rounds, inputs, applied)
+        return self.finish_revision_reply(reviser, model, round, human, text, mode_note, max_rounds, inputs, applied,
+                                          author_edit=author_edit)
 
     # --- the loop ---
     def waiting_adr_push(self):
