@@ -4,6 +4,7 @@ The streams follow logs recorded on a runner host (2026-10): Claude and Codex qu
 Cursor dev run, a Cursor weekly-limit error. Claude/Codex quota and auth errors have
 not happened there yet; those use the shapes cooldown.sh already relies on.
 """
+from dataclasses import replace
 import json
 import os
 import subprocess
@@ -13,8 +14,9 @@ from pathlib import Path
 
 import pytest
 
-from baton import agents, prompts
+from baton import agents, claude_cli, config, prompts, scratch, session
 from baton.common import Request
+from conftest import FULL as FULL_CONFIG
 
 FAKE_CLI = f"""#!{sys.executable}
 import json, os, pathlib, sys
@@ -146,6 +148,35 @@ def test_claude_success_flags_and_environment(env):
     assert "VIRTUAL_ENV" not in child, "the runner's venv must not reach the agent's tools"
 
 
+def repo_session(root):
+    """One repository's session with its state under ROOT."""
+    cfg = config.load(FULL_CONFIG, home=root)
+    cfg = replace(cfg, paths=replace(cfg.paths, state=root / "state"))
+    return session.create(cfg, repo=cfg.repos[0])
+
+
+def test_claude_run_hands_the_guard_the_repositorys_scratch_directory(env):
+    """#306: guard.sh allows Edit/Write there instead of anywhere under /tmp."""
+    sess = repo_session(env.root)
+    options = claude_cli.configure("review", sess.config.models.route("review", "claude"),
+                                   sess.config.vendor("claude"), sess)[3]
+    env.plan(stream=claude_stream("REVIEW: pass"))
+    assert env.run("claude", "review", scratch=options["scratch"]).status == "success"
+    assert env.child_env()["BATON_AGENT_SCRATCH"] == str(sess.dirs.scratch)
+    assert sess.dirs.scratch == env.root / "state/repos" / sess.repo.gh_repo / "scratch" and sess.dirs.scratch.is_dir()
+
+
+def test_codex_redirects_a_scratch_output_and_copies_the_artifact_back(env):
+    """#306: Codex needs no writable root for the scratch directory."""
+    out = scratch.path(repo_session(env.root).dirs, "fix", 11)
+    env.plan(stream=CODEX_STREAM, last="RESULT: fixed", base=out.name, artifacts={"": "Reply\n", ".body": "Body\n"})
+    assert env.run("codex", "fix", prompt=f"write {out} and {out}.body now", output=str(out)).status == "success"
+    prompt = env.args()[-1]
+    assert str(out.parent) not in prompt and f"{env.worktree}/.baton-codex-" in prompt
+    assert out.read_text() == "Reply\n" and Path(f"{out}.body").read_text() == "Body\n"
+    assert str(out.parent) not in " ".join(env.args()[:-1])
+
+
 def test_claude_can_run_shell_commands_on_the_context_directory(env):
     """dontAsk denied `wc -l <ctx>/...md` outside the worktree, and the spec reviser gave up (#53)."""
     env.plan(stream=claude_stream("Done.\nREVIEW: pass"))
@@ -245,6 +276,13 @@ def test_cursor_reply_is_the_last_assistant_message(env):
     args, child = env.args(), env.child_env()
     assert args[:4] == ["-p", "--force", "--trust", "--model"] and args[-1] == "do it"
     assert (child["GH_TOKEN"], child["GITHUB_TOKEN"], child["GIT_SSH_COMMAND"]) == ("no-github-for-cursor", "", "/bin/false")
+
+
+@pytest.mark.parametrize("requested, recorded", [("grok-4.7-high", "grok-4.7-high"), ("auto", "unknown")])
+def test_cursor_run_model_is_the_requested_one(env, requested, recorded):
+    """#221, ADR 0004: cursor-agent names no model, so the request does; `auto` is unknown."""
+    env.plan(stream=cursor_stream("REVIEW: pass"))
+    assert env.run("cursor", "review", model=requested).model == recorded
 
 
 def test_cursor_weekly_limit(env):

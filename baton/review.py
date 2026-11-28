@@ -24,8 +24,8 @@ import sys
 import time
 from typing import NamedTuple
 
-from . import advisor, agents, check_verdicts, checkpoint, checks as check_section, design_findings, dispatch, fix, handoff as owner_handoff, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, vendors
-from .common import Deferred, Exhausted, changed, git, restore, strip_markers
+from . import advisor, agents, check_verdicts, checkpoint, checks as check_section, design_findings, dispatch, fix, handoff as owner_handoff, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, scratch, tiers, vendors
+from .common import Deferred, Exhausted, PROFILE_MARKER, changed, git, restore, strip_markers
 from . import recovery as task_recovery
 
 REPLY_CAP = 60000
@@ -84,6 +84,8 @@ def issue_context_from(issue, data, owner, login_re, limit):
     for comment in data.get("comments") or ():
         login = (comment.get("author") or {}).get("login") or ""
         body = comment.get("body") or ""
+        if body.startswith(PROFILE_MARKER):
+            continue
         # Advisor answers are runner-wrapped owner posts: keep them out of owner context (#125).
         answer = re.match(r"<!-- baton-advisor-answer round=\d+ questions=[0-9a-f]+ by=(claude|deepseek) -->", body)
         if login == owner and answer:
@@ -859,8 +861,8 @@ class Review:
         return prompts.render(self.self_dir / template, list(pairs.items()), env=self.env)
 
     def review_followup(self, round, reviewer):
-        """A later round mostly re-checks the fix commits, so it runs on the cheaper model. Codex keeps
-        its usual one on code Codex wrote: the two must be different models."""
+        """A later round mostly re-checks the fix commits, so it runs on the cheaper model. A
+        same-vendor reviewer keeps the base route (vendors.review_model)."""
         return round > 1 and not (vendors.same_vendor_review(reviewer)
                                   and reviewer in vendors.review_excluded(self.state, self.pr, self.fixed_by))
 
@@ -881,8 +883,8 @@ class Review:
                            issue=self.issue, fixed_by=self.fixed_by, pinned=continuity_pin(current))
 
     def review_allowed(self, vendor, model=""):
-        """Persisted authors survive restarts and role changes: a vendor that wrote the PR does
-        not review it. The PR goes to the owner otherwise."""
+        """Persisted authors survive restarts and role changes: a vendor that wrote the PR reviews
+        it only under a same-vendor policy. The PR goes to the owner otherwise."""
         cfg = self.env.config
         if vendor not in cfg.declared() or not cfg.allows(vendor, "reviewer"):
             self.handoff("reviewer_role_denied", f"PR #{self.pr} needs you",
@@ -932,11 +934,14 @@ class Review:
         head = git(wt, "rev-parse", "HEAD") or ""
         if not self.seed():
             return self.failed("review_author_state_failed", "RESULT: failed recording PR authors")
+        self.env = tiers.carry(self.env, "review", self.issue, pr)
         if reviewer is None:
             reviewer = self.review_vendor("pool")
         self.values.update(round=round, step="review", reviewer=reviewer)
         followup = self.review_followup(round, reviewer)
-        expected = self.env.config.models.route("review", reviewer, followup=followup).model
+        tier = tiers.step(self.env, "review", self.issue, pr)
+        expected, same_vendor = vendors.review_model(self.state, pr, reviewer, tier, followup, self.fixed_by,
+                                                     config=self.env.config)
         if not self.review_allowed(reviewer, expected):
             return self.failed(ALREADY, "RESULT: failed reviewer model may be a PR author")
         numstat = git(wt, "diff", "--numstat", "origin/main...HEAD") or ""
@@ -959,11 +964,13 @@ class Review:
                      "runner artifact.\n</runner-preflight>\n")
         context.write_text(text)
         adapter = agents.ADAPTERS[reviewer]
-        review_file = None if adapter.REVIEW_DELIVERY == "reply" else Path(f"/tmp/baton-review-{pr}-{round}.md")
-        fields = {"PR": str(pr), "ISSUE": self.issue or "unknown", "GH_REPO": self.repo, "WORKTREE": str(wt),
+        review_file = None if adapter.REVIEW_DELIVERY == "reply" else scratch.path(self.env.dirs, "review", pr, round)
+        # First, so the path is filled in before any untrusted value could carry the placeholder.
+        path_field = {} if review_file is None else {"REVIEW_FILE": str(review_file)}
+        fields = {**path_field, "PR": str(pr),"ISSUE": self.issue or "unknown", "GH_REPO": self.repo, "WORKTREE": str(wt),
                   "ROUND": str(round), "MAX_ROUNDS": str(self.max_rounds), "ROUND_NOTE": note,
                   "CONTEXT_FILE": str(context), "NIT_RULE": nit_rule(self.repo, self.issue)}
-        runtime = self.env.with_runtime(review_followup=followup)
+        runtime = self.env.with_runtime(review_followup=followup, review_model=expected if same_vendor else "")
         if review_file is None:
             out = self.agent(reviewer, "review", self.render(adapter.REVIEW_TEMPLATE, **fields),
                              f"pr-{pr}-{reviewer}-review-{round}", env=runtime)
@@ -983,7 +990,7 @@ class Review:
         review_note = ""
         if vendors.same_vendor_review(reviewer) and reviewer in vendors.review_excluded(self.state, pr, self.fixed_by):
             mode = vendors.same_vendor_review_mode(self.state, pr, reviewer, model)
-            review_note = f"Review mode: {mode} ({reviewer}/{model}).\n\n"
+            review_note = f"Review mode: {mode} ({reviewer}/{model or 'unknown'}).\n\n"
         if review_file is None:
             reply = strip_markers(out["reply"] or "")
             body = "\n".join(line for line in reply.split("\n") if not MARKER_LINE.match(line)).rstrip("\n")[:REPLY_CAP]
@@ -1038,7 +1045,7 @@ class Review:
         limit = int(self.env.config.scheduling.review_context_max_chars or 20000)
         context = Path(self.ctx, f"pr-{pr}-screenshot-review-{round}-{time.strftime('%Y%m%d-%H%M%S')}.md")
         context.write_text(issue_context(self.env, self.issue) if re.fullmatch(r"\d+", str(self.issue or "")) else "")
-        review_file = Path(f"/tmp/baton-screenshot-review-{pr}-{round}.md")
+        review_file = scratch.path(self.env.dirs, "screenshot-review", pr, round)
         review_file.unlink(missing_ok=True)
         if agents.ADAPTERS[vendor].SCREENSHOT_DELIVERY == "final_message":
             delivery = "Include the full review in your final message, above the verdict line."
@@ -1185,6 +1192,7 @@ class Review:
             self.binding_fields = {}
             self.design, self.design_unusable = [], False
             self.shot_round, self.design_only, self.loop_id = 0, False, self.new_loop_id()
+        self.env = tiers.carry(self.env, "review", self.issue, pr)
         pending_post = self.post_pending()
         screenshot_post = self.screenshot_post_pending()
         cfg = self.env.config
@@ -1459,7 +1467,7 @@ class Review:
                 if resuming_fix and self.seed():
                     self.seed_contrib()
                 if not task_recovery.pending_fix(self.env, self.issue or pr, pr):
-                    fixer = pick.choose(self.env, "fixer", fixer, "contrib", self.vendors(), pr=str(pr),
+                    fixer = pick.choose(runner.env, "fixer", fixer, "contrib", self.vendors(), pr=str(pr),
                                         exclude=exclude, issue=self.issue)
                 self.values["fixer"] = fixer
                 self.save()

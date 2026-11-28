@@ -138,6 +138,12 @@ screenshot_review = false
 # false: every PR of this repository waits for the owner (ready-for-human), even when
 # [scheduling].auto_merge is true. Use it for a repository whose changes you merge yourself.
 auto_merge = true
+# Integer ≥ 1 (default 1). Under baton serve, when free slots are contended, equal-priority
+# candidates across repositories: higher weight starts first, then rotation. Priority always
+# beats it. It does not expire; set it back to 1 to stop favouring a project. It does not change
+# quota or vendor choice, and has no effect without contention, on the legacy timer path, or
+# inside a child's own next_issue().
+weight = 1
 # Globs relative to the repository root (* also matches /). A PR that touches one, under its old
 # or new name, waits for the owner after review and CI pass, even with auto_merge on; no advisor
 # may release it. List the files that decide what agents may do (guard, quota, merge rules).
@@ -151,6 +157,9 @@ advisor = true
 advisor_diff_excerpts = false
 advisor_ci_log_excerpts = false
 advisor_local_documents = false
+# Intake task profiles (ADR 0009): subject lines of main's newest commits for the paths an issue
+# names, redacted and capped. Never authors, committers, message bodies or trailers.
+advisor_commit_subjects = false
 
 [repos.areas]
 # Top-level directory -> area, for per-area vendor preferences (`dev_ui = [...]`). Anything else is "other".
@@ -239,6 +248,20 @@ codex = { model = "codex_fast", effort = "low" }
 [models.routes.spec_followup]
 claude = { model = "claude_fast", effort = "low" }
 
+# Optional route tiers (ADR 0009) for dev, fix, review, spec_review and spec: <role> is the standard
+# tier, <role>_light and <role>_heavy replace a vendor's whole base entry for a step of that tier.
+# Omitted vendors inherit the base. Follow-up runs ignore the tier. Same-vendor eligibility is
+# judged from the tier's model (a code review of the vendor's own work may swap in another of its
+# models), and agy review models must differ from its write models in every tier. Nothing sets a non-standard tier yet. Examples:
+# [models.routes.dev_light]
+# claude = { model = "claude_fast", effort = "low" }
+#
+# [models.routes.fix_heavy]
+# claude = { model = "claude_strong", effort = "high" }
+
+# reviser is open to any declared vendor (pool or extra) whose roles include it; a grant still
+# needs a base [models.routes.spec] entry for that vendor. The baseline leaves cursor without
+# reviser; an optional extra such as agy may add it when its adapter supports the role.
 [vendors.claude]
 adapter = "claude"
 roles = ["dev", "fixer", "reviewer", "screenshot_reviewer", "spec_reviewer", "reviser", "retrospective", "scan"]
@@ -250,6 +273,10 @@ quota_probe_model = "claude_probe"
 # Optional override of [quota] quota_five_hour_max for this vendor's 5-hour window (same fraction
 # rules as cap). Omit to use the global default. Only vendors that report a 5-hour window are gated.
 # five_hour_max = 1.0
+# Optional unattended login: CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`) comes from the
+# runner's environment, else this file, which only its owner may read (chmod 600). Only the claude
+# processes baton starts get it; without it Claude uses its stored /login credential.
+# env_file = "~/.config/baton/claude.env"   # CLAUDE_CODE_OAUTH_TOKEN
 
 [vendors.codex]
 adapter = "codex"
@@ -280,8 +307,8 @@ quota_stale_minutes = 30
 # Independent quota worker retries incomplete probes with exponential backoff.
 quota_probe_retry_minutes = 5
 quota_probe_max_retry_minutes = 60
-# Same-vendor review (Codex reviewing Codex, Claude revising Claude's spec) runs only when every
-# other vendor is blocked for the long term: weekly cap, expired credential, or a cooldown ending
+# Same-vendor review (of a vendor's own code, or Claude revising Claude's spec) runs only when
+# every other vendor is blocked for the long term: weekly cap, expired credential, or a cooldown ending
 # later than this. A vendor back sooner (5-hour window, short cooldown) is waited for (ADR 0002).
 same_vendor_wait_max_minutes = 360
 
@@ -319,7 +346,8 @@ claude_code_auto_compact_window = 200000
 enable_claudeai_mcp_servers = false
 
 # Optional integrations, none by default. Each key comes from the runner's environment or from
-# env_file, which only its owner may read (chmod 600); no tool inherits them.
+# env_file, which only its owner may read (chmod 600); no tool inherits them. Claude's setup-token
+# file is [vendors.claude] env_file above.
 #
 # [linear]                  owner actions ("## Before release") become Linear issues, else a GitHub issue
 # env_file = "~/.config/baton/linear.env"     # LINEAR_API_KEY
@@ -364,7 +392,9 @@ budget_usd = 1.0
 # Complete, cited grounded answers to SPEC: human questions may resume revision in live mode.
 # Decisions go to STATE/advisor/decisions.jsonl and a daily digest. A [[repos]] entry with
 # advisor = false keeps that repository's text off both providers. Per-repository excerpt flags
-# (advisor_diff_excerpts, advisor_ci_log_excerpts, advisor_local_documents) default off.
+# (advisor_diff_excerpts, advisor_ci_log_excerpts, advisor_local_documents,
+# advisor_commit_subjects) default off. Either enabled mode also records an intake task profile
+# per issue, in observation only (ADR 0009).
 [advisor]
 env_file = "~/.config/baton/deepseek.env"     # DEEPSEEK_API_KEY
 # Backends, tried in order: "claude" (Claude Code, the grant for the advisor; Claude must be

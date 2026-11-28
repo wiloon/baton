@@ -13,8 +13,9 @@ import re
 import subprocess
 import time
 
-from . import advisor, after_merge, agents, checks as check_section, dispatch, fix, handoff as owner_handoff, md, names, pr as pr_helpers, pr_contract, prompts, recovery, spec, vendors
-from .common import Deferred, git, push, strip_markers
+from . import advisor, after_merge, agents, checks as check_section, dispatch, fix, handoff as owner_handoff, md, names, pr as pr_helpers, pr_contract, prompts, recovery, restart, scratch, spec, tiers, vendors
+from . import intake
+from .common import Deferred, MAINTENANCE_PREFIX, PROFILE_MARKER, git, push, strip_markers
 
 REPLY_CAP = 60000
 RESUME_NOTE = ("This worktree already holds earlier work on this issue (an earlier run stopped early). "
@@ -164,7 +165,7 @@ def finish_opening(tick, intent, path):
                 vendors.record_author_model(state, pr, author, model)
             vendors.record_author(state, pr, author)
             vendors.record_contrib(state, pr, author, intent["wt"], start, end, once=True)
-    Path(f"/tmp/baton-dev-{issue}.pr.md").unlink(missing_ok=True)
+    scratch.path(tick.env.dirs, "dev", issue).unlink(missing_ok=True)
     tick.active["issue"] = ""
     if (tick.state / f"review-pending-{pr}").exists():
         path.unlink(missing_ok=True)
@@ -294,7 +295,7 @@ def run_dev_worker(tick, issue, dev_vendor, wt, branch, body, base, plan, payloa
         ("VENDOR", dev_vendor), ("ISSUE", issue), ("GH_REPO", tick.gh_repo), ("WORKTREE", str(wt)), ("BRANCH", branch),
         ("PR_BODY_FILE", body), ("RESUME_NOTE", resume_note), ("CONTEXT_FILE", str(ctx)), ("SHOTS_DIR", shots)], env=env)
     out = dispatch.dispatch(dev_vendor, "dev", prompt, f"issue-{issue}-dev", str(wt), str(tick.self_dir / "settings.json"), body,
-                            env.with_runtime(shots_dir=shots), hooks)
+                            env.with_runtime(shots_dir=shots, pr_body_file=body), hooks)
     if out["rc"] == 75:
         raise Deferred(dev_vendor, out["defer"])
     outcome = out["outcome"]
@@ -320,7 +321,7 @@ def issue_binding(wt, issue, branch, payload):
     if current["branch"] != branch or not current["clean"] or not current["local_head"]:
         return None
     comments = [comment for comment in payload["comments"]
-                if not comment["body"].startswith("<!-- baton-note by=")]
+                if not comment["body"].startswith(("<!-- baton-note by=", PROFILE_MARKER))]
     current["issue_evidence"] = recovery.feedback_digest(json.dumps(
         [payload["title"], payload["body"], comments], sort_keys=True))
     return current
@@ -386,7 +387,7 @@ def finish_dev_push(tick, binding):
     intent = {"issue": str(issue), "branch": branch, "wt": str(wt), "base": binding["base"],
               "head": binding["commit"], "vendor": binding["vendor"],
               "model": binding["model"], "attempts": binding["attempts"], "pr": ""}
-    Path(f"/tmp/baton-dev-{issue}.pr.md").write_text(binding["title"] + "\n\n" + binding["body_text"] + "\n")
+    scratch.path(tick.env.dirs, "dev", issue).write_text(binding["title"] + "\n\n" + binding["body_text"] + "\n")
     save_opening(opening_path(tick, issue), intent)
     recovery.clear(tick.env, issue, issue)
     attempts_path(tick, issue).unlink(missing_ok=True)
@@ -429,6 +430,15 @@ def push_with_retry(tick, env, issue, wt, branch, *, vendor, title, body_text, b
     if initial:
         if found is not None:
             raise Deferred("handoff-retry", reason, lends_slot=False)
+        # The replacement after a closed PR (#303): on the active branch, and not the closed work.
+        try:
+            closed = restart.closed_heads(tick, issue)
+            restart.attach(tick, issue, wt, branch, closed)
+            rejected = restart.built_on(wt, "HEAD", closed)
+        except restart.Failed as exc:
+            return handoff(f"{branch} is committed in {wt}; {exc}.")
+        if rejected:
+            return handoff(f"{branch} is committed in {wt}; its HEAD is built on closed PR #{rejected}, not pushing.")
         if env.repo.signoff:
             from .common import sign_off
             if not sign_off(wt):
@@ -446,7 +456,8 @@ def push_with_retry(tick, env, issue, wt, branch, *, vendor, title, body_text, b
             body_text += f"\n\n## E2E gate\n{gate_result}, on {short}. The runner ran this."
         binding = {
             "issue": str(issue), "commit": commit, "branch": dest, "ref": dest,
-            "remote": remote, "upstream": True, "wt": str(wt), "feedback": feedback,
+            "remote": remote, "lease": restart.lease(wt, remote, commit, closed),
+            "upstream": True, "wt": str(wt), "feedback": feedback,
             "vendor": vendor, "title": title, "body_text": body_text, "base": base,
             "model": model, "gate_result": gate_result or "", "attempts": attempts,
         }
@@ -497,9 +508,14 @@ def push_with_retry(tick, env, issue, wt, branch, *, vendor, title, body_text, b
                 return handoff(f"{binding['branch']} is committed in {binding['wt']}; local inputs changed.")
             remote, unreadable_transient = owner_handoff.observe_remote(binding["wt"], binding["branch"])
             if remote is not None:
+                try:
+                    lease = restart.lease(binding["wt"], remote, binding["commit"],
+                                          restart.closed_heads(tick, issue) if remote else {})
+                except restart.Failed as exc:
+                    return handoff(f"{binding['branch']} is committed in {binding['wt']}; {exc}.")
                 consumed = owner_handoff.load_retry(env, issue, reason)
                 binding = owner_handoff.save_push_baseline(
-                    env, issue, issue, consumed, remote, reason=reason)
+                    env, issue, issue, consumed, remote, reason=reason, lease=lease)
                 pending = {**pending, "continuation": binding}
             elif not unreadable_transient:
                 return handoff(f"{binding['branch']} is committed in {binding['wt']}; could not observe the remote ref.")
@@ -513,8 +529,9 @@ def push_with_retry(tick, env, issue, wt, branch, *, vendor, title, body_text, b
     else:
         status = owner_handoff.check_push_landed(binding)
     if status == "absent" and (initial or pending["attempts"] < owner_handoff.MAX_ATTEMPTS):
+        lease = {"lease": binding["lease"]} if binding.get("lease") else {}
         pushed = push(binding["wt"], f"{binding['commit']}:refs/heads/{binding['branch']}",
-                      upstream=binding["upstream"], signoff=False)
+                      upstream=binding["upstream"], signoff=False, **lease)
         if pushed:
             status = "landed"
         else:
@@ -557,10 +574,16 @@ def waiting_dev_push(tick, env, issue):
     return found
 
 
+def accepted(plan):
+    """Whether PLAN is an accept verdict's, not a revise one's or none."""
+    verdict = spec.VERDICT.match(plan or "")
+    return bool(verdict) and verdict[1] == "accept"
+
+
 def run(tick, issue):
-    env, repo = tick.env.with_runtime(issue=str(issue)), tick.gh_repo
+    env, repo = tiers.carry(tick.env.with_runtime(issue=str(issue)), "dev", issue), tick.gh_repo
     branch, wt = names.for_issue(tick.wt_root, issue)
-    body = f"/tmp/baton-dev-{issue}.pr.md"
+    body = str(scratch.path(env.dirs, "dev", issue))
     shots = str(tick.ctx / f"issue-{issue}-shots")
     url = f"https://github.com/{repo}/issues/{issue}"
     tick.active["issue"] = issue
@@ -577,6 +600,11 @@ def run(tick, issue):
                                feedback=waiting["continuation"]["feedback"], pending=waiting)
     if waiting is not None:
         return 80
+    # Work built on a PR the owner closed is saved and set aside before anything else runs (#303).
+    started = restart.fresh_start(tick, issue)
+    if started is None:
+        return 1
+    branch, wt = started
     runner = spec.Spec(env, hooks, issue)
     payload = tick.recovered_issues.pop(str(issue), None)
     if payload is None:
@@ -584,6 +612,9 @@ def run(tick, issue):
     if payload is None:
         return 80
     plan = spec.verdict_plan(env, issue, listed=payload["comments"])
+    # The intake profile (#238, observation only): before the spec loop, and again once accepted.
+    if not accepted(plan) and not spec.accept_pending(env, issue, listed=payload["comments"]):
+        intake.run(env, issue, payload, "pickup")
     if not plan:
         tick.recovered_issues[str(issue)] = payload
         if not tick.spec_loop(issue):
@@ -596,8 +627,12 @@ def run(tick, issue):
         if not plan:
             tick.notify(f"#{issue}: spec accepted but no plan comment found", url)
             return 1
-    if (verdict := spec.VERDICT.match(plan)) and verdict[1] == "accept":
+    if accepted(plan):
         advisor.finish_episode(env, "issue", issue, "accept")
+    if reason := tick.draining():
+        raise Deferred("maintenance", f"{MAINTENANCE_PREFIX}{reason}")
+    if accepted(plan):
+        intake.run(env, issue, payload, "accept")
     resume_note, ok = setup_worktree(tick, wt, branch, issue)
     if not ok:
         return 1
@@ -616,7 +651,8 @@ def run(tick, issue):
     attempts = load_attempts(tick, issue)
     if pending and pending[0]["remaining_budget"].get("base_sha"):
         base = pending[0]["remaining_budget"]["base_sha"]   # a verification retry checks the same base
-    dev_vendor = pending[1] if pending else tick.pick_vendor("dev", "contrib", tick.all_vendors(), issue=issue)
+    dev_vendor = pending[1] if pending else tick.pick_vendor("dev", "contrib", tick.all_vendors(),
+                                                            issue=issue, env=env)
 
     def ask(reason, title, detail, *, budget=None, local=False, before_labels=None):
         return recovery.request(

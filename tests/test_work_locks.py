@@ -15,6 +15,7 @@ import time
 import pytest
 
 from baton import advisor, bootstrap, maintenance, migrate, tick
+from conftest import in_flight, probing
 from test_repos import TWO, load, two  # noqa: F401  (two is a fixture)
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -205,6 +206,13 @@ def test_a_tick_still_starts_once_the_lock_files_exist(two, capsys):
     assert "Single-repository state" not in capsys.readouterr().err
 
 
+def test_the_vendor_run_marker_and_probe_lock_are_global_state(two):
+    c = two[0]
+    with in_flight(c.paths.state, "claude"), probing(c.paths.state, "claude"):
+        pass
+    assert migrate.pending(c) == ""
+
+
 def test_each_repository_keeps_its_own_chain_flag(two, monkeypatch):
     c, _, _, ticks = two
     flag = c.paths.state / "repos/acme/app/chain-next"
@@ -250,7 +258,7 @@ def work(self):
         env = self.env
         env.tools["STUB_REPO"] = self.gh_repo
         out = dispatch.dispatch(chosen["vendor"], "dev", "p", "item", sys.argv[2], env=env)
-        assert out["defer"] != "vendor capacity reserved", out
+        assert out["defer"] == "", out
     self.item(body)
     return 0
 
@@ -305,13 +313,94 @@ def test_two_ticks_run_items_in_different_repositories_at_the_same_time(tmp_path
         second = start()
         output = second.communicate(timeout=60)[0]
         assert second.returncode == 0, output + runner_log(config)
-        # B's whole run, on another vendor, happened inside A's run.
+        # B's whole run happened inside A's run.
         assert marks("acme_shop", "ended"), output + runner_log(config)
         assert marks("acme_app", "ended") == []
-        assert marks("acme_shop", "ended") != marks("acme_app", "started")
         assert f"[acme/app] {BUSY}" in runner_log(config)
     finally:
         (sync / "release").touch()
         output = first.communicate(timeout=60)[0]
     assert first.returncode == 0, output
     assert marks("acme_app", "ended")
+
+
+# --- two runs of one vendor (#299) ---------------------------------------------------------------
+SAME_VENDOR_DRIVER = '''"""A tick whose item is one real Claude dispatch."""
+import json
+import sys
+from pathlib import Path
+from baton import bootstrap, dispatch, tick, vendors
+
+def work(self):
+    def body():
+        chosen, rc = vendors.pick(self.env.config.paths.state, ["claude"], "dev", ["claude"])
+        assert rc == 0, chosen
+        env = self.env
+        env.tools["STUB_REPO"] = self.gh_repo
+        out = dispatch.dispatch(chosen["vendor"], "dev", "p", "item", sys.argv[2], env=env)
+        Path(sys.argv[3], self.gh_repo.replace("/", "_") + ".out").write_text(json.dumps(out))
+    self.item(body)
+    return 0
+
+tick.Tick.work = work
+sys.exit(bootstrap.main(["--config", sys.argv[1]]))
+'''
+
+# Both runs end in a quota rejection. The one that ends last (acme/app) names the earlier reset.
+QUOTA_STUB = '''#!/bin/sh
+case "$*" in *--version*) exit 0 ;; esac
+repo=$(echo "$STUB_REPO" | tr / _)
+touch "{sync}/claude.$repo.started"
+if [ "$STUB_REPO" = acme/app ]; then
+  until_epoch={early}
+  i=0
+  while [ ! -e "{sync}/release" ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done
+else
+  until_epoch={late}
+fi
+touch "{sync}/claude.$repo.ended"
+printf '{{"type":"result","subtype":"success","is_error":true,"result":"Claude usage limit reached. resets_at: %s"}}\\n' "$until_epoch"
+exit 1
+'''
+
+
+def test_two_runs_of_one_vendor_in_different_repositories_overlap(tmp_path):
+    sync, bin_dir, home = tmp_path / "sync", tmp_path / "bin", tmp_path / "home"
+    for path in (sync, bin_dir, home):
+        path.mkdir()
+    early, late = int(time.time()) + 3600, int(time.time()) + 7200
+    (bin_dir / "claude").write_text(QUOTA_STUB.format(sync=sync, early=early, late=late))
+    (bin_dir / "claude").chmod(0o755)
+    text = re.sub(r'(?m)^path_prefix = .*$', f'path_prefix = ["{bin_dir}"]', TWO)
+    config = load(tmp_path, text)
+    driver = tmp_path / "driver.py"
+    driver.write_text(SAME_VENDOR_DRIVER)
+    work_tree = tmp_path / "wt"
+    subprocess.run(["git", "init", "-q", str(work_tree)], check=True)
+    child = {"HOME": str(home), "PATH": f"{bin_dir}{os.pathsep}{os.defpath}", "PYTHONPATH": str(ROOT)}
+
+    def start():
+        return subprocess.Popen([sys.executable, str(driver), str(config.source), str(work_tree), str(sync)],
+                                cwd=ROOT, env=child, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+    def result(repo):
+        return json.loads((sync / f"{repo}.out").read_text())
+    first = start()
+    try:
+        wait_for(lambda: (sync / "claude.acme_app.started").exists(), first, lambda: runner_log(config))
+        (config.paths.state / "last-repo").unlink()
+        second = start()
+        output = second.communicate(timeout=60)[0]
+        assert second.returncode == 0, output + runner_log(config)
+        # The second run started, and ended, while the first was still in flight.
+        assert (sync / "claude.acme_shop.started").exists(), "the second run never started\n" + runner_log(config)
+        assert not (sync / "claude.acme_app.ended").exists()
+        assert result("acme_shop")["status"] == "quota"
+    finally:
+        (sync / "release").touch()
+        output = first.communicate(timeout=60)[0]
+    assert first.returncode == 0, output
+    assert result("acme_app")["status"] == "quota"
+    state = config.paths.state
+    assert (state / f"runs-{time.strftime('%F')}").read_text() == "2\n"
+    assert (state / "claude-cooldown-until").read_text() == f"{late}\n"

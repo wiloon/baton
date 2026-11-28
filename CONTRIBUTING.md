@@ -17,6 +17,17 @@ Opening an issue does not authorize a run. Agents use the issue body and trusted
 maintainers relay any needed clarifications from contributors. Vulnerabilities follow
 [SECURITY.md](SECURITY.md).
 
+When an owner session drafts or edits an issue body outside the spec loop, include a single
+marker line naming the drafting vendor and model:
+
+```markdown
+<!-- baton-author: vendor=claude model=claude-opus-5-5 -->
+```
+
+Place it on its own line (at the top of the body, or after a leading `<!-- baton-scan ... -->`
+line). Replace the marker when a different session edits the body outside the spec loop. The
+marker only steers spec reviewer selection toward another vendor and grants no authorization.
+
 ## Pull requests
 
 1. Fork the repository and create a branch in your fork.
@@ -43,6 +54,10 @@ gitleaks git --log-opts=--all --redact
 The real telemetry integration tests run when `alloy` is on PATH (or `ALLOY_BIN` names it);
 otherwise they are skipped. They use ephemeral loopback listeners and need permission to start
 Alloy and bind local ports. Other offline checks need no vendor subscription or live credentials.
+
+Agent files (descriptions, replies, drafts) live in each repository's scratch directory under the
+state directory ([README](README.md#agent-scratch-files)); take the path from `baton/scratch.py`
+instead of naming a file under `/tmp`, and point the state directory at a temporary one in tests.
 
 CI runs the offline suite on Linux. Live provider compatibility and a fresh-host installation
 must be checked separately; the offline suite does not call the coding-agent services.

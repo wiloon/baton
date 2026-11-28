@@ -33,7 +33,12 @@ Use a dedicated OS account on a disposable host or VM. Give it only the reposito
 credentials and outbound access it needs. Keep production credentials, unrelated repositories,
 host-management sockets and personal SSH agents outside that environment. Scope the runner's
 GitHub token to the watched repositories and required operations. Keep integration credential
-files owner-readable only (`chmod 600`), and keep raw run logs private.
+files owner-readable only (`chmod 600`), and keep raw run logs private. The runner's own env
+files (`[linear]`, `[telegram]` and `[advisor] env_file`, and `[vendors.claude] env_file` with
+Claude's `CLAUDE_CODE_OAUTH_TOKEN`) sit under `~/.config/baton/`, which `bin/guard.sh` keeps
+Claude agents from reading. No agent inherits these keys; the setup-token goes only to the
+`claude` processes baton starts, never to another vendor's agent, a verify hook or a CI command.
+It is in those processes' environment, so a command a Claude run executes can read it.
 
 Host-side verify and gate hooks keep their definitions outside a PR, but execute the code being
 tested. They do not create an execution sandbox. Review the first runs with `auto_merge = false`.

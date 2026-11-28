@@ -10,7 +10,7 @@ only for Codex and only per role, not per round. Several modules also read `mode
 directly. A model generation change (6.1 → 6.2, #61) touched the baseline, a config default and a
 family regex, and found a telemetry allowlist that had silently drifted. We decided that model
 identifiers appear once, as **aliases**. Dispatch takes its model and effort from a
-**route**: role × phase × vendor → model choice + effort. Probes and retrospectives use
+**route**: role × tier × phase × vendor → model choice + effort (the tier dimension is ADR 0009's). Probes and retrospectives use
 the same alias catalog. Updating a model identifier means changing its alias definition.
 
 ```toml
@@ -49,6 +49,13 @@ codex  = { model = "codex_fast", effort = "low" }
   If the entry or table is absent, inherit the complete base entry for that vendor, including
   effort and subagent model. A present entry replaces the complete base entry. An omitted or
   empty effort or subagent field uses the CLI default for that field.
+- `dev`, `fix`, `review`, `spec_review` and `spec` have optional tier tables `ROLE_light` and
+  `ROLE_heavy` (ADR 0009); `ROLE` itself is the standard tier. Without follow-up, use the
+  step's tier entry for that vendor, else the `ROLE` entry. A present tier entry replaces the
+  complete `ROLE` entry, as a follow-up entry does. When follow-up is selected the tier is
+  ignored: `ROLE_followup`, else the `ROLE` entry, never a tier entry. Tier entries need the
+  same fields, aliases and vendor roles as other entries. There are no other tier tables
+  (none for `scan` or `screenshot_review`, no `ROLE_standard`, no tiered follow-up).
 - The adapter declares whether effort and subagent fields are supported. Codex receives effort
   via `-c model_reasoning_effort` and Claude Code via `--effort`. A Cursor model identifier
   carries the effort level. Claude supports subagent models.
@@ -69,8 +76,8 @@ and dispatch where applicable. An absent follow-up entry preserves the base assi
 
 | Role | When to select follow-up |
 | --- | --- |
-| `review` | Review round greater than one. The writer-model fallback policy keeps the base route for a reviewer excluded by the existing PR/fixer rules (Codex reviewing Codex-authored work). |
-| `spec_review` | Spec-review round greater than one. The known-distinct-model spec policy keeps the base route after a revision by that same vendor (Codex). |
+| `review` | Review round greater than one. The writer-model fallback policy keeps the base route for a reviewer excluded by the existing PR/fixer rules (any vendor reviewing its own work). |
+| `spec_review` | Spec-review round greater than one. The known-distinct-model spec policy keeps the base route after a revision by that same vendor (Codex, agy). |
 | `spec` | Round-one same-vendor revision for the alternating-phase policy (Claude). Later same-vendor revisions for that policy and other revisions use the base entry. A retry uses the original phase. |
 | `fix` | Fixing agent review feedback from review round greater than one. Fixes from round-one review, owner feedback, CI and verification repairs use the base entry. |
 | `screenshot_review` | Always use the base entry. Validation rejects `screenshot_review_followup`. |
@@ -107,12 +114,24 @@ The config remains valid and normal cross-vendor selection applies.
   `config.toml`. A test checks every model filter against the identifiers resolved from the
   shipped Codex routes, fallback list and retrospective setting.
 - Vendor selection and preflight use the same resolved model and phase that dispatch
-  requests. The writer-model policy (Codex) allows code review with a known different model
-  or a known same model in a fresh session. Its screenshot fallback requires a known
+  requests. The writer-model policy (every reviewer-capable adapter, ADR 0002) allows code
+  review of the vendor's own work. It takes the first model provably distinct from every
+  recorded writer model from: the `review` route at the step's tier, `spec_review` at that
+  tier, the base `screenshot_review` route, `review_followup`, `spec_review_followup`, then the
+  vendor's `fallback_models`; an absent route is skipped. Only the model changes: effort and
+  sub-agent model stay those of the `review` route. With no such model, no writer record, or an
+  unknown model on either side, it runs the `review` route's model in a fresh session
+  (`same-model-fresh-context`). The screenshot fallback requires a known
   model distinct from every recorded writer model (ADR 0005). The known-distinct-model spec
-  policy (Codex) requires two known, different models for same-vendor review and revision.
+  policy (Codex, agy) requires two known, different models for same-vendor review and revision.
+  It is enforced at selection and after the run, never by rejecting the config.
   Same-vendor fallbacks retain ADR 0002's wait for short cross-vendor quota blocks. Post-run eligibility and review
   mode use the actual model reported by the run, which may differ after a capacity fallback.
+- Cursor is the exception to the last sentence, for writers and reviewers: `cursor-agent`
+  reports only `Auto`, so a run that requested a pinned model records that requested model, and
+  a run that requested `auto` records `unknown`. A pinned request served by another model is
+  therefore labelled `same-vendor-different-model` without proof. Cursor takes no images, so
+  the screenshot review never relies on this.
 - For alternating-phase revision (Claude), carry the actual main-session model from CLI output
   through dispatch and the runner's round record so selection can use the preceding review's
   reported model. Use the adapter's model identity comparison to account for shorthand and
@@ -142,3 +161,12 @@ The config remains valid and normal cross-vendor selection applies.
   `cli.log` entry, agy is not enabled.
 - ADR 0009 (owner, 2026-11-24): routes gain a tier dimension chosen by the task profile;
   an absent tier entry inherits the standard entry, and follow-up rounds keep `ROLE_followup`.
+- Issue #237, spec round 1: wrote the tier rules into Rules. "Base entry" for an absent
+  follow-up stays the `ROLE` table whatever the tier, so follow-up rounds resolve as before.
+- Issue #324, round 1: agy can revise specs and follows the known-distinct-model spec policy.
+  Equal or unknown models make it ineligible at run time and leave the config valid, as for the
+  other vendors.
+- Issue #221: the writer-model policy now covers every reviewer-capable adapter, tries the
+  vendor's other configured models before the same model, and lets an unknown model fall back to
+  a fresh session so review never stalls. Cursor records the requested pinned model because its
+  CLI names no other; without that its runs could never count as distinct.

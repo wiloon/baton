@@ -50,8 +50,16 @@ new issue, and `max_pending_prs` limits new issues, with one exception: `P0`, fo
 `P0` issue goes before the resumed work of lower-priority issues and is not limited by
 `max_pending_prs`, however many `P0` issues there are (their PRs count toward it as usual). A
 running step is never interrupted, and a `P0` that cannot run now does not hold up other work.
-Priority is per repository: the turns across repositories do not change, so a `P0` may wait while
-another repository takes its turn. A run by hand on one issue or PR has no `P0` step
+Under `baton serve`, priority is global across repositories: when free slots are contended the
+supervisor lists each due repository and starts the best ready work first (`P0` anywhere before
+`P1`, and so on). Equal priority is broken by each repository's `weight` (an integer ≥ 1 in
+`[[repos]]`, default 1; higher first), then by rotation. Priority always beats weight: a `P1` in a
+weight-1 repository goes before a `P2` in a weight-5 one. Weight does not expire, does not change
+quota spend or vendor choice, and has no effect when free slots are not contended, on the legacy
+timer path, or inside a child's own `next_issue()`. In-flight work of a repository keeps its slot
+ahead of any new issue elsewhere
+([ADR 0012](docs/adr/0012-supervisor-orders-work-by-priority-across-repositories.md)). The legacy
+timer path still turns per repository. A run by hand on one issue or PR has no `P0` step
 ([ADR 0010](docs/adr/0010-priority-labels-order-the-queue-and-p0-preempts.md)).
 
 When a step ends, the tick can go straight on to the next one, up to `chain_max`. With
@@ -71,9 +79,21 @@ deferred dev run) and logs `released agent-wip (no open PR)`; an unsettled merge
 is not counted, and a failed lookup leaves the label and retries next tick. When the cap blocks a start, the log lists each in-flight issue, its PR, and the
 saved deferral reason.
 
+**After you close a PR.** Baton never closes a PR, so closing an issue's PR without merging rejects
+that work. The next dev run of the issue (picked, relabelled or `python -m baton N`) starts again from
+`main`: an `agent-N`/`cursor-N` worktree whose HEAD shares a commit outside `main` with a closed PR's
+head is saved and removed. The saved work stays in the runner's clone under
+`refs/baton/backup/issue-N/<sha>`, together with any branch tip baton moves; uncommitted work is a
+commit whose parent holds the staged changes (`git show <sha>:<file>`). Other worktrees are resumed as
+they are. The replacement push may overwrite the remote branch only while it still holds exactly the
+closed PR's head (`--force-with-lease`), or fast-forward it; a remote that diverged, or a replacement that merged
+the closed work back in, is not pushed and the issue is handed to you.
+
 **Picking a vendor.** For each run, baton drops the vendors that are resting after a limit or an
 auth failure, that are over their quota caps, or, for a review, that wrote any of the PR (when
-every vendor did, the same vendor reviews on a different model). That same-vendor fallback waits
+no other vendor can review, a vendor reviews its own code: on a different model when one is
+configured, otherwise on the same model in a fresh session; the screenshot review still needs a
+different model). That same-vendor fallback waits
 while another vendor is only briefly blocked, such as a full 5-hour window, and runs only when
 the others are out for the week, logged out, or resting past `same_vendor_wait_max_minutes`
 ([ADR 0002](docs/adr/0002-same-vendor-review-waits-for-short-blocks.md)). From the rest it takes the one
@@ -137,7 +157,8 @@ existing alternatives, replacement criteria and the proposed boundary for model-
   - Antigravity (`agy`) as an extra vendor (`[vendors.agy]` with `quota = "extra"`) or a pool vendor
     (`quota = "pool"`): baton reads its Gemini 5-hour and weekly windows from `agy -p /quota`. Gemini
     models only: a model that is not `gemini-*` is a config error, and its review route needs a model
-    distinct from its dev and fix routes (an effort suffix alone is not distinct)
+    distinct from its dev and fix routes (an effort suffix alone is not distinct). It can hold
+    `reviser` (with a `[models.routes.spec]` entry); revision is not limited to pool vendors
 - whatever the watched repository's own checks need (its toolchain; `mise.toml` here pins one
   for everything under `~/baton`, edit it to suit)
 
@@ -146,10 +167,11 @@ the capabilities and policies of its CLI as constants: the roles it can run, its
 its review and fix protocol, and, for retrospectives, its analyst command, approved model family,
 environment and budget enforcement. Config only enables a vendor (`[vendors.<id>]`) and grants it
 roles from the adapter's supported set; a grant for a role the adapter lacks is a config error.
-Preferences order the vendors that are eligible for a role and never widen the grant. The
-retrospective model comes from `retrospectives.model_<id>` for Claude, Codex and Cursor; any other
-adapter uses its built-in alias, resolved through `[models.aliases]`. Adding an adapter means adding
-its module and one `ADAPTERS` entry, with no new config fields.
+`reviser` may be granted to an extra vendor the same way as to a pool vendor. Preferences order
+the vendors that are eligible for a role and never widen the grant. The retrospective model comes
+from `retrospectives.model_<id>` for Claude, Codex and Cursor; any other adapter uses its built-in
+alias, resolved through `[models.aliases]`. Adding an adapter means adding its module and one
+`ADAPTERS` entry, with no new config fields.
 
 The watched repository explains its conventions (tests, CI command, commit style) in its own
 `AGENTS.md`; the agents read it like any other agent would.
@@ -225,16 +247,22 @@ beside the supervisor: the repository lock keeps them apart.
 ### Supervisor
 
 `python -m baton serve` is a resident process that replaces the timer
-([ADR 0011](docs/adr/0011-resident-supervisor-runs-one-tick-child-per-repository.md)). It only
-schedules: it never calls GitHub or an agent CLI. Each tick is a child process for one repository,
-which honours maintenance and `scheduling.paused`, takes its own locks and scans when its
-repository is idle and a scan is due.
+([ADR 0011](docs/adr/0011-resident-supervisor-runs-one-tick-child-per-repository.md),
+[ADR 0012](docs/adr/0012-supervisor-orders-work-by-priority-across-repositories.md)). It schedules
+children and, when more due repositories compete than free slots, lists GitHub read-only to order
+work by priority across repositories. It never writes to GitHub or a repository's state and never
+calls an agent CLI. Each tick is a child process for one repository, which honours maintenance and
+`scheduling.paused`, takes its own locks and scans when its repository is idle and a scan is due
+(an assigned `--issue` / `--no-new-issue` child does not scan).
 
 - **`[scheduling] max_parallel`** (default 1): children running at once, across all repositories,
-  never two for one repository. Repositories take turns in the configured order.
+  never two for one repository. Under contention the supervisor prefers in-flight work, then an
+  hour-idle housekeeping turn, then the best candidate by priority (equal priority: higher
+  `[[repos]] weight`, then rotation), then plain rotation.
 - **`[serve] poll_seconds`** (default 60, at least 10): how often it looks, and how long a
   repository waits after its tick exits. After a merged partial slice the next tick starts at once,
-  at most `chain_max` times in a row.
+  at most `chain_max` times in a row. An assigned child that ran no item exits 81: due at once, and
+  that assignment is skipped for one poll so another repository can take the slot.
 - A failing tick doubles its repository's wait each time, up to one hour; success resets it.
 - `config.toml` is read again on every loop; while it is invalid nothing starts. Lowering
   `max_parallel` or removing a repository never stops a running tick.
@@ -271,11 +299,14 @@ a redacted snapshot and the allowed actions (`extra_round` or `handoff`).
 first and DeepSeek is the fallback. `["deepseek"]` uses DeepSeek only; `["claude"]` has no fallback.
 Listing `claude` is the grant for the advisor: Claude must be declared under `[vendors]` but needs
 no role. The call is a tool-less, isolated one-shot (`[advisor] claude = { model, effort }`, default
-`claude_strong` at `medium`) that takes no vendor lease; its quota use and quota, auth and busy
+`claude_strong` at `medium`) that does not mark Claude as running a workload; its quota use and quota, auth and busy
 rejections are accounted like any Claude run. Claude is skipped when it is undeclared, at its cap or
 five-hour limit, in cooldown, or its credential has expired. The next backend is tried once when one
 is skipped, fails or returns an unusable reply, never after a valid `handoff` or other well-formed
-outcome. Records, handoff notes and answer comments name the backend that answered. In `mode = "live"` the
+outcome. Records, handoff notes and answer comments name the backend that answered. An evidence
+quote must be in the sent snapshot (runs of whitespace aside): mismatching quotes are dropped while
+at least one matches, and the record and `runner.log` keep the first one, redacted and cut, as
+`evidence_miss` (except for a snapshot with opted-in excerpts). In `mode = "live"` the
 runner revalidates the state and grants at most one extra round per task episode. Failed
 review, fix, spec, implementation, local verification and worktree steps can also send a
 redacted step snapshot. Where the role and task allow it, `retry_step` repeats the failed step
@@ -291,6 +322,13 @@ makes no call. `[[repos]] advisor = false` keeps a repository's issue and PR tex
 providers. Decisions go to `<state>/advisor/decisions.jsonl`; once a day a "Advisor digest"
 notification lists them with how the extra rounds ended (merged or accepted). `DEEPSEEK_API_KEY` comes from the
 environment or `[advisor] env_file` (mode 0600) and is never passed to agents.
+
+When the runner picks up an issue, and again once its spec is accepted, the advisor also records a
+task profile ([ADR 0009](docs/adr/0009-task-profile-selects-route-tier.md): size, kind, risk and a
+tier per route) and comments it on the issue. This is observation only in either enabled mode: every
+role still runs at the standard tier. The snapshot adds main's commit count and last-change date for
+paths the issue names; `[[repos]] advisor_commit_subjects = true` also sends their recent commit
+subjects.
 
 ### Maintenance mode
 
@@ -328,6 +366,17 @@ directory, none ever waited for):
 The nightly run and `baton.migrate` take every repository lock at once (migrate also the
 housekeeping and scan locks) and give up with 75 when one is held; `--preflight` reports 75 then.
 
+### Agent scratch files
+
+Files the runner exchanges with an agent run (PR descriptions, review and fix replies, spec and
+scan drafts) are written under `<state>/repos/OWNER/NAME/scratch/` (mode `0700`), so two
+repositories with the same issue or PR number never share a file. Besides its worktree, this is
+the only directory `bin/guard.sh` lets a Claude run write with the file tools; `/tmp` is not
+allowed. The runner removes a task's files when it cleans up the task, and `baton-tmp-sweep.timer`
+removes anything left there after a day without writes. A repository that overrides prompt
+templates (`prompt_dir`) names these files with `{{REPLY_FILE}}` (fix), `{{REVIEW_FILE}}` (review)
+and `{{OUT}}` (spec, scan), never a fixed `/tmp` path.
+
 ### systemd units
 
 | Unit | What it does |
@@ -336,7 +385,7 @@ housekeeping and scan locks) and give up with 75 when one is held; `--preflight`
 | `baton.timer` / `.service` | a tick every 10 minutes: the rollback path for one release |
 | `baton-quota.*` | every 5 minutes after completion: refreshes only stale vendor quota observations |
 | `baton-retrospectives.*` | every minute after completion: analyzes eligible task episodes |
-| `baton-tmp-sweep.*` | hourly: removes the agents' stale `/tmp` files |
+| `baton-tmp-sweep.*` | hourly: removes the agents' stale `/tmp` and [scratch](#agent-scratch-files) files |
 | `baton-postmerge.*` | every 6 hours: finds reverts of, and issues about, merged agent PRs (telemetry) |
 | `baton-e2e-nightly.*` | nightly: runs the repository's `nightly_hook` on `origin/main`, notifies when red |
 
@@ -348,11 +397,20 @@ The units assume the checkout is at `~/baton` and uv at `/usr/bin/uv`; adjust `E
 quota probe retry settings, and `[[repos]]` `auto_merge` are optional. The repository's `auto_merge` defaults to `true`. Set it to `false` to keep
 that repository's PRs for manual merging. `owner_review_paths` (globs, default empty) keeps only the PRs that touch those files for the owner, after review and CI pass. Edit the `[[repos]]` entry, declare your installed vendors under `[vendors.<id>]`, and
 choose whether `[scheduling].auto_merge` should be enabled. The optional
-`[linear]` and `[telegram]` tables are at the end of the file.
+`[linear]` and `[telegram]` tables are at the end of the file. Their keys, like `DEEPSEEK_API_KEY`
+and `CLAUDE_CODE_OAUTH_TOKEN`, come from the runner's environment or from a mode 0600 env file
+(`[linear] env_file`, `[telegram] env_file`, `[advisor] env_file`, `[vendors.claude] env_file`)
+and never reach other tools. `CLAUDE_CODE_OAUTH_TOKEN` is the one-year login `claude setup-token`
+prints; set `[vendors.claude] env_file` (e.g. `~/.config/baton/claude.env`) and only the `claude`
+processes baton starts (runs, quota probes, the retrospective analyst, the advisor) get it. A file
+others can read stops Claude as an auth failure. Without it, Claude uses its stored `/login`.
 
 Define model identifiers in `[models.aliases]` and reference those aliases in
 `[models.routes.<role>]` for each vendor. An optional `<role>_followup` entry replaces the
 vendor's whole base entry. If the vendor is omitted, its base entry carries over.
+`dev`, `fix`, `review`, `spec_review` and `spec` also take optional `<role>_light` and
+`<role>_heavy` entries ([route tiers](docs/adr/0009-task-profile-selects-route-tier.md)); `<role>` is the standard
+tier, and follow-up runs ignore the tier.
 Screenshot review is base-only. Every round uses `[models.routes.screenshot_review]`.
 Set `[preferences].screenshot_reviewer` to order Claude and Codex for that run. The picker
 checks `screenshot_reviewer_<area>`, `screenshot_reviewer`, `reviewer_<area>`, and
@@ -364,9 +422,13 @@ Migrate legacy flat model keys before validating a host config. Run records dist
 the requested model from the actual model when the CLI reports it.
 
 Each vendor choice logs its preference order, weekly usage/cap, time to reset, pace score and
-quota/cooldown gate. Lower pace scores mean further behind the weekly spending pace. Cursor is
-an extra vendor outside pool balancing: a configured preference can choose it before comparing
-pool pace. This policy remains subject to quota limits and independent-review eligibility.
+quota/cooldown gate. Lower pace scores mean further behind the weekly spending pace. Extra
+vendors such as Cursor are outside pool balancing. Review-style picks among equal candidates
+choose in three steps: a vendor named by the preference wins, in its order (an extra whatever
+its pace, a pool vendor only when pool pace selects it); otherwise the best eligible pool vendor
+by pace; otherwise, among extras only, the best by pace. Pace scores within the tie margin
+keep candidate order. This policy remains subject to quota limits and independent-review
+eligibility.
 
 ## Telemetry
 

@@ -34,7 +34,8 @@ of adapters supplies validation and dispatch. Adding an adapter requires a catal
 - Keep existing author and fixer exclusions and the model evidence requirements in
   ADRs 0002, 0004 and 0005. A temporary block defers the review. All eligible reviewers
   excluded by authorship or fixer identity, with no qualifying fallback, hands it off
-  to the owner.
+  to the owner. For code review every real adapter has a fallback (ADR 0002), so this
+  remains for the screenshot review, which requires a distinct model (ADR 0005).
 - Disabling a vendor takes a config edit, including removal of its explicit route, model and
   preference references. Historical attribution survives disablement.
 - A pending reply-protocol fix request belongs to the adapter that produced it. If another
@@ -63,3 +64,5 @@ of adapters supplies validation and dispatch. Adding an adapter requires a catal
   use existing workflow roles without adding vendor branches or new configuration fields.
 - Issue #113: record who owns a pending reply fix so adapter reselection cannot replay another
   fixer's request or skip verification of its unpushed commits.
+- Issue #221: noted that code review no longer reaches the authorship handoff, since every
+  adapter now has a same-vendor fallback.

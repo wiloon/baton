@@ -30,13 +30,29 @@ codex  = { model = "codex_strong", effort = "xhigh" }
   It records size, kind (docs, test, bugfix, feature, refactor) and risk, each with a reason.
   The runner stores it with the task episode. Whether an issue is split is decided at spec
   review (#272), not by the profile.
-- The profile maps to one tier per role. Code applies floors that judgement cannot lower: a
-  change to an owner-review path, or a profile with high risk, never gets `light` review.
+- Intake keeps ADR 0008's contract: its one action besides handoff records a profile, which the
+  reply carries and the runner validates as a whole. The profile comment the runner posts is
+  advisor-authored text and never counts as owner input. Linked ADR text is sent only under the
+  repository's local-documents opt-in (ADR 0008).
+- Data boundary for git history (owner, #238): for each path an issue names, intake may send the
+  commit count and last-change date on the main branch. Commit subjects, bounded and redacted,
+  are sent only under a separate per-repository opt-in that defaults to off, and decision records
+  don't keep them. Commit authors and message bodies are never sent.
+- The profile maps to one tier per role, for `dev`, `fix`, `review`, `spec_review` and
+  `spec`. `screenshot_review` always uses its base route (ADR 0004, ADR 0005), and `scan` is
+  not a step of a task, so it has no profile. Code applies floors that judgement cannot lower: a
+  change to an owner-review path, or a profile with high risk, never gets `light` `review` or
+  `spec_review`. At intake no change exists yet, so the paths the issue names stand for it. The
+  record keeps both the advised and the floored tier.
 - A tier entry follows ADR 0004's inheritance: an absent `ROLE_TIER` entry for a vendor inherits
-  that vendor's standard entry. Follow-up rounds keep using `ROLE_followup`, because a follow-up
-  round re-checks earlier findings whatever the task's size.
-- Same-vendor rules (ADR 0002, ADR 0004's distinct-model policies) use the resolved model of the
-  chosen tier, so a tier never turns a review into a same-model review.
+  that vendor's standard entry. Follow-up rounds keep using `ROLE_followup` (or, when absent,
+  the standard entry), because a follow-up round re-checks earlier findings whatever the task's
+  size.
+- Same-vendor rules (ADR 0002, ADR 0004's distinct-model policies) judge the resolved model of
+  the chosen tier by the adapter's existing policy. For code review, a tier that resolves to a
+  writer's model leads to another configured model and otherwise to a fresh session recorded as
+  `same-model-fresh-context` (ADR 0004). The spec and screenshot policies still require a
+  distinct model.
 - The profile does not choose the vendor. Vendor selection stays with code: quota caps and
   cooldowns, the owner's `[preferences]` order, and review independence (the reviewer of an
   issue or a PR is a different vendor from its author whenever one can run; ADR 0002). Judgement
@@ -73,3 +89,15 @@ codex  = { model = "codex_strong", effort = "xhigh" }
 - Owner, 2026-11-26: the profile chooses model and effort only (through the tier). The vendor is
   not a judgement call: code keeps author and reviewer on different vendors. The split
   recommendation moved to spec review (#272).
+- Issue #237, spec round 1: named the tiered roles and why the others have none; stated that
+  follow-up never uses a tier entry; and corrected the same-vendor rule, which had claimed
+  more than ADR 0004's writer-model policy allows (a same model in a fresh session).
+- Issue #221: a tier that resolves to the writer's model no longer rules out same-vendor code
+  review, because the owner decided the pipeline never stalls on review independence.
+- Issue #238, spec round 1: said how a structured profile fits the one-action advisor contract,
+  kept its comment out of owner input and linked ADRs behind the opt-in, applied the floor to
+  `spec_review` too (its review is as much a gate as code review), and defined the floor's input
+  and what is recorded, so implementations can't differ on authority or the data boundary.
+- Issue #238 (owner answer to spec round 1): set the data boundary for git history, which ADR
+  0008's baseline and opt-ins did not cover: counts and dates, plus commit subjects only by
+  opt-in, so intake can judge size and risk without sending free text by default.

@@ -10,6 +10,7 @@ import sys
 import pytest
 
 from baton import dispatch, hooks
+from conftest import in_flight
 from test_agents import CODEX_STREAM, FAKE_CLI, claude_stream, lines
 
 FAKE_TELEMETRY = f"""#!{sys.executable}
@@ -303,14 +304,33 @@ def test_ci_result_is_unknown_when_the_head_moved(runner, tmp_path, monkeypatch)
     assert call[call.index("--ci-result") + 1] == "unknown"
 
 
-def test_vendor_lease_defers_workload_without_starting_or_counting(runner):
-    from baton import capacity
-    with capacity.lease(runner.state_dir, 'claude') as available:
-        assert available
+def test_a_run_in_flight_does_not_defer_another_run_of_its_vendor(runner):
+    runner.plan(stream=claude_stream("fine\nREVIEW: pass"))
+    with in_flight(runner.state_dir, 'claude'):
         out = runner.run()
-    assert out['rc'] == 75 and out['defer'] == 'vendor capacity reserved'
-    assert not list(runner.state_dir.glob('runs-*'))
-    assert not (runner.root/'fake/calls').exists()
+    assert (out['rc'], out['outcome'], out['defer']) == (0, 'REVIEW: pass', '')
+
+
+def test_a_run_in_flight_does_not_stop_a_probe_and_a_probe_does_not_stop_a_run(runner, monkeypatch):
+    from baton import settle
+    runner.plan(stream=claude_stream("fine\nREVIEW: pass"))
+    real_run, probes, during_probe = dispatch.agents.run, [], []
+
+    def probe_request(state, logs, vendor, model, settings=None):
+        probes.append(vendor)
+        monkeypatch.setattr(dispatch.agents, "run", real_run)
+        during_probe.append(runner.run())
+
+    def run_and_probe(*args):
+        monkeypatch.setattr(settle, "_probe", probe_request)
+        probes.append(settle.probe(str(runner.state_dir), str(runner.root / "logs"), "claude", "m",
+                                   needed=lambda: True))
+        return real_run(*args)
+
+    monkeypatch.setattr(dispatch.agents, "run", run_and_probe)
+    out = runner.run()
+    assert probes == ["claude", True] and out["outcome"] == "REVIEW: pass"
+    assert [(o["outcome"], o["defer"]) for o in during_probe] == [("REVIEW: pass", "")]
 
 
 def test_a_claude_screenshot_review_gets_its_own_route_and_budget(runner):
@@ -414,3 +434,102 @@ def test_a_deferred_run_keeps_its_status_but_the_files_are_still_restored(runner
     out = runner.run()
     assert out["status"] == "quota" and out["rc"] == 75
     assert not (runner.worktree / ".git" / "hooks" / "post-checkout").exists()
+
+
+# --- route tiers (#237) --------------------------------------------------------------------
+
+LIGHT_DEV = '\n[models.routes.dev_light]\nclaude = { model = "claude_probe", effort = "low" }\n'
+HEAVY_FIX = '\n[models.routes.fix_heavy]\nclaude = { model = "claude_strong", effort = "high" }\n'
+
+
+def tiered(runner, tables):
+    """The runner's session, its config's routes extended by `tables`."""
+    from dataclasses import replace
+    from baton import config, session
+    sess = session.resolve(runner.env)
+    path = runner.root / "tiered.toml"
+    path.write_text(sess.config.source.read_text() + tables)
+    sess.config = replace(sess.config, models=config.load(path, home=runner.root / "home").models)
+    return sess
+
+
+def requested(runner, sess, role):
+    runner.plan(stream=claude_stream("ok"))
+    dispatch.dispatch("claude", role, "p", "t", str(runner.worktree), settings="/s/settings.json", env=sess)
+    args = json.loads((runner.root / "fake" / "args.json").read_text())
+    return args[args.index("--model") + 1], args[args.index("--effort") + 1]
+
+
+@pytest.mark.parametrize("tables, model", [(LIGHT_DEV, ("haiku", "low")), ("", ("sonnet", "medium"))])
+def test_a_stored_light_tier_runs_the_dev_step_on_its_route(runner, tables, model):
+    from baton import tiers
+    sess = tiered(runner, tables)
+    tiers.write(sess, "142", {"dev": "light"})
+    assert requested(runner, sess, "dev") == model
+
+
+def test_a_follow_up_run_ignores_the_stored_tier(runner):
+    from baton import tiers
+    sess = tiered(runner, HEAVY_FIX)
+    tiers.write(sess, "142", {"fix": "heavy"})
+    assert requested(runner, sess, "fix") == ("opus", "high")
+    assert requested(runner, sess.with_runtime(fix_followup=True), "fix") == ("sonnet", "medium")
+    ends = [line for line in runner.runner_log() if line.startswith("end t ")]
+    assert ends[-1].endswith(" tier=heavy")   # the step's tier, whichever entry ran
+
+
+def test_the_end_line_and_the_run_record_name_the_tier(runner):
+    from baton import tiers
+    runner.enable_telemetry()
+    sess = tiered(runner, LIGHT_DEV)
+    tiers.write(sess, "142", {"dev": "light"})
+    requested(runner, sess, "dev")
+    assert runner.runner_log()[1].startswith("end t rc=0 ") and runner.runner_log()[1].endswith(" tier=light")
+    begin = runner.calls()[0]
+    assert begin[begin.index("--tier") + 1] == "light"
+
+
+def test_an_adapter_error_still_names_the_tier(runner, monkeypatch):
+    def boom(*args):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(dispatch.agents, "run", boom)
+    runner.run()
+    assert "end t adapter rc=1, no result tier=standard" in runner.runner_log()
+
+
+# --- maintenance drain (#337) -----------------------------------------------------------------
+
+def test_maintenance_deferral_does_not_lend_a_slot():
+    from baton.common import Deferred, MAINTENANCE_PREFIX
+    assert Deferred("codex", f"{MAINTENANCE_PREFIX}reboot").lends_slot is False
+    assert Deferred("codex", "vendor capacity reserved").lends_slot is True
+    assert Deferred("codex", "quota exhausted").lends_slot is True
+    assert Deferred("codex", f"{MAINTENANCE_PREFIX}x", lends_slot=True).lends_slot is True
+
+
+def test_dispatch_defers_for_maintenance_without_starting_or_counting(runner):
+    import json, time
+    from baton.common import MAINTENANCE_PREFIX
+    (runner.state_dir / "maintenance").write_text(json.dumps({"expires": time.time() + 600, "reason": "reboot", "id": "t"}))
+    out = runner.run()
+    assert (out["rc"], out["status"], out["defer"]) == (75, "deferred", f"{MAINTENANCE_PREFIX}reboot")
+    assert not (runner.root / "fake" / "calls").exists()
+    assert not list(runner.state_dir.glob("runs-*")) and not list(runner.state_dir.glob("*cooldown*"))
+    assert runner.runner_log() == []
+
+
+def test_dispatch_continues_a_step_during_maintenance(runner):
+    import json, time
+    (runner.state_dir / "maintenance").write_text(json.dumps({"expires": time.time() + 600, "reason": "reboot", "id": "t"}))
+    runner.plan(stream=claude_stream("fine\nREVIEW: pass"))
+    out = runner.run(continues_step=True)
+    assert (out["rc"], out["status"], out["outcome"]) == (0, "success", "REVIEW: pass")
+    assert (runner.state_dir / f"runs-{__import__('time').strftime('%F')}").read_text() == "1\n"
+
+
+def test_an_expired_maintenance_flag_does_not_defer_dispatch(runner):
+    import json, time
+    (runner.state_dir / "maintenance").write_text(json.dumps({"expires": time.time() - 10, "reason": "old", "id": "t"}))
+    runner.plan(stream=claude_stream("fine\nREVIEW: pass"))
+    out = runner.run()
+    assert (out["rc"], out["status"]) == (0, "success")

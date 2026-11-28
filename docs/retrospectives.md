@@ -74,10 +74,13 @@ apply even when analysis is disabled.
 The `quota` field in each vendor table assigns its lane. The
 `preferences.retrospective` order overrides `preferences.reviewer`; when absent the reviewer
 order is reused. The shared `baton.vendor_policy` module supplies cooldown/capacity checks,
-quota pacing, close-tie preferences and the review policy for extras. Workload review retains its
-own author/contribution constraints; retrospectives assess all eligible candidates without
-contribution weighting. Quota caps and unavailable credentials always take precedence over
-preferences. A lease race reselects another available vendor without waiting for the runner.
+quota pacing, close-tie preferences and the review policy for extras: a vendor named by the
+preference wins, in its order (an extra whatever its pace, a pool vendor only when pool pace
+selects it); otherwise the best eligible pool vendor by pace; otherwise, among extras only, the
+best by pace. Workload review retains its own author/contribution constraints; retrospectives
+assess all eligible candidates without contribution weighting. Quota caps and unavailable
+credentials always take precedence over preferences. A vendor with a workload running is blocked
+with `vendor_capacity`, and another available vendor is chosen without waiting for the runner.
 
 A failed vendor is a last resort on the next activation for that report revision. All vendors
 share one invocation per activation, the UTC daily cap and the revision attempt allowance;
@@ -130,14 +133,14 @@ not a claim about subscription billing.
 ## Parallel work and pause
 
 Retrospectives never acquire the workload runner's global lock. Their workspace, processing state
-and worker lock are independent. Workloads, quota probes and analyses share a **nonblocking
-per-vendor lease**: one CLI invocation per vendor at a time, across repositories. Thus a Claude
-retrospective and a Codex workload can run concurrently. Same-vendor work waits or selects another
-vendor; a workload start race yields instead of blocking on a lock. This initial account/session
-constraint avoids concurrent quota check/start races, but does not preempt an already running
-analysis. Keep analysis deadlines/budgets small if workload latency is more important; stop or
-pause retrospectives before a time-sensitive workload. Other hosts and owner sessions do not
-participate in these local leases, so provider-reported limits remain authoritative.
+and worker lock are independent. Workloads of one vendor run concurrently, across repositories
+([ADR 0013](adr/0013-concurrent-runs-of-one-vendor.md)). Workloads keep priority over analyses:
+each run holds a shared lock on `STATE/vendor-leases/<vendor>`, and an analysis does not start on a
+vendor while one is held. The analysis itself holds no vendor lock, so a workload never waits or
+defers for it and does not preempt it. Analyses run one at a time. Keep analysis deadlines/budgets
+small if workload latency is more important; stop or pause retrospectives before a time-sensitive
+workload. Other hosts and owner sessions do not take these local locks, so provider-reported limits
+remain authoritative.
 
 Workload scheduling being busy or paused does not pause retrospectives. Set
 `retrospectives.paused = true` or create `WORK_STATE/paused` to defer new analysis calls while
@@ -170,8 +173,7 @@ Restart can reuse a successful saved assessment even if report publication was i
 An interrupted attempt is marked ambiguous with unknown usage and counts against budgets;
 a new call waits until its deadline/watchdog grace has elapsed. Exactly-once provider invocation
 is not promised. The independent GNU timeout watchdog bounds an orphaned CLI after worker death;
-the vendor lease is inherited by the watchdog, and the supplied service also uses
-`KillMode=control-group`.
+the supplied service also uses `KillMode=control-group`.
 
 After per-revision attempts are exhausted, inspect the failure and explicitly retry:
 
@@ -197,8 +199,9 @@ file using a unique temporary name. Readers see a complete generation without ac
 The optional `baton-quota.timer` checks every five minutes after completion, independently of
 both workload scheduling and retrospective analysis. It probes only enabled vendors whose required
 quota windows are missing, reset or older than `[quota].quota_stale_minutes` (default example: 30),
-or whose authenticated credential observation has expired. It acquires the shared vendor lease
-and rechecks before probing, yielding to active model calls and respecting vendor cooldowns.
+or whose authenticated credential observation has expired. It takes the vendor's probe lock
+(`STATE/quota-probes/<vendor>.lock`) and rechecks before probing, yielding to another probe, not to
+active model calls, and respecting vendor cooldowns.
 Cursor probes query its API without a model call; Claude/Codex probes make a small model request.
 Failed or incomplete probes back off from `quota_probe_retry_minutes` (default 5) up to
 `quota_probe_max_retry_minutes` (default 60). A probe attempt does not refresh quota observations.

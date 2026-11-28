@@ -101,10 +101,23 @@ class Decision:
     previous: bool = False
     answers: tuple = ()    # grounded answer set for answer_spec_questions, else ()
     backend: str = ""      # "claude" or "deepseek"; "" when no record names one
+    profile: dict = field(default_factory=dict)   # a ReplyTask's parsed reply, else {}
+    decision_id: str = ""  # set only by the call that created the record
 
     @property
     def extra_round(self):
         return self.action == "extra_round"
+
+
+@dataclass(frozen=True)
+class ReplyTask:
+    """A decision point whose action carries a structured "profile" reply field, with its own system text."""
+    action: str            # the action that carries the profile
+    system: str
+    version: str           # the prompt version
+    parse: object          # parse(raw profile, values to redact) -> stored dict; raises ValueError
+    fields: dict = field(default_factory=dict)   # extra record fields
+    withheld: tuple = ()   # sent text the decision record must not repeat
 
 
 def extract_questions(text):
@@ -158,11 +171,17 @@ def baseline_snapshot(snapshot):
     text = "\n".join(line for line in text.split("\n") if not (
         (m := CITATION_LINE.match(line)) and m["source"].startswith("document ")))
     cut = len(text)
-    for marker in ("\n\nDiff excerpt:\n", "\n\nCI log excerpt:\n", "\n\nLocal documents:\n"):
+    for marker in ("\n\nDiff excerpt:\n", "\n\nCI log excerpt:\n", "\n\nLocal documents:\n",
+                   "\n\nCommit subjects:\n"):
         at = text.find(marker)
         if 0 <= at < cut:
             cut = at
     return text[:cut]
+
+
+def find_quote(quote, snapshot):
+    """QUOTE's span in SNAPSHOT, any run of whitespace matching any other; None when it is not there."""
+    return re.search(r"\s+".join(map(re.escape, quote.split())), snapshot)
 
 
 def question_ids(snapshot):
@@ -223,7 +242,8 @@ def format_citations(entries):
     return "Citation evidence:\n" + "\n".join(f"[{i}] ({source}): {text}" for i, source, text in entries)
 
 
-def augment_snapshot(env, baseline, *, diff_excerpt="", ci_log_excerpt="", document_excerpts=()):
+def augment_snapshot(env, baseline, *, diff_excerpt="", ci_log_excerpt="", document_excerpts=(),
+                     commit_subjects=""):
     """Append repository-opted-in excerpts; baseline alone when every flag is off (#125)."""
     env = session.resolve(env)
     repo = env.repo
@@ -236,6 +256,8 @@ def augment_snapshot(env, baseline, *, diff_excerpt="", ci_log_excerpt="", docum
         blocks = [f"Document {path}:\n{text}" for path, text in document_excerpts if path and text]
         if blocks:
             parts.append("Local documents:\n" + "\n\n".join(blocks))
+    if getattr(repo, "advisor_commit_subjects", False) and commit_subjects:
+        parts.append(f"Commit subjects:\n{commit_subjects}")
     return "\n\n".join(parts)
 
 
@@ -251,6 +273,14 @@ def secret_values(env):
             values.update(credentials.load(path, tuple(keys), environ={}).values())
         except credentials.CredentialError:
             pass
+    # Claude's setup-token may come only from its env file (#255).
+    for vendor in getattr(getattr(env, "config", None), "vendors", ()):
+        if vendor.adapter == claude_cli.ID and vendor.env_file:
+            try:
+                token = credentials.load(vendor.env_file, (claude_cli.OAUTH_KEY,), environ={})
+            except credentials.CredentialError:
+                continue
+            values.update(v for v in token.values() if len(v) >= 8)
     for name, value in os.environ.items():
         if (SECRET_NAME.search(name) or name in keys or name in credentials.RUNNER_KEYS) and len(value) >= 8:
             values.add(value)
@@ -359,6 +389,16 @@ def saved_attempt(env, point, item, task_kind):
         return None
 
 
+def redaction_values(env):
+    """What advise() redacts, for a caller that must redact text before capping it."""
+    values = secret_values(env)
+    try:
+        key = credentials.load(settings(env).env_file, (KEY,)).get(KEY, "")
+    except credentials.CredentialError:
+        key = ""
+    return values | {key} if key else values
+
+
 def settings(env):
     """The [advisor] section (one seam for tests)."""
     return env.config.advisor
@@ -393,13 +433,13 @@ def user_message(snapshot, actions):
     return f"Allowed actions: {json.dumps(list(actions))}\n\n<snapshot>\n{snapshot}\n</snapshot>"
 
 
-def call_deepseek(cfg, key, snapshot, actions, *, category=None):
+def call_deepseek(cfg, key, snapshot, actions, *, category=None, system=None):
     """(parsed reply dict, usage dict); raises on transport, HTTP or format failure."""
     body = json.dumps({
         "model": cfg.model,
         "temperature": 0,
         "response_format": {"type": "json_object"},
-        "messages": [{"role": "system", "content": instructions(actions, category)},
+        "messages": [{"role": "system", "content": system or instructions(actions, category)},
                      {"role": "user", "content": user_message(snapshot, actions)}],
     }).encode()
     request = urllib.request.Request(cfg.base_url.rstrip("/") + "/chat/completions", data=body, method="POST",
@@ -428,6 +468,10 @@ def claude_unavailable(env):
     state, now = env.config.paths.state, time.time()
     if "claude" not in env.config.declared():
         return "claude is not declared"
+    try:
+        claude_cli.oauth_env(env.config.vendor("claude"))
+    except credentials.CredentialError as error:
+        return str(error)
     try:
         until = vendor_policy.cooldown_until(state, "claude", now)
     except ValueError:
@@ -483,10 +527,14 @@ def claude_usage(spent):
     return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
 
 
-def call_claude(cfg, env, snapshot, actions, *, category=None):
-    """(parsed reply, usage dict) from one tool-less, isolated Claude Code call. No vendor lease."""
-    command = claude_cli.advisor_command(cfg.claude.model, cfg.claude.effort, instructions(actions, category))
-    child = retrospective_analyst.environment(env.config)
+def call_claude(cfg, env, snapshot, actions, *, category=None, system=None):
+    """(parsed reply, usage dict) from one tool-less, isolated Claude Code call. No vendor run marker."""
+    command = claude_cli.advisor_command(cfg.claude.model, cfg.claude.effort,
+                                         system or instructions(actions, category))
+    try:
+        child = retrospective_analyst.environment(env.config, env.config.vendor("claude"))
+    except credentials.CredentialError as error:
+        raise BackendError(str(error)) from None
     child["BATON_INVOCATION_KIND"] = "advisor"
     with tempfile.TemporaryDirectory(prefix="baton-advisor-") as workspace:
         status, raw, rc, diagnostics = retrospective_analyst.bounded_process(
@@ -527,12 +575,15 @@ class Attempt:
     advised: str = ""
     reason: str = ""
     evidence: list = field(default_factory=list)
+    evidence_dropped: int = 0   # mismatching quotes left out of a reply that was kept
+    evidence_miss: str = ""   # the first mismatching quote, redacted and cut
     answers: tuple = ()
     observed_only: bool = False   # a well-formed answer set with a non-grounded case: recorded, never executed
+    profile: dict = field(default_factory=dict)
 
 
 def attempt_backend(env, cfg, backend, key, key_failure, text, actions, *, category, values, sources, cut_rows,
-                    recordable):
+                    recordable, task=None):
     """One call to BACKEND and the validation every reply gets. Never raises."""
     claude = backend == "claude"
     result = Attempt(backend, cfg.claude.model if claude else cfg.model)
@@ -552,6 +603,9 @@ def attempt_backend(env, cfg, backend, key, key_failure, text, actions, *, categ
             result.actual_model = metadata.get("actual_model", "") if claude else ""
     try:
         options = {"category": category} if category else {}
+        if task:
+            options["system"] = task.system
+            values = values | set(task.withheld)
         reply, metadata = (call_claude(cfg, env, text, actions, **options) if claude
                            else call_deepseek(cfg, key, text, actions, **options))
         consumed(metadata)   # the call consumed these tokens even if the reply is rejected
@@ -567,20 +621,27 @@ def attempt_backend(env, cfg, backend, key, key_failure, text, actions, *, categ
             raise ValueError("expected a nonblank reason string")
         if not isinstance(raw_evidence, list):
             raise ValueError("expected an evidence array")
-        if any(not isinstance(quote, str) for quote in raw_evidence):
+        if any(not isinstance(quote, str) or not quote.strip() for quote in raw_evidence):
             raise ValueError("evidence is outside the sent snapshot")
         # JSON escapes can decode to lone surrogates. Reject them before keeping any provider text.
         for value in (raw_action, raw_reason, *raw_evidence):
             value.encode("utf-8")
-        if any(not quote or quote not in text for quote in raw_evidence):
+        misses = [quote for quote in raw_evidence if not find_quote(quote, text)]
+        # A near miss of an opted-in excerpt would put its text in the record and the log (#125).
+        if misses and text == recordable:
+            result.evidence_miss = redact(misses[0], values)[:80]
+        if raw_evidence and len(misses) == len(raw_evidence):
             raise ValueError("evidence is outside the sent snapshot")
+        result.evidence_dropped = len(misses)
         result.advised = raw_action
         if raw_action not in actions:
             result.advised = redact(raw_action, values)
             result.failure = f"action outside the allowed set: {result.advised[:60]!r}"
         result.reason = redact(raw_reason, values)[:600]
         # Keep opted-in raw excerpts out of the decision record (#125).
-        result.evidence = [redact(quote, values)[:300] for quote in raw_evidence[:5] if quote in recordable]
+        # The snapshot's own span, never the provider's variant of it.
+        spans = [find_quote(quote, recordable) for quote in raw_evidence[:5] if quote not in misses]
+        result.evidence = [redact(span.group(), values)[:300] for span in spans if span]
         if not result.failure and raw_action == "answer_spec_questions":
             answers = normalize_answers(reply.get("answers"), text, sources, cut_rows)
             for row in answers:
@@ -589,6 +650,8 @@ def attempt_backend(env, cfg, backend, key, key_failure, text, actions, *, categ
                     raise ValueError("answer text was changed by redaction or exceeds the length limit")
             result.observed_only = any(row["case"] != "grounded" for row in answers)
             result.answers = tuple({**row, "text": redact(row["text"], values)[:600]} for row in answers)
+        if task and not result.failure and raw_action == task.action:
+            result.profile = task.parse(reply.get("profile"), values)
     except urllib.error.HTTPError as error:
         result.failure = f"HTTP {error.code}"
     except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as error:
@@ -607,12 +670,17 @@ def attempt_backend(env, cfg, backend, key, key_failure, text, actions, *, categ
     return result
 
 
+def evidence_fields(attempt):
+    """ATTEMPT's record fields about mismatching quotes, each only when it exists."""
+    return {name: value for name in ("evidence_dropped", "evidence_miss") if (value := getattr(attempt, name))}
+
+
 def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=None, rule=HANDOFF, mode=None,
-           category=None):
+           category=None, task=None):
     """The action to execute at POINT for ITEM (a PR or issue number). ACTIONS always contains
     HANDOFF. REVALIDATE() is called before a non-handoff action executes and must return True when
     the state still matches the snapshot. MODE overrides the configured global mode when the
-    caller already applied ADR 0008's ceiling (#125). Never raises."""
+    caller already applied ADR 0008's ceiling (#125). TASK is a ReplyTask. Never raises."""
     env = session.resolve(env)
     task_kind = task_kind or ("issue" if point.startswith("spec_") else "pr")
     actions = tuple(dict.fromkeys((HANDOFF, *actions)))
@@ -650,16 +718,17 @@ def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=No
                             backend=record.get("backend") or "deepseek")
     decision_id = uuid4().hex
     answering = "answer_spec_questions" in actions
-    version = (QUESTIONS_PROMPT_VERSION if answering
+    version = (task.version if task else QUESTIONS_PROMPT_VERSION if answering
                else OBSERVATION_PROMPT_VERSION if category else PROMPT_VERSION)
     record = {"kind": "decision", "ts": int(time.time()), "point": point, "repo": env.repo.gh_repo, "item": str(item),
               "task_kind": task_kind, "episode": pending[0]["episode"] if pending else decision_id,
               "decision_id": decision_id, "snapshot_sha": digest, "actions": list(actions),
-              "prompt_version": version, "mode": effective, "rule": rule}
+              "prompt_version": version, "mode": effective, "rule": rule, **(task.fields if task else {})}
     tries = []
     for backend in cfg.backend_order:
         tries.append(attempt_backend(env, cfg, backend, key, key_failure, text, actions, category=category,
-                                     values=values, sources=sources, cut_rows=cut_rows, recordable=recordable))
+                                     values=values, sources=sources, cut_rows=cut_rows, recordable=recordable,
+                                     task=task))
         if not tries[-1].failure:
             break
     # The backend that answered; else the last one actually called; else the first in order.
@@ -676,8 +745,10 @@ def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=No
         else:
             record["fallback_from"] = {name: getattr(first, name)
                                        for name in ("backend", "model", "failure", "latency_ms", "usage")}
+            record["fallback_from"].update(evidence_fields(first))
     advised, reason, evidence, answers = chosen.advised, chosen.reason, chosen.evidence, chosen.answers
     observed_only, usage = chosen.observed_only, chosen.usage
+    profile = {} if failure else chosen.profile
     executed = rule
     if not failure and advised != rule and effective == "live":
         try:
@@ -706,14 +777,20 @@ def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=No
             recorded.append(saved)
         record.update(advised=advised, reason=reason, evidence=evidence, executed=executed, failure=failure,
                       latency_ms=int((time.monotonic() - started) * 1000), usage=usage,
-                      **({"answers": recorded} if recorded else {}))
+                      **({"answers": recorded} if recorded else {}), **({"profile": profile} if profile else {}),
+                      **evidence_fields(chosen))
         append(env, record)
     except OSError as error:
         executed, failure, answers = rule, f"could not persist advisor decision: {type(error).__name__}", ()
+        profile = {}
+    # !r: provider text must not split or forge log lines.
+    misses = (("evidence_miss", chosen.evidence_miss),
+              ("fallback_evidence_miss", record.get("fallback_from", {}).get("evidence_miss")))
     notify.log(f"advisor {point} #{item}: advised={advised or '-'} executed={executed}"
-               + (f" failure={failure}" if failure else ""))
+               + (f" failure={failure}" if failure else "")
+               + "".join(f" {name}={miss!r}" for name, miss in misses if miss))
     return Decision(executed, reason, tuple(evidence), advised, failure, True, answers=answers,
-                    backend=chosen.backend)
+                    backend=chosen.backend, profile=profile, decision_id=decision_id)
 
 
 def pending_items(env, task_kind):
@@ -760,7 +837,9 @@ def finish_episode(env, task_kind, item, result):
     points = {legacy}
     try:
         for decision in pending_decisions(env, task_kind, item):
-            if task_kind == "issue" and result == "accept" and not decision["point"].startswith("spec_"):
+            # An accept also ends the intake's pickup stage; the accept stage's own record stays open.
+            if (task_kind == "issue" and result == "accept" and not decision["point"].startswith("spec_")
+                    and (decision["point"], decision.get("stage")) != ("intake", "pickup")):
                 continue
             append(env, {**{key: decision[key] for key in ("point", "repo", "task_kind", "item", "episode", "decision_id")},
                          "kind": "outcome", "ts": int(time.time()), "result": result})

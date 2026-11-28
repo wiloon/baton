@@ -23,7 +23,7 @@ import sys
 import tempfile
 import time
 
-from . import agents, design_findings, dispatch, e2e_gate, hooks as telemetry, notify, pick, pr as pr_helpers, pr_contract, prompts, recovery, vendors
+from . import agents, design_findings, dispatch, e2e_gate, hooks as telemetry, notify, pick, pr as pr_helpers, pr_contract, prompts, recovery, scratch, tiers, vendors
 from .common import Deferred, Exhausted, child_env, git, push, strip_markers
 
 REPLY_CAP = 60000
@@ -50,6 +50,7 @@ class Runner:
     @session.scoped
     def __init__(self, env=None, hooks=None, pr=0, round=""):
         env = session.resolve(env)
+        env = tiers.carry(env, "fix", env.runtime.issue, pr or env.runtime.pr)
         self.env, self.round = env, round
         self.state, self.ctx = str(env.dirs.state), str(env.dirs.ctx)
         self.repo, self.self_dir = env.repo.gh_repo, Path(str(env.config.paths.self_dir))
@@ -161,11 +162,19 @@ class Runner:
         finally:
             self.verification_progress = None
 
+    def pr_head_branch(self, pr):
+        """The PR's headRefName from GitHub, or '' when unreadable."""
+        try:
+            data = pr_helpers.view(pr, "headRefName")
+        except ValueError:
+            return ""
+        branch = data.get("headRefName") if isinstance(data, dict) else ""
+        return branch.strip() if isinstance(branch, str) else ""
+
     def finish_verified(self, pr, wt, fixer, *, prefix="", description_rc=0, description_reason=""):
         url = f"https://github.com/{self.repo}/pull/{pr}"
         reply = agents.ADAPTERS[fixer].FIX_RESUMABLE_VIA_REPLY
-        ref = (git(wt, "branch", "--show-current") or "HEAD") if reply else "HEAD"
-        return self.push_with_retry(pr, wt, ref, next_step="done", url=url, who=prefix, fixer=fixer,
+        return self.push_with_retry(pr, wt, "HEAD", next_step="done", url=url, who=prefix, fixer=fixer,
                                     description_rc=description_rc, description_reason=description_reason,
                                     clear_cursor=reply)
 
@@ -360,26 +369,33 @@ class Runner:
             if disposition == "changed":
                 return self.handoff(pr, reason, title, f"{text}: owner feedback changed{note}. {url}")
             if pending.get("phase"):
-                if disposition == "ok" and owner_handoff.check_push_landed(binding) == "landed":
+                if disposition == "ok" and owner_handoff.check_push_landed(binding, allow_detached=True) == "landed":
                     return self.continue_push(pr, pending, url)
                 return self.handoff(pr, reason, title, f"{text}: could not confirm the landed push{note}. {url}")
         if initial:
             if self.push_feedback is None:   # a recovery step re-entered past fix_pr's own capture
                 self.push_feedback = self.capture_push_feedback(pr)
+            branch = self.pr_head_branch(pr)
+            if not branch:
+                return self.handoff(pr, reason, title, f"{text}: could not read PR head branch{note}. {url}")
+            current = git(wt, "branch", "--show-current")
+            if current is None:
+                return self.handoff(pr, reason, title, f"{text}: local commit or branch missing{note}. {url}")
+            if current and current != branch:
+                return self.handoff(pr, reason, title, f"{text}: local inputs changed{note}. {url}")
             if self.env.repo.signoff:
                 from .common import sign_off
                 if not sign_off(wt):
                     return self.handoff(pr, reason, title, f"{text}: sign-off failed{note}. {url}")
-            branch = owner_handoff.push_destination(wt, ref)
             commit = git(wt, "rev-parse", "HEAD")
-            if not branch or not commit or not re.fullmatch(r"[0-9a-f]{40}", commit):
+            if not commit or not re.fullmatch(r"[0-9a-f]{40}", commit):
                 return self.handoff(pr, reason, title, f"{text}: local commit or branch missing{note}. {url}")
             remote, unreadable_transient = owner_handoff.observe_remote(wt, branch)
             if remote is None and not unreadable_transient:
                 return self.handoff(pr, reason, title, unreadable)
             binding = {
                 "pr": str(pr), "issue": str(self.env.runtime.issue or ""), "commit": commit,
-                "branch": branch, "ref": ref, "remote": remote, "upstream": upstream,
+                "branch": branch, "ref": ref if ref in ("HEAD", branch) else "HEAD", "remote": remote, "upstream": upstream,
                 "wt": str(wt), "next": next_step, "outcome": outcome,
                 "handoff_reason": handoff_reason, "description_rc": description_rc,
                 "description_reason": description_reason or "", "who": who, "fixer": fixer,
@@ -405,7 +421,7 @@ class Runner:
                     raise Deferred("handoff-retry", reason, lends_slot=False)
                 return self.handoff(pr, reason, title, f"{text}: could not verify the owner inputs{note}. {url}")
             if binding["remote"] is None:
-                if not owner_handoff.check_push_local(binding):
+                if not owner_handoff.check_push_local(binding, allow_detached=True):
                     return self.handoff(pr, reason, title, f"{text}: local inputs changed{note}. {url}")
                 # Nothing was pushed yet, so what origin holds now is the pre-push state.
                 remote, unreadable_transient = owner_handoff.observe_remote(wt, binding["branch"])
@@ -421,7 +437,7 @@ class Runner:
         if binding["remote"] is None:
             status = "retry"   # origin could not be read yet; retry before any push
         else:
-            status = owner_handoff.check_push_landed(binding)
+            status = owner_handoff.check_push_landed(binding, allow_detached=True)
         if status == "absent" and (initial or pending["attempts"] < owner_handoff.MAX_ATTEMPTS):
             # Push the saved commit to that destination; never force (#151).
             pushed = push(binding["wt"], f"{binding['commit']}:refs/heads/{binding['branch']}",
@@ -430,7 +446,7 @@ class Runner:
                 status = "landed"
             else:
                 # A lost response may still have updated the remote: look before retrying.
-                status = owner_handoff.check_push_landed(binding)
+                status = owner_handoff.check_push_landed(binding, allow_detached=True)
                 if status != "landed" and not pushed.transient:
                     detail = pushed.detail or "permanent push failure"
                     return self.handoff(pr, reason, title, f"{text}: {detail}{note}. {url}")
@@ -465,10 +481,11 @@ class Runner:
     def render(self, template, **pairs):
         return prompts.render(self.self_dir / template, list(pairs.items()), env=self.env)
 
-    def agent(self, vendor, role, prompt, tag, wt, output="", env=None):
+    def agent(self, vendor, role, prompt, tag, wt, output="", env=None, *, continues_step=False):
         """One agent run; Deferred when the vendor cannot run now."""
+        extra = {"continues_step": True} if continues_step else {}
         out = dispatch.dispatch(vendor, role, prompt, tag, str(wt), str(self.self_dir / "settings.json"), output,
-                                env or self.env, self.hooks)
+                                env or self.env, self.hooks, **extra)
         if out["rc"] == 75:
             raise Deferred(vendor, out["defer"])
         return out
@@ -507,8 +524,8 @@ class Runner:
             notify.log(f"{kind} #{number}: {failure}")
             return 1, failure, 0
         failure_file = Path(self.ctx, f"{kind}-{number}-verify-failure.txt")
-        # Under /tmp, the one place outside the worktree guard.sh lets a fixer write (#38).
-        reply_file = Path("/tmp", f"baton-{self.repo.replace('/', '-')}-{kind}-{number}-verify-fix.md")
+        # In scratch, the one place outside the worktree guard.sh lets a fixer write (#38).
+        reply_file = scratch.path(self.env.dirs, f"verify-fix-{kind}", number)
         local_repairs, failure = 0, ""
         budget = self.max_verify if repairs is None else int(repairs)
         total_rounds = int(repairs_before)
@@ -559,7 +576,7 @@ class Runner:
                 self.verification_progress(total_rounds + local_repairs, budget - local_repairs, head)
             try:
                 out = self.agent(vendor, "fix", prompt, f"{kind}-{number}-verify-fix-{total_rounds + local_repairs}",
-                                 wt, str(reply_file), self.env.with_runtime(fix_followup=False))
+                                 wt, str(reply_file), self.env.with_runtime(fix_followup=False), continues_step=True)
             except Deferred:
                 if self.verification_progress and not dirty() and git(wt, "rev-parse", "HEAD") == head:
                     self.verification_progress(total_rounds + local_repairs - 1, budget - local_repairs + 1, head)
@@ -590,6 +607,8 @@ class Runner:
             prior = self.prior_author or agents.LEGACY_REPLY_VENDOR   # a saved legacy base is Cursor's
             if cursor_base and cursor_base != agent_head and prior not in self.attempt_authors:
                 self.add_author(prior)
+                if agents.ADAPTERS[prior].RECORDS_AUTHOR_MODEL:
+                    vendors.record_author_model(self.state, pr, prior, "unknown")
                 vendors.record_author(self.state, pr, prior)
                 vendors.record_contrib(self.state, pr, prior, str(wt), cursor_base, agent_head)
             if self.head(wt) != agent_head:
@@ -1185,7 +1204,7 @@ class Runner:
         self.last_fixer = fixer
         url = f"https://github.com/{self.repo}/pull/{pr}"
         self.push_feedback = self.capture_push_feedback(pr)
-        fix_file = Path(f"/tmp/baton-fix-{pr}.md")
+        fix_file = scratch.path(self.env.dirs, "fix", pr)
         agent_head = self.head(wt)
         head = self.claim_fix(pr, fixer, head, agent_head)
         cursor_base = head if self.prior_author else ""   # the earlier reply producer's commits
@@ -1199,7 +1218,7 @@ class Runner:
         adapter = agents.ADAPTERS[fixer]
         template = adapter.FIX_TEMPLATE
         description = Path(self.ctx, f"pr-{pr}-description.md")
-        # Artifact fixers edit the description through /tmp; the runner applies it (#75).
+        # Artifact fixers edit the description through a scratch file; the runner applies it (#75).
         # The adapter's FIX_TEMPLATE tells it how to reach that file.
         description.write_text(pr_helpers.body(pr) or "")
         shots_note, env = "", None
@@ -1214,6 +1233,7 @@ class Runner:
             env = self.env.with_runtime(shots_dir=str(shots))
         out = self.agent(fixer, "fix", self.render(template, PR=str(pr), ISSUE=self.env.runtime.issue or "unknown",
                                                    GH_REPO=self.repo, WORKTREE=str(wt), SOURCE=source,
+                                                   REPLY_FILE=str(fix_file),
                                                    FIX_SCOPE=fix_scope(fixer, owner_triggered), FEEDBACK=feedback,
                                                    PR_DESCRIPTION_FILE=str(description), SHOTS_NOTE=shots_note),
                          f"pr-{pr}-fix{f'-{self.round}' if self.round else ''}", wt, str(fix_file), env)
@@ -1443,11 +1463,11 @@ class Runner:
         name = adapter.DISPLAY_NAME
         agent_head = self.head(wt)
         url = f"https://github.com/{self.repo}/pull/{pr}"
-        branch = git(wt, "branch", "--show-current") or ""
         base_file = Path(self.state, f"{fixer}-fix-base-{pr}")
         baseline_file = Path(self.state, f"pr-body-base-{pr}")
         task_file = Path(self.state, f"{fixer}-fix-task-{pr}")
         design_file = Path(self.state, f"{fixer}-fix-design-{pr}")
+        model = ""   # stays empty when a resume runs no agent
         head = self.claim_fix(pr, fixer, head, agent_head)
         base_file.write_text(head + "\n")
         request = Path(self.ctx, f"pr-{pr}-body.md")
@@ -1459,6 +1479,11 @@ class Runner:
             want = ""
             self.push_feedback = self.capture_push_feedback(pr)
         else:
+            branch = self.pr_head_branch(pr)
+            if not branch:
+                from . import handoff as owner_handoff
+                return self.handoff(pr, owner_handoff.FIX_PUSH, f"PR #{pr}: pushing fix failed",
+                                    f"PR #{pr}: pushing fix failed: could not read PR head branch. {url}")
             self.push_feedback = self.capture_push_feedback(pr)
             feedback_file = Path(self.ctx, f"pr-{pr}-{fixer}-fix-{time.strftime('%Y%m%d-%H%M%S')}.md")
             feedback_file.write_text(f"{feedback}\n\n<pr-description>\n{pr_helpers.body(pr) or ''}\n</pr-description>\n")
@@ -1475,8 +1500,10 @@ class Runner:
                 adapter.FIX_TEMPLATE, PR=str(pr), ISSUE=self.env.runtime.issue or "unknown", GH_REPO=self.repo,
                 WORKTREE=str(wt), BRANCH=branch, SOURCE=source, FEEDBACK_FILE=str(feedback_file),
                 FIX_SCOPE=fix_scope(fixer, owner_triggered),
-                SHOTS_DIR=str(shots), PR_BODY_FILE=str(request)), f"pr-{pr}-{fixer}-fix", wt)
+                SHOTS_DIR=str(shots), PR_BODY_FILE=str(request)), f"pr-{pr}-{fixer}-fix", wt,
+                env=self.env.with_runtime(shots_dir=str(shots), pr_body_file=str(request)))
             outcome, reply_raw = out["outcome"], out["reply"] or ""
+            model = out["model"] or "unknown"
             self.reply = reply_raw
             want = pr_helpers.task_wanted(reply_raw)
             reply = "\n".join(line for line in strip_markers(reply_raw).split("\n") if not line.startswith("RESULT: ")).rstrip("\n")
@@ -1502,7 +1529,7 @@ class Runner:
                 if self.head(wt) != head:
                     if not self.record(pr, fixer, wt, head, out["model"] or "unknown", ""):
                         return 1
-                    return self.push_partial_fix(pr, wt, branch, url, outcome, fixer, source, feedback, head)
+                    return self.push_partial_fix(pr, wt, "HEAD", url, outcome, fixer, source, feedback, head)
                 if outcome.startswith("RESULT: needs-info"):
                     return self.handoff(pr, "fix_needs_info", f"{name} PR #{pr} has questions", url)
                 if not self.record(pr, fixer, wt, agent_head, "", ""):
@@ -1522,7 +1549,7 @@ class Runner:
                 temp.replace(task_file)
         has_request = request.exists() or request.is_symlink()
         resume = {"head": head, "agent_head": agent_head, "description_changed": False,
-                  "model": "", "cursor_base": ""}
+                  "model": model, "cursor_base": ""}
         body_changed, description_reason, task_changed, discarded = False, "", False, False
         if has_request:
             rc, body_changed, description_reason, task_changed, discarded = self.write_description(
@@ -1556,7 +1583,7 @@ class Runner:
                 self.clear_reply_request(pr, fixer, keep_base=True)
                 return self.dispatch_fixer(pr, wt, alt, source, correction(feedback, log), head)
         return self.finish_reply_fix(
-            pr, wt, fixer, branch, url, source, feedback, head, agent_head=agent_head,
+            pr, wt, fixer, "HEAD", url, source, feedback, head, agent_head=agent_head, model=model,
             body_changed=body_changed, task_changed=task_changed, discarded=discarded,
             description_reason=description_reason)
 
@@ -1607,11 +1634,10 @@ class Runner:
                 return self.dispatch_fixer(pr, wt, alt, source, correction(feedback, log), saved["head"])
         else:
             saved = {**saved, "description_changed": bool(body_changed)}
-        branch = git(wt, "branch", "--show-current") or ""
         return self.finish_reply_fix(
-            pr, wt, fixer, branch, url, source, feedback, saved["head"], agent_head=saved["agent_head"],
-            body_changed=saved["description_changed"], task_changed=task_changed, discarded=discarded,
-            description_reason=description_reason)
+            pr, wt, fixer, "HEAD", url, source, feedback, saved["head"], agent_head=saved["agent_head"],
+            model=saved.get("model") or "", body_changed=saved["description_changed"], task_changed=task_changed,
+            discarded=discarded, description_reason=description_reason)
 
     def resume_task_write(self, pr, wt, url, source, feedback, pending):
         from . import handoff as owner_handoff
@@ -1637,11 +1663,10 @@ class Runner:
                 model=saved["model"], cursor_base=saved["cursor_base"], task_changed=task_changed,
                 description_rc=binding["description_rc"], description_changed=saved["description_changed"],
                 description_reason=binding["description_reason"])
-        branch = git(wt, "branch", "--show-current") or ""
         return self.finish_reply_fix(
-            pr, wt, fixer, branch, url, source, feedback, saved["head"], agent_head=saved["agent_head"],
+            pr, wt, fixer, "HEAD", url, source, feedback, saved["head"], agent_head=saved["agent_head"],
             body_changed=saved["description_changed"], task_changed=task_changed, discarded=binding["description_rc"] == 2,
-            description_reason=binding["description_reason"])
+            description_reason=binding["description_reason"], model=saved.get("model") or "")
 
     def finish_cursor_fix(self, pr, wt, branch, url, source, feedback, head, *, agent_head,
                           body_changed, task_changed, discarded, description_reason):
@@ -1651,7 +1676,7 @@ class Runner:
             description_reason=description_reason)
 
     def finish_reply_fix(self, pr, wt, fixer, branch, url, source, feedback, head, *, agent_head,
-                         body_changed, task_changed, discarded, description_reason):
+                         body_changed, task_changed, discarded, description_reason, model=""):
         name = agents.ADAPTERS[fixer].DISPLAY_NAME
         who = f"{name} "
         moved = self.head(wt) != head
@@ -1697,8 +1722,13 @@ class Runner:
                     and prior not in self.attempt_authors):
                 # The earlier producer's commits (original base..agent_head) are its own.
                 self.add_author(prior)
+                if agents.ADAPTERS[prior].RECORDS_AUTHOR_MODEL:
+                    vendors.record_author_model(self.state, pr, prior, "unknown")
                 vendors.record_author(self.state, pr, prior)
                 vendors.record_contrib(self.state, pr, prior, str(wt), head, agent_head)
+            if moved and not recorded_before_retry and agents.ADAPTERS[fixer].RECORDS_AUTHOR_MODEL:
+                # Verification repairs may have run on another model.
+                vendors.record_author_model(self.state, pr, fixer, model if rounds == 0 else "unknown")
             vendors.record_author(self.state, pr, fixer)
         except OSError:
             return 1

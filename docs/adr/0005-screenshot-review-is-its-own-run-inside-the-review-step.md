@@ -49,9 +49,13 @@ fix                        reads both, answers Must fix and design findings, re-
   review comment this run posted, bound by its digest (`Review.current_screenshot`). Round
   numbers repeat across loops on one PR, so a same-round comment of an earlier loop, or any
   comment the run did not post, never creates, resolves or holds a finding.
-- Skip screenshot review on owner-authored PRs and when the code review adapter has the
-  screenshot-skip policy (Cursor). Select from declared, role-allowed vendors with image input
-  support (Claude and Codex). The setting remains per repository and off by default.
+- Skip screenshot review on owner-authored PRs. Which vendor did the code review never decides
+  whether it runs. Select from declared, role-allowed vendors with image input support (Claude
+  and Codex). The setting remains per repository and off by default.
+- When authorship and fixer exclusions leave no eligible screenshot reviewer, the PR goes to the
+  owner right after the code review (ADR 0007), also when the code verdict is `changes`, so no
+  fix runs in that loop. A temporary block defers the screenshot step instead (ADR 0002). Both
+  apply whichever vendor did the code review.
 - After a successful code review (`pass` or `changes`), checkpoint its result before starting
   screenshot review. A deferral resumes that step using the saved code verdict. A failed review
   hands off the PR via `review_failed`.
@@ -83,7 +87,12 @@ fix                        reads both, answers Must fix and design findings, re-
   answers`. An id with no valid, single answer stays open, however many rounds pass. Only the
   fixer's *current* answer decides a disposition: the answer to that id in the fix replies since
   the previous screenshot review, which must be exactly one valid line (an id answered twice, even
-  identically, or in two of those replies, counts as unanswered). An earlier round's answer is
+  identically, or in two of those replies, counts as unanswered). A round with no screenshot
+  review does not move that window, and its fixer still gets the block and is asked to answer
+  every id in it. If it answers an id an earlier reply in the window already answered, neither
+  answer counts: the next reviewer sees none, a `held` makes no disagreement, and the id stays
+  open. This is accepted because it fails safe: the finding still blocks its checks, although
+  the fixer's position is lost. An earlier round's answer is
   history: the block shows it, labelled as earlier, but it never makes a disagreement and never
   closes an id. A held finding whose current answer is `rejected` is a disagreement for the owner;
   a held finding the fixer adopted, did not answer, or answered ambiguously stays open. Only a
@@ -140,3 +149,10 @@ fix                        reads both, answers Must fix and design findings, re-
 - Issue #178: a fix comment records a runner-observed `needs-info` outcome in its marker, and such
   a comment does not end the owner feedback window, because both posting paths drop the agent's
   `RESULT:` line and a label-only retry after a question otherwise lost the owner's decision.
+- Issue #321: record what the two-replies rule does across a round with no screenshot review (the
+  rule is unchanged), because the multi-round tests pin that outcome and it was only implied.
+- Issue #384: remove the skip after a Cursor (or agy) code review. It came from #67, when Cursor
+  reviewed only owner-authored PRs, which have no agent screenshots. Those PRs now have their own
+  skip, and Cursor also reviews agent PRs, so the rule only blocked screenshot reviews that
+  should run (wiloon/enx#1293). Also record that the existing no-eligible-reviewer hand-off and
+  deferral now reach rounds those vendors review.

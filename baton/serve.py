@@ -1,10 +1,12 @@
 """`python -m baton serve`: the resident supervisor that runs one tick child per repository
-(ADR 0011, #271).
+(ADR 0011, ADR 0012, #271, #291).
 
-It only schedules: it never calls GitHub or an agent CLI. A child is
-`python -m baton --repo OWNER/NAME --serve-child`. The rotation and every timer are in memory; after
-a restart the locks and GitHub say what there is to do. <state>/serve.json is for telemetry, never
-read back. SIGTERM drains: nothing new starts, no child is signalled, and it exits after them.
+It schedules and, under contention, lists GitHub read-only to order work by priority across
+repositories. It never writes to GitHub or a repository's state and never calls an agent CLI. A
+child is `python -m baton --repo OWNER/NAME --serve-child` with optional `--issue N` or
+`--no-new-issue`. The rotation and every timer are in memory; after a restart the locks and GitHub
+say what there is to do. <state>/serve.json is for telemetry, never read back. SIGTERM drains:
+nothing new starts, no child is signalled, and it exits after them.
 """
 import json
 import os
@@ -13,35 +15,50 @@ import subprocess
 import sys
 import time
 
-from . import maintenance, notify, statefile
+from . import eligibility, maintenance, notify, statefile
 from .config import load as load_config
 from .tick import rotation
 
 POLL = 0.5   # how often a wait looks for an exited child or a stop
 MAX_BACKOFF = 3600
 CHAIN = 80   # a child's exit code after a partial slice merged: start it again at once
+IDLE = 81    # an assigned child that ran no item: due at once, that assignment suppressed
 STATUS = 'serve.json'
 
 
-def command(config_path, name):
-    return [sys.executable, '-m', 'baton', '--config', str(config_path), '--repo', name, '--serve-child']
+def command(config_path, name, *, issue=None, no_new_issue=False):
+    argv = [sys.executable, '-m', 'baton', '--config', str(config_path), '--repo', name, '--serve-child']
+    if issue:
+        argv.extend(['--issue', str(issue)])
+    elif no_new_issue:
+        argv.append('--no-new-issue')
+    return argv
 
 
-def spawn_child(config_path, name):
-    return subprocess.Popen(command(config_path, name), stdin=subprocess.DEVNULL)
+def spawn_child(config_path, name, *, issue=None, no_new_issue=False):
+    return subprocess.Popen(command(config_path, name, issue=issue, no_new_issue=no_new_issue),
+                            stdin=subprocess.DEVNULL)
 
 
 class Supervisor:
-    """SPAWN(config path, repository) starts a child with a Popen's poll(); CLOCK and SLEEP time
-    the waits; LOAD reads the config, again on every loop."""
-    def __init__(self, config_path, *, spawn=spawn_child, load=load_config, clock=time.monotonic, sleep=time.sleep):
+    """SPAWN(config path, repository, issue=/no_new_issue=) starts a child with a Popen's poll();
+    CLOCK and SLEEP time the waits; LOAD reads the config, again on every loop; LIST lists due
+    repositories under contention (injected in tests)."""
+    def __init__(self, config_path, *, spawn=spawn_child, load=load_config, clock=time.monotonic,
+                 sleep=time.sleep, list_repos=None):
         self.config_path, self.spawn, self.load = config_path, spawn, load
         self.clock, self.sleep = clock, sleep
+        self.list_repos = list_repos or eligibility.list_due
         self.config = None   # the last valid one
         self.children = {}   # repository -> its running child
         self.eligible = {}   # repository -> the clock time it may start again
         self.chains, self.failures = {}, {}   # consecutive exits 80 and failures
         self.last = ''       # the last repository started: the rotation goes on after it
+        self.born = None     # clock at first schedule: hour-idle is counted from here
+        self.last_child = {}  # repository -> clock when a child last started
+        self.assignment = {}  # repository -> ('issue', N) | ('no-new', '') of the running child
+        self.suppress = {}    # (repo, kind, value) -> clock until which it is left out of ranking
+        self.owner_cache = {}   # (repo, issue, updatedAt) -> the owner check, across listing passes
         self.stopping = self.drain_logged = False
         self.problem = ''
 
@@ -94,6 +111,7 @@ class Supervisor:
         """When NAME is eligible again after a child exited CODE (None: it could not be started)."""
         poll = self.config.serve.poll_seconds
         wait = poll
+        assigned = self.assignment.pop(name, None)
         if code == CHAIN:
             self.failures.pop(name, None)
             self.chains[name] = self.chains.get(name, 0) + 1
@@ -101,6 +119,12 @@ class Supervisor:
                 wait = 0
             else:
                 del self.chains[name]
+        elif code == IDLE:
+            self.failures.pop(name, None)
+            self.chains.pop(name, None)
+            wait = 0
+            if assigned:
+                self.suppress[(name,) + assigned] = self.clock() + poll
         elif code == 0:
             self.failures.pop(name, None)
             self.chains.pop(name, None)
@@ -124,6 +148,11 @@ class Supervisor:
         self.problem = ''
         return True
 
+    def weight(self, name):
+        """Per-repository scheduling weight from the current config (#300). One accessor so a
+        runtime override (#293) can land here without touching ranking."""
+        return self.config.repo(name).weight
+
     def schedule(self):
         config = self.config
         if config.scheduling.paused:
@@ -131,19 +160,51 @@ class Supervisor:
         # An expired flag is left for a tick to remove and log.
         if maintenance.admit(config.paths.state, None, acquire=False).reason is not None:
             return
-        for name in rotation([repo.gh_repo for repo in config.repos], self.last):
+        if self.born is None:
+            self.born = self.clock()
+        now = self.clock()
+        self.suppress = {key: until for key, until in self.suppress.items() if until > now}
+        names = [repo.gh_repo for repo in config.repos]
+        order = rotation(names, self.last)
+        due = [name for name in order
+               if name not in self.children and self.eligible.get(name, now) <= now]
+        free = config.scheduling.max_parallel - len(self.children)
+        if free <= 0 or not due or self.stopping:
+            return
+        if len(due) <= free:
+            starts = [(name, None, False) for name in due]
+        else:
+            listings = self.list_repos(config, due, clock=self.clock, stop=lambda: self.stopping,
+                                       cache=self.owner_cache, log=self.log)
+            # Children that finished while we listed are reaped so slots stay accurate.
+            self.reap()
+            free = config.scheduling.max_parallel - len(self.children)
+            due = [name for name in due if name not in self.children]
+            if free <= 0 or not due:
+                return
+            starts = eligibility.rank(
+                due, listings, order=order, last_child=self.last_child, born=self.born, now=now,
+                suppress=self.suppress, weight=self.weight)
+        for name, issue, no_new in starts:
             if self.stopping or len(self.children) >= config.scheduling.max_parallel:
                 return
-            now = self.clock()
-            if name in self.children or self.eligible.get(name, now) > now:
+            if name in self.children or self.eligible.get(name, self.clock()) > self.clock():
                 continue
             try:
-                self.children[name] = self.spawn(self.config_path, name)
+                self.children[name] = self.spawn(self.config_path, name, issue=issue,
+                                                 no_new_issue=no_new)
             except (OSError, ValueError, subprocess.SubprocessError) as error:
                 self.log(f'{name} could not start: {type(error).__name__}')
                 self.settle(name, None)
                 continue
             self.last = name
+            self.last_child[name] = self.clock()
+            if issue:
+                self.assignment[name] = ('issue', str(issue))
+            elif no_new:
+                self.assignment[name] = ('no-new', '')
+            else:
+                self.assignment.pop(name, None)
 
     def write_status(self):
         if self.config is None:

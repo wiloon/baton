@@ -1,0 +1,11 @@
+# Narrow allowlist for false-positive test fixtures that the initial #238 commit
+# put in literal strings. The tip now builds those values at run time (as in #136);
+# these entries only silence the historical commit that gitleaks still scans on the PR.
+title = "gitleaks config"
+
+[allowlist]
+description = "intake redaction fixtures mistaken for generic-api-key"
+regexes = [
+  '''token=abcdefghij123456''',
+  '''token=abcdefgh12345678''',
+]

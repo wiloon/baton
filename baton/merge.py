@@ -24,7 +24,7 @@ import sys
 import time
 
 from . import advisor, after_merge, check_verdicts, checkpoint, checks, ci, design_findings, fix, hooks as telemetry, names, notify, pick, pr as pr_helpers, pr_contract, statefile
-from .common import Deferred, git
+from .common import Deferred, MAINTENANCE_PREFIX, git
 
 
 def remove_worktree(repo_dir, wt):
@@ -193,13 +193,14 @@ class Merger:
                 fixer = waiting["continuation"].get("fixer") or "agent"
                 rc = fix.fix_pr(runner, pr, wt, fixer, "CI code checks", "")
             else:
-                fixer = pick.choose(self.env, "fixer", "agent", "contrib", pick.all_vendors(self.env),
+                fixer = pick.choose(runner.env, "fixer", "agent", "contrib", pick.all_vendors(self.env),
                                     pr=str(pr), issue=self.issue)
                 notify.log(f"PR #{pr}: code-only CI failure on {head}; one repair round by {fixer}")
                 rc = fix.fix_pr(runner, pr, wt, fixer, "CI code checks", found["feedback"])
         except Deferred as deferred:
-            # Category-1 push waits keep the repair; a vendor deferral still hands the head off (#151).
-            if deferred.vendor == "handoff-retry":
+            # Category-1 push waits keep the repair; a maintenance drain keeps the merge step (#337);
+            # a vendor deferral still hands the head off (#151).
+            if deferred.vendor == "handoff-retry" or deferred.reason.startswith(MAINTENANCE_PREFIX):
                 raise
             rc = 75
         if rc == 75:

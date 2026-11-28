@@ -16,7 +16,8 @@ import subprocess
 import time
 
 from .initialization import child_environment
-from . import agents
+from . import agents, claude_cli
+from .credentials import CredentialError
 from .analyst_models import approved_model
 from .retrospective_evidence import encoded
 
@@ -84,7 +85,9 @@ def unfenced(reply):
     return match.group(1) if match else reply
 
 
-def environment(config):
+def environment(config, vendor=None):
+    """VENDOR: the config entry of the vendor whose CLI runs; a Claude vendor also gets its setup-token
+    (claude_cli.oauth_env, which may raise credentials.CredentialError)."""
     # No repo variables, secrets, workload identities, OTEL context or runner integrations.
     # Each adapter contributes its keep/strip/set constants; every vendor's analyst gets the union.
     adapters = agents.ADAPTERS.values()
@@ -103,17 +106,18 @@ def environment(config):
                BATON_INVOCATION_KIND='retrospective', FORCE_PROMPT_CACHING_5M='1')
     for a in adapters:
         env.update(a.ANALYST_ENV_SET)
+    env.update(claude_cli.oauth_env(vendor))   # after the CLAUDE_CODE_ strip
     return env
 
 
-def bounded_process(command, prompt, workspace, env, seconds, max_bytes, lease_fd=None):
+def bounded_process(command, prompt, workspace, env, seconds, max_bytes):
     """Bound stdout/stderr in memory and kill the entire process group on timeout/overflow."""
     with (workspace / 'input.json').open('w+') as source:
         source.write(prompt)
         source.seek(0)
         try:
             process = subprocess.Popen(['timeout', '--kill-after=5', f'{seconds}s', *command], stdin=source, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                       cwd=workspace, env=env, start_new_session=True, pass_fds=() if lease_fd is None else (lease_fd,))
+                                       cwd=workspace, env=env, start_new_session=True)
         except OSError:
             return 'unavailable', b'', 127, {}
         buffers = {process.stdout: bytearray(), process.stderr: bytearray()}
@@ -180,12 +184,18 @@ def approved_actual(vendor, model):
     return approved_model(vendor, model)
 
 
-def analyze(config, analyst, prompt, workspace, facts, lease_fd):
+def analyze(config, analyst, prompt, workspace, facts):
     settings = config.retrospectives
     deadline = time.monotonic() + settings.timeout_seconds
-    env = environment(config)
-    command = command_for(config, analyst, workspace, env)
     adapter = agents.ADAPTERS[analyst.vendor]
+    try:
+        env = environment(config, next((v for v in config.vendors if v.id == analyst.vendor), None))
+    except CredentialError as error:
+        # Nothing starts; the attempt ends instead of staying "started".
+        return dict(state='credential_error', failure=str(error), rc=1, usage={'usage_state': 'unavailable'},
+                    actual_model='unknown', actual_models=[], cli_version='unknown',
+                    budget_enforcement=adapter.ANALYST_BUDGET, quota_windows={})
+    command = command_for(config, analyst, workspace, env)
     version = 'unknown'
     try:
         done = subprocess.run([adapter.VERSION_EXECUTABLE, '--version'], env=env, cwd=workspace,
@@ -196,7 +206,7 @@ def analyze(config, analyst, prompt, workspace, facts, lease_fd):
     except (OSError, subprocess.SubprocessError):
         pass
     status, raw, rc, diagnostics = bounded_process(command, prompt, workspace, env, max(0.001, deadline - time.monotonic()),
-                                      max(65536, settings.output_chars * 8), lease_fd)
+                                      max(65536, settings.output_chars * 8))
     raw_path = workspace / 'response.jsonl'
     rows, reply, valid, actual, models, tool_use = parse_response(analyst.vendor, raw)
     raw_path.write_text(''.join(json.dumps(r) + '\n' for r in rows))

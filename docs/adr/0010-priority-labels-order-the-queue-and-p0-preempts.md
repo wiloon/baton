@@ -31,14 +31,16 @@ controls how many there are.
   the "one extra issue above the cap" bound does not cover `P0` issues.
 - Nothing running is interrupted. Blockers, `ready-for-agent`, owner authorization and vendor quota
   apply to `P0` as to any issue, and a `P0` that cannot run now does not hold up other work.
-- Priority is per repository. The rotation across repositories is unchanged, so a `P0` can wait
-  while other repositories take their turn.
+- Priority within one repository stands as above. Across repositories under `baton serve`, the
+  supervisor orders ready work globally (ADR 0012, #291): a `P0` anywhere ranks ahead of a lower
+  priority in the repository next in rotation. The legacy timer path keeps per-repository turns.
 
 ## Revision record
 
 - Issue #194: first recorded.
 - Issue #290: an unlabelled issue ranks after `P3` (it ranked as `P2`); scan findings are
   candidates only with the owner's `ready-for-agent`.
+- Issue #291: under the resident supervisor, priority is global across repositories (ADR 0012).
 - Issue #307: the per-repository milestone filter (`agent_milestone`) is removed and no
   milestone-based selection remains, because a second gate hid ready issues from the queue
   (owner, 2026-11-26).
