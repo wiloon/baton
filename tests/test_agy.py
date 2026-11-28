@@ -794,6 +794,35 @@ def test_a_null_weekly_reset_time_resets_one_window_length_from_now(agy_runner):
     assert windows["seven_day"]["resets_at"] == NOW + quota.WINDOW_SECONDS["seven_day"]
 
 
+def disabled_five_hour(**bucket):
+    """The answer of a used-up week (#371): the 5h bucket is disabled and has no reset_time."""
+    answer = json.loads(gemini(week=0, five=1, week_reset="2026-12-03T07:01:53Z", omit_reset=("5h",)))
+    buckets = answer["command"]["data"]["groups"][0]["buckets"]
+    next(b for b in buckets if b["window"] == "5h").update({"disabled": True, **bucket})
+    return json.dumps(answer)
+
+
+@pytest.mark.parametrize("extra", [{}, {"reset_time": "2026-11-26T03:06:19Z"}],
+                         ids=["no-reset-time", "with-reset-time"])
+def test_a_disabled_bucket_does_not_apply_and_the_used_up_week_stops_agy(agy_runner, extra):
+    state = str(agy_runner.state_dir)
+    windows = agy_cli.refresh_quota(state, NOW, run=answering(disabled_five_hour(**extra)))
+    weekly_reset = epoch("2026-12-03T07:01:53Z")
+    assert windows == {"seven_day": {"used": 1, "resets_at": weekly_reset},
+                       "five_hour": {"used": 0, "resets_at": NOW + quota.WINDOW_SECONDS["five_hour"]}}
+    snap = quota.load(state, "agy")
+    assert quota.assess(snap, 1.0, 0.9, weekly_reset - 1)[1]
+    assert quota.horizon(snap, 1.0, 0.9, weekly_reset - 1) == "long"
+    assert quota.assess(snap, 1.0, 0.9, weekly_reset)[1] is None
+
+
+def test_a_bucket_with_disabled_false_keeps_its_reset_time(agy_runner):
+    state = str(agy_runner.state_dir)
+    windows = agy_cli.refresh_quota(state, NOW, run=answering(gemini(extra={"disabled": False})))
+    assert windows["five_hour"]["resets_at"] == epoch("2026-11-26T03:06:19Z")
+    assert windows["seven_day"]["resets_at"] == epoch("2026-12-01T03:23:36Z")
+
+
 FAILURES = {
     "timeout": raising(subprocess.TimeoutExpired(["agy"], 30)),
     "missing": raising(FileNotFoundError("agy")),
@@ -806,6 +835,10 @@ FAILURES = {
     "no-weekly": answering(gemini(drop=("weekly",))),
     "numeric-reset": answering(gemini(week_reset=1764500000)),
     "missing-reset": answering(gemini(omit_reset=("weekly",))),
+    "enabled-missing-reset": answering(gemini(omit_reset=("5h",), extra={"disabled": False})),
+    "string-disabled": answering(disabled_five_hour(disabled="true")),
+    "number-disabled": answering(gemini(extra={"disabled": 1})),
+    "null-disabled": answering(gemini(extra={"disabled": None})),
     "no-zone": answering(gemini(week_reset="2026-12-03T07:01:53")),
     "bad-reset": answering(gemini(five_reset="soon")),
     "string-fraction": answering(gemini(five="0.5")),
