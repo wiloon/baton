@@ -20,16 +20,52 @@ deny() {
   exit 0
 }
 
+# GNU `realpath -m` without GNU: macOS has no such option. Prints the physical path of $1, whose
+# components need not exist. Fails, printing nothing, on an empty path, a symlink loop (more
+# than 40 links) or a readlink / `pwd -P` error. Bash 3.2; splitting by expansion never globs.
+# The trailing `x` keeps $(…) from eating newlines that belong to a name.
+resolve_path() {
+  local rest=$1 out='' part target hops=0
+  [[ -n "$rest" ]] || return 1
+  if [[ "$rest" != /* ]]; then
+    # Physical, as getcwd: a logical $PWD through a symlink would look like it is inside.
+    out=$(pwd -P && echo x) || return 1
+    out=${out%$'\n'x}
+    out=${out%/}
+  fi
+  while [[ -n "$rest" ]]; do
+    part=${rest%%/*}
+    if [[ "$rest" == */* ]]; then rest=${rest#*/}; else rest=''; fi
+    case "$part" in
+      ''|.) ;;
+      ..) out=${out%/*} ;;   # symlinks before it are already followed
+      *)
+        if [[ -L "$out/$part" ]]; then
+          (( ++hops <= 40 )) || return 1
+          target=$(readlink "$out/$part" && echo x) || return 1
+          target=${target%$'\n'x}
+          [[ "$target" != /* ]] || out=''
+          rest=$target/$rest
+        else
+          out=$out/$part
+        fi
+        ;;
+    esac
+  done
+  printf '%s\n' "${out:-/}"
+}
+
 case "$tool" in
   Edit|Write|NotebookEdit|MultiEdit)
     p=$(jq -r '.tool_input.file_path // .tool_input.notebook_path // ""' <<<"$input")
-    p=$(realpath -m -- "$p")
+    # `deny` runs here, not inside $(…). An empty path stays empty: no rule below allows it.
+    if [[ -n "$p" ]]; then p=$(resolve_path "$p") || deny "cannot resolve the file path"; fi
     # Vendor markers belong to the runner; an agent writing one could
     # impersonate another vendor and approve its own work. The runner reads markers
     # only from what it posts to GitHub, never from committed files, so test files in
     # the worktree may hold them as fixtures (baton's own tests do, #84).
     is_test_file() {
-      local wt; wt=$(realpath -m -- "$WT")   # resolved like $p
+      local wt; wt=$(resolve_path "$WT") || return 1   # resolved like $p
       [[ "$p" == "$wt"/* ]] || return 1
       local rel=${p#"$wt"/} base=${p##*/}
       [[ "/$rel" == */tests/* || "/$rel" == */test/* || "/$rel" == */__tests__/* \
@@ -47,7 +83,7 @@ case "$tool" in
     # Bash are unaffected.
     in_scratch() {
       [[ -n "${BATON_AGENT_SCRATCH:-}" ]] || return 1   # unset must not become /*
-      local dir; dir=$(realpath -m -- "$BATON_AGENT_SCRATCH")   # resolved like $p
+      local dir; dir=$(resolve_path "$BATON_AGENT_SCRATCH") || return 1   # never /* on failure
       [[ "$p" == "$dir"/* ]]
     }
     if [[ "$ROLE" == review || "$ROLE" == screenshot_review || "$ROLE" == spec_review || "$ROLE" == scan ]]; then
@@ -58,8 +94,14 @@ case "$tool" in
     ;;
   Read)
     p=$(jq -r '.tool_input.file_path // ""' <<<"$input")
-    p=$(realpath -m -- "$p")
-    [[ "$p" == "$HOME/.config/baton/"* || "$p" == "$HOME/.ssh/"* || "$p" == "$HOME/.config/gh/"* ]] && deny "secrets are off limits"
+    if [[ -n "$p" ]]; then
+      p=$(resolve_path "$p") || deny "cannot resolve the file path"
+      # Resolved like $p: $HOME or one of these may sit behind a symlink.
+      for secret in "$HOME/.config/baton" "$HOME/.ssh" "$HOME/.config/gh"; do
+        dir=$(resolve_path "$secret") || deny "cannot resolve $secret"
+        [[ "$p" == "$dir"/* ]] && deny "secrets are off limits"
+      done
+    fi
     ;;
   Bash)
     c=$(jq -r '.tool_input.command // ""' <<<"$input")

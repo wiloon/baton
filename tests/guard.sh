@@ -142,4 +142,87 @@ for s in settings review-settings spec-settings scan-settings; do
     and (.permissions.deny | index("ScheduleWakeup") and index("RemoteTrigger") and index("CronCreate"))' \
     "$BIN/$s.json" >/dev/null || fail "$s.json does not trim the unattended context"
 done
+# #355: paths are resolved by guard.sh's own resolve_path (macOS has no `realpath -m`). These
+# cases need real files, so the worktree is now a real directory given as its physical path.
+RT=$(cd "$TEST_ROOT" && pwd -P)
+WT="$RT/wt"; OUT="$RT/outside"; mkdir -p "$WT/sub" "$OUT"
+read_of() { jq -nc --arg p "$1" '{tool_name:"Read",tool_input:{file_path:$p}}'; }
+decides() {   # LABEL WANT ROLE TOOL_JSON
+  local got
+  got=$(guard_decision "$3" "$4")
+  [[ $got == "$2" ]] || fail "guard-path $1: want $2, got $got"
+}
+ln -s "$OUT/missing" "$WT/dangling"
+ln -s "$OUT" "$WT/sub/out"
+ln -s loop-b "$WT/loop-a"; ln -s loop-a "$WT/loop-b"
+decides dangling deny dev "$(write_to Write "$WT/dangling")"
+decides after-missing deny dev "$(write_to Write "$WT/sub/nope/../out/f")"
+(cd "$WT" && decides relative-inside none dev "$(write_to Write sub/f)")
+(cd "$OUT" && decides relative-outside deny dev "$(write_to Write sub/f)")
+(cd "$WT/sub/out" && decides relative-symlinked-cwd deny dev "$(write_to Write f)")
+decides loop-write deny dev "$(write_to Write "$WT/loop-a/f")"
+decides loop-read deny dev "$(read_of "$WT/loop-a/f")"
+decides plain-read none dev "$(read_of "$WT/sub/f")"
+decides empty-write deny dev "$(write_to Write '')"
+decides empty-read none dev "$(read_of '')"
+# A failing readlink or pwd -P (here: a removed working directory) denies too.
+mkdir -p "$RT/shim" "$RT/gone"
+printf '#!/bin/sh\nexit 1\n' > "$RT/shim/readlink"; chmod +x "$RT/shim/readlink"
+ln -s sub "$WT/inner"
+decides inner-link none dev "$(write_to Write "$WT/inner/f")"
+PATH="$RT/shim:$PATH" decides readlink-fails-write deny dev "$(write_to Write "$WT/inner/f")"
+PATH="$RT/shim:$PATH" decides readlink-fails-read deny dev "$(read_of "$WT/inner/f")"
+(cd "$RT/gone" && rmdir "$RT/gone" && decides pwd-fails deny dev "$(read_of f)")
+# An unresolvable scratch directory or worktree never widens what is allowed.
+GUARD_SCRATCH="$WT/loop-a"
+decides scratch-loop-outside deny dev "$(write_to Write "$OUT/f")"
+for f in "$WT/sub/f" "$OUT/f" "$SCRATCH/out.md"; do
+  decides "scratch-loop-review $f" deny review "$(write_to Write "$f")"
+done
+decides scratch-loop-inside none dev "$(write_to Write "$WT/sub/f")"
+unset GUARD_SCRATCH
+real_wt=$WT; WT="$real_wt/loop-a"
+decides worktree-loop-marker deny dev "$(marker_write "$SCRATCH/tests/reply.md")"
+WT=$real_wt
+# The secret directories are compared as resolved paths.
+H="$RT/home"; mkdir -p "$H/x" "$H/.ssh" "$H/.config/baton" "$H/.config/gh"
+ln -s "$H" "$RT/home-link"
+HOME="$H" decides ssh-dotdot deny dev "$(read_of "$H/x/../.ssh/id_rsa")"
+HOME="$RT/home-link" decides ssh-home-link deny dev "$(read_of "$RT/home-link/x/../.ssh/id_rsa")"
+HOME="$H" decides home-other none dev "$(read_of "$H/x/notes")"
+for d in .ssh .config/baton .config/gh; do
+  linked="$RT/linked-home/$d"; target="$RT/targets/$d"
+  mkdir -p "$(dirname "$linked")" "$target"
+  ln -s "$target" "$linked"
+  HOME="$RT/linked-home" decides "linked $d" deny dev "$(read_of "$target/id")"
+done
+mkdir -p "$RT/loop-home"; ln -s .ssh "$RT/loop-home/.ssh"
+HOME="$RT/loop-home" decides secret-dir-loop deny dev "$(read_of "$WT/sub/f")"
+# Where GNU `realpath -m` exists, resolve_path agrees with it (loops excluded: it fails there).
+if realpath -m / >/dev/null 2>&1; then
+  eval "$(sed -n '/^resolve_path() {/,/^}/p' "$BIN/guard.sh")"
+  mkdir -p "$WT/sp ace"; : > "$WT/sub/file"; : > "$OUT/*"
+  ln -s ../outside "$WT/rel"
+  ln -s sub/out "$WT/chain"
+  ln -s "$WT/sub/../dangling" "$WT/abs"
+  ln -s / "$WT/rootlink"
+  ln -s '*' "$WT/star"
+  parity() {   # PATH, resolved from the current directory
+    local want got
+    want=$(realpath -m -- "$1")
+    got=$(resolve_path "$1") || fail "guard-parity $1: resolve_path failed"
+    [[ $got == "$want" ]] || fail "guard-parity $1 (in $PWD): want $want, got $got"
+  }
+  (
+    cd "$WT"
+    for f in "$WT" "$WT/" / // /.. /../.. "$WT/dangling" "$WT/dangling/x/.." "$WT/sub/nope/../out/f" \
+      "$WT/nope/../sub/out" "$WT/sub/out/.." "$WT/sub/out/../wt/sub" "$WT/sub/file/x/.." "$WT/sub//./out/./f/" \
+      "$WT/rel/f" "$WT/chain/f" "$WT/abs" "$WT/rootlink/tmp" "$WT/star" "$OUT/*" "$WT/sp ace/../*/?" \
+      "$H/x/../.ssh/id_rsa" "$RT/home-link/x/../.ssh/id_rsa" "$RT/linked-home/.ssh/id" \
+      . .. sub/f sub/nope/../out/f ./dangling ../outside/f '*' 'sp ace/*' -n; do
+      parity "$f"
+    done
+  )
+  (cd "$WT/sub/out" && for f in f . .. ../wt/sub nope/../f; do parity "$f"; done)
+fi
 echo 'PASS: guard decisions, prompt shell rule, unattended settings'
