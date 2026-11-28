@@ -194,7 +194,6 @@ def agy_runner(tmp_path, monkeypatch):
 def test_agy_is_registered_with_gemini_only_review_policy():
     agy = agents.ADAPTERS["agy"]
     assert agy.SAME_VENDOR_REVIEW is True and agy.RECORDS_AUTHOR_MODEL is True
-    assert agy.SAME_VENDOR_SAME_MODEL is False
     assert agy.ROUTE_FIELDS == frozenset({"model"})
     assert agy.COMMIT_MARKERS == ()
     assert agy.QUOTA_SOURCE == "api"
@@ -967,14 +966,14 @@ def test_agy_spec_run_uses_accept_edits_read_allowlist_and_restores_on_failure(a
 
 # --- review independence and attribution ------------------------------------------------------
 
-def test_agy_never_reviews_its_own_head_on_the_same_model(tmp_path):
+def test_agy_calls_a_same_model_self_review_fresh_context(tmp_path):
     state, pr = str(tmp_path), 7
     vendors.record_author(state, pr, "agy")
     vendors.record_author_model(state, pr, "agy", MODEL)
-    assert vendors.review_allowed(state, pr, "agy", "gemini-4-neon-xhigh") is False
-    assert vendors.review_allowed(state, pr, "agy", REVIEW_MODEL) is True
     assert vendors.same_vendor_review_mode(state, pr, "agy", REVIEW_MODEL) == "same-vendor-different-model"
-    assert vendors.review_allowed(state, pr, "agy", "") is False
+    for same in ("gemini-4-neon-xhigh", ""):
+        assert vendors.same_vendor_review_mode(state, pr, "agy", same) == "same-model-fresh-context"
+        assert vendors.screenshot_allowed(state, pr, "agy", same) is False
 
 
 def test_agy_reviews_another_vendors_pr_and_others_review_agy(tmp_path):
@@ -1001,12 +1000,12 @@ def test_agy_reviews_its_own_pr_on_a_distinct_model_when_every_other_reviewer_is
     assert (result["vendor"], rc, result["review_mode"]) == ("agy", 0, "same-vendor-different-model")
 
 
-def test_agy_is_not_picked_to_review_its_own_pr_on_the_writers_model(agy_runner):
+def test_agy_reviews_its_own_pr_when_its_review_model_wrote_it(agy_runner):
     state = str(agy_runner.state_dir)
     vendors.record_author(state, "21", "agy")
     vendors.record_author_model(state, "21", "agy", REVIEW_MODEL)   # the review route model wrote it
     result, rc = pick_review(agy_runner, "21")
-    assert result["vendor"] != "agy" and rc == 75
+    assert (result["vendor"], rc) == ("agy", 0)
 
 
 def test_dev_opening_attributes_the_pr_to_agy_with_the_verified_model(agy_runner):

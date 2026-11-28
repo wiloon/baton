@@ -8,13 +8,14 @@ exits the item's subshell):
     status   how it ended; "deferred" when the vendor cannot run now; "" for rejected requests
     outcome  the RESULT:/REVIEW:/SPEC:/... line
     reply    the agent's final message (untrusted: callers strip markers)
-    model    the actual Claude or Codex model when reported
+    model    the actual model when reported (Cursor: the pinned model requested, else "unknown")
     defer    why the item must yield, or ""
 Exit code: 0 ok, 1 failed, 75 deferred.
 """
 
 from . import session
 import argparse
+from dataclasses import replace
 import json
 from pathlib import Path
 import sys
@@ -44,6 +45,8 @@ def configure(vendor, role, env):
     )
     tier = tiers.step(env, role, runtime.issue, runtime.pr)
     route = models.route(role, vendor, followup=followup, tier=tier)
+    if role == "review" and runtime.review_model:
+        route = replace(route, model=runtime.review_model)
     settings = env.config.vendor(vendor)
     return agents.ADAPTERS[vendor].configure(role, route, settings, env)
 

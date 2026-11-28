@@ -48,6 +48,24 @@ def test_repository_auto_merge_defaults_on_and_turns_off_per_repository(tmp_path
     assert c.scheduling.auto_merge is True and c.repos[0].auto_merge is False
 
 
+def test_repository_weight_defaults_to_one_and_rejects_bad_values(tmp_path):
+    head, repo = TEXT.split('\n[[repos]]\n', 1)
+    stripped = repo.replace('\nweight = 1\n', '\n', 1)
+    omitted = write(tmp_path, head + '\n[[repos]]\n' + stripped)
+    assert config.load(omitted, home=tmp_path).repos[0].weight == 1
+    set_five = write(tmp_path, TEXT.replace('\nweight = 1\n', '\nweight = 5\n', 1))
+    assert config.load(set_five, home=tmp_path).repos[0].weight == 5
+    for value, message in (
+        ('0', 'repos.weight: expected a positive integer'),
+        ('1.5', 'repos.weight: expected int'),
+        ('"2"', 'repos.weight: expected int'),
+        ('true', 'repos.weight: expected int'),
+    ):
+        bad = write(tmp_path, TEXT.replace('\nweight = 1\n', f'\nweight = {value}\n', 1))
+        with pytest.raises(config.ConfigError, match=re.escape(message)):
+            config.load(bad, home=tmp_path)
+
+
 @pytest.mark.parametrize('old,new', [
     ('auto_merge = true', 'auto_merge = 1'),
     ('chain_max = 5', 'chain_max = true'),

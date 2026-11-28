@@ -148,6 +148,11 @@ class Supervisor:
         self.problem = ''
         return True
 
+    def weight(self, name):
+        """Per-repository scheduling weight from the current config (#300). One accessor so a
+        runtime override (#293) can land here without touching ranking."""
+        return self.config.repo(name).weight
+
     def schedule(self):
         config = self.config
         if config.scheduling.paused:
@@ -179,7 +184,7 @@ class Supervisor:
                 return
             starts = eligibility.rank(
                 due, listings, order=order, last_child=self.last_child, born=self.born, now=now,
-                suppress=self.suppress)
+                suppress=self.suppress, weight=self.weight)
         for name, issue, no_new in starts:
             if self.stopping or len(self.children) >= config.scheduling.max_parallel:
                 return
