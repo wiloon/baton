@@ -687,3 +687,99 @@ def test_evidence_from_optional_excerpts_is_omitted_from_the_decision_record(adv
 def replace_cap(cfg, chars):
     from dataclasses import replace
     return replace(cfg, snapshot_chars=chars)
+
+
+SENT = "Latest review:\nthe retry loop never\nstops on **success**\nand the test is missing"
+MISS = "evidence is outside the sent snapshot"
+
+
+def quoting(*quotes):
+    return {"action": "extra_round", "reason": "r", "evidence": list(quotes)}
+
+
+def advise_quotes(adv, *quotes, snapshot=SENT):
+    adv.replies = [quoting(*quotes)]
+    decision = advisor.advise(adv.env, "review_limit", 40, snapshot, ("extra_round",), revalidate=lambda: True)
+    [record] = adv.records()
+    return decision, record, Path(os.environ["LOGS"], "runner.log").read_text()
+
+
+def test_a_mismatching_quote_is_dropped_and_the_action_still_runs(adv):
+    miss = "the loop is invented " + "z" * 100
+    decision, record, log = advise_quotes(adv, "the retry loop never", miss)
+    assert decision.extra_round and decision.evidence == ("the retry loop never",)
+    assert record["executed"] == "extra_round" and record["failure"] == ""
+    assert record["evidence"] == ["the retry loop never"]
+    assert record["evidence_dropped"] == 1 and record["evidence_miss"] == miss[:80]
+    assert f"evidence_miss={miss[:80]!r}" in log
+
+
+@pytest.mark.parametrize("quote", ["retry loop never stops on", "  retry loop never \t stops on\n"])
+def test_a_whitespace_variant_matches_and_records_the_snapshot_span(adv, quote):
+    decision, record, log = advise_quotes(adv, quote)
+    assert decision.extra_round and record["evidence"] == ["retry loop never\nstops on"]
+    assert "evidence_dropped" not in record and "evidence_miss" not in record and "evidence_miss" not in log
+
+
+def test_a_miss_after_the_fifth_quote_is_counted(adv):
+    exact = ("Latest", "review:", "retry", "loop", "never")
+    decision, record, _ = advise_quotes(adv, *exact, "invented")
+    assert decision.extra_round and record["evidence"] == list(exact)
+    assert record["evidence_dropped"] == 1 and record["evidence_miss"] == "invented"
+
+
+@pytest.mark.parametrize("quote", ["The retry loop never", "stops on success", "retryloop"],
+                         ids=["case", "markdown", "joined"])
+def test_a_reply_whose_quotes_all_miss_is_rejected_with_the_first_miss(adv, quote):
+    decision, record, log = advise_quotes(adv, quote, "also invented")
+    assert decision.action == "handoff" and record["failure"] == f"malformed reply: ValueError: {MISS}"
+    assert record["evidence_miss"] == quote and "evidence_dropped" not in record
+    assert f"evidence_miss={quote!r}" in log
+
+
+def test_an_empty_evidence_array_is_accepted(adv):
+    decision, record, _ = advise_quotes(adv)
+    assert decision.extra_round and record["evidence"] == []
+    assert "evidence_dropped" not in record and "evidence_miss" not in record
+
+
+@pytest.mark.parametrize("item", [7, "", " \n\t "], ids=["non-string", "empty", "blank"])
+def test_an_invalid_evidence_item_rejects_the_reply_without_a_miss(adv, item):
+    decision, record, log = advise_quotes(adv, "the retry loop never", "invented", item)
+    assert decision.action == "handoff" and record["failure"] == f"malformed reply: ValueError: {MISS}"
+    assert "evidence_dropped" not in record and "evidence_miss" not in record and "evidence_miss" not in log
+
+
+@pytest.mark.parametrize("lead", [5, 70], ids=["inside", "straddling-the-cut"])
+def test_an_evidence_miss_is_redacted_before_it_is_cut(adv, monkeypatch, lead):
+    secret = "planted-opaque-" + "value-0123456789"
+    monkeypatch.setenv("SOME_SERVICE_TOKEN", secret)
+    quote = "q" * lead + secret
+    _, record, log = advise_quotes(adv, quote)
+    assert record["evidence_miss"] == ("q" * lead + "[redacted]")[:80]
+    assert "planted" not in log and "planted" not in advisor.records_path(adv.env).read_text()
+
+
+def test_a_miss_with_line_breaks_stays_on_one_log_line(adv):
+    _, _, log = advise_quotes(adv, "invented\nforged line\u2028more")
+    [line] = log.splitlines()
+    assert "evidence_miss='invented\\nforged line\\u2028more'" in line
+
+
+EXCERPTED = SENT + "\n\nDiff excerpt:\n+ only_in_the_excerpt = True"
+
+
+def test_a_quote_found_only_in_an_excerpt_is_accepted_and_unrecorded(adv):
+    decision, record, _ = advise_quotes(adv, "only_in_the_excerpt  =  True", snapshot=EXCERPTED)
+    assert decision.extra_round and record["evidence"] == [] and "evidence_dropped" not in record
+
+
+@pytest.mark.parametrize("quotes, dropped", [
+    (("the retry loop never", "only_in_the_excerpt = False"), 1),
+    (("only_in_the_excerpt = False",), None),
+], ids=["dropped", "rejected"])
+def test_an_excerpted_snapshot_keeps_no_evidence_miss(adv, quotes, dropped):
+    decision, record, log = advise_quotes(adv, *quotes, snapshot=EXCERPTED)
+    assert decision.extra_round == bool(dropped) and record.get("evidence_dropped") == dropped
+    assert "evidence_miss" not in record and "evidence_miss" not in log
+    assert "only_in_the_excerpt" not in log + advisor.records_path(adv.env).read_text()

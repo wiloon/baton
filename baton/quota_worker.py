@@ -24,8 +24,9 @@ def run(config):
             path = state / 'quota-probes' / f'{vendor}.json'
 
             def needed():
-                # Called under the shared vendor lease, after any preceding call
-                # has finished updating the observations. No storage lock spans I/O.
+                # Called under the vendor's probe lock, so no other probe is between this
+                # check and its request. Runs in flight may still be updating the
+                # observations. No storage lock spans I/O.
                 now = time.time()
                 if (quota.fresh(state, vendor, now, settings.quota_stale_minutes)
                         and quota.credential_current(state, vendor, now)):

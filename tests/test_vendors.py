@@ -12,7 +12,9 @@ from unittest.mock import patch
 from contextlib import redirect_stdout
 from io import StringIO
 
-from baton import vendors
+from baton import config, vendors
+from conftest import full_text, in_flight
+from test_adapter_capabilities import with_stub
 
 NOW = 1_793_000_000
 POOL = ["claude", "codex"]
@@ -60,14 +62,22 @@ class VendorTests(unittest.TestCase):
         self.assertEqual(rc, 75)
         self.assertIn("quota limits: claude=blocked(week 70% >= cap 70%)", result["reason"])
 
-    def test_occupied_vendor_is_skipped_for_workloads_and_probes(self):
-        from baton import capacity
-        with capacity.lease(self.state, 'claude'):
+    def test_a_vendor_with_a_run_in_flight_is_still_picked_and_probed(self):
+        with in_flight(self.state, 'claude'):
             result, rc = self.pick(current='claude')
-            self.assertEqual((result['vendor'], rc), ('codex', 0))
-            self.assertEqual(result['blocked']['claude'], 'vendor capacity reserved')
+            self.assertEqual((result['vendor'], rc, result['blocked']), ('claude', 0, {}))
             result, _ = vendors.pick(self.state, POOL, 'dev', POOL, now=NOW, probe_only=True)
-            self.assertNotIn('claude', result['probe'])
+            self.assertIn('claude', result['probe'])
+
+    def test_a_run_in_flight_overshoots_until_the_snapshot_reaches_a_cap(self):
+        # #299: admission is a check at pick time; nothing is reserved for runs in flight.
+        with in_flight(self.state, 'claude'):
+            self.snap("claude", 0.69, five=0.89)
+            self.assertEqual(self.pick(by="contrib", candidates=["claude"])[0]["vendor"], "claude")
+            for week, five in ((0.70, 0.0), (0.0, 0.90)):
+                self.snap("claude", week, five)
+                result, rc = self.pick(by="contrib", candidates=["claude"])
+                self.assertEqual((rc, result["vendor"]), (75, ""))
 
     def test_probe_candidates_skip_cooldown_and_exclusions(self):
         Path(self.state, "claude-cooldown-until").write_text(str(NOW + 3600))
@@ -265,9 +275,16 @@ class VendorTests(unittest.TestCase):
         vendors.record_author(self.state, "7", "codex")
         self.assertEqual(vendors.review_excluded(self.state, "7").count("codex"), 1)
         self.assertEqual(set(vendors.review_excluded(self.state, "7")), set(vendors.all_vendors(POOL)))
-        # A whole-PR review by any writer is handed to the owner.
-        result, rc = vendors.pick(self.state, POOL, "review", [*POOL, "cursor"],
-                                  current="claude", pr="7", by="contrib", now=NOW, review=True)
+        # A writer without a same-vendor review (only the stub) is handed to the owner.
+        for vendor in ("cursor", "stub"):   # cursor: the extra vendor outside the candidates
+            vendors.record_author(self.state, "70", vendor)
+        path = self.state / "stub.toml"
+        path.write_text(with_stub(full_text()))
+        env = vendors.session.resolve()
+        env.config = config.load(path, home=self.state)
+        with patch.object(vendors.session, "resolve", return_value=env):
+            result, rc = vendors.pick(self.state, ["stub"], "review", ["stub"],
+                                      pr="70", by="contrib", now=NOW, review=True)
         self.assertEqual((result.get("exhausted"), rc), (True, 0))
         self.assertEqual(vendors.review_excluded(self.state, "7", "claude"), ["claude"])
         result, rc = vendors.pick(self.state, POOL, "review", [*POOL, "cursor"],
@@ -298,23 +315,24 @@ class VendorTests(unittest.TestCase):
         codex_cooldown.write_text(str(NOW + LONG_REST))
         cursor_cooldown = Path(self.state, "cursor-cooldown-until")
         cursor_cooldown.write_text(str(NOW + LONG_REST))
-        with patch.object(vendors.agents.ADAPTERS["claude"], "SAME_VENDOR_SAME_MODEL", True):
-            result, rc = vendors.pick(self.state, POOL, "review", ["codex", "claude", "cursor"],
-                                      pr="9", by="contrib", now=NOW, review=True)
-            self.assertEqual((result["vendor"], rc), ("claude", 0))
-            self.assertEqual(result["review_mode"], "same-model-fresh-context")
-            self.assertIn("codex", result["blocked"])
-            codex_cooldown.unlink()
-            self.snap("codex", 0.20)
-            cursor_cooldown.write_text(str(NOW + 60))
-            result, rc = vendors.pick(self.state, POOL, "review", ["codex", "claude", "cursor"],
-                                      pr="9", by="contrib", now=NOW, review=True)
-            self.assertEqual((result["vendor"], rc), ("", 75))
-            self.assertIn("waiting for cursor", result["reason"])
+        vendors.record_author_model(self.state, "9", "claude", "sonnet")   # every configured one
+        result, rc = vendors.pick(self.state, POOL, "review", ["codex", "claude", "cursor"],
+                                  pr="9", by="contrib", now=NOW, review=True)
+        self.assertEqual((result["vendor"], rc), ("claude", 0))
+        self.assertEqual(result["review_mode"], "same-model-fresh-context")
+        self.assertIn("codex", result["blocked"])
+        codex_cooldown.unlink()
+        self.snap("codex", 0.20)
+        cursor_cooldown.write_text(str(NOW + 60))
+        result, rc = vendors.pick(self.state, POOL, "review", ["codex", "claude", "cursor"],
+                                  pr="9", by="contrib", now=NOW, review=True)
+        self.assertEqual((result["vendor"], rc), ("", 75))
+        self.assertIn("waiting for cursor", result["reason"])
 
     def test_review_falls_back_to_the_same_codex_model_in_a_fresh_session(self):
         vendors.record_author(self.state, "16", "codex")
-        vendors.record_author_model(self.state, "16", "codex", "gpt-6.2-astra")
+        for model in ("gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.1-sol", "gpt-6.1-terra"):   # every one
+            vendors.record_author_model(self.state, "16", "codex", model)
         with patch.dict(os.environ, {"MODEL_CODEX_REVIEW": "gpt-6.1-sol"}):
             result, rc = vendors.pick(self.state, POOL, "review", [*POOL, "cursor"],
                                       pr="16", by="contrib", now=NOW, review=True)
@@ -330,7 +348,7 @@ class VendorTests(unittest.TestCase):
         self.assertEqual(vendors.same_vendor_review_mode(self.state, "16", "codex", "gpt-6.1-terra"), "same-model-fresh-context")
         self.assertEqual(vendors.same_vendor_review_mode(self.state, "16", "codex", "gpt-6.2"), "same-vendor-different-model")
 
-    def test_claude_reviews_claude_code_only_on_a_distinct_model(self):
+    def test_claude_review_is_different_model_only_when_distinct(self):
         vendors.record_author(self.state, "17", "claude")
         vendors.record_author_model(self.state, "17", "claude", "claude-sonnet-5-5")
         self.assertEqual(vendors.same_vendor_review_mode(self.state, "17", "claude", "opus"),
@@ -338,7 +356,9 @@ class VendorTests(unittest.TestCase):
         self.assertTrue(vendors.review_allowed(self.state, "17", "claude", "claude-opus-5-5"))
         self.assertTrue(vendors.screenshot_allowed(self.state, "17", "claude", "opus"))
         for same in ("sonnet", "claude-sonnet-5-5", "unknown", ""):
-            self.assertFalse(vendors.review_allowed(self.state, "17", "claude", same), same)
+            self.assertEqual(vendors.same_vendor_review_mode(self.state, "17", "claude", same),
+                             "same-model-fresh-context", same)
+            self.assertFalse(vendors.screenshot_allowed(self.state, "17", "claude", same), same)
         for vendor in ("codex", "cursor"):
             Path(self.state, f"{vendor}-cooldown-until").write_text(str(NOW + LONG_REST))
         result, rc = vendors.pick(self.state, POOL, "review", [*POOL, "cursor"],
@@ -372,13 +392,18 @@ class VendorTests(unittest.TestCase):
         self.assertEqual((result["vendor"], rc), ("claude", 0))
         self.assertEqual(result["review_mode"], "same-vendor-different-model")
 
-    def test_claude_without_a_recorded_model_never_reviews_its_own_code(self):
+    def test_no_model_record_or_an_unknown_own_model_is_fresh_context(self):
         vendors.record_author(self.state, "18", "claude")
-        self.assertFalse(vendors.review_allowed(self.state, "18", "claude", "opus"))
+        self.assertEqual(vendors.same_vendor_review_mode(self.state, "18", "claude", "opus"),
+                         "same-model-fresh-context")
+        vendors.record_author_model(self.state, "18", "claude", "sonnet")
+        for own in ("unknown", "auto", ""):
+            self.assertEqual(vendors.same_vendor_review_mode(self.state, "18", "claude", own),
+                             "same-model-fresh-context", own)
 
-    def test_review_does_not_accept_an_unknown_codex_model(self):
+    def test_review_of_an_unknown_codex_model_is_fresh_context(self):
         for vendor in ("claude", "cursor"):
-            Path(self.state, f"{vendor}-cooldown-until").write_text(str(NOW + 3600))
+            Path(self.state, f"{vendor}-cooldown-until").write_text(str(NOW + LONG_REST))
         with patch.dict(os.environ, {"MODEL_CODEX_REVIEW": "gpt-6.1-sol"}):
             for pr, model in (("11", "unknown"), ("12", "")):
                 vendors.record_author(self.state, pr, "codex")
@@ -386,21 +411,27 @@ class VendorTests(unittest.TestCase):
                     vendors.record_author_model(self.state, pr, "codex", model)
                 result, rc = vendors.pick(self.state, POOL, "review", [*POOL, "cursor"],
                                           pr=pr, by="contrib", now=NOW, review=True)
-                self.assertEqual((result["vendor"], rc), ("", 75))
+                self.assertEqual((result["vendor"], rc, result["review_mode"]),
+                                 ("codex", 0, "same-model-fresh-context"))
+
+    def fresh_only(self, pr, model):
+        self.assertEqual(vendors.same_vendor_review_mode(self.state, pr, "codex", model),
+                         "same-model-fresh-context", model)
+        self.assertFalse(vendors.screenshot_allowed(self.state, pr, "codex", model), model)
 
     def test_final_review_guard_checks_actual_model(self):
         vendors.record_author(self.state, "13", "codex")
         vendors.record_author_model(self.state, "13", "codex", "gpt-6.1-terra")
         self.assertTrue(vendors.review_allowed(self.state, "13", "codex", "gpt-6.1-sol"))
         self.assertTrue(vendors.review_allowed(self.state, "13", "codex", "gpt-6.1-terra"))
-        self.assertFalse(vendors.review_allowed(self.state, "13", "codex", "unknown"))
-        self.assertFalse(vendors.review_allowed(self.state, "13", "codex", ""))
+        self.fresh_only("13", "unknown")
+        self.fresh_only("13", "")
 
     def test_legacy_codex_contribution_stays_unknown_after_a_new_fix(self):
         vendors.record_author(self.state, "14", "codex")
         Path(self.state, "pr-14-contrib").write_text("codex 17\n")
         vendors.record_author_model(self.state, "14", "codex", "gpt-6.1-terra")
-        self.assertFalse(vendors.review_allowed(self.state, "14", "codex", "gpt-6.1-sol"))
+        self.fresh_only("14", "gpt-6.1-sol")
 
     def test_legacy_writer_stays_unknown_with_another_adapters_model_evidence(self):
         pr = "14"
@@ -411,7 +442,7 @@ class VendorTests(unittest.TestCase):
         vendors.record_author_model(self.state, pr, "codex", "gpt-6.1-terra")
         vendors.record_author_model(self.state, pr, "codex", "gpt-6.1-terra")
 
-        self.assertFalse(vendors.review_allowed(self.state, pr, "codex", "gpt-6.1-sol"))
+        self.fresh_only(pr, "gpt-6.1-sol")
         self.assertEqual(Path(self.state, f"pr-{pr}-author-models").read_text().splitlines(),
                          ["claude opus", "codex unknown", "codex gpt-6.1-terra"])
 
@@ -527,14 +558,12 @@ class VendorTests(unittest.TestCase):
         quota.credential(self.state, "claude", "authenticated", NOW + 1)
         self.assertEqual(self.review("25")[1], 75)
 
-    def test_a_vendor_holding_its_capacity_lease_is_waited_for(self):
-        from baton import capacity
+    def test_a_cross_vendor_reviewer_with_a_run_in_flight_is_picked(self):
         self.codex_pr("23")
         Path(self.state, "cursor-cooldown-until").write_text(str(NOW + LONG_REST))
-        with capacity.lease(self.state, "claude"):
+        with in_flight(self.state, "claude"):
             result, rc = self.review("23")
-        self.assertEqual(rc, 75)
-        self.assertIn("waiting for claude (vendor capacity reserved)", result["reason"])
+        self.assertEqual((rc, result["vendor"]), (0, "claude"))
 
     def test_stale_quota_is_waited_for_before_same_vendor_review(self):
         self.codex_pr("24")

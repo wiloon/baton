@@ -64,3 +64,13 @@ def test_setting_replaces_every_section_with_one_and_appends_when_missing():
     assert done.count("## Checks to verify") == 1 and "Manual checks" not in done
     assert "- c" in done and "- a" not in done and "- b" not in done and "## Notes\nx" in done
     assert checks.set_checks("Closes #1", "- c") == "Closes #1\n\n## Checks to verify\n- c\n"
+
+
+def test_author_marker_after_checks_section_is_ignored():
+    marker = "<!-- baton-author: vendor=claude model=claude-opus-5-5 -->"
+    none_body = f"Goal\n\n## Checks to verify\nnone\n\n{marker}\n"
+    assert checks.is_none(none_body)
+    assert checks.lines(none_body) == []
+    list_body = f"Goal\n\n## Checks to verify\n- open page\n{marker}\n"
+    assert checks.items(list_body) == ["open page"]
+    assert checks.lines(list_body) == ["- open page"]

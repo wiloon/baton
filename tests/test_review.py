@@ -22,6 +22,7 @@ from test_adapter_capabilities import with_stub
 
 REAL_MERGE = merge.Merger.merge_or_handoff
 REAL_FIX = review.fix.fix_pr
+REAL_DISPATCH = review.dispatch.dispatch
 
 BIN = Path(__file__).resolve().parents[1] / "bin"
 PR = 987654
@@ -214,14 +215,17 @@ def test_a_same_model_review_says_so_and_the_pr_still_merges(loop, monkeypatch):
     assert loop.merged == [PR] and not loop.labelled("ready-for-human")
 
 
-@pytest.mark.parametrize("scenario", ["short block", "identical", "capacity"])
-def test_codex_pr_self_review_uses_base_and_reports_actual_model(loop, monkeypatch, tmp_path, scenario):
+@pytest.mark.parametrize("scenario", ["short block", "distinct", "identical", "capacity"])
+def test_codex_pr_self_review_picks_a_distinct_model_and_reports_the_actual_one(
+        loop, monkeypatch, tmp_path, scenario):
     from baton import codex_cli
 
-    base, fallback = "gpt-6.2-astra", "gpt-6.1-sol"
+    base, other, fallback = "gpt-6.2-astra", "gpt-6.1-terra", "gpt-6.1-sol"
     loop.gh.set(headRefName="owner/issue-297", author={"login": "owner"})
     vendors.record_author(loop.env["STATE"], PR, "codex")
-    vendors.record_author_model(loop.env["STATE"], PR, "codex", base)
+    written = (base, other, "gpt-6.2-sol", fallback) if scenario == "identical" else (base,)
+    for model in written:
+        vendors.record_author_model(loop.env["STATE"], PR, "codex", model)
     for vendor in ("claude", "cursor"):
         delay = 60 if vendor == "claude" and scenario == "short block" else 86400
         Path(loop.env["STATE"], f"{vendor}-cooldown-until").write_text(str(int(time.time()) + delay))
@@ -253,8 +257,11 @@ def test_codex_pr_self_review_uses_base_and_reports_actual_model(loop, monkeypat
     else:
         assert rv.run_review(2, "") == "REVIEW: pass"
         if scenario == "capacity":
-            assert calls == [base, fallback]
+            assert calls == [other, fallback]
             assert f"same-vendor-different-model (codex/{fallback})" in loop.comments()[0]
+        elif scenario == "distinct":
+            assert calls == [other]
+            assert f"same-vendor-different-model (codex/{other})" in loop.comments()[0]
         else:
             assert calls == [base]
             assert f"same-model-fresh-context (codex/{base})" in loop.comments()[0]
@@ -289,11 +296,14 @@ def test_reloading_one_alias_changes_review_and_fix_cli_models(loop, monkeypatch
     assert calls == ["sonnet", "sonnet", "claude-sonnet-4-6", "claude-sonnet-4-6"]
 
 
-def test_a_reviewer_that_wrote_the_pr_is_refused_and_the_owner_gets_it(loop):
-    for vendor in ("claude", "codex", "cursor"):
+def test_a_reviewer_that_wrote_the_pr_is_refused_and_the_owner_gets_it(loop, monkeypatch):
+    """Only the stub has no same-vendor review (#221)."""
+    admit_stub(loop, monkeypatch)
+    monkeypatch.setattr(review.Review, "vendors", lambda self: ["stub"])
+    for vendor in ("claude", "codex", "cursor", "stub"):
         vendors.record_author(loop.env["STATE"], PR, vendor)
-    assert not vendors.review_allowed(loop.env["STATE"], PR, "codex")
-    assert loop.run(fixer="cursor", reviewer="codex") == 0
+    assert not vendors.review_allowed(loop.env["STATE"], PR, "stub")
+    assert loop.run(fixer="cursor", reviewer="stub") == 0
     assert loop.agents == [] and loop.merged == [] and loop.fixes == []
     assert loop.labelled("ready-for-human")
 
@@ -357,6 +367,33 @@ def test_a_deferred_fixer_leaves_a_checkpoint_and_the_resume_goes_straight_to_th
     assert loop.run(note="ignored", fixer="agent", reviewer="pool") == 0
     assert [f["fixer"] for f in loop.fixes] == ["cursor", "cursor"] and len(loop.agents) == 1
     assert loop.fixes[1]["head"] == loop.fixes[0]["head"]
+
+
+def test_a_fix_waits_for_maintenance_to_end_and_then_runs(loop, monkeypatch):
+    """#337: the review returns changes while the flag is set; dispatch does not start the fix."""
+    from baton.common import MAINTENANCE_PREFIX
+    flag = Path(loop.env["STATE"], "maintenance")
+    reviewer, fake_fix = review.dispatch.dispatch, review.fix.fix_pr
+
+    def dispatch(vendor, role, *args, **kwargs):
+        return (reviewer if role == "review" else REAL_DISPATCH)(vendor, role, *args, **kwargs)
+
+    loop.after["review"] = lambda: flag.write_text(
+        json.dumps({"expires": time.time() + 600, "reason": "reboot", "id": "t"}))
+    monkeypatch.setattr(review.dispatch, "dispatch", dispatch)
+    monkeypatch.setattr(review.fix, "fix_pr", REAL_FIX)
+    monkeypatch.setattr(review.fix.Runner, "fetch_main", lambda *_: None)
+    with pytest.raises(Deferred) as waiting:
+        loop.run(fixer="cursor", reviewer="codex")
+    assert waiting.value.reason == f"{MAINTENANCE_PREFIX}reboot" and not waiting.value.lends_slot
+    assert loop.checkpoint()["step"] == "fix"
+    assert not Path(loop.env["STATE"], f"slot-deferred-{PR}").exists()
+
+    flag.unlink()
+    loop.after.clear()
+    monkeypatch.setattr(review.fix, "fix_pr", fake_fix)
+    assert loop.run(fixer="cursor", reviewer="codex") == 0
+    assert len(loop.fixes) == 1
 
 
 def save_waiting_fix_push(loop, fixer, ci_head=""):
@@ -456,7 +493,7 @@ def test_a_saved_cursor_review_uses_an_enabled_vendor_after_cursor_is_disabled(l
 
 
 def test_no_vendor_able_to_review_defers_the_pool(loop):
-    for vendor in ("claude", "codex"):
+    for vendor in ("claude", "codex", "cursor"):   # cursor wrote it and could review itself
         Path(loop.env["STATE"], f"{vendor}-cooldown-until").write_text("1999999999\n")
     with pytest.raises(Deferred) as deferred:
         loop.run(fixer="cursor", reviewer="codex")
@@ -1516,11 +1553,12 @@ def _one_handoff(loop, seen, reason):
 
 
 def test_a_configured_model_refusal_hands_off_once_with_its_reason(loop, monkeypatch):
+    admit_stub(loop, monkeypatch)
     seen = _watch(monkeypatch)
-    for vendor in ("claude", "codex", "cursor"):
+    for vendor in ("claude", "codex", "cursor", "stub"):
         vendors.record_author(loop.env["STATE"], PR, vendor)
-    monkeypatch.setattr(review.Review, "review_vendor", lambda self, current: "codex")
-    assert loop.run(fixer="cursor", reviewer="codex") == 0
+    monkeypatch.setattr(review.Review, "review_vendor", lambda self, current: "stub")
+    assert loop.run(fixer="cursor", reviewer="stub") == 0
     _one_handoff(loop, seen, "review_independence_denied")
 
 
@@ -2971,7 +3009,6 @@ def test_same_vendor_reply_review_checks_and_reports_actual_model(loop, monkeypa
     env = admit_stub(loop, monkeypatch)
     loop.gh.set(headRefName="owner/issue-1", author={"login": "owner"})
     monkeypatch.setattr(agents.ADAPTERS["stub"], "SAME_VENDOR_REVIEW", True)
-    monkeypatch.setattr(agents.ADAPTERS["stub"], "SAME_VENDOR_SAME_MODEL", True)
     vendors.record_author(loop.env["STATE"], PR, "stub")
     vendors.record_author_model(loop.env["STATE"], PR, "stub", "stub-1")
 
@@ -2981,19 +3018,14 @@ def test_same_vendor_reply_review_checks_and_reports_actual_model(loop, monkeypa
 
     monkeypatch.setattr(review.dispatch, "dispatch", agent)
     rv = review.Review(env, review.telemetry.from_env(env, issue="297", pr=PR), PR, loop.wt, "297", "")
-    outcome = rv.run_review(1, "", "stub")
-    if actual_model == "unknown":
-        assert outcome == "RESULT: failed actual reviewer model may be a PR author"
-        assert not any(body.startswith("<!-- baton-review") for body in loop.comments())
-    else:
-        assert outcome == "REVIEW: pass"
-        assert loop.comments()[0].startswith("<!-- baton-review round=1 by=stub -->\n"
-                                             "Review mode: same-model-fresh-context (stub/stub-1).\n\n")
+    assert rv.run_review(1, "", "stub") == "REVIEW: pass"
+    assert loop.comments()[0].startswith("<!-- baton-review round=1 by=stub -->\n"
+                                         f"Review mode: same-model-fresh-context (stub/{actual_model}).\n\n")
 
 
-@pytest.mark.parametrize("tier, allowed", [("standard", True), ("light", False)])
-def test_run_review_judges_the_review_tiers_model(loop, monkeypatch, tmp_path, tier, allowed):
-    """#237: a light review tier on the model that wrote the PR is no same-vendor review."""
+@pytest.mark.parametrize("tier", ["standard", "light"])
+def test_run_review_judges_the_review_tiers_model(loop, monkeypatch, tmp_path, tier):
+    """#237, #221: a light review tier on the model that wrote the PR gives way to a distinct one."""
     from dataclasses import replace
     from baton import config, tiers
     env = session.resolve(loop.env)
@@ -3007,17 +3039,14 @@ def test_run_review_judges_the_review_tiers_model(loop, monkeypatch, tmp_path, t
     ran = []
 
     def agent(vendor, role, prompt, tag, cwd, settings="", output="", env=None, hooks=None):
-        ran.append(env.runtime.tiers.get("review"))
+        ran.append((env.runtime.tiers.get("review"), env.runtime.review_model))
         return {"rc": 1, "status": "failure", "outcome": "RESULT: failed stopped here", "reply": "",
                 "model": "", "defer": ""}
 
     monkeypatch.setattr(review.dispatch, "dispatch", agent)
     rv = review.Review(env, review.telemetry.from_env(env, issue="297", pr=PR), PR, loop.wt, "297", "")
-    outcome = rv.run_review(1, "", "claude")
-    if allowed:
-        assert ran and set(ran) == {tier}   # dispatch gets the tier the eligibility check used
-    else:
-        assert outcome == "RESULT: failed reviewer model may be a PR author" and not ran
+    rv.run_review(1, "", "claude")
+    assert ran and set(ran) == {(tier, "opus")}   # dispatch gets the tier and model that were checked
 
 
 def test_stub_dirty_reply_review_restores_and_posts_no_verdict(loop, monkeypatch):
@@ -3195,3 +3224,110 @@ def test_review_vendor_selection_pins_by_adapter_continuity(monkeypatch, vendor,
     rv = review.Review({}, None, "1", "/tmp", "1", "")
     assert rv.review_vendor(vendor) == vendor
     assert seen["pinned"] is expected
+
+
+# --- same-vendor review as the last resort (#221) -------------------------------------------
+
+def through_dispatch(loop, monkeypatch, module, vendor, reply, reported="", edit=None):
+    """Run reviews through the real pick, dispatch and adapter, faking only the vendor CLI."""
+    from baton import dispatch
+    env = session.resolve(loop.env)
+    if edit:
+        path = Path(loop.env["CTX"], "routes.toml")
+        path.write_text(edit(env.config.source.read_text()))
+        cfg = load(path)
+        env.config = replace(cfg, paths=replace(env.config.paths, self_dir=BIN))
+    loop.gh.set(headRefName="owner/issue-1", author={"login": "owner"})
+    for other in ("claude", "codex", "cursor"):
+        if other != vendor:
+            Path(loop.env["STATE"], f"{other}-cooldown-until").write_text("1999999999\n")
+    rv = review.Review(env, review.telemetry.from_env(env, issue="297", pr=PR), PR, loop.wt, "297", "")
+    monkeypatch.setattr(rv, "vendors", lambda: ["claude", "codex", "cursor"])
+    calls = []
+
+    def cli(args, log, minutes, child, **kwargs):
+        calls.append((args, child))
+        message = {"role": "assistant", "content": [{"type": "text", "text": reply}]}
+        if reported:
+            message["model"] = reported
+        log.write_text(json.dumps({"type": "assistant", "parent_tool_use_id": None, "message": message}) + "\n"
+                       + json.dumps({"type": "result", "subtype": "success", "result": reply}) + "\n")
+        if vendor == "claude":
+            Path(env.dirs.scratch, f"review-{PR}-{len(calls)}.md").write_text("findings\n")
+        return 0
+
+    monkeypatch.setattr(module, "run_cli", cli)
+    monkeypatch.setattr(dispatch.agents, "preflight", lambda *_: "")
+    monkeypatch.setattr(dispatch.vendors, "vendor_blocked", lambda *_: "")
+    monkeypatch.setattr(review.dispatch, "dispatch", dispatch_run)
+    return rv, calls
+
+
+def wrote(loop, vendor, *models):
+    vendors.record_author(loop.env["STATE"], PR, vendor)
+    for model in models:
+        vendors.record_author_model(loop.env["STATE"], PR, vendor, model)
+
+
+def review_modes(loop):
+    return [line for body in loop.comments() for line in body.splitlines() if line.startswith("Review mode:")]
+
+
+def dispatched(call, flag="--model"):
+    args, _ = call
+    return args[args.index(flag) + 1]
+
+
+@pytest.mark.parametrize("writers, requested, mode", [
+    (["claude-opus-5-5"], "sonnet", "same-vendor-different-model"),
+    (["claude-opus-5-5", "claude-sonnet-5-5"], "opus", "same-model-fresh-context"),
+])
+def test_claude_reviews_its_own_pr_on_the_resolved_model_in_every_round(loop, monkeypatch, writers, requested, mode):
+    from baton import claude_cli
+    ran_on = f"claude-{requested}-5-5"
+    wrote(loop, "claude", *writers)
+    rv, calls = through_dispatch(loop, monkeypatch, claude_cli, "claude", "REVIEW: pass", reported=ran_on)
+    for number in (1, 2):
+        assert rv.run_review(number, "", None) == "REVIEW: pass"
+    assert len(calls) == 2
+    for call in calls:
+        assert dispatched(call) == requested
+        assert dispatched(call, "--effort") == "high"
+        assert call[1]["CLAUDE_CODE_SUBAGENT_MODEL"] == "sonnet"
+    assert review_modes(loop) == [f"Review mode: {mode} (claude/{ran_on})."] * 2
+    assert not loop.labelled("ready-for-human")
+
+
+@pytest.mark.parametrize("reported", ["claude-opus-5-5", ""])
+def test_a_run_on_a_writers_model_or_none_is_posted_as_fresh_context(loop, monkeypatch, reported):
+    """The pre-run pick was distinct (sonnet); a capacity fallback may still serve another model."""
+    from baton import claude_cli
+    wrote(loop, "claude", "claude-opus-5-5")
+    rv, calls = through_dispatch(loop, monkeypatch, claude_cli, "claude", "REVIEW: pass", reported=reported)
+    assert rv.run_review(1, "", None) == "REVIEW: pass"
+    assert dispatched(calls[0]) == "sonnet"
+    assert review_modes(loop) == [f"Review mode: same-model-fresh-context (claude/{reported or 'unknown'})."]
+
+
+def pin_cursor_review(text):
+    start = text.index("[models.routes.review]\n")
+    end = text.index("\n\n", start)
+    section = text[start:end]
+    pinned = section.replace('cursor = { model = "cursor_auto" }', 'cursor = { model = "cursor_analyst" }')
+    assert pinned != section
+    return text[:start] + pinned + text[end:]
+
+
+@pytest.mark.parametrize("writer, edit, requested, mode, labelled", [
+    ("composer-9", pin_cursor_review, "grok-4.7-high", "same-vendor-different-model", "grok-4.7-high"),
+    ("unknown", pin_cursor_review, "grok-4.7-high", "same-model-fresh-context", "grok-4.7-high"),
+    ("composer-9", None, "auto", "same-model-fresh-context", "unknown"),
+])
+def test_cursor_reviews_its_own_pr_when_nobody_else_can(loop, monkeypatch, writer, edit, requested, mode, labelled):
+    from baton import cursor_cli
+    wrote(loop, "cursor", writer)
+    rv, calls = through_dispatch(loop, monkeypatch, cursor_cli, "cursor", "findings\nREVIEW: pass", edit=edit)
+    assert rv.run_review(1, "", None) == "REVIEW: pass"
+    assert dispatched(calls[0]) == requested
+    assert review_modes(loop) == [f"Review mode: {mode} (cursor/{labelled})."]
+    assert not loop.labelled("ready-for-human")

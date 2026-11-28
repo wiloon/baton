@@ -13,15 +13,17 @@ from types import SimpleNamespace
 
 import pytest
 
-from baton import capacity, dev, fix, handoff, merge, notify, pick, review, scan, spec, tick
-from baton.common import Deferred
-from conftest import issue_snapshot_pages, sh
+from baton import dev, fix, handoff, merge, notify, pick, review, scan, spec, tick
+from baton.common import Deferred, MAINTENANCE_PREFIX
+from baton.session import resolve as resolve_session
+from conftest import in_flight, issue_snapshot_pages, sh
 
 REAL_VERDICT_PLAN = spec.verdict_plan   # the devrun fixture stubs it
 
 BIN = Path(__file__).resolve().parents[1] / "bin"
 LOGIN = r"^cursor$"
 DONE = {"rc": 0, "status": "success", "outcome": "RESULT: ready", "reply": "done\nRESULT: ready", "model": "gpt-x", "defer": ""}
+REAL_VERIFY = fix.Runner.verify
 
 
 class FakeGH:
@@ -726,33 +728,12 @@ def test_a_review_deferred_on_quota_lends_its_slot(ctx, monkeypatch):
     assert ctx.make().next_issue() == "12"
 
 
-@pytest.mark.parametrize("same_vendor", [False, True])
-def test_a_lease_only_wait_in_vendor_selection_keeps_the_cap(ctx, monkeypatch, same_vendor):
+def test_a_run_in_flight_does_not_make_vendor_selection_wait(ctx):
     pr_state(ctx)
-    flight(ctx, wip=[5], ready=[issue(12)], prs={5: 11})
-    if same_vendor:
-        ctx.path("pr-11-authors").write_text("codex\n")
-        ctx.path("pr-11-author-models").write_text("codex another-model\n")
-        ctx.env["VENDOR_EXTRA"] = ""
-
-    def review_loop(self, *args, **kwargs):
-        if same_vendor:
-            pick.choose(self.env, "reviewer", "", "review", ["claude", "codex"], pr="11")
-        else:
-            self.pick_vendor("reviewer", "pool", ["claude"], current="")
-        pytest.fail("selection should defer")
-
-    monkeypatch.setattr(tick.Tick, "review_loop", review_loop)
-    checkpoint(ctx, pr="11")
     t = ctx.make()
-    with capacity.lease(t.env.config.paths.state, "claude"):
-        t.pending_reviews()
-    expected = ("waiting for claude (vendor capacity reserved) instead of same-vendor codex" if same_vendor
-                else "no vendor can run now; claude: vendor capacity reserved")
-    assert expected in ctx.log()
-    assert not ctx.path("slot-deferred-11").exists()
-    no_vendor_blocked(monkeypatch)
-    assert ctx.make().next_issue() == ""
+    with in_flight(t.env.config.paths.state, "claude"):
+        chosen = pick.choose(t.env, "reviewer", "", "review", ["claude"], pr="11")
+    assert chosen == "claude"
 
 
 def test_a_lent_slot_starts_nothing_when_every_vendor_is_blocked(ctx, monkeypatch):
@@ -1034,12 +1015,12 @@ def test_the_first_review_after_opening_a_pr_can_lend_the_slot(devrun, monkeypat
     assert devrun.make().next_issue() == "12"
 
 
-@pytest.mark.parametrize("how", ["lease", "candidate", "closed", "no-wip"])
+@pytest.mark.parametrize("how", ["maintenance", "candidate", "closed", "no-wip"])
 def test_other_deferrals_leave_no_marker(ctx, monkeypatch, how):
     pr_state(ctx)
     t = ctx.make()
-    if how == "lease":
-        defer_loop(monkeypatch, "vendor capacity reserved", "codex")
+    if how == "maintenance":
+        defer_loop(monkeypatch, "maintenance: reboot", "codex")
         checkpoint(ctx, pr="11")
         ctx.make().pending_reviews()
     elif how == "candidate":
@@ -1369,7 +1350,7 @@ def test_a_forced_blocked_issue_warns_and_runs(ctx, capsys):
     assert "#7: still blocked by #62; running it as asked" in capsys.readouterr().err
 
 
-def test_a_spec_in_review_needs_a_pool_vendor(ctx, monkeypatch):
+def test_a_spec_in_review_considers_all_vendors(ctx, monkeypatch):
     issues(ctx, ready=[issue(12)])
     ctx.gh.answers["issue view"] = {"title": "T", "body": "B", "comments": [
         {"author": {"login": "owner"}, "body": "<!-- baton-spec-review round=1 by=claude -->"}
@@ -1377,7 +1358,37 @@ def test_a_spec_in_review_needs_a_pool_vendor(ctx, monkeypatch):
     seen = []
     monkeypatch.setattr(tick.Tick, "pick_vendor", lambda self, role, mode, cands, **k: seen.append(cands) or "claude")
     assert ctx.make().next_issue() == "12"
-    assert seen == [["claude", "codex"]]
+    assert seen == [["claude", "codex", "cursor"]]
+
+
+def test_revision_admission_yields_when_agy_is_free_and_pool_is_blocked(ctx, monkeypatch):
+    """Tick.runnable: pool revisers blocked, agy (extra) holds reviser and is free (#324)."""
+    from contextvars import ContextVar
+    from dataclasses import replace
+    from baton import config, session
+    from conftest import full_text
+    from test_agy import with_agy_reviser
+
+    issues(ctx, ready=[issue(12)])
+    ctx.gh.answers["issue view"] = {"title": "T", "body": "B", "comments": [
+        {"author": {"login": "owner"}, "body": "<!-- baton-spec-review round=1 by=claude -->"}
+    ]}
+    t = ctx.make()
+    path = Path(ctx.env["CTX"], "agy-reviser.toml")
+    path.write_text(with_agy_reviser(full_text()))
+    loaded = config.load(path, home=Path(ctx.env["HOME"]))
+    cfg = replace(t.env.config, vendors=loaded.vendors, models=loaded.models,
+                  quota=replace(t.env.config.quota, vendor_pool=loaded.quota.vendor_pool,
+                                vendor_extra=loaded.quota.vendor_extra, caps=loaded.quota.caps,
+                                five_hour_maxes=loaded.quota.five_hour_maxes))
+    t.env = replace(t.env, config=cfg)
+    monkeypatch.setattr(session, "resolve", resolve_session)
+    monkeypatch.setattr(session, "_active", ContextVar("test_session", default=t.env))
+    for vendor in ("claude", "codex"):
+        (t.runner_state / f"{vendor}-cooldown-until").write_text(str(t.now + 3600))
+    monkeypatch.setattr(pick.settle, "probe", lambda *a, **k: None)
+    assert t.next_issue() == "12"
+    assert "DEFERRED" not in ctx.log()
 
 
 @pytest.mark.parametrize("labels, pr, ok", [
@@ -1545,7 +1556,7 @@ def test_scan_fallback_skips_when_no_vendor_has_scan_role(ctx, monkeypatch):
     from baton.config import Config
     real = Config.for_role
     monkeypatch.setattr(Config, "for_role",
-                        lambda self, role, pool_only=False: () if role == "scan" else real(self, role, pool_only=pool_only))
+                        lambda self, role: () if role == "scan" else real(self, role))
     t = fallback(ctx)
     ctx.path("scan-area").write_text("1\n")
     assert t.scan_fallback() is None
@@ -1890,6 +1901,8 @@ def advised_dev(devrun, monkeypatch):
     devrun.advice_calls, devrun.action = [], "retry_step_other_vendor"
 
     def advise(cfg, key, snapshot, actions, **kwargs):
+        if "record_profile" in actions:   # the intake profile (#238) is not a recovery decision
+            return {"action": "handoff", "reason": "no profile", "evidence": []}, {}
         devrun.advice_calls.append((snapshot, actions))
         reason = snapshot.splitlines()[0].split(".")[0]
         return {"action": devrun.action, "reason": "try again", "evidence": [reason]}, {}
@@ -2460,7 +2473,7 @@ def test_tick_resumes_pending_adr_even_with_agent_wip_and_no_vendor(ctx, monkeyp
             {"author": {"login": "owner"}, "body": pending}, *posted]}
 
     def read_pr(args):
-        if "state,headRefOid" not in args:   # dev's own look-up after the resumed accept
+        if "state,headRefOid,mergedBy,mergeCommit" not in args:   # dev's own look-up after the resumed accept
             return {}
         reads.append(now)
         if len(reads) == 1:
@@ -3653,5 +3666,212 @@ def test_tick_resumes_a_saved_review_in_a_detached_worktree_and_pushes_to_head_b
     assert new_head != base_head, log
     assert sh(origin, "git", "rev-parse", branch) == new_head, log
     assert not any(c[:2] == ["pr", "edit"] and "ready-for-human" in c for c in gh.calls()), log
+
+
+# --- maintenance drain while a tick holds its lock (#337) ---------------------------------------------
+
+def set_maintenance(ctx, reason="reboot", expires=None):
+    Path(ctx.env["STATE"], "maintenance").write_text(
+        json.dumps({"expires": expires if expires is not None else time.time() + 600,
+                    "reason": reason, "id": "t"}))
+
+
+def test_a_tick_stops_before_the_next_issue_when_maintenance_turns_on(ctx, monkeypatch):
+    """Two runnable issues: the flag is set while the first runs; the second never starts."""
+    issues(ctx, ready=[issue(12), issue(13)])
+    no_vendor_blocked(monkeypatch)
+    quiet_tick(monkeypatch)
+    started, next_calls = [], []
+    original_next = tick.Tick.next_issue
+
+    def run(t, n):
+        started.append(n)
+        set_maintenance(ctx, "owner reboot")
+        raise Deferred("pool", "quota exhausted")
+
+    def next_issue(self):
+        found = original_next(self)
+        next_calls.append(found)
+        return found
+
+    monkeypatch.setattr(dev, "run", run)
+    monkeypatch.setattr(tick.Tick, "next_issue", next_issue)
+    assert ctx.make().work() == 0
+    assert started == ["12"]
+    assert next_calls == ["12"]
+    assert "maintenance (owner reboot): tick stops before the next item" in ctx.log()
+
+
+def test_pass_returns_0_when_the_items_next_step_defers_for_maintenance(ctx, monkeypatch):
+    issues(ctx, ready=[issue(12)])
+    no_vendor_blocked(monkeypatch)
+    quiet_tick(monkeypatch)
+    scans = []
+
+    def run(t, n):
+        set_maintenance(ctx, "deploy")
+        raise Deferred("codex", f"{MAINTENANCE_PREFIX}deploy")
+
+    monkeypatch.setattr(dev, "run", run)
+    monkeypatch.setattr(tick.Tick, "scan_fallback", lambda self: scans.append("scan") or 0)
+    t = ctx.make()
+    assert t.pass_() == 0
+    assert scans == []
+    assert "maintenance (deploy): tick stops before the next item" in ctx.log()
+
+
+def test_an_assigned_serve_child_returns_0_not_81_when_maintenance_defers(ctx, monkeypatch):
+    issues(ctx, ready=[issue(12)])
+    no_vendor_blocked(monkeypatch)
+    quiet_tick(monkeypatch)
+
+    def run(t, n):
+        set_maintenance(ctx, "deploy")
+        raise Deferred("codex", f"{MAINTENANCE_PREFIX}deploy")
+
+    monkeypatch.setattr(dev, "run", run)
+    t = ctx.make()
+    t.env.runtime.assign_issue = "12"
+    t.env.runtime.serve_child = True
+    assert t.pass_() == 0
+
+
+def test_pick_review_does_nothing_while_draining(ctx, monkeypatch):
+    set_maintenance(ctx, "reboot")
+    ctx.gh.answers["pr list"] = [{"number": 4}]
+    ctx.gh.answers["pr view"] = pr_json()
+    notified = []
+    monkeypatch.setattr(tick.Tick, "notify", lambda self, *a, **k: notified.append(a))
+    assert ctx.make().pick_review() == 0
+    assert not ctx.gh.ran("pr", "edit") and notified == [] and not ctx.loops
+    assert "maintenance (reboot): tick stops before the next item" in ctx.log()
+
+
+def test_dev_run_defers_for_maintenance_before_a_worktree_or_started_notice(devrun, monkeypatch):
+    set_maintenance(devrun, "reboot")
+    monkeypatch.setattr(spec, "verdict_plan", lambda env, n, listed=None: "<!-- baton-verdict: accept by=codex -->\nplan")
+    setups, picks, notices = [], [], []
+    monkeypatch.setattr(dev, "setup_worktree", lambda *a, **k: setups.append(a) or ("", True))
+    monkeypatch.setattr(tick.Tick, "pick_vendor", lambda self, *a, **k: picks.append(a) or "codex")
+    monkeypatch.setattr(tick.Tick, "notify", lambda self, *a, **k: notices.append(a))
+    t, rc = devrun.go()
+    assert rc == 75
+    assert setups == [] and picks == [] and notices == []
+    assert not Path(devrun.env["WT_ROOT"], "agent-300").exists()
+    assert not devrun.gh.ran("issue", "edit", "300", "-R", "owner/app", "--add-label", "agent-wip")
+    assert f"DEFERRED: maintenance {MAINTENANCE_PREFIX}reboot" in devrun.log()
+
+
+def test_a_maintenance_deferral_of_a_fix_does_not_lend_a_slot(ctx, monkeypatch):
+    pr_state(ctx)
+    flight(ctx, wip=[5], ready=[], prs={5: 11})
+    set_maintenance(ctx, "reboot")
+    defer_loop(monkeypatch, reason=f"{MAINTENANCE_PREFIX}reboot", vendor="codex")
+    deferred_review(ctx, [11])
+    assert not ctx.path("slot-deferred-11").exists()
+    assert "lends its agent-wip slot" not in ctx.log()
+
+
+def gate_dispatch(devrun, monkeypatch):
+    """The devrun agent stub behind dispatch's maintenance gate; returns the (role, continues_step) calls."""
+    inner, seen = dev.dispatch.dispatch, []
+
+    def gated(vendor, role, *args, continues_step=False, **kwargs):
+        reason = tick.maintenance.admit(devrun.env["STATE"], None, acquire=False).reason
+        if reason and not continues_step:
+            return {"rc": 75, "status": "deferred", "outcome": "", "reply": None, "model": "",
+                    "defer": f"{MAINTENANCE_PREFIX}{reason}"}
+        seen.append((role, continues_step))
+        return inner(vendor, role, *args, **kwargs)
+
+    monkeypatch.setattr(dev.dispatch, "dispatch", gated)
+    return seen
+
+
+def test_verify_repair_still_dispatches_during_maintenance_and_the_pr_opens(devrun, monkeypatch):
+    """#337: the worker finishes as maintenance turns on; its verify.sh repair finishes the step."""
+    seen = gate_dispatch(devrun, monkeypatch)
+    monkeypatch.setattr(fix.Runner, "verify", REAL_VERIFY)
+    monkeypatch.setattr(fix.Runner, "e2e_gate", lambda self, kind, number: "")
+    real_run, attempts = fix.session.run_process, []
+
+    def run_process(cmd, *args, **kwargs):
+        if Path(str(cmd[0])).name == "verify.sh":
+            attempts.append(cmd)
+            if len(attempts) == 1:
+                return subprocess.CompletedProcess(cmd, 1, "", "tests failed")
+            return subprocess.CompletedProcess(cmd, 0, "Verification passed\n", "")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(fix.session, "run_process", run_process)
+    worker = implements()
+
+    def worker_then_maintenance(cwd, output):
+        out = worker(cwd, output)
+        set_maintenance(devrun, "reboot")
+        return out
+
+    def repair(cwd, output):
+        Path(output).write_text("RESULT: fixed\n")
+        return {**DONE, "outcome": "RESULT: fixed", "reply": "RESULT: fixed"}
+
+    devrun.script = [worker_then_maintenance, repair]
+    devrun.go()
+    assert seen == [("dev", False), ("fix", True)]
+    assert len(attempts) == 2 and devrun.gh.ran("pr", "create")
+
+
+def test_a_spec_accepted_during_maintenance_starts_dev_after_it_ends_without_a_resume_note(devrun, monkeypatch):
+    plans, specs, notices = [""], [], []
+    monkeypatch.setattr(spec, "verdict_plan", lambda env, n, listed=None: plans[0])
+    monkeypatch.setattr(tick.Tick, "notify", lambda self, title, *a: notices.append(title))
+
+    def spec_loop(self, issue):
+        specs.append(issue)
+        plans[0] = "the agreed plan"
+        set_maintenance(devrun, "reboot")
+        return True
+
+    monkeypatch.setattr(tick.Tick, "spec_loop", spec_loop)
+    assert devrun.go()[1] == 75
+    assert devrun.runs == [] and notices == []
+    # The usual deferral cleanup may drop agent-wip; ready-for-agent stays and nothing is added.
+    assert all(c[5:] == ["--remove-label", "agent-wip"] for c in devrun.gh.ran("issue", "edit", "300"))
+    assert not Path(devrun.env["WT_ROOT"], "agent-300").exists()
+    Path(devrun.env["STATE"], "maintenance").unlink()
+    devrun.script = [implements()]
+    devrun.go()
+    assert specs == ["300"]
+    assert [run["role"] for run in devrun.runs] == ["dev"]
+    assert dev.RESUME_NOTE not in devrun.runs[0]["prompt"]
+    assert "#300 started (codex)" in notices
+
+
+def test_a_p0_tick_does_not_look_at_the_next_issue_once_maintenance_is_on(ctx, monkeypatch):
+    issues(ctx, ready=[issue(12, labels=["ready-for-agent", "P0"]), issue(13, labels=["ready-for-agent", "P0"])])
+    no_vendor_blocked(monkeypatch)
+    quiet_tick(monkeypatch)
+    picked, started = [], []
+    monkeypatch.setattr(tick.Tick, "pick_vendor", lambda self, *a, **k: picked.append(k.get("issue")) or "codex")
+
+    def run(t, n):
+        started.append(n)
+        set_maintenance(ctx, "reboot")
+        return 0
+
+    monkeypatch.setattr(dev, "run", run)
+    assert ctx.make().work() == 0
+    assert (started, picked) == (["12"], ["12"])
+    assert ctx.log().count("maintenance (reboot): tick stops before the next item") == 1
+
+
+def test_an_expired_maintenance_flag_does_not_stop_the_tick(ctx, monkeypatch):
+    issues(ctx, ready=[issue(12)])
+    no_vendor_blocked(monkeypatch)
+    quiet_tick(monkeypatch)
+    set_maintenance(ctx, "old", expires=time.time() - 10)
+    monkeypatch.setattr(dev, "run", lambda t, n: 80)
+    assert ctx.make().work() == 0
+    assert "tick stops before the next item" not in ctx.log()
 
 

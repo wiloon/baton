@@ -142,6 +142,8 @@ def two(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))   # no telegram.env: no network
     c = load(tmp_path)
     initialization.prepare(c)
+    # test_work_locks runs under conftest's resolve, which takes the logs directory from LOGS (#380).
+    monkeypatch.setenv("LOGS", str(c.paths.logs))
     busy, handled = set(), []
 
     def work(self):

@@ -8,20 +8,21 @@ exits the item's subshell):
     status   how it ended; "deferred" when the vendor cannot run now; "" for rejected requests
     outcome  the RESULT:/REVIEW:/SPEC:/... line
     reply    the agent's final message (untrusted: callers strip markers)
-    model    the actual Claude or Codex model when reported
+    model    the actual model when reported (Cursor: the pinned model requested, else "unknown")
     defer    why the item must yield, or ""
 Exit code: 0 ok, 1 failed, 75 deferred.
 """
 
 from . import session
 import argparse
+from dataclasses import replace
 import json
 from pathlib import Path
 import sys
 import time
 
-from . import agents, capacity, claude_cli, gitcontrol, hooks as telemetry, notify, settle, tiers, vendors
-from .common import LEASE_REASON, Request
+from . import agents, capacity, claude_cli, gitcontrol, hooks as telemetry, maintenance, notify, settle, tiers, vendors
+from .common import MAINTENANCE_PREFIX, Request
 
 
 
@@ -44,6 +45,8 @@ def configure(vendor, role, env):
     )
     tier = tiers.step(env, role, runtime.issue, runtime.pr)
     route = models.route(role, vendor, followup=followup, tier=tier)
+    if role == "review" and runtime.review_model:
+        route = replace(route, model=runtime.review_model)
     settings = env.config.vendor(vendor)
     return agents.ADAPTERS[vendor].configure(role, route, settings, env)
 
@@ -143,7 +146,8 @@ def _run_log_path(logs, tag, suffix, retry=""):
 
 
 @session.scoped
-def dispatch(vendor, role, prompt, tag, cwd, settings="", output="", env=None, hooks=None):
+def dispatch(vendor, role, prompt, tag, cwd, settings="", output="", env=None, hooks=None,
+             continues_step=False):
     env = session.resolve(env)
     why = (f"unknown vendor {vendor}" if vendor not in agents.ADAPTERS
            else env.config.admission_error(vendor, role))
@@ -152,14 +156,13 @@ def dispatch(vendor, role, prompt, tag, cwd, settings="", output="", env=None, h
         print(outcome, file=sys.stderr)
         return {"rc": 1, "status": "", "outcome": outcome, "reply": None,
                 "model": "", "defer": "", "log": ""}
-    with capacity.lease(env.config.paths.state, vendor) as available:
-        if not available:
-            return {"rc": 75, "status": "deferred", "outcome": "", "reply": None,
-                    "model": "", "defer": LEASE_REASON}
-        return _dispatch(vendor, role, prompt, tag, cwd, settings, output, env, hooks)
+    # Excludes no other run: the shared mark covers the denial retry too (ADR 0013).
+    with capacity.running(env.config.paths.state, vendor):
+        return _dispatch(vendor, role, prompt, tag, cwd, settings, output, env, hooks,
+                         continues_step=continues_step)
 
 
-def _dispatch(vendor, role, prompt, tag, cwd, settings, output, env, hooks):
+def _dispatch(vendor, role, prompt, tag, cwd, settings, output, env, hooks, *, continues_step=False):
     # Cooldowns and run counts are the machine's; the run's log is its repository's.
     state, logs = str(env.config.paths.state), str(env.dirs.logs)
     cooldown_hours = int(env.config.scheduling.cooldown_hours or agents.COOLDOWN_HOURS)
@@ -169,6 +172,9 @@ def _dispatch(vendor, role, prompt, tag, cwd, settings, output, env, hooks):
 
     if why := vendors.vendor_blocked(state, vendor):
         return result(75, "deferred", "", defer=why)
+    if not continues_step:
+        if reason := maintenance.admit(env.config.paths.state, None, acquire=False).reason:
+            return result(75, "deferred", "", defer=f"{MAINTENANCE_PREFIX}{reason}")
     settle.count_run(state, vendor)
     adapter = agents.ADAPTERS[vendor]
     # Read once, from the caller's hooks too when only they name the PR; configure sees the same tier.
@@ -241,7 +247,7 @@ def _dispatch(vendor, role, prompt, tag, cwd, settings, output, env, hooks):
     # adapter before we get here (#315).
     if ran is None or tampered or ran.denial is None:
         return first
-    # A denial-ended run: one same-vendor retry inside this lease (#315).
+    # A denial-ended run: one same-vendor retry inside this run (#315).
     quotes = denial_quotes(ran.denial)
     for quote in quotes:
         notify.log(f"{tag}: denied action (untrusted): {quote}")

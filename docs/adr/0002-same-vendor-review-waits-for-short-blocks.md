@@ -21,6 +21,14 @@ Apply this comparison to declared vendors eligible for the role (ADR 0007) and t
 current task. A same-vendor fallback must be role-allowed and pass its adapter's model
 eligibility policy (ADRs 0004 and 0005).
 
+The pipeline never stalls on review independence. This is permanent and applies to every
+reviewer-capable adapter (the test stub excepted). When no other vendor can review and only
+long blocks stand in the way, a vendor reviews code it wrote: on a configured model that is
+provably distinct from every recorded writer model, or, when there is none or a model is
+unknown, on its `review` route's model in a fresh session (`same-model-fresh-context`). ADR
+0004 gives the order in which models are tried. The screenshot review is stricter and still
+requires a distinct model (ADR 0005).
+
 Spec review also avoids the vendor that last wrote the issue outside the spec loop, as named by
 the issue's author marker: in round 1, and in a later round after such an edit. That vendor is
 then a last resort under the same short-block wait. The marker is untrusted and only a
@@ -61,12 +69,13 @@ The rules for the previous round's vendor are unchanged.
   outside the registry or allowlist cannot run or hold up the step.
 - Issue #148: use each vendor's effective 5-hour cap for short quota blocks so one vendor
   can use its full 5-hour window while others keep their reserve.
-- 2026-11-24 (owner, temporary while Codex and Cursor were out of weekly quota): Claude may
-  review Claude-written code too, on a distinct model only (Opus after Sonnet). Claude records
-  the writer's model; `SAME_VENDOR_SAME_MODEL` keeps the same-model fresh-session fallback to
-  Codex. Revert by setting Claude's `SAME_VENDOR_REVIEW` back to `False`.
+- Issue #221 (owner rule 2026-11-24, extended 2026-11-26, permanent): the pipeline never
+  stalls on review independence. Every vendor, Claude and Cursor included, reviews its own code
+  as the last resort, on a distinct model when one is configured and otherwise on the same
+  model in a fresh session. This replaces the 2026-11-24 entry that let Claude do so on a
+  distinct model only and kept the same-model fallback to Codex.
 - Issue #109, round 1: agy declares `SAME_VENDOR_REVIEW = True`, `RECORDS_AUTHOR_MODEL = True`,
-  `SAME_VENDOR_SAME_MODEL = False` (owner rule #221). Its `distinct_models` strips the effort
+  `SAME_VENDOR_SAME_MODEL = False` (a flag issue #221 later removed). Its `distinct_models` strips the effort
   suffix, and config requires agy's `review` route model to be distinct from its `dev`, `fix`
   and `fix_followup` route models, so the never-stall fallback exists.
 - Issue #194: exempt `P0` issues from the one-extra-issue bound and from PR work going first, so an

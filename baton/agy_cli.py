@@ -30,7 +30,7 @@ ANALYST_BUDGET = "deadline_and_call_caps"
 ANALYST_ENV_KEEP = ()
 ANALYST_ENV_STRIP = ()
 ANALYST_ENV_SET = {}
-SUPPORTED_ROLES = frozenset({"dev", "fixer", "reviewer", "spec_reviewer"})
+SUPPORTED_ROLES = frozenset({"dev", "fixer", "reviewer", "spec_reviewer", "reviser"})
 QUOTA_SOURCE = "api"
 QUOTA_WINDOWS = frozenset({"five_hour", "seven_day"})
 # A run's output carries no quota data (refresh_quota asks `agy -p /quota`); a limit a run hits
@@ -43,7 +43,6 @@ ROUTE_FIELDS = frozenset({"model"})
 EMPTY_MODEL_OK = False
 RECORDS_AUTHOR_MODEL = True
 SAME_VENDOR_REVIEW = True
-SAME_VENDOR_SAME_MODEL = False
 # config.load: the review route's model must differ from the dev/fix routes' (effort alone is not distinct).
 DISTINCT_REVIEW_MODEL = True
 DEFAULT_MAX_MINUTES = 60
@@ -77,9 +76,9 @@ USAGE_EVENT_KEY = "event"
 USAGE_FIELDS = {"input_tokens": "input_tokens", "cache_read_tokens": "cache_read_tokens",
                 "cache_write_tokens": "cache_write_tokens", "output_tokens": "output_tokens"}
 USAGE_CACHE_IN_INPUT = False
-SPEC_STAGE = "spec-review"
+SPEC_STAGE = "spec-reply"
 SPEC_SAME_VENDOR = "known-distinct-model"
-SPEC_TEMPLATE = "spec-prompt.md"
+SPEC_TEMPLATE = "agy-spec-prompt.md"
 SPEC_UNMARKED_REVIEWER = False
 
 CLI_LOG = ".gemini/antigravity-cli/cli.log"
@@ -174,6 +173,9 @@ def _run_quota(command, *, cwd, env, timeout):
 
 
 def _reset_epoch(value):
+    # Explicit JSON null: no reset is pending (same as a never-used window's epoch-0 time).
+    if value is None:
+        return NO_RESET
     if not isinstance(value, str):
         raise QuotaError(f"agy quota: reset_time {value!r} is not a time")
     try:
@@ -187,7 +189,9 @@ def _reset_epoch(value):
 
 def parse_quota(answer, now):
     """{five_hour, seven_day} of the Gemini group of a `/quota` JSON answer; raises QuotaError
-    unless both windows parse. A never-used window resets one window length from NOW."""
+    unless both windows parse. A never-used window, one with reset_time null, or a disabled one
+    (it does not currently apply; its reset_time is ignored) resets one window length from NOW.
+    Otherwise a missing reset_time key is a format error, as is a non-boolean disabled."""
     from . import quota
     try:
         groups = answer["command"]["data"]["groups"]
@@ -204,7 +208,15 @@ def parse_quota(answer, now):
         if (isinstance(remaining, bool) or not isinstance(remaining, (int, float)) or not math.isfinite(remaining)
                 or not 0 <= remaining <= 1):
             raise QuotaError(f"agy quota: {window} remaining_fraction {remaining!r} is not a fraction")
-        reset = _reset_epoch(bucket.get("reset_time"))
+        disabled = bucket.get("disabled", False)
+        if not isinstance(disabled, bool):
+            raise QuotaError(f"agy quota: {window} disabled {disabled!r} is not a boolean")
+        if disabled:
+            reset = NO_RESET
+        elif "reset_time" in bucket:
+            reset = _reset_epoch(bucket["reset_time"])
+        else:
+            raise QuotaError(f"agy quota: {window} has no reset_time")
         if reset == NO_RESET:
             reset = int(now) + quota.WINDOW_SECONDS[name]
         windows[name] = {"used": 1 - remaining, "resets_at": reset}

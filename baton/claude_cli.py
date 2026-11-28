@@ -23,10 +23,9 @@ SKIP_SCREENSHOT_AFTER_REVIEW = False
 ROUTE_FIELDS = frozenset({"model", "effort", "subagent_model"})
 EMPTY_MODEL_OK = False
 RECORDS_AUTHOR_MODEL = True
-# Owner, 2026-11-24 (temporary while Codex and Cursor are out of weekly quota): Claude may review
-# Claude-written code, but only on a distinct model (e.g. Opus after Sonnet); never the same model.
+# The pipeline never stalls on review independence (ADR 0002): as the last resort Claude reviews
+# Claude-written code, on a distinct model when one is configured, else in a fresh session.
 SAME_VENDOR_REVIEW = True
-SAME_VENDOR_SAME_MODEL = False
 DEFAULT_MAX_MINUTES = 150
 PREFLIGHT_CHECKS = (("claude", "--version"),)
 VERSION_EXECUTABLE = "claude"

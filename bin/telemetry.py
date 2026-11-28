@@ -270,7 +270,7 @@ REASONS = ('none',
            'screenshot_reviewer_role_denied', 'review_independence_denied', 'screenshot_independence_denied',
            'spec_reviewer_model_unverified', 'spec_reviser_model_unverified',
            'auto_merge_off', 'owner_review_paths', 'manual_checks', 'spec_rejected', 'spec_adr_closed',
-           'fix_needs_info', 'dev_blocked', 'spec_questions')
+           'spec_adr_head_moved', 'fix_needs_info', 'dev_blocked', 'spec_questions')
 CI_RESULTS = ('pass', 'failure', 'no_checks', 'pending', 'timeout', 'cancelled', 'infra_error', 'unknown')
 
 
@@ -368,6 +368,7 @@ class Tasks:
             'head_sha': lambda v: bool(re.fullmatch(r'[a-f0-9]{40,64}', v)),
             'run_id': lambda v: str(uuid.UUID(v)) == v,
             'agent': lambda v: v in VENDORS,
+            'author_agent': lambda v: v == 'unknown' or v in VENDORS,
             'round': lambda v: type(v) is int and 0 <= v <= 10000,
             'must_fix': lambda v: type(v) is int and 0 <= v <= 1000,
             'adopted': lambda v: type(v) is int and 0 <= v <= 1000,
@@ -1207,7 +1208,7 @@ def main():
     task.add_argument('--pr', type=int, default=0)
     task.add_argument('--pipeline')
     task.add_argument('--key', required=True)
-    for field in ('verdict', 'reason', 'head-sha', 'run-id', 'agent', 'ci-result'):
+    for field in ('verdict', 'reason', 'head-sha', 'run-id', 'agent', 'author-agent', 'ci-result'):
         task.add_argument('--' + field)
     task.add_argument('--round', type=int)
     task.add_argument('--must-fix', type=int)
@@ -1272,7 +1273,7 @@ def main():
             if record is None:
                 return
             pipeline = record['pipeline_id']
-        attrs = {k: getattr(args, k) for k in ('verdict', 'reason', 'head_sha', 'run_id', 'agent', 'ci_result', 'round', 'must_fix', 'adopted', 'rejected', 'duration_ms', 'merged_by')
+        attrs = {k: getattr(args, k) for k in ('verdict', 'reason', 'head_sha', 'run_id', 'agent', 'author_agent', 'ci_result', 'round', 'must_fix', 'adopted', 'rejected', 'duration_ms', 'merged_by')
                  if getattr(args, k) is not None}
         if args.pr:
             attrs['pr'] = args.pr

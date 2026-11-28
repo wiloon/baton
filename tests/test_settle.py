@@ -12,6 +12,7 @@ import time
 import pytest
 
 from baton import cursor_cli, settle
+from conftest import probing
 
 PROBE_CLI = f"""#!{sys.executable}
 import os, pathlib, sys
@@ -187,9 +188,9 @@ def test_a_cursor_run_refreshes_its_quota_and_a_failure_is_only_logged(gh, tmp_p
     assert "quota: refreshing cursor failed: api down" in (tmp_path / "logs" / "runner.log").read_text()
 
 
-def test_independent_quota_worker_only_probes_stale_data_and_rechecks_under_lease(gh, tmp_path, probe_cli, monkeypatch):
+def test_independent_quota_worker_only_probes_stale_data_and_rechecks_under_lock(gh, tmp_path, probe_cli, monkeypatch):
     from dataclasses import replace
-    from baton import capacity, quota, quota_worker, session
+    from baton import quota, quota_worker, session
     env = session.resolve()
     c = replace(env.config, quota=replace(env.config.quota, vendor_pool=('codex',), vendor_extra=()))
     state = c.paths.state
@@ -198,15 +199,21 @@ def test_independent_quota_worker_only_probes_stale_data_and_rechecks_under_leas
     monkeypatch.setenv('FAKE_OUT', json.dumps({'rate_limits': {
         'primary': {'used_percent': 20, 'window_minutes': 300, 'resets_at': now+10000},
         'secondary': {'used_percent': 20, 'window_minutes': 10080, 'resets_at': now+10000}}}))
-    with capacity.lease(state, 'codex'):
+    # Another probe holds the lock: no CLI, and the backoff record stays as it was.
+    backoff = state/'quota-probes/codex.json'
+    backoff.parent.mkdir(parents=True, exist_ok=True)
+    backoff.write_text('{"failures": 1, "next_attempt": 0}')
+    with probing(state, 'codex'):
         assert quota_worker.run(c)[0]['state'] == 'deferred'
+        assert settle.probe(str(state), str(c.paths.logs), 'codex', 'm') is False
     assert not (probe_cli/'calls').exists()
+    assert backoff.read_text() == '{"failures": 1, "next_attempt": 0}'
     assert quota_worker.run(c)[0]['state'] == 'fresh'
     assert (probe_cli/'calls').read_text().splitlines() == ['call']
     assert quota_worker.run(c)[0]['state'] == 'fresh'
     assert (probe_cli/'calls').read_text().splitlines() == ['call']
     # The observation expires, but a workload completes while this worker is
-    # selecting the vendor. The recheck after acquiring its lease must win.
+    # selecting the vendor. The recheck after acquiring the probe lock must win.
     old = quota.load(state, 'codex')
     old['observed_at'] = now - 3600
     for window in old['windows'].values():

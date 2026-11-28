@@ -200,8 +200,8 @@ class Tick:
 
     def lend_slot(self, deferred):
         """An open PR of a counted agent-wip issue whose next step yields on vendor quota or
-        cooldown lends its max_pending_prs slot (state file slot-deferred-<pr>). A lease-only
-        deferral (the vendor's capacity is reserved for a moment) does not."""
+        cooldown lends its max_pending_prs slot (state file slot-deferred-<pr>). A maintenance
+        deferral does not."""
         pr = self.active.get("pr")
         if pr and deferred.vendor == "handoff-retry" and deferred.reason == owner_handoff.FIX_PUSH:
             (self.state / f"slot-deferred-{pr}").unlink(missing_ok=True)
@@ -226,10 +226,25 @@ class Tick:
         """{PR number: "vendor reason"} of the PRs that lend their slots."""
         return eligibility.slot_markers(self.state, unreadable=lambda path: path.unlink(missing_ok=True))
 
+    def draining(self):
+        """Active maintenance reason, or None. An expired flag counts as none (as serve.py)."""
+        return maintenance.admit(self.runner_state, None, acquire=False).reason
+
+    def stop_if_draining(self):
+        """0 when maintenance is active (logged once); None when the tick may take the next item."""
+        if reason := self.draining():
+            self.log(f"maintenance ({reason}): tick stops before the next item")
+            return 0
+        return None
+
     def after_item(self, rc):
         """What the tick does with an item's exit code: None to go on, else the exit code."""
         if rc == 75:
-            return 75 if self.manual else None
+            if self.manual:
+                return 75
+            if (stopped := self.stop_if_draining()) is not None:
+                return stopped
+            return None
         if rc == 80:
             return 80 if self.chain_next() else 0
         return rc or None
@@ -365,6 +380,8 @@ class Tick:
         cannot run now leaves the tick to the next P0 item and then the normal order."""
         if self.force_issue or self.force_pr or self.force_review:
             return None
+        if (stopped := self.stop_if_draining()) is not None:
+            return stopped
         p0 = self.p0_issues()
         if not p0:
             return None
@@ -376,14 +393,21 @@ class Tick:
 
     def start_p0(self, p0):
         """A new P0 issue: every candidate filter applies, max_pending_prs does not."""
+        if (stopped := self.stop_if_draining()) is not None:
+            return stopped
         candidates = self.candidates(p0)
         prs = self.open_prs() if candidates else None
         if prs is None:
             return None
         for issue in self.runnable(candidates, {p["headRefName"] for p in prs}):
+            if (stopped := self.stop_if_draining()) is not None:
+                return stopped
             done = self.start(issue, ", ahead of lower-priority work; max_pending_prs not applied")
             if done is not None:
                 return done
+            # Resuming runnable() already picks a vendor for the next candidate.
+            if (stopped := self.stop_if_draining()) is not None:
+                return stopped
         return None
 
     def start(self, issue, note=""):
@@ -616,6 +640,8 @@ class Tick:
     def pending_openings(self):
         """A previous tick may have created a PR before it recorded the review state."""
         for path in sorted(self.state.glob("pr-opening-*.json")):
+            if (stopped := self.stop_if_draining()) is not None:
+                return stopped
             issue = path.name.removeprefix("pr-opening-").removesuffix(".json")
             if self.force_issue and self.force_issue != issue:
                 continue
@@ -634,6 +660,8 @@ class Tick:
         paths = set(self.state.glob("review-pending-*"))
         paths.update(self.state / f"review-pending-{pr}" for pr in posts)
         for path in sorted(paths):
+            if (stopped := self.stop_if_draining()) is not None:
+                return stopped
             pr = path.name.removeprefix("review-pending-")
             if ("review", pr) in self.tried or only is not None and self.checkpoint_issue(path) not in only:
                 continue
@@ -722,6 +750,8 @@ class Tick:
         spec. A vendor that did not write it reviews, and the fixer is picked by contribution."""
         if self.force_issue or self.force_pr:
             return None
+        if (stopped := self.stop_if_draining()) is not None:
+            return stopped
         pr = self.force_review
         pushes = self.fix_push_episodes()
         if pr in pushes:
@@ -792,8 +822,12 @@ class Tick:
         PRs of these issues, and then every one of them gets a turn."""
         if self.force_issue or self.force_review:
             return None
+        if (stopped := self.stop_if_draining()) is not None:
+            return stopped
         pushes = self.fix_push_episodes()
         for pr, episodes in sorted(pushes.items(), key=lambda pair: int(pair[0])):
+            if (stopped := self.stop_if_draining()) is not None:
+                return stopped
             if (self.force_pr and self.force_pr != pr) or (self.state / f"review-pending-{pr}").exists():
                 continue
             if ("fix", pr) in self.tried or only is not None and not episodes & only:
@@ -818,6 +852,8 @@ class Tick:
                              and not self.comment_post_pending(str(p["number"]))), key=lambda p: p["number"])
             found = [(str(p["number"]), p["headRefName"]) for p in (listed if only is not None else listed[:1])]
         for pr, head_ref in found:
+            if (stopped := self.stop_if_draining()) is not None:
+                return stopped
             self.tried.add(("fix", pr))
             done = self.attempt(lambda pr=pr, head_ref=head_ref: self.fix_item(pr, head_ref))
             if done is not None:
@@ -1015,6 +1051,8 @@ class Tick:
         scheduled semantics and may only start N (or nothing); p0_pass still may start a P0."""
         if self.force_pr or self.force_review:
             return None
+        if (stopped := self.stop_if_draining()) is not None:
+            return stopped
         pending = self.pending_specs()
         done = self.resume_specs()
         if done is not None:
@@ -1029,15 +1067,21 @@ class Tick:
             self.housekeep_admission()
             return None
         if assign:
+            if (stopped := self.stop_if_draining()) is not None:
+                return stopped
             self.housekeep_admission()
             return self.start(assign) if self.assigned_ready(assign) else None
         # A deferred issue waits alone (ADR 0002): the tick goes on to the next candidate, through
         # the whole admission check again, since the deferred one may have opened a PR (#323).
-        while issue := self.next_issue():
+        while True:
+            if (stopped := self.stop_if_draining()) is not None:
+                return stopped
+            issue = self.next_issue()
+            if not issue:
+                return None
             done = self.start(issue)
             if done is not None:
                 return done
-        return None
 
     def housekeep_admission(self):
         """The writes that come before a new issue: release stale agent-wip, hand off stalled PRs,
@@ -1086,6 +1130,8 @@ class Tick:
         """The pending_specs() entries that are due; ONLY restricts them to these issues."""
         pending = self.pending_specs()
         for issue in sorted(pending, key=int):
+            if (stopped := self.stop_if_draining()) is not None:
+                return stopped
             if self.force_issue and self.force_issue != issue:
                 continue
             if ("issue", issue) in self.tried or only is not None and issue not in only:
@@ -1231,7 +1277,7 @@ class Tick:
             if str(n) in waiting or any(names.issue_of(b) == str(n) for b in branches):
                 continue   # already has a PR
             # These issues can be at different steps: one whose next step no vendor can run now must
-            # not block another (revision needs a pool vendor).
+            # not block another (revision needs an eligible reviser among all vendors).
             issue = str(n)
             if ("issue", issue) in self.tried:
                 continue
@@ -1246,9 +1292,8 @@ class Tick:
             if not (spec.accept_pending(self.env, issue, listed=payload["comments"])
                     or recovery.path(self.env, issue, issue).exists()):
                 role = spec.role_from(payload["comments"], self.env)
-                vendor_candidates = list(self.env.config.pool()) if role == "reviser" else self.all_vendors()
                 try:
-                    self.pick_vendor(role, "contrib", vendor_candidates, issue=issue)
+                    self.pick_vendor(role, "contrib", self.all_vendors(), issue=issue)
                 except Deferred as deferred:
                     self.defer(deferred.vendor, deferred.reason)
                     continue

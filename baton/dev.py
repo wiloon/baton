@@ -14,7 +14,8 @@ import subprocess
 import time
 
 from . import advisor, after_merge, agents, checks as check_section, dispatch, fix, handoff as owner_handoff, md, names, pr as pr_helpers, pr_contract, prompts, recovery, restart, scratch, spec, tiers, vendors
-from .common import Deferred, git, push, strip_markers
+from . import intake
+from .common import Deferred, MAINTENANCE_PREFIX, PROFILE_MARKER, git, push, strip_markers
 
 REPLY_CAP = 60000
 RESUME_NOTE = ("This worktree already holds earlier work on this issue (an earlier run stopped early). "
@@ -320,7 +321,7 @@ def issue_binding(wt, issue, branch, payload):
     if current["branch"] != branch or not current["clean"] or not current["local_head"]:
         return None
     comments = [comment for comment in payload["comments"]
-                if not comment["body"].startswith("<!-- baton-note by=")]
+                if not comment["body"].startswith(("<!-- baton-note by=", PROFILE_MARKER))]
     current["issue_evidence"] = recovery.feedback_digest(json.dumps(
         [payload["title"], payload["body"], comments], sort_keys=True))
     return current
@@ -573,6 +574,12 @@ def waiting_dev_push(tick, env, issue):
     return found
 
 
+def accepted(plan):
+    """Whether PLAN is an accept verdict's, not a revise one's or none."""
+    verdict = spec.VERDICT.match(plan or "")
+    return bool(verdict) and verdict[1] == "accept"
+
+
 def run(tick, issue):
     env, repo = tiers.carry(tick.env.with_runtime(issue=str(issue)), "dev", issue), tick.gh_repo
     branch, wt = names.for_issue(tick.wt_root, issue)
@@ -605,6 +612,9 @@ def run(tick, issue):
     if payload is None:
         return 80
     plan = spec.verdict_plan(env, issue, listed=payload["comments"])
+    # The intake profile (#238, observation only): before the spec loop, and again once accepted.
+    if not accepted(plan) and not spec.accept_pending(env, issue, listed=payload["comments"]):
+        intake.run(env, issue, payload, "pickup")
     if not plan:
         tick.recovered_issues[str(issue)] = payload
         if not tick.spec_loop(issue):
@@ -617,8 +627,12 @@ def run(tick, issue):
         if not plan:
             tick.notify(f"#{issue}: spec accepted but no plan comment found", url)
             return 1
-    if (verdict := spec.VERDICT.match(plan)) and verdict[1] == "accept":
+    if accepted(plan):
         advisor.finish_episode(env, "issue", issue, "accept")
+    if reason := tick.draining():
+        raise Deferred("maintenance", f"{MAINTENANCE_PREFIX}{reason}")
+    if accepted(plan):
+        intake.run(env, issue, payload, "accept")
     resume_note, ok = setup_worktree(tick, wt, branch, issue)
     if not ok:
         return 1

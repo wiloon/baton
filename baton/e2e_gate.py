@@ -8,13 +8,14 @@ repository's patterns (`repo.gate_target`, then `repo.gate_option`) and anything
 import re
 
 from . import md
+from .common import strip_author_markers
 
 
 def parse(body, repo):
     """The gate hook's arguments, "" for no gate; ValueError when the section is malformed."""
     if repo.gate_hook is None:
         return ""
-    text = md.section("E2E gate", body).strip()
+    text = md.section("E2E gate", strip_author_markers(body)).strip()
     if not text:
         return ""
     line = text.strip("`").strip()

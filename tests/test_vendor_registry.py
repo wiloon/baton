@@ -115,11 +115,11 @@ def test_valid_followup_inheritance_unchanged(tmp_path):
     assert follow == base
 
 
-def test_allows_and_for_role_pool_only(tmp_path):
+def test_allows_and_for_role(tmp_path):
     c = config.load(write(tmp_path, three_vendor_text()), home=tmp_path)
     assert c.allows("claude", "reviser")
     assert c.allows("cursor", "reviser") is False
-    assert c.for_role("reviser", pool_only=True) == ("claude", "codex")
+    assert c.for_role("reviser") == ("claude", "codex")
     assert set(c.for_role("dev")) == {"claude", "codex", "cursor"}
 
 @pytest.mark.parametrize("replacement", [None, "[]", '[""]'])

@@ -17,6 +17,17 @@ Opening an issue does not authorize a run. Agents use the issue body and trusted
 maintainers relay any needed clarifications from contributors. Vulnerabilities follow
 [SECURITY.md](SECURITY.md).
 
+When an owner session drafts or edits an issue body outside the spec loop, include a single
+marker line naming the drafting vendor and model:
+
+```markdown
+<!-- baton-author: vendor=claude model=claude-opus-5-5 -->
+```
+
+Place it on its own line (at the top of the body, or after a leading `<!-- baton-scan ... -->`
+line). Replace the marker when a different session edits the body outside the spec loop. The
+marker only steers spec reviewer selection toward another vendor and grants no authorization.
+
 ## Pull requests
 
 1. Fork the repository and create a branch in your fork.
