@@ -50,8 +50,18 @@ fix                        reads both, answers Must fix and design findings, re-
   numbers repeat across loops on one PR, so a same-round comment of an earlier loop, or any
   comment the run did not post, never creates, resolves or holds a finding.
 - Skip screenshot review on owner-authored PRs. Which vendor did the code review never decides
-  whether it runs. Select from declared, role-allowed vendors with image input support (Claude
-  and Codex). The setting remains per repository and off by default.
+  whether it runs. Select from declared, role-allowed vendors with image input support (Claude,
+  Codex and Cursor). The setting remains per repository and off by default.
+- An adapter without a guard hook (Cursor, #383) keeps the screenshot run read-only by its
+  invocation: `--mode ask`, never `--force`, and a runner-generated permission set that allows
+  `Read` only on the worktree, the PR's shots directory and the run's context file, and denies
+  Shell, Write, WebFetch and MCP. The permission config and the CLI's working directory are
+  runner-owned temporary directories outside the worktree, so no file is written into the PR
+  checkout and the PR's own `.cursor` files are not the run's project config. The reviewer
+  returns the comment as its final message and the adapter writes the review file; it is not cut
+  by a reply cap. The post-run worktree check and reset (`READONLY_RESET`) stay as a second
+  layer. The host enables the role only after the real CLI is shown to read a shot and refuse a
+  file outside the allowed paths.
 - When authorship and fixer exclusions leave no eligible screenshot reviewer, the PR goes to the
   owner right after the code review (ADR 0007), also when the code verdict is `changes`, so no
   fix runs in that loop. A temporary block defers the screenshot step instead (ADR 0002). Both
@@ -156,3 +166,6 @@ fix                        reads both, answers Must fix and design findings, re-
   skip, and Cursor also reviews agent PRs, so the rule only blocked screenshot reviews that
   should run (wiloon/enx#1293). Also record that the existing no-eligible-reviewer hand-off and
   deferral now reach rounds those vendors review.
+- Issue #383: Cursor joins the screenshot reviewers, because it can read PNGs and the pool of
+  Claude and Codex alone can run dry. Record how an adapter without a guard hook stays
+  read-only (owner decision: ask mode, deny by default, no `--force`).
