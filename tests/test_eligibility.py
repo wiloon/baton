@@ -265,3 +265,35 @@ def test_a_suppressed_no_new_issue_turn_does_not_suppress_the_plain_turn():
     got = eligibility.rank(["a", "b"], listings, order=["a", "b"], last_child={}, born=0, now=0,
                            suppress={("a", "no-new", ""), ("b", "no-new", "")})
     assert got == [("a", None, False), ("b", None, False)]
+
+
+def test_rank_breaks_equal_priority_ties_by_weight():
+    listings = {
+        "a": RepoListing("a", candidates=[Candidate(1, 1)]),
+        "b": RepoListing("b", candidates=[Candidate(2, 1)]),
+    }
+    got = eligibility.rank(["a", "b"], listings, order=["a", "b"], last_child={}, born=0, now=0,
+                           weight=lambda name: {"a": 1, "b": 5}[name])
+    assert got[0] == ("b", "2", False)
+    assert got[1] == ("a", "1", False)
+
+
+def test_rank_equal_weight_keeps_rotation():
+    listings = {
+        "a": RepoListing("a", candidates=[Candidate(3, 1)]),
+        "b": RepoListing("b", candidates=[Candidate(1, 1)]),
+    }
+    got = eligibility.rank(["a", "b"], listings, order=["a", "b"], last_child={}, born=0, now=0)
+    assert got[0] == ("a", "3", False)
+    assert got[1] == ("b", "1", False)
+
+
+def test_rank_priority_beats_weight():
+    listings = {
+        "a": RepoListing("a", candidates=[Candidate(1, 1)]),
+        "b": RepoListing("b", candidates=[Candidate(2, 2)]),
+    }
+    got = eligibility.rank(["a", "b"], listings, order=["a", "b"], last_child={}, born=0, now=0,
+                           weight=lambda name: {"a": 1, "b": 5}[name])
+    assert got[0] == ("a", "1", False)
+    assert got[1] == ("b", "2", False)

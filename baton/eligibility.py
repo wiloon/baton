@@ -269,11 +269,16 @@ def list_repository(gh_json, repo, state: Path, *, milestone, owner, cap, cache=
     return RepoListing(name=repo, in_flight=local or remote_flight, candidates=candidates)
 
 
-def rank(due, listings, *, order, last_child, born, now, suppress=(), hour=HOUR):
-    """Assignments that fill free slots: (repo, issue|None, no_new_issue). ORDER is rotation order."""
+def rank(due, listings, *, order, last_child, born, now, suppress=(), hour=HOUR, weight=None):
+    """Assignments that fill free slots: (repo, issue|None, no_new_issue). ORDER is rotation order.
+
+    WEIGHT(name) -> int (≥ 1) breaks ties among equal-priority candidates (group 3); default 1.
+    """
     suppress = set(suppress)
     used, chosen = set(), []
     index = {name: i for i, name in enumerate(order)}
+    if weight is None:
+        weight = lambda name: 1
 
     def take(name, issue=None, no_new=False):
         if name in used:
@@ -300,8 +305,9 @@ def rank(due, listings, *, order, last_child, born, now, suppress=(), hour=HOUR)
         for candidate in listing.candidates:
             if (name, "issue", str(candidate.number)) in suppress:
                 continue
-            pool.append((candidate.priority, index.get(name, 0), candidate.number, name))
-    for _, _, number, name in sorted(pool):
+            # (priority, −weight, rotation, issue number, repository name)
+            pool.append((candidate.priority, -weight(name), index.get(name, 0), candidate.number, name))
+    for _, _, _, number, name in sorted(pool):
         if name not in used:
             take(name, issue=number)
     for name in order:
