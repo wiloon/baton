@@ -150,6 +150,7 @@ REASONS = {
     "manual_checks": Reason(4, "direct"),
     "spec_rejected": Reason(4, "direct"),
     "spec_adr_closed": Reason(4, "direct"),
+    "spec_adr_head_moved": Reason(4, "direct"),
     "fix_needs_info": Reason(4, "direct"),
     "dev_blocked": Reason(4, "direct"),
     "spec_questions": Reason(2, "live", ("answer_spec_questions",)),

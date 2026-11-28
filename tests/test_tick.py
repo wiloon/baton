@@ -2473,7 +2473,7 @@ def test_tick_resumes_pending_adr_even_with_agent_wip_and_no_vendor(ctx, monkeyp
             {"author": {"login": "owner"}, "body": pending}, *posted]}
 
     def read_pr(args):
-        if "state,headRefOid" not in args:   # dev's own look-up after the resumed accept
+        if "state,headRefOid,mergedBy,mergeCommit" not in args:   # dev's own look-up after the resumed accept
             return {}
         reads.append(now)
         if len(reads) == 1:

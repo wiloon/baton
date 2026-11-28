@@ -55,6 +55,7 @@ class FakeGH:
         self.adr_pr, self.fails = "", set()
         self.flaky = {}   # "issue edit --body-file": [(stderr, landed), ...] failures before it works
         self.pr_state = "OPEN"
+        self.merged_by, self.merge_commit, self.pr_files = None, None, []
         self.merge_state, self._head_oid, self.wt_head = "", None, None
         self.update_heads, self.merge_results, self.merge_fail_status = [], [], []
         self.update_stderr = "failed to update"
@@ -168,7 +169,10 @@ class FakeGH:
                 if self.lag[1] < 0:
                     self.head_oid, self.lag = self.lag[0], None
             data = {"state": self.pr_state, "mergeStateStatus": self.merge_state, "headRefOid": self.head_oid,
-                    "baseRefName": "main"}
+                    "baseRefName": "main",
+                    "mergedBy": {"login": self.merged_by} if self.merged_by else None,
+                    "mergeCommit": {"oid": self.merge_commit} if self.merge_commit else None,
+                    "files": [{"path": path} for path in self.pr_files]}
             if "--jq" in args:
                 out = str(data.get(args[args.index("--jq") + 1].lstrip("."), "") or "")
             else:
@@ -3330,7 +3334,7 @@ def test_a_pending_accept_post_that_finds_its_verdict_continues_without_repostin
             if "baton-spec-accept-pending" in body:
                 posts.append(body)
                 return subprocess.CompletedProcess(args, 1, "", "HTTP 503 unavailable")
-        if (restart and args[:2] == ("pr", "view") and "state,headRefOid" in args
+        if (restart and args[:2] == ("pr", "view") and "state,headRefOid,mergedBy,mergeCommit" in args
                 and loop.gh.pr_state == "MERGED"):
             raise InterruptedError("runner stopped before saving the verdict transition")
         return call(*args, input=input, limit=limit)
