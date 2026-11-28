@@ -110,14 +110,14 @@ def environment(config, vendor=None):
     return env
 
 
-def bounded_process(command, prompt, workspace, env, seconds, max_bytes, lease_fd=None):
+def bounded_process(command, prompt, workspace, env, seconds, max_bytes):
     """Bound stdout/stderr in memory and kill the entire process group on timeout/overflow."""
     with (workspace / 'input.json').open('w+') as source:
         source.write(prompt)
         source.seek(0)
         try:
             process = subprocess.Popen(['timeout', '--kill-after=5', f'{seconds}s', *command], stdin=source, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                       cwd=workspace, env=env, start_new_session=True, pass_fds=() if lease_fd is None else (lease_fd,))
+                                       cwd=workspace, env=env, start_new_session=True)
         except OSError:
             return 'unavailable', b'', 127, {}
         buffers = {process.stdout: bytearray(), process.stderr: bytearray()}
@@ -184,7 +184,7 @@ def approved_actual(vendor, model):
     return approved_model(vendor, model)
 
 
-def analyze(config, analyst, prompt, workspace, facts, lease_fd):
+def analyze(config, analyst, prompt, workspace, facts):
     settings = config.retrospectives
     deadline = time.monotonic() + settings.timeout_seconds
     adapter = agents.ADAPTERS[analyst.vendor]
@@ -206,7 +206,7 @@ def analyze(config, analyst, prompt, workspace, facts, lease_fd):
     except (OSError, subprocess.SubprocessError):
         pass
     status, raw, rc, diagnostics = bounded_process(command, prompt, workspace, env, max(0.001, deadline - time.monotonic()),
-                                      max(65536, settings.output_chars * 8), lease_fd)
+                                      max(65536, settings.output_chars * 8))
     raw_path = workspace / 'response.jsonl'
     rows, reply, valid, actual, models, tool_use = parse_response(analyst.vendor, raw)
     raw_path.write_text(''.join(json.dumps(r) + '\n' for r in rows))

@@ -528,7 +528,7 @@ def claude_usage(spent):
 
 
 def call_claude(cfg, env, snapshot, actions, *, category=None, system=None):
-    """(parsed reply, usage dict) from one tool-less, isolated Claude Code call. No vendor lease."""
+    """(parsed reply, usage dict) from one tool-less, isolated Claude Code call. No vendor run marker."""
     command = claude_cli.advisor_command(cfg.claude.model, cfg.claude.effort,
                                          system or instructions(actions, category))
     try:

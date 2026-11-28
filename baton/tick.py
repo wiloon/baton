@@ -200,8 +200,8 @@ class Tick:
 
     def lend_slot(self, deferred):
         """An open PR of a counted agent-wip issue whose next step yields on vendor quota or
-        cooldown lends its max_pending_prs slot (state file slot-deferred-<pr>). A lease-only
-        deferral (the vendor's capacity is reserved for a moment) does not."""
+        cooldown lends its max_pending_prs slot (state file slot-deferred-<pr>). A maintenance
+        deferral does not."""
         pr = self.active.get("pr")
         if pr and deferred.vendor == "handoff-retry" and deferred.reason == owner_handoff.FIX_PUSH:
             (self.state / f"slot-deferred-{pr}").unlink(missing_ok=True)

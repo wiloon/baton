@@ -463,7 +463,7 @@ def test_a_denied_run_retries_once_and_the_second_prompt_quotes_the_denial(agy_r
 
 
 def test_a_denied_run_still_retries_when_maintenance_turns_on_mid_call(agy_runner, monkeypatch):
-    """#337: the same-lease denial retry is inside one dispatch call and does not recheck the flag."""
+    """#337: the same-run denial retry is inside one dispatch call and does not recheck the flag."""
     import time
     from baton import agents
     denied = [{"tool": "read_file", "path": "/outside/x"}]

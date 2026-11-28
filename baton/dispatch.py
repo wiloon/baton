@@ -22,7 +22,7 @@ import sys
 import time
 
 from . import agents, capacity, claude_cli, gitcontrol, hooks as telemetry, maintenance, notify, settle, tiers, vendors
-from .common import LEASE_REASON, MAINTENANCE_PREFIX, Request
+from .common import MAINTENANCE_PREFIX, Request
 
 
 
@@ -156,10 +156,8 @@ def dispatch(vendor, role, prompt, tag, cwd, settings="", output="", env=None, h
         print(outcome, file=sys.stderr)
         return {"rc": 1, "status": "", "outcome": outcome, "reply": None,
                 "model": "", "defer": "", "log": ""}
-    with capacity.lease(env.config.paths.state, vendor) as available:
-        if not available:
-            return {"rc": 75, "status": "deferred", "outcome": "", "reply": None,
-                    "model": "", "defer": LEASE_REASON}
+    # Excludes no other run: the shared mark covers the denial retry too (ADR 0013).
+    with capacity.running(env.config.paths.state, vendor):
         return _dispatch(vendor, role, prompt, tag, cwd, settings, output, env, hooks,
                          continues_step=continues_step)
 
@@ -249,7 +247,7 @@ def _dispatch(vendor, role, prompt, tag, cwd, settings, output, env, hooks, *, c
     # adapter before we get here (#315).
     if ran is None or tampered or ran.denial is None:
         return first
-    # A denial-ended run: one same-vendor retry inside this lease (#315).
+    # A denial-ended run: one same-vendor retry inside this run (#315).
     quotes = denial_quotes(ran.denial)
     for quote in quotes:
         notify.log(f"{tag}: denied action (untrusted): {quote}")

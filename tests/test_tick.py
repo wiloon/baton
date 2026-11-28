@@ -13,10 +13,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from baton import capacity, dev, fix, handoff, merge, notify, pick, review, scan, spec, tick
+from baton import dev, fix, handoff, merge, notify, pick, review, scan, spec, tick
 from baton.common import Deferred, MAINTENANCE_PREFIX
 from baton.session import resolve as resolve_session
-from conftest import issue_snapshot_pages, sh
+from conftest import in_flight, issue_snapshot_pages, sh
 
 REAL_VERDICT_PLAN = spec.verdict_plan   # the devrun fixture stubs it
 
@@ -728,33 +728,12 @@ def test_a_review_deferred_on_quota_lends_its_slot(ctx, monkeypatch):
     assert ctx.make().next_issue() == "12"
 
 
-@pytest.mark.parametrize("same_vendor", [False, True])
-def test_a_lease_only_wait_in_vendor_selection_keeps_the_cap(ctx, monkeypatch, same_vendor):
+def test_a_run_in_flight_does_not_make_vendor_selection_wait(ctx):
     pr_state(ctx)
-    flight(ctx, wip=[5], ready=[issue(12)], prs={5: 11})
-    if same_vendor:
-        ctx.path("pr-11-authors").write_text("codex\n")
-        ctx.path("pr-11-author-models").write_text("codex another-model\n")
-        ctx.env["VENDOR_EXTRA"] = ""
-
-    def review_loop(self, *args, **kwargs):
-        if same_vendor:
-            pick.choose(self.env, "reviewer", "", "review", ["claude", "codex"], pr="11")
-        else:
-            self.pick_vendor("reviewer", "pool", ["claude"], current="")
-        pytest.fail("selection should defer")
-
-    monkeypatch.setattr(tick.Tick, "review_loop", review_loop)
-    checkpoint(ctx, pr="11")
     t = ctx.make()
-    with capacity.lease(t.env.config.paths.state, "claude"):
-        t.pending_reviews()
-    expected = ("waiting for claude (vendor capacity reserved) instead of same-vendor codex" if same_vendor
-                else "no vendor can run now; claude: vendor capacity reserved")
-    assert expected in ctx.log()
-    assert not ctx.path("slot-deferred-11").exists()
-    no_vendor_blocked(monkeypatch)
-    assert ctx.make().next_issue() == ""
+    with in_flight(t.env.config.paths.state, "claude"):
+        chosen = pick.choose(t.env, "reviewer", "", "review", ["claude"], pr="11")
+    assert chosen == "claude"
 
 
 def test_a_lent_slot_starts_nothing_when_every_vendor_is_blocked(ctx, monkeypatch):
@@ -1036,12 +1015,12 @@ def test_the_first_review_after_opening_a_pr_can_lend_the_slot(devrun, monkeypat
     assert devrun.make().next_issue() == "12"
 
 
-@pytest.mark.parametrize("how", ["lease", "candidate", "closed", "no-wip"])
+@pytest.mark.parametrize("how", ["maintenance", "candidate", "closed", "no-wip"])
 def test_other_deferrals_leave_no_marker(ctx, monkeypatch, how):
     pr_state(ctx)
     t = ctx.make()
-    if how == "lease":
-        defer_loop(monkeypatch, "vendor capacity reserved", "codex")
+    if how == "maintenance":
+        defer_loop(monkeypatch, "maintenance: reboot", "codex")
         checkpoint(ctx, pr="11")
         ctx.make().pending_reviews()
     elif how == "candidate":

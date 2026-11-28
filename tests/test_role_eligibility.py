@@ -83,7 +83,7 @@ def test_admission_rejects_before_vendor_calls_or_state_changes(pool_env, monkey
     def unexpected(*args, **kwargs):
         pytest.fail("rejected request reached a vendor or acquired capacity")
 
-    for module, symbol in ((dispatch.capacity, "lease"), (agents, "run"), (agents, "preflight"),
+    for module, symbol in ((dispatch.capacity, "running"), (agents, "run"), (agents, "preflight"),
                            (cursor_cli, "refresh_quota")):
         monkeypatch.setattr(module, symbol, unexpected)
     before = sorted(cfg.paths.state.glob("**/*"))
@@ -158,7 +158,7 @@ def test_analyst_reserve_empty_when_role_eligible_all_blocked(tmp_path):
     now = int(time.time())
     for vendor in ("claude", "codex", "cursor"):
         (state / f"{vendor}-cooldown-until").write_text(str(now + 3600))
-    with analyst_pool.reserve(cfg, state, now) as (analyst, lease, selection):
+    with analyst_pool.reserve(cfg, state, now) as (analyst, selection):
         assert analyst is None
 
 
@@ -269,8 +269,8 @@ def test_analyst_reserve_inherits_only_eligible_preferences(tmp_path, order, exp
             name: {"used": 0.25, "resets_at": now + 3600}
             for name in agents.ADAPTERS[vendor].QUOTA_WINDOWS
         }, now)
-    with analyst_pool.reserve(cfg, state, now) as (analyst, lease, selection):
-        assert lease and analyst.vendor == expected
+    with analyst_pool.reserve(cfg, state, now) as (analyst, selection):
+        assert analyst.vendor == expected
         assert selection["preference"] == filtered
 
 

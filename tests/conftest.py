@@ -1,6 +1,8 @@
 """A fake `gh` (and `timeout`) on PATH: baton.pr / .ci run their real subprocess
 calls against one PR held in a directory. No network."""
+from contextlib import contextmanager
 import errno
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -10,6 +12,26 @@ import tempfile
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+@contextmanager
+def flocked(path, operation):
+    """Hold a flock on PATH from an independent descriptor, as another process would."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open('a') as file:
+        fcntl.flock(file, operation | fcntl.LOCK_NB)
+        yield
+
+
+def in_flight(state, vendor):
+    """What a dispatch of VENDOR holds while it runs."""
+    return flocked(Path(state) / 'vendor-leases' / vendor, fcntl.LOCK_SH)
+
+
+def probing(state, vendor):
+    """What a quota probe of VENDOR holds while it runs."""
+    return flocked(Path(state) / 'quota-probes' / f'{vendor}.lock', fcntl.LOCK_EX)
 
 
 def issue_snapshot_pages(*issues):
