@@ -626,6 +626,23 @@ def test_all_vendors_unavailable_preserve_evidence_without_calls(host):
     assert not host.calls()
 
 
+def test_extra_analysts_are_reserved_by_quota_pace(host):
+    from baton import analyst_pool
+    enable_vendors(host, ('codex', 'cursor'))
+    # Both outside the pool: candidate order puts the near-exhausted one first.
+    host.config = replace(host.config, preferences=(),
+                          vendors=tuple(replace(v, quota='extra', cap=0.999) for v in host.config.vendors),
+                          quota=replace(host.config.quota, vendor_pool=(), vendor_extra=('codex', 'cursor'),
+                                        caps=(('codex', 0.999), ('cursor', 0.999))))
+    for vendor, used in (('codex', 0.993), ('cursor', 0.276)):
+        path = host.state/f'quota-{vendor}.json'
+        row = json.loads(path.read_text())
+        row['windows']['seven_day']['used'] = used
+        path.write_text(json.dumps(row))
+    with analyst_pool.reserve(host.config, host.state, time.time()) as (analyst, lease, selection):
+        assert analyst.vendor == 'cursor'
+
+
 def test_explicit_retrospective_preference_matches_review_extra_policy(host):
     pipe=seed(host.state);enable_vendors(host)
     host.config=replace(host.config,preferences=(*host.config.preferences,('retrospective',('cursor','codex','claude'))))

@@ -422,9 +422,13 @@ Migrate legacy flat model keys before validating a host config. Run records dist
 the requested model from the actual model when the CLI reports it.
 
 Each vendor choice logs its preference order, weekly usage/cap, time to reset, pace score and
-quota/cooldown gate. Lower pace scores mean further behind the weekly spending pace. Cursor is
-an extra vendor outside pool balancing: a configured preference can choose it before comparing
-pool pace. This policy remains subject to quota limits and independent-review eligibility.
+quota/cooldown gate. Lower pace scores mean further behind the weekly spending pace. Extra
+vendors such as Cursor are outside pool balancing. Review-style picks among equal candidates
+choose in three steps: a vendor named by the preference wins, in its order (an extra whatever
+its pace, a pool vendor only when pool pace selects it); otherwise the best eligible pool vendor
+by pace; otherwise, among extras only, the best by pace. Pace scores within the tie margin
+keep candidate order. This policy remains subject to quota limits and independent-review
+eligibility.
 
 ## Telemetry
 
