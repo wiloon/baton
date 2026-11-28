@@ -17,8 +17,10 @@ from baton.config import load
 from baton.dispatch import dispatch as dispatch_run
 from baton.fix import fix_pr as fix_pr_run
 from baton.common import Deferred, changed
+import conftest
 from conftest import full_text, sh, watch_retirement
 from test_adapter_capabilities import with_stub
+from test_agy import with_agy
 
 REAL_MERGE = merge.Merger.merge_or_handoff
 REAL_FIX = review.fix.fix_pr
@@ -79,7 +81,7 @@ def loop(gh, worktree, tmp_path, monkeypatch):
         state.artifacts.append((role, output))
         if state.after.get(role):
             state.after[role]()
-        if vendor == "cursor":
+        if vendor in ("agy", "cursor"):   # reply delivery
             return {"rc": 0, "status": "success", "outcome": outcome, "reply": f"{text}\n{outcome}", "model": "", "defer": ""}
         if not (shots and state.skip_screen_artifact):
             Path(output).write_text(text)
@@ -808,8 +810,8 @@ def test_either_verdict_sends_one_fix_with_both_comments(loop, code, shot):
     assert [a["followup"] for a in loop.agents if a["role"] == "screenshot_review"] == [False, False]
 
 
-@pytest.mark.parametrize("case", ["setting off", "checks none", "owner pr in the pool", "cursor review",
-                                  "cursor review without screenshots"])
+@pytest.mark.parametrize("case", ["setting off", "checks none", "owner pr in the pool",
+                                  "owner pr, cursor review", "owner pr, cursor review without screenshots"])
 def test_screenshot_review_is_skipped_and_the_code_review_keeps_its_outcome(loop, case):
     overrides = {"SCREENSHOT_REVIEW": "1"}
     reviewer, body = "pool", CHECKS_BODY
@@ -822,7 +824,7 @@ def test_screenshot_review_is_skipped_and_the_code_review_keeps_its_outcome(loop
     else:
         loop.gh.set(headRefName="owner/issue-1", author={"login": "owner"})
         reviewer = "cursor"
-    if case != "cursor review without screenshots":
+    if case != "owner pr, cursor review without screenshots":
         shoot(loop, "01-library-390.png")
     loop.gh.set(body=body)
     loop.reviews = ["changes", "pass"]
@@ -835,7 +837,7 @@ def test_screenshot_review_is_skipped_and_the_code_review_keeps_its_outcome(loop
 
 
 @pytest.mark.parametrize("first_pick", ["claude", "cursor"])
-def test_the_dispatched_code_reviewer_controls_screenshot_eligibility(loop, monkeypatch, first_pick):
+def test_the_dispatched_code_reviewer_never_controls_screenshot_eligibility(loop, monkeypatch, first_pick):
     # GitHub's owner opened the agent's PR. The recorded writer is Codex.
     loop.gh.set(headRefName="owner/issue-297", author={"login": "owner"})
     write_codex(loop, "gpt-6.2-astra")
@@ -851,8 +853,62 @@ def test_the_dispatched_code_reviewer_controls_screenshot_eligibility(loop, monk
     assert picks == ["pool"]
     assert loop.agents[0]["vendor"] == first_pick
     assert loop.comments()[0].startswith(f"<!-- baton-review round=1 by={first_pick} -->")
-    assert bool(screenshot_comments(loop)) == (first_pick != "cursor")
+    assert roles(loop) == ["review", "screenshot_review"] and len(screenshot_comments(loop)) == 1
     assert loop.merged == [PR]
+
+
+def review_agent_pr_with(loop, monkeypatch, reviewer):
+    """Codex wrote the agent's PR and `reviewer` does every code review of it."""
+    if reviewer == "agy":   # an optional vendor: declare it with a review route
+        declared = Path(loop.env["CTX"], "agy-review.toml")
+        declared.write_text(with_agy(full_text()))
+        monkeypatch.setattr(conftest, "FULL", declared)
+    loop.gh.set(headRefName="owner/issue-297", author={"login": "owner"})
+    write_codex(loop, "gpt-6.2-astra")
+    monkeypatch.setattr(review.Review, "review_vendor", lambda self, current: reviewer)
+
+
+@pytest.mark.parametrize("code, shot", [("changes", "pass"), ("pass", "changes")])
+@pytest.mark.parametrize("reviewer", ["cursor", "agy"])
+def test_a_code_review_without_image_support_is_still_followed_by_the_screenshot_review(
+        loop, monkeypatch, reviewer, code, shot):
+    review_agent_pr_with(loop, monkeypatch, reviewer)
+    loop.reviews, loop.screens = [code, "pass"], [shot, "pass"]
+    assert screen_run(loop) == 0
+    assert roles(loop) == ["review", "screenshot_review", "review", "screenshot_review"]
+    assert [a["vendor"] for a in loop.agents[::2]] == [reviewer, reviewer]
+    assert {a["vendor"] for a in loop.agents[1::2]} <= {"claude", "codex"}   # an image-capable pick
+    assert len(screenshot_comments(loop)) == 2 and len(loop.fixes) == 1
+    feedback = loop.fixes[0]["feedback"]
+    assert 0 <= feedback.find("<!-- baton-review round=1") < feedback.find("<!-- baton-screenshot-review round=1")
+    assert loop.merged == [PR] and not loop.labelled("ready-for-human")
+
+
+@pytest.mark.parametrize("reviewer", ["claude", "codex", "cursor", "agy"])
+def test_a_pr_with_no_checks_gets_no_screenshot_review_whoever_reviewed_the_code(loop, monkeypatch, reviewer):
+    review_agent_pr_with(loop, monkeypatch, reviewer)
+    if reviewer == "codex":   # Codex wrote it, so its review needs another model (ADR 0002)
+        write_codex(loop, "gpt-6.1-terra")
+    shoot(loop, "01-library-390.png")
+    loop.gh.set(body="Refs #297\n\n## Checks to verify\nnone\n")
+    loop.reviews = ["pass"]
+    assert loop.run(fixer="cursor", SCREENSHOT_REVIEW="1") == 0
+    assert [(a["vendor"], a["role"]) for a in loop.agents] == [(reviewer, "review")]
+    assert not screenshot_comments(loop) and loop.merged == [PR]
+
+
+@pytest.mark.parametrize("code", ["pass", "changes"])
+def test_a_cursor_review_with_no_screenshot_model_left_posts_then_hands_off_once(loop, monkeypatch, code):
+    seen = _watch(monkeypatch)
+    review_agent_pr_with(loop, monkeypatch, "cursor")
+    write_codex(loop, "gpt-6.1-terra", "claude")   # Terra, the screenshot route's model, wrote it too
+    loop.reviews = [code]
+    assert screen_run(loop) == 0
+    assert [(a["vendor"], a["role"]) for a in loop.agents] == [("cursor", "review")]
+    [posted] = [c for c in loop.comments() if c.startswith("<!-- baton-")]
+    assert posted.startswith("<!-- baton-review round=1 by=" "cursor -->")
+    assert not loop.fixes and not loop.merged and not loop.checkpoint()
+    _one_handoff(loop, seen, "screenshot_reviewer_unavailable")
 
 
 def test_a_failed_code_review_never_starts_the_screenshot_review(loop):

@@ -34,7 +34,6 @@ QUOTA_WINDOWS = frozenset({"five_hour", "seven_day"})
 QUOTA_ERROR = r"usage_limit_reached|hit your usage limit|usage limit (reached|exceeded)|insufficient_quota"
 IMAGES = True
 SCAN = False
-SKIP_SCREENSHOT_AFTER_REVIEW = False
 ROUTE_FIELDS = frozenset({"model", "effort"})
 EMPTY_MODEL_OK = True
 RECORDS_AUTHOR_MODEL = True
