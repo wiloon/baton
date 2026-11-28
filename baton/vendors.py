@@ -391,9 +391,8 @@ def _quota_pick(state, vendors, now, current=None, prefer=()):
                                 current=current, prefer=prefer)
 
 
-def _preferred(state, pool, tied, prefer, now):
-    """The first of TIED in PREFER order that may win: Cursor (outside the pool's balance)
-    always, a pool vendor when its headroom is within quota.TIE of the best tied pool vendor."""
+def _tie_choice(state, pool, tied, prefer, now):
+    """The winner among TIED by the shared preference, pool, then extra-pace policy."""
     try:
         chosen, _ = vendor_policy.choose(state, session.resolve().config.quota, pool, tied, now,
                                          prefer=prefer, extras=True)
@@ -408,7 +407,7 @@ def selection_details(state, pool, candidates, chosen, role, *, area="", now=Non
     prefer, label = preference(role, area)
     config = session.resolve().config.quota
     parts = [f"chosen={chosen} role={role} preference={label or role}:{','.join(prefer) or 'none'}",
-             "extra_policy=preference-before-pool-pace"]
+             "extra_policy=preference-then-pool-then-extra-pace"]
     for vendor in dict.fromkeys(candidates):
         snap = quota.load(state, vendor)
         cap = config.cap_of(vendor)
@@ -569,17 +568,8 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
         chosen, preferred = current, ""
     elif len(tied) < 2:
         preferred = ""
-    elif prefer:
-        chosen = _preferred(state, pool, tied, prefer, now)
     else:
-        pool_tied = [v for v in tied if v in pool]
-        if len(pool_tied) > 1:
-            try:
-                best, _ = _quota_pick(state, pool_tied, now)
-                if best:
-                    chosen = best
-            except Exception:
-                pass
+        chosen = _tie_choice(state, pool, tied, prefer, now)
     lines = "".join(f" {v}={counts[v]}" for v in eligible)
     skipped = "".join(f"; {v}: {why}" for v, why in blocked.items())
     model = {"review_model": fallback_models[chosen]} if chosen in fallback_models else {}

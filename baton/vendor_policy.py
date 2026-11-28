@@ -88,8 +88,14 @@ def availability(state, settings, vendor, now, *, strict=False, leased=False):
 
 
 def choose(state, settings, pool, candidates, now, *, prefer=(), current='', extras=False):
-    """Quota pace within the pool; preferences break close ties. For review-style
-    selection, extras keep the existing preference-before-pool-pace behavior.
+    """Quota pace within the pool; preferences break close ties. With extras=True
+    (review-style selection):
+
+    1. A vendor named by PREFER wins, in its order: an extra whatever its pace, a pool
+       vendor only when quota pace over the pool candidates selects it.
+    2. Otherwise the best eligible pool vendor by quota pace.
+    3. Otherwise quota pace over the eligible extras.
+
     Candidates must already pass role-specific eligibility and availability checks.
     """
     candidates = list(dict.fromkeys(candidates))
@@ -102,8 +108,10 @@ def choose(state, settings, pool, candidates, now, *, prefer=(), current='', ext
     best, summary = quota.pick(pooled, snapshots, caps, limits, now, current, prefer)
     eligible = [v for v in candidates if not quota.assess(
         snapshots[v], caps[v], limits[v], now)[1]]
-    ordered = quota.preference_order(eligible, prefer)
-    chosen = next((v for v in ordered if v not in pool or v == best), None)
+    chosen = next((v for v in dict.fromkeys(prefer or ())
+                   if v in eligible and (v not in pool or v == best)), best)
+    if chosen is None:
+        chosen, _ = quota.pick(eligible, snapshots, caps, limits, now)
     return chosen, summary
 
 

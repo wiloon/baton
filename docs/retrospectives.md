@@ -74,10 +74,13 @@ apply even when analysis is disabled.
 The `quota` field in each vendor table assigns its lane. The
 `preferences.retrospective` order overrides `preferences.reviewer`; when absent the reviewer
 order is reused. The shared `baton.vendor_policy` module supplies cooldown/capacity checks,
-quota pacing, close-tie preferences and the review policy for extras. Workload review retains its
-own author/contribution constraints; retrospectives assess all eligible candidates without
-contribution weighting. Quota caps and unavailable credentials always take precedence over
-preferences. A lease race reselects another available vendor without waiting for the runner.
+quota pacing, close-tie preferences and the review policy for extras: a vendor named by the
+preference wins, in its order (an extra whatever its pace, a pool vendor only when pool pace
+selects it); otherwise the best eligible pool vendor by pace; otherwise, among extras only, the
+best by pace. Workload review retains its own author/contribution constraints; retrospectives
+assess all eligible candidates without contribution weighting. Quota caps and unavailable
+credentials always take precedence over preferences. A lease race reselects another available
+vendor without waiting for the runner.
 
 A failed vendor is a last resort on the next activation for that report revision. All vendors
 share one invocation per activation, the UTC daily cap and the revision attempt allowance;

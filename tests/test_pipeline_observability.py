@@ -100,6 +100,7 @@ def test_selection_explains_extra_policy_and_quota_pace(tmp_path):
         result = vendors.selection_details(str(tmp_path), ['codex'], ['codex', 'cursor'], 'cursor', 'dev', now=1000)
     finally:
         session._active.reset(token)
-    assert 'extra_policy=preference-before-pool-pace' in result
+    assert 'extra_policy=preference-then-pool-then-extra-pace' in result
     assert 'codex[pool] week=15.0%' in result and 'reset_in=518400s' in result and 'pace=' in result
-    assert 'cursor[extra] week=unknown' in result
+    extra = result.split('cursor[extra] ')[1]
+    assert extra.startswith('week=unknown') and 'pace=unknown' in extra and 'gate=open' in extra
