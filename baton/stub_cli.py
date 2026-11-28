@@ -25,7 +25,6 @@ QUOTA_WINDOWS = frozenset({"seven_day"})
 QUOTA_ERROR = r"stub quota exhausted|stub_usage_limit"
 IMAGES = False
 SCAN = False
-SKIP_SCREENSHOT_AFTER_REVIEW = False
 ROUTE_FIELDS = frozenset({"model", "effort"})
 EMPTY_MODEL_OK = False
 RECORDS_AUTHOR_MODEL = False

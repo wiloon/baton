@@ -38,7 +38,6 @@ QUOTA_WINDOWS = frozenset({"five_hour", "seven_day"})
 QUOTA_ERROR = r"RESOURCE_EXHAUSTED|\b429\b"
 IMAGES = False
 SCAN = False
-SKIP_SCREENSHOT_AFTER_REVIEW = True
 ROUTE_FIELDS = frozenset({"model"})
 EMPTY_MODEL_OK = False
 RECORDS_AUTHOR_MODEL = True
