@@ -166,7 +166,8 @@ def test_spec_restart_from_the_pending_post_and_update_files(loop, monkeypatch, 
     if expired:
         assert handoffs == ["spec_adr_merge_failed"]
         assert merges(loop) == [] and not loop.gh.posted(ACCEPTED)
-        assert not any(c[0] == "pr" for c in loop.gh.calls[before:])
+        # After the deadline failed, one read: was the PR merged at another head meanwhile (#376)?
+        assert [list(c[:2]) for c in loop.gh.calls[before:] if c[0] == "pr"] == [["pr", "view"]]
     else:
         assert pin(merges(loop)[0]) == UPDATED and loop.gh.posted(ACCEPTED)
 

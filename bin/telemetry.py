@@ -270,7 +270,7 @@ REASONS = ('none',
            'screenshot_reviewer_role_denied', 'review_independence_denied', 'screenshot_independence_denied',
            'spec_reviewer_model_unverified', 'spec_reviser_model_unverified',
            'auto_merge_off', 'owner_review_paths', 'manual_checks', 'spec_rejected', 'spec_adr_closed',
-           'fix_needs_info', 'dev_blocked', 'spec_questions')
+           'spec_adr_head_moved', 'fix_needs_info', 'dev_blocked', 'spec_questions')
 CI_RESULTS = ('pass', 'failure', 'no_checks', 'pending', 'timeout', 'cancelled', 'infra_error', 'unknown')
 
 
