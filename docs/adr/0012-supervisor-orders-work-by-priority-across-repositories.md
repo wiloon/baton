@@ -77,8 +77,8 @@ changed: it waits.
 
 ## Shared eligibility
 
-The read-only part of the child's selection (`ready-for-agent`, milestone, excluded labels, open
-blockers, owner check, no open PR on the issue's agent branches, no pending spec, and the
+The read-only part of the child's selection (`ready-for-agent`, excluded labels, open blockers,
+owner check, no open PR on the issue's agent branches, no pending spec, and the
 `max_pending_prs` count with the same formula as `next_issue()`, including the `P0` exemption)
 lives in `baton.eligibility` and is called by both the supervisor and the child. The child alone
 runs writes, agent CLIs, vendor quota, cooldowns and work locks. Owner authorization is cached in
