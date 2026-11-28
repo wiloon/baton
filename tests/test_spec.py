@@ -66,6 +66,7 @@ class FakeGH:
         self.keep_open_on_merge = False
         self._next_comment_id = 1
         self.comment_page_size = 100
+        self.last_edited_at = None
 
     @property
     def head_oid(self):
@@ -121,6 +122,7 @@ class FakeGH:
             self._ensure_comment_ids()
             issue = {
                 "title": "T", "body": self.body, "state": self.issue_state,
+                "lastEditedAt": self.last_edited_at,
                 "labels": [{"name": name} for name in sorted(self.labels)],
             }
             size = self.comment_page_size
@@ -4427,6 +4429,249 @@ def test_stub_end_line_model_reads_the_logged_model_field():
     from baton import stub_cli
     assert stub_cli.end_line_model(["revised", "model=stub-model-1"]) == "stub-model-1"
     assert stub_cli.end_line_model(["revised"]) == ""
+
+
+# --- #274: issue author marker & spec reviewer selection ------------------------------------
+
+def _write_quota(state, vendor, *, five_hour=0.1, seven_day=0.1, now=None):
+    now = int(time.time()) if now is None else now
+    Path(state, f"quota-{vendor}.json").write_text(json.dumps({
+        "observed_at": now,
+        "windows": {
+            "five_hour": {"used": five_hour, "resets_at": now + 3600, "observed_at": now},
+            "seven_day": {"used": seven_day, "resets_at": now + 86400 * 3, "observed_at": now},
+        },
+    }))
+
+
+def test_round_1_avoids_author_marker_and_falls_back_on_distinct_model_without_stalling(loop):
+    state = loop.env["STATE"]
+    loop.env["VENDOR_EXTRA"] = ""
+    _write_quota(state, "claude", five_hour=0.1, seven_day=0.1)
+    _write_quota(state, "codex", five_hour=0.1, seven_day=0.1)
+    loop.gh.body = "<!-- baton-author: vendor=claude model=claude-opus-5-5 -->\nGoal\n"
+    loop.script = [ACCEPT]
+    assert loop.run() is True
+    assert loop.runs[0]["vendor"] == "codex"
+    assert "claude (claude-opus-5-5)" in loop.runs[0]["prompt"]
+    assert "Claude Code" not in loop.runs[0]["prompt"]
+
+    # With codex long-blocked (weekly cap), claude runs on its followup (distinct) model and never stalls
+    _write_quota(state, "codex", five_hour=0.1, seven_day=0.99)
+    loop.gh.comments.clear()
+    loop.runs.clear()
+    loop.env["MODEL_CLAUDE_SPEC_REVIEW"] = "opus"
+    loop.env["MODEL_CLAUDE_SPEC_REVIEW_FOLLOWUP"] = "sonnet"
+    loop.script = [{**ACCEPT, "model": "claude-sonnet-4-6"}]
+    assert loop.run() is True
+    assert loop.runs[0]["vendor"] == "claude"
+    assert loop.runs[0]["followup"] is True
+    [verdict] = loop.gh.posted("<!-- baton-verdict: accept by=claude -->")
+    assert "Review mode:" in verdict and "author claude" in verdict
+
+
+def test_author_marker_waits_for_short_blocked_other_vendor_adr_0002(loop):
+    state = loop.env["STATE"]
+    loop.env["VENDOR_EXTRA"] = ""
+    _write_quota(state, "claude", five_hour=0.1, seven_day=0.1)
+    _write_quota(state, "codex", five_hour=0.99, seven_day=0.1)   # short block
+    loop.gh.body = "<!-- baton-author: vendor=claude model=claude-opus-5-5 -->\nGoal\n"
+    loop.script = [ACCEPT]
+    with pytest.raises(Deferred) as exc:
+        loop.run()
+    assert "waiting for codex" in exc.value.reason
+
+
+def test_author_marker_never_stalls_for_vendor_without_spec_same_vendor_or_unknown_model(loop):
+    state = loop.env["STATE"]
+    loop.env["VENDOR_POOL"] = "claude codex"
+    loop.env["VENDOR_EXTRA"] = "cursor"
+    _write_quota(state, "claude", five_hour=0.1, seven_day=0.99)   # long block
+    _write_quota(state, "codex", five_hour=0.1, seven_day=0.99)    # long block
+    _write_quota(state, "cursor", five_hour=0.1, seven_day=0.1)
+    loop.gh.body = "<!-- baton-author: vendor=cursor model=unknown -->\nGoal\n"
+    loop.script = [ACCEPT]
+    assert loop.run() is True
+    assert loop.runs[0]["vendor"] == "cursor"
+    [verdict] = loop.gh.posted("<!-- baton-verdict: accept by=cursor -->")
+    assert "Review mode:" in verdict and "author cursor" in verdict
+
+
+def test_owner_edit_in_later_round_and_between_review_and_revision_avoids_author(loop):
+    state = loop.env["STATE"]
+    loop.env["VENDOR_POOL"] = "claude codex"
+    loop.env["VENDOR_EXTRA"] = "cursor"
+    for v in ("claude", "codex", "cursor"):
+        _write_quota(state, v, five_hour=0.1, seven_day=0.1)
+    # Round 1 already reviewed by claude, revised by codex; then owner session rewrote body with vendor=claude.
+    loop.gh.body = "<!-- baton-author: vendor=claude model=claude-opus-5-5 -->\nRewritten goal\n"
+    loop.gh.last_edited_at = "2026-11-26T10:05:00Z"
+    loop.gh.comments = [
+        {"author": {"login": "owner"}, "body": "<!-- baton-spec-review round=1 by=claude -->\nfix", "createdAt": "2026-11-26T10:00:00Z"},
+        {"author": {"login": "owner"}, "body": "<!-- baton-spec-reply round=1 by=codex -->\ndone", "createdAt": "2026-11-26T10:02:00Z"},
+    ]
+    loop.script = [ACCEPT]
+    assert loop.run() is True
+    # Must avoid both claude (author marker) and codex (last_vendor) -> picks cursor!
+    assert loop.runs[0]["vendor"] == "cursor"
+
+    # Now test edit between review and revision -> reply gets baton-spec-author-edit -> round 2 avoids both
+    loop.runs.clear()
+    loop.gh.body = "<!-- baton-author: vendor=claude model=claude-opus-5-5 -->\nEdited before revision\n"
+    loop.gh.last_edited_at = "2026-11-26T11:05:00Z"
+    loop.gh.comments = [
+        {"author": {"login": "owner"}, "body": "<!-- baton-spec-review round=1 by=claude -->\nfix", "createdAt": "2026-11-26T11:00:00Z"},
+    ]
+    loop.script = [reviser(comment="fixed", body="Updated body\n"), ACCEPT]
+    assert loop.run() is True
+    replies = loop.gh.posted("<!-- baton-spec-reply round=1")
+    assert len(replies) == 1
+    assert replies[0].splitlines()[1] == "<!-- baton-spec-author-edit -->"
+    # Round 2 review must avoid both codex (reviser) and claude (author) -> cursor
+    assert loop.runs[1]["vendor"] == "cursor"
+    # And the reviser's edit preserved the original author marker!
+    assert loop.gh.body.startswith("<!-- baton-author: vendor=claude model=claude-opus-5-5 -->\n")
+
+
+def test_unchanged_body_keeps_last_vendor_only_rule(loop):
+    state = loop.env["STATE"]
+    _write_quota(state, "claude", five_hour=0.1, seven_day=0.1)
+    _write_quota(state, "codex", five_hour=0.1, seven_day=0.1)
+    loop.gh.body = "<!-- baton-author: vendor=claude model=claude-opus-5-5 -->\nGoal\n"
+    loop.gh.last_edited_at = "2026-11-26T10:01:00Z"   # before reply
+    loop.gh.comments = [
+        {"author": {"login": "owner"}, "body": "<!-- baton-spec-review round=1 by=claude -->\nfix", "createdAt": "2026-11-26T10:00:00Z"},
+        {"author": {"login": "owner"}, "body": "<!-- baton-spec-reply round=1 by=codex -->\ndone", "createdAt": "2026-11-26T10:02:00Z"},
+    ]
+    loop.script = [ACCEPT]
+    assert loop.run() is True
+    # Only last_vendor (codex) is avoided; claude is NOT avoided because no owner edit happened since reply.
+    assert loop.runs[0]["vendor"] == "claude"
+
+
+def test_stale_marker_after_owner_edit_avoids_both_and_says_unknown(loop):
+    state = loop.env["STATE"]
+    loop.env["VENDOR_POOL"] = "claude codex"
+    loop.env["VENDOR_EXTRA"] = "cursor"
+    for v in ("claude", "codex", "cursor"):
+        _write_quota(state, v, five_hour=0.1, seven_day=0.1)
+    marker = "<!-- baton-author: vendor=claude model=claude-opus-5-5 -->"
+    loop.gh.body = f"{marker}\nGoal\n"
+    loop.path("spec-owner-body").write_text(f"{marker}\nGoal\n")
+    loop.gh.last_edited_at = "2026-11-26T10:05:00Z"
+    loop.gh.comments = [
+        {"author": {"login": "owner"}, "body": "<!-- baton-spec-review round=1 by=codex -->\nfix", "createdAt": "2026-11-26T10:00:00Z"},
+        {"author": {"login": "owner"}, "body": "<!-- baton-spec-reply round=1 by=codex -->\ndone", "createdAt": "2026-11-26T10:02:00Z"},
+    ]
+    loop.script = [ACCEPT]
+    assert loop.run() is True
+    assert loop.runs[0]["vendor"] == "cursor"
+    assert "unknown" in loop.runs[0]["prompt"].lower()
+
+
+@pytest.mark.parametrize("edit_before_first_revision", [False, True])
+def test_revision_after_an_owner_answer_ignores_the_revisers_own_body_edit(loop, edit_before_first_revision):
+    state = loop.env["STATE"]
+    loop.env["VENDOR_POOL"] = "claude codex"
+    loop.env["VENDOR_EXTRA"] = "cursor"
+    for v in ("claude", "codex", "cursor"):
+        _write_quota(state, v, five_hour=0.1, seven_day=0.1)
+    marker = "<!-- baton-author: vendor=claude model=claude-opus-5-5 -->"
+    loop.gh.body = f"{marker}\nGoal\n"
+    loop.path("spec-owner-body").write_text(f"{marker}\nGoal\n")
+    loop.gh.comments = [{"author": {"login": "owner"}, "createdAt": "2026-11-26T10:00:00Z",
+                         "body": "<!-- baton-spec-review round=1 by=claude -->\nfix"}]
+    if edit_before_first_revision:
+        loop.gh.last_edited_at = "2026-11-26T10:01:00Z"
+
+    def asking(vendor, output, cwd):
+        loop.gh.last_edited_at = "2026-11-26T10:02:00Z"   # the reviser's own body edit
+        return reviser("which one?", body="Revised goal\n", outcome="SPEC: human")(vendor, output, cwd)
+
+    loop.script = [asking]
+    assert loop.run() is False
+    [asked] = [c for c in loop.gh.comments if c["body"].startswith("<!-- baton-spec-reply round=1 human")]
+    asked["createdAt"] = "2026-11-26T10:03:00Z"
+    loop.gh.comments.append({"author": {"login": "owner"}, "body": "the first one",
+                             "createdAt": "2026-11-26T10:04:00Z"})
+    loop.gh.labels.discard("ready-for-human")
+    loop.runs.clear()
+    loop.script = [reviser("ok"), ACCEPT]
+    assert loop.run() is True
+
+    final = loop.gh.posted("<!-- baton-spec-reply round=1 by=")[-1]
+    assert ("<!-- baton-spec-author-edit -->" in final) is edit_before_first_revision
+    revision, review = loop.runs
+    assert review["vendor"] != revision["vendor"]
+    if edit_before_first_revision:
+        # A real edit is kept: the next review also avoids the drafting agent.
+        assert review["vendor"] != "claude" and "drafting agent is unknown" in revision["prompt"]
+    else:
+        # Only the last reviser is avoided, so the first eligible vendor, claude, reviews.
+        assert review["vendor"] == "claude" and "claude (claude-opus-5-5)" in revision["prompt"]
+
+
+def test_reviser_cannot_drop_or_forge_author_marker_and_malformed_marker_is_unknown(loop):
+    state = loop.env["STATE"]
+    _write_quota(state, "claude", five_hour=0.1, seven_day=0.1)
+    _write_quota(state, "codex", five_hour=0.1, seven_day=0.1)
+    loop.gh.body = "<!-- baton-author: vendor=claude model=claude-opus-5-5 -->\nGoal\n## Checks to verify\n- check a\n## E2E gate\nnone\n"
+    loop.script = [
+        CHANGES,
+        reviser(comment="updated", body="<!-- baton-author: vendor=codex model=forged -->\nNew goal\n## Checks to verify\n- check a\n## E2E gate\nnone\n"),
+        ACCEPT,
+    ]
+    assert loop.run() is True
+    assert loop.gh.body.startswith("<!-- baton-author: vendor=claude model=claude-opus-5-5 -->\n")
+    assert "vendor=codex" not in loop.gh.body
+    # Reviser prompt names drafting vendor and model and does not assume Claude Code
+    assert "claude (claude-opus-5-5)" in loop.runs[1]["prompt"]
+    assert "Claude Code" not in loop.runs[1]["prompt"]
+
+    # Malformed marker (two lines) -> treated as unknown, never fails
+    loop.runs.clear()
+    loop.gh.comments.clear()
+    loop.gh.body = (
+        "<!-- baton-author: vendor=claude model=claude-opus-5-5 -->\n"
+        "<!-- baton-author: vendor=codex model=gpt-5 -->\n"
+        "Goal\n"
+    )
+    loop.script = [ACCEPT]
+    assert loop.run() is True
+    assert "unknown" in loop.runs[0]["prompt"].lower()
+
+
+def test_accept_problems_ignores_author_marker_after_checks_and_e2e_gate(loop):
+    marker = "<!-- baton-author: vendor=claude model=claude-opus-5-5 -->"
+    body = f"Goal\n\n## Checks to verify\n- check a\n{marker}\n\n## E2E gate\nnone\n{marker}\n"
+    loop.gh.body = body
+    s = spec.Spec(loop.env, spec.telemetry.from_env(loop.env, issue=N), N)
+    s.keep_owner_body(body)
+    assert s.accept_problems() == []
+
+
+def test_retried_spec_review_applies_author_preference(loop, monkeypatch):
+    from baton import advisor
+    state = loop.env["STATE"]
+    loop.env["VENDOR_POOL"] = "claude codex"
+    loop.env["VENDOR_EXTRA"] = "cursor"
+    for v in ("claude", "codex", "cursor"):
+        _write_quota(state, v, five_hour=0.1, seven_day=0.1)
+    loop.gh.body = "<!-- baton-author: vendor=claude model=claude-opus-5-5 -->\nGoal\n"
+    monkeypatch.setattr(advisor, "enabled", lambda env: True)
+    monkeypatch.setattr(advisor, "settings", lambda env: SimpleNamespace(mode="live"))
+    monkeypatch.setattr(spec.recovery, "decision_id", lambda env, reason, item: "dec-1")
+    monkeypatch.setattr(
+        spec.owner_handoff, "perform",
+        lambda *a, **kw: SimpleNamespace(action="retry_step_other_vendor", handed_off=False, decision=None),
+    )
+    # First run (codex) fails; retry_step_other_vendor must prefer cursor over claude (author)!
+    loop.script = [
+        {"rc": 1, "status": "error", "outcome": "RESULT: failed crash", "reply": "", "model": "", "defer": ""},
+        ACCEPT,
+    ]
+    assert loop.run() is True
+    assert [r["vendor"] for r in loop.runs] == ["codex", "cursor"]
 
 
 # --- the saved other-vendor retry keeps the same-vendor last resort (#329) ----------------------

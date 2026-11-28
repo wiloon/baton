@@ -42,9 +42,11 @@ def issue_snapshot_pages(*issues):
         row = {
             "title": issue.get("title", "Issue"), "body": issue.get("body", "Body"),
             "state": issue.get("state", "OPEN"),
+            "lastEditedAt": issue.get("lastEditedAt"),
             "labels": {"totalCount": len(labels), "nodes": labels},
             "comments": {
                 "nodes": [{"fullDatabaseId": str(row.get("id", i)), "body": row["body"],
+                           "createdAt": row.get("createdAt"),
                            "author": row.get("author")}
                           for i, row in enumerate(issue["comments"], 1)],
                 "pageInfo": {"hasNextPage": index + 1 < len(issues), "endCursor": str(index)},

@@ -34,6 +34,15 @@ def test_spec_reviewer_asks_for_test_seams_and_authors_add_them_as_decidable():
         assert "**Test seams** point is `decidable`" in text(name), name
 
 
+@pytest.mark.parametrize("name", ["spec-prompt.md", "codex-spec-prompt.md", "agy-spec-prompt.md"])
+@pytest.mark.parametrize("note", ["The issue was last drafted by claude (opus).", "The drafting agent is unknown."])
+def test_spec_revisers_are_told_who_drafted_the_issue(name, note):
+    prompt = prompts.render(BIN / name, [("VENDOR", "agy"), ("OWNER", "alice"), ("AUTHOR_NOTE", note)])
+    opening = prompt.splitlines()[0]
+    assert opening.startswith("You are the agy agent") and note in opening
+    assert "wrote GitHub issue" not in prompt
+
+
 def test_dev_prompt_asks_for_as_many_acceptance_items_as_one_pr_holds():
     prompt = text("dev-prompt.md")
     assert "as many of the remaining acceptance items as one reviewable PR holds" in prompt
