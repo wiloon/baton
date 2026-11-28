@@ -146,7 +146,7 @@ existing alternatives, replacement criteria and the proposed boundary for model-
 ## Requirements
 
 - Linux with systemd user units (`loginctl enable-linger` so they run without a login session)
-- git, bash, jq, GNU coreutils (`timeout` and `realpath -m`),
+- git, bash, jq, GNU coreutils (`timeout`),
   [uv](https://docs.astral.sh/uv/) (it installs Python 3.15 for you)
 - [gh](https://cli.github.com/), logged in as an account that can push branches, open PRs and
   edit labels in the watched repositories
