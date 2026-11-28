@@ -201,7 +201,7 @@ def verify_status(*, repairs_used, max_repairs, failure=""):
 
 def retry_candidates(env, role, candidates, *, mode, pr="", issue="", fixed_by="", exclusions=()):
     """Static eligibility; temporary quota and cooldown blocks belong to the picker."""
-    allowed = vendors._role_eligible(role, pool_only=role == "reviser", env=env)
+    allowed = vendors._role_eligible(role, env=env)
     eligible = [v for v in candidates if v in allowed and v not in exclusions]
     if mode == "review":
         check = vendors.screenshot_allowed if role == "screenshot_reviewer" else vendors.review_allowed

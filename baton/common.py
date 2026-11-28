@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 LEASE_REASON = "vendor capacity reserved"
+MAINTENANCE_PREFIX = "maintenance: "
 
 
 class Deferred(Exception):
@@ -17,7 +18,9 @@ class Deferred(Exception):
     def __init__(self, vendor, reason, *, lends_slot=None):
         super().__init__(f"{vendor}: {reason}")
         self.vendor, self.reason = vendor, reason
-        self.lends_slot = reason != LEASE_REASON if lends_slot is None else lends_slot
+        if lends_slot is None:
+            lends_slot = reason != LEASE_REASON and not reason.startswith(MAINTENANCE_PREFIX)
+        self.lends_slot = lends_slot
 
 
 class Exhausted(Exception):
@@ -131,6 +134,11 @@ def prepend_author_marker(body, marker):
     if lines and lines[0].startswith("<!-- baton-scan "):
         return "\n".join([lines[0], marker, *lines[1:]])
     return f"{marker}\n{body}" if body else f"{marker}\n"
+
+
+# First line of an intake task profile (#238): advisor text posted from the owner's account, so no
+# reader of owner input, evidence or issue text may take it (ADR 0008 provenance).
+PROFILE_MARKER = "<!-- baton-profile "
 
 
 def strip_markers(text):

@@ -33,8 +33,9 @@ import sys
 import time
 
 from . import advisor, agents, checks as check_section, dispatch, e2e_gate, fix, handoff as owner_handoff, hooks as telemetry, merge, notify, pick, pr as pr_helpers, prompts, recovery, review, scratch, tiers, vendors
-from .common import (Deferred, changed, child_env, format_author_marker, git, parse_author_marker,
-                     permission_denials, prepend_author_marker, push, restore, strip_markers)
+from .common import (Deferred, PROFILE_MARKER, changed, child_env, format_author_marker, git,
+                     parse_author_marker, permission_denials, prepend_author_marker, push, restore,
+                     strip_markers)
 from .quota import atomic_json
 
 REPLY_CAP = 60000
@@ -327,9 +328,45 @@ def trusted_comment_digest(listed, owner, login_re):
     bodies = []
     for comment in listed or []:
         login = (comment.get("author") or {}).get("login") or ""
-        if login == owner or re.search(login_re, login):
-            bodies.append(comment.get("body") or "")
+        body = comment.get("body") or ""
+        if (login == owner or re.search(login_re, login)) and not body.startswith(PROFILE_MARKER):
+            bodies.append(body)
     return recovery.feedback_digest(json.dumps(bodies))
+
+
+def referenced_documents(cwd, texts, revision, limit, chars):
+    """Read referenced ADR blobs from a commit, retaining whether the raw excerpt was cut."""
+    if not revision:
+        return []
+    tree = git(cwd, "ls-tree", "--format=%(objectmode) %(objectname) %(path)", revision, "--", "docs/adr/")
+    documents = {}
+    for row in (tree or "").splitlines():
+        mode, oid, name = row.split(" ", 2)
+        if mode in ("100644", "100755") and re.fullmatch(r"docs/adr/[A-Za-z0-9][A-Za-z0-9._-]*\.md", name):
+            documents[name.removeprefix("docs/adr/")] = oid
+    names = []
+    for text in texts:
+        for match in re.finditer(r"docs/adr/([A-Za-z0-9][A-Za-z0-9._-]*\.md)|\bADR[ -]?0*(\d{1,4})\b",
+                                 text or "", re.IGNORECASE):
+            if match.group(1):
+                names.append(match.group(1))
+            else:
+                prefix = f"{int(match.group(2)):04d}-"
+                names.extend(name for name in documents if name.startswith(prefix))
+    found = []
+    for name in dict.fromkeys(names):
+        if len(found) >= limit:
+            break
+        if name not in documents:
+            continue
+        try:
+            blob = subprocess.run(["git", "-C", str(cwd), "cat-file", "blob", documents[name]],
+                                  capture_output=True, env=child_env(), check=True)
+            text = blob.stdout.decode("utf-8")
+        except (subprocess.CalledProcessError, UnicodeError, OSError):
+            continue
+        found.append((f"docs/adr/{name}", text[:chars], len(text) > chars))
+    return found
 
 
 class Spec:
@@ -381,14 +418,16 @@ class Spec:
                 return followup
         return preferred
 
-    def agent(self, vendor, role, prompt, tag, settings, output="", followup=False, round_s=""):
+    def agent(self, vendor, role, prompt, tag, settings, output="", followup=False, round_s="",
+              *, continues_step=False):
         env = self.env.with_runtime(spec_followup=followup)
         saved_role = {"spec_review": "spec_reviewer", "spec": "reviser"}.get(role)
         # A saved grant is consumed before the step runs; a short block settles it (recovery.dispatching).
         with recovery.dispatching(self.env, self.issue, self.issue, lambda: self.retry_binding(round_s),
                                   role=saved_role):
+            extra = {"continues_step": True} if continues_step else {}
             out = dispatch.dispatch(vendor, role, prompt, tag, str(self.wt), str(self.self_dir / settings), output,
-                                    env, self.hooks)
+                                    env, self.hooks, **extra)
             if out["rc"] == 75:
                 raise Deferred(vendor, out["defer"])
         return out
@@ -516,9 +555,8 @@ class Spec:
         return result
 
     def retry_picker(self, role, other_model, spec_followup, avoid_author=""):
-        candidates = list(self.env.config.quota.vendor_pool) if role == "reviser" else pick.all_vendors(self.env)
-        return dict(mode="contrib", candidates=candidates, issue=self.issue, other_model=other_model,
-                    spec_followup=spec_followup, avoid_author=avoid_author)
+        return dict(mode="contrib", candidates=pick.all_vendors(self.env), issue=self.issue,
+                    other_model=other_model, spec_followup=spec_followup, avoid_author=avoid_author)
 
     def resume_worker(self, role, reason, round, other_model, spec_followup=False, avoid_author=""):
         return recovery.resume(
@@ -863,38 +901,8 @@ class Spec:
         return data
 
     def referenced_documents(self, texts, revision, limit, chars):
-        """Read referenced ADR blobs from a commit, retaining whether the raw excerpt was cut."""
-        if not revision:
-            return []
-        tree = git(self.wt, "ls-tree", "--format=%(objectmode) %(objectname) %(path)", revision, "--", "docs/adr/")
-        documents = {}
-        for row in (tree or "").splitlines():
-            mode, oid, name = row.split(" ", 2)
-            if mode in ("100644", "100755") and re.fullmatch(r"docs/adr/[A-Za-z0-9][A-Za-z0-9._-]*\.md", name):
-                documents[name.removeprefix("docs/adr/")] = oid
-        names = []
-        for text in texts:
-            for match in re.finditer(r"docs/adr/([A-Za-z0-9][A-Za-z0-9._-]*\.md)|\bADR[ -]?0*(\d{1,4})\b",
-                                     text or "", re.IGNORECASE):
-                if match.group(1):
-                    names.append(match.group(1))
-                else:
-                    prefix = f"{int(match.group(2)):04d}-"
-                    names.extend(name for name in documents if name.startswith(prefix))
-        found = []
-        for name in dict.fromkeys(names):
-            if len(found) >= limit:
-                break
-            if name not in documents:
-                continue
-            try:
-                blob = subprocess.run(["git", "-C", str(self.wt), "cat-file", "blob", documents[name]],
-                                      capture_output=True, env=child_env(), check=True)
-                text = blob.stdout.decode("utf-8")
-            except (subprocess.CalledProcessError, UnicodeError, OSError):
-                continue
-            found.append((f"docs/adr/{name}", text[:chars], len(text) > chars))
-        return found
+        """The referenced ADRs as this worktree's repository has them at REVISION."""
+        return referenced_documents(self.wt, texts, revision, limit, chars)
 
     def questions_citation_entries(self, issue_body, comments, reply, document_head):
         """Baseline citation rows from the issue body and genuine owner comments."""
@@ -2366,7 +2374,7 @@ class Spec:
         if pending is False:
             return "stop"
         reviser = pending[1] if pending else self.pick(
-            "reviser", list(env.config.quota.vendor_pool), last_vendor, other_model, spec_followup=alt_followup)
+            "reviser", pick.all_vendors(env), last_vendor, other_model, spec_followup=alt_followup)
         self.mark_base(round)
         budget = pending[0]["remaining_budget"] if pending else {}
         saved_answer = answer_intent or {}
@@ -2402,7 +2410,8 @@ class Spec:
                 for suffix in (".body", ".comment"):
                     Path(f"{out_base}{suffix}").unlink(missing_ok=True)
                 out = self.agent(reviser, "spec", prompt + DENIED_NOTE.format(command=denied[0]), f"{tag}-rerun",
-                                 "spec-settings.json", out_base, followup=followup, round_s=str(round))
+                                 "spec-settings.json", out_base, followup=followup, round_s=str(round),
+                                 continues_step=True)
                 denied = permission_denials(out.get("log", "")) if out["outcome"].startswith("RESULT: failed") else []
             self.settle_answer_intent()
             outcome, model = out["outcome"], out["model"] or ""

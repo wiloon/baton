@@ -215,7 +215,7 @@ def loop(worktree, tmp_path, monkeypatch):
     state = SimpleNamespace(env=env, gh=fake, repo=worktree.repo, runs=[], script=[], ci=True, merged=[])
     monkeypatch.setattr(merge.Merger, "ci_green", lambda self, minutes: state.ci)
 
-    def agent(vendor, role, prompt, tag, cwd, settings="", output="", env=None, hooks=None):
+    def agent(vendor, role, prompt, tag, cwd, settings="", output="", env=None, hooks=None, **_):
         state.runs.append({"vendor": vendor, "role": role, "tag": tag, "prompt": prompt, "settings": settings, "output": output,
                            "followup": session.resolve(env).runtime.spec_followup if env else False})
         step = state.script.pop(0)
@@ -1158,6 +1158,30 @@ def test_a_revision_that_failed_on_a_denied_command_is_rerun_once_and_finishes(l
     assert rerun["tag"] == f"issue-{N}-spec-reply-1-rerun"
     assert "`wc -l /ctx/issue.md`" in rerun["prompt"] and rerun["prompt"].startswith(loop.runs[1]["prompt"])
     assert "rerunning once" in loop.log() and "ready-for-human" not in loop.gh.labels
+
+
+def test_a_denied_revision_is_still_rerun_during_maintenance_and_the_next_step_waits(loop, tmp_path, monkeypatch):
+    """#337: the denied-command rerun finishes the revision; the next review is a new step."""
+    inner = spec.dispatch.dispatch
+    flag = Path(loop.env["STATE"], "maintenance")
+
+    def gated(*args, continues_step=False, **kwargs):
+        if flag.exists() and not continues_step:
+            return {"rc": 75, "status": "deferred", "outcome": "", "reply": None, "model": "",
+                    "defer": "maintenance: reboot"}
+        return inner(*args, **kwargs)
+
+    def denied_then_maintenance(vendor, output, cwd):
+        flag.write_text("{}")
+        return denied_failure(tmp_path)
+
+    monkeypatch.setattr(spec.dispatch, "dispatch", gated)
+    loop.script = [CHANGES, denied_then_maintenance, reviser()]
+    with pytest.raises(spec.Deferred) as waiting:
+        loop.run()
+    assert waiting.value.reason == "maintenance: reboot" and not waiting.value.lends_slot
+    assert [run["tag"] for run in loop.runs][1:] == [f"issue-{N}-spec-reply-1", f"issue-{N}-spec-reply-1-rerun"]
+    assert "ready-for-human" not in loop.gh.labels
 
 
 def test_a_revision_denied_twice_goes_to_the_owner_naming_the_command(loop, tmp_path, monkeypatch):
@@ -2264,8 +2288,10 @@ def test_dev_reconciles_an_interrupted_spec_acceptance_after_worktree_removal(ad
     assert dev.run(tick.Tick(env), N) == 1
     assert dev.run(tick.Tick(env), N) == 1
 
-    decision, outcome = advisor.read_records(env)
+    # The accept dev.run finds also gets one intake profile (#238), which stays open.
+    decision, outcome, intake = advisor.read_records(env)
     assert outcome["decision_id"] == decision["decision_id"] and outcome["result"] == "accept"
+    assert (intake["point"], intake["stage"]) == ("intake", "accept")
     assert not advisor.granted(env, "spec_limit", N)
 
 
@@ -4056,6 +4082,27 @@ def test_a_resumed_worker_after_a_deferred_denied_rerun_keeps_the_command_and_is
     assert [r["role"] for r in advised.runs] == ["spec_review", "spec", "spec", "spec", "spec"]
 
 
+def test_a_resumed_denied_rerun_is_a_new_step_under_maintenance(advised, monkeypatch, tmp_path):
+    """#337: only the rerun right after the denied run finishes a step; a later tick's resume starts one."""
+    advised.gh.body = f"Goal\n{EXCERPT}\n"
+    deferral = {"rc": 75, "status": "quota", "outcome": "", "reply": None, "model": "", "defer": "quota"}
+    advised.script = [CHANGES, reviser(QUESTIONS, outcome="SPEC: human"), denied_failure(tmp_path), deferral,
+                      deferral]
+    advised.advice = advice(grounded())
+    monkeypatch.setattr(dev, "setup_worktree", lambda *a, **k: ("", False))
+    inner, continued = spec.dispatch.dispatch, []
+
+    def record(*args, continues_step=False, **kwargs):
+        continued.append(continues_step)
+        return inner(*args, **kwargs)
+
+    monkeypatch.setattr(spec.dispatch, "dispatch", record)
+    for _ in range(2):
+        assert spec.run(SimpleNamespace(issue=N), session.resolve(advised.env))["rc"] == 75
+    assert advised.runs[-1]["tag"].endswith("-rerun")
+    assert continued == [False, False, False, True, False]
+
+
 EXCERPT = "Manual checks use the existing gate path."
 
 
@@ -4844,3 +4891,137 @@ def test_a_saved_other_vendor_revision_runs_on_the_last_resort(advised, spec_han
     reply, = advised.gh.posted("<!-- baton-spec-reply round=1 by=claude -->")
     assert "Revision mode: same-vendor-different-model (claude after claude)." in reply
     spec_handoffs(None)
+
+
+# --- extra vendors may revise (#324) ------------------------------------------------------------
+
+def install_agy_reviser(loop, monkeypatch, *, spec_alias="agy_dev"):
+    """Load a config where agy (extra) holds reviser; keep the loop's paths and clone."""
+    from dataclasses import replace
+    from baton.config import load
+    from conftest import full_text
+    from test_agy import with_agy_reviser
+
+    env = session.resolve(loop.env)
+    path = Path(loop.env["CTX"], "agy-reviser.toml")
+    path.write_text(with_agy_reviser(full_text(), spec_alias=spec_alias))
+    loaded = load(path, home=Path(str(env.home)))
+    cfg = replace(env.config, vendors=loaded.vendors, models=loaded.models,
+                  quota=replace(env.config.quota, vendor_pool=loaded.quota.vendor_pool,
+                                vendor_extra=loaded.quota.vendor_extra, caps=loaded.quota.caps,
+                                five_hour_maxes=loaded.quota.five_hour_maxes),
+                  source=path)
+    sess = replace(env, config=cfg)
+    monkeypatch.setattr(session, "resolve", resolve_session)
+    monkeypatch.setattr(session, "_active", ContextVar("test_session", default=sess))
+    loop.gh.labels = {"needs-triage", "agent-wip"}
+    return sess
+
+
+def test_claude_reviewed_revision_goes_to_agy_when_pool_is_blocked(loop, monkeypatch):
+    sess = install_agy_reviser(loop, monkeypatch)
+    for vendor in ("claude", "codex"):
+        Path(sess.config.paths.state, f"{vendor}-cooldown-until").write_text(str(int(time.time()) + 86400))
+    loop.gh.comments = [{"author": {"login": "owner"},
+                         "body": "<!-- baton-spec-review round=1 by=claude -->\nx"}]
+    context = Path(loop.env["CTX"], "issue.md")
+    context.write_text("issue")
+    loop.script = [reviser(body="Goal\nNew step\n", commit=True, model="gemini-4-neon-medium")]
+    s = spec.Spec(sess, spec.telemetry.from_env(sess, issue=N), N)
+    assert s.worktree()
+    base = spec.git(s.wt, "rev-parse", "HEAD")
+    assert s.revise_round(1, context, s.issue_payload()) == "revised"
+    assert [r["vendor"] for r in loop.runs if r["role"] == "spec"] == ["agy"]
+    prompt = loop.runs[0]["prompt"]
+    assert "Shell commands are limited to an exact allowlist" in prompt
+    assert "`git`" in prompt and "file tools" in prompt
+    reply, = loop.gh.posted("<!-- baton-spec-reply round=1 by=agy -->")
+    assert "same-vendor" not in reply
+    assert spec.git(s.wt, "diff", "--name-only", f"{base}..HEAD") == "adr.md"
+    assert loop.gh.adr_pr == "77" and "ADR revisions: #77" in reply
+
+
+def test_agy_revises_its_own_review_only_with_a_distinct_spec_model(loop, monkeypatch):
+    sess = install_agy_reviser(loop, monkeypatch, spec_alias="agy_dev")
+    for vendor in ("claude", "codex"):
+        Path(sess.config.paths.state, f"{vendor}-cooldown-until").write_text(str(int(time.time()) + 86400))
+    loop.gh.comments = [{"author": {"login": "owner"},
+                         "body": "<!-- baton-spec-review round=1 by=agy -->\nx"}]
+    Path(loop.env["LOGS"], "runner.log").write_text(
+        f"2026-10-27 10:00:00 [owner/app] end issue-{N}-spec-1 rc=0 SPEC: changes model=gemini-3.8-flash-high\n")
+    context = Path(loop.env["CTX"], "issue.md")
+    context.write_text("issue")
+    loop.script = [reviser(body="Goal\nNew step\n", model="gemini-4-neon-medium")]
+    s = spec.Spec(sess, spec.telemetry.from_env(sess, issue=N), N)
+    assert s.worktree()
+    assert s.revise_round(1, context, s.issue_payload()) == "revised"
+    assert [r["vendor"] for r in loop.runs] == ["agy"]
+    reply, = loop.gh.posted("<!-- baton-spec-reply round=1 by=agy -->")
+    assert "same-vendor-different-model (agy/gemini-4-neon-medium after agy/gemini-3.8-flash-high)" in reply
+
+
+def test_agy_is_not_chosen_to_revise_its_own_review_on_an_equal_model(loop, monkeypatch):
+    sess = install_agy_reviser(loop, monkeypatch, spec_alias="agy_review")
+    for vendor in ("claude", "codex"):
+        Path(sess.config.paths.state, f"{vendor}-cooldown-until").write_text(str(int(time.time()) + 86400))
+    loop.gh.comments = [{"author": {"login": "owner"},
+                         "body": "<!-- baton-spec-review round=1 by=agy -->\nx"}]
+    Path(loop.env["LOGS"], "runner.log").write_text(
+        f"2026-10-27 10:00:00 [owner/app] end issue-{N}-spec-1 rc=0 SPEC: changes model=gemini-3.8-flash-high\n")
+    context = Path(loop.env["CTX"], "issue.md")
+    context.write_text("issue")
+    s = spec.Spec(sess, spec.telemetry.from_env(sess, issue=N), N)
+    assert s.worktree()
+    with pytest.raises(Deferred):
+        s.revise_round(1, context, s.issue_payload())
+    assert not loop.runs
+
+
+def test_agy_is_not_chosen_to_revise_its_own_review_with_an_unknown_model(loop, monkeypatch):
+    sess = install_agy_reviser(loop, monkeypatch, spec_alias="agy_dev")
+    for vendor in ("claude", "codex"):
+        Path(sess.config.paths.state, f"{vendor}-cooldown-until").write_text(str(int(time.time()) + 86400))
+    loop.gh.comments = [{"author": {"login": "owner"},
+                         "body": "<!-- baton-spec-review round=1 by=agy -->\nx"}]
+    # No runner.log model evidence: other_model is empty / unknown.
+    context = Path(loop.env["CTX"], "issue.md")
+    context.write_text("issue")
+    s = spec.Spec(sess, spec.telemetry.from_env(sess, issue=N), N)
+    assert s.worktree()
+    with pytest.raises(Deferred):
+        s.revise_round(1, context, s.issue_payload())
+    assert not loop.runs
+
+
+def test_an_extra_vendor_without_reviser_is_never_picked_to_revise(loop, monkeypatch):
+    sess = install_agy_reviser(loop, monkeypatch)
+    # Drop reviser from agy; cursor already lacks it. Only pool vendors remain eligible.
+    from dataclasses import replace
+    vendors = tuple(replace(v, roles=tuple(r for r in v.roles if r != "reviser")) if v.id == "agy" else v
+                    for v in sess.config.vendors)
+    sess = replace(sess, config=replace(sess.config, vendors=vendors))
+    monkeypatch.setattr(session, "_active", ContextVar("test_session", default=sess))
+    for vendor in ("claude", "codex"):
+        Path(sess.config.paths.state, f"{vendor}-cooldown-until").write_text(str(int(time.time()) + 86400))
+    loop.gh.comments = [{"author": {"login": "owner"},
+                         "body": "<!-- baton-spec-review round=1 by=claude -->\nx"}]
+    context = Path(loop.env["CTX"], "issue.md")
+    context.write_text("issue")
+    s = spec.Spec(sess, spec.telemetry.from_env(sess, issue=N), N)
+    assert s.worktree()
+    with pytest.raises(Deferred):
+        s.revise_round(1, context, s.issue_payload())
+    assert not loop.runs
+
+
+def test_revision_retry_offers_agy(loop, monkeypatch):
+    from baton import recovery
+    sess = install_agy_reviser(loop, monkeypatch)
+    for vendor in ("claude", "codex"):
+        Path(sess.config.paths.state, f"{vendor}-cooldown-until").write_text(str(int(time.time()) + 86400))
+    s = spec.Spec(sess, spec.telemetry.from_env(sess, issue=N), N)
+    picker = s.retry_picker("reviser", "gemini-3.8-flash-high", False)
+    assert "agy" in picker["candidates"]
+    offered = recovery.retry_candidates(sess, "reviser", picker["candidates"], mode="contrib",
+                                        issue=N, exclusions=["claude"])
+    assert "agy" in offered and "claude" not in offered

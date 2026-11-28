@@ -22,8 +22,8 @@ ADR 0010's "Priority is per repository".
   1. Repositories with in-flight work: `--serve-child --no-new-issue`.
   2. Any other due repository with no child for one hour (from supervisor start):
      `--serve-child --no-new-issue` (housekeeping without starting an outranked candidate).
-  3. Candidate issues by (priority, rotation order of the repository, issue number):
-     `--serve-child --issue N`.
+  3. Candidate issues by (priority, −weight of the repository, rotation order of the repository,
+     issue number): `--serve-child --issue N`.
   4. The remaining due repositories (nothing to rank, or the listing failed): `--serve-child`.
 - **In-flight work** is what the child's resume steps would find: an open PR labelled
   `agent-review`, an agent-branch PR labelled `agent-fix`, or local `pr-opening-*`,
@@ -31,8 +31,13 @@ ADR 0010's "Priority is per repository".
   `slot-deferred-*`, recovery files, `ready-label-pending-*` and settlement records alone are not
   in-flight. A repository with in-flight work ranks ahead of every new issue anywhere; ADR 0010's
   within-repository rule stands for a new `P0` of that repository.
-- There is no preemption of work already in progress (#301 later) and no per-repository weight
-  (#300 later).
+- **Weight** (`[[repos]] weight`, an integer ≥ 1, default 1, no expiry; #300) breaks ties between
+  candidates of one priority, higher first, in item 3 only; priority always beats it. Items 1, 2
+  and 4 keep plain rotation. It has no effect when nothing is ranked (no contention), on the
+  legacy timer path or inside a child's own choice, and does not change quota spend or vendor
+  choice. The supervisor reads it through one accessor, where a runtime override can be added
+  (#293).
+- There is no preemption of work already in progress (#301 later).
 
 ## Shared eligibility
 
@@ -72,3 +77,5 @@ The legacy `baton.timer` path (`walk()`) keeps plain rotation as the rollback pa
 - Issue #291, round 1. Status moved to accepted with the owner's decisions on supervisor
   selection, fresh state each pass, no preemption, no weight, and exit 81 for an assigned child
   that ran no item.
+- Issue #300, round 1. Added a per-repository weight, which #291 left for later: the owner wants
+  to favour one project for a period. It orders only candidates of equal priority.

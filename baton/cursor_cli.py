@@ -35,9 +35,8 @@ SCAN = False
 SKIP_SCREENSHOT_AFTER_REVIEW = True
 ROUTE_FIELDS = frozenset({"model"})
 EMPTY_MODEL_OK = False
-RECORDS_AUTHOR_MODEL = False
-SAME_VENDOR_REVIEW = False
-SAME_VENDOR_SAME_MODEL = False
+RECORDS_AUTHOR_MODEL = True
+SAME_VENDOR_REVIEW = True
 DEFAULT_MAX_MINUTES = 60
 PREFLIGHT_CHECKS = (("cursor-agent", "--version"),)
 VERSION_EXECUTABLE = "cursor-agent"
@@ -250,7 +249,9 @@ def run(req):
     if head and changed(req.cwd, head):
         restore(req.cwd, head)
         outcome = f"RESULT: failed Cursor changed files in a read-only {req.role}"
-    return Run(rc, outcome, reply, used, summary)
+    # cursor-agent names no model, so the request does (ADR 0004 exception).
+    model = req.model if req.model and req.model.lower() != "auto" else "unknown"
+    return Run(rc, outcome, reply, used, summary, model=model)
 
 
 def reconnect_row(row):

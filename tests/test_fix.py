@@ -129,7 +129,7 @@ def fix_worktree(gh, tmp_path, monkeypatch):
 
     state = Run()
 
-    def stub(vendor, role, prompt, tag, cwd, settings="", output="", env=None, hooks=None):
+    def stub(vendor, role, prompt, tag, cwd, settings="", output="", env=None, hooks=None, **_):
         state.agent_calls.append((vendor, role, tag, output))
         state.prompts.append(prompt)
         plan = {"outcome": "RESULT: fixed", "reply": "", "commit": True, "rc": 0, "model": "",
@@ -430,6 +430,25 @@ def test_a_verified_fix_is_recorded_pushed_and_its_checks_refreshed(run):
     assert (state / f"pr-{PR}-authors").read_text() == "codex\n"
     assert (state / f"pr-{PR}-author-models").read_text() == "codex gpt-6.1-sol\n"
     assert (state / f"pr-{PR}-contrib").read_text().startswith("codex ")
+
+
+@pytest.mark.parametrize("model", ["grok-4.7-high", "unknown"])
+def test_a_cursor_fix_records_the_model_that_wrote_it(run, model):
+    """#221: a Cursor fix left out of the writer models could pass as a different-model review."""
+    run.agent(cursor_plan("RESULT: fixed", model=model))
+    assert run.fix("cursor")["rc"] == 0 and run.pushed()
+    assert (run.root / "state" / f"pr-{PR}-author-models").read_text() == f"cursor {model}\n"
+
+
+def test_a_resumed_cursor_fix_records_the_saved_model(run, monkeypatch):
+    clock, _ = _flaky_edits(monkeypatch)
+    request = BODY.replace("## Checks to verify\nnone", "## Checks to verify\n- /billing: badge")
+    run.agent(cursor_plan("## Checks to verify\n- /billing: badge\n\nRESULT: fixed", request=request,
+                          model="grok-4.7-high"))
+    assert run.fix("cursor")["rc"] == 75
+    clock["now"] = 1_060
+    assert run.fix("cursor")["rc"] == 0
+    assert (run.root / "state" / f"pr-{PR}-author-models").read_text() == "cursor grok-4.7-high\n"
 
 
 @pytest.mark.parametrize("fixer", ["codex", "cursor"])

@@ -99,6 +99,17 @@ def with_agy(text, review=REVIEW_MODEL, dev=MODEL):
         'quota = "extra"\ncap = 0.9\nmax_minutes = 30\n\n[vendors.cursor]\n')
 
 
+def with_agy_reviser(text, review=REVIEW_MODEL, dev=MODEL, spec_alias="agy_dev"):
+    """agy holds reviser and a base `spec` route (#324)."""
+    text = with_agy(text, review=review, dev=dev)
+    text = text.replace(
+        'roles = ["dev", "fixer", "reviewer", "spec_reviewer"]\nquota = "extra"',
+        'roles = ["dev", "fixer", "reviewer", "spec_reviewer", "reviser"]\nquota = "extra"',
+        1)
+    return text.replace("[models.routes.spec]\n",
+                        f"[models.routes.spec]\nagy = {{ model = \"{spec_alias}\" }}\n")
+
+
 def write(tmp_path, text):
     path = tmp_path / "config.toml"
     path.write_text(text)
@@ -118,7 +129,7 @@ def agy_runner(tmp_path, monkeypatch):
     for name, value in (("PATH", f"{fake}{os.pathsep}{os.environ['PATH']}"), ("FAKE_DIR", str(fake)),
                         ("HOME", str(home))):
         monkeypatch.setenv(name, value)
-    cfg = write(tmp_path, with_agy(full_text()))
+    cfg = write(tmp_path, with_agy_reviser(full_text()))
     cfg = replace(cfg, paths=replace(cfg.paths, state=state, logs=logs, self_dir=tmp_path / "bin"))
     sess = session.create(cfg, repo=cfg.repos[0])
     sess.dirs.logs.mkdir(parents=True, exist_ok=True)
@@ -183,12 +194,13 @@ def agy_runner(tmp_path, monkeypatch):
 def test_agy_is_registered_with_gemini_only_review_policy():
     agy = agents.ADAPTERS["agy"]
     assert agy.SAME_VENDOR_REVIEW is True and agy.RECORDS_AUTHOR_MODEL is True
-    assert agy.SAME_VENDOR_SAME_MODEL is False
     assert agy.ROUTE_FIELDS == frozenset({"model"})
     assert agy.COMMIT_MARKERS == ()
     assert agy.QUOTA_SOURCE == "api"
     assert agy.QUOTA_WINDOWS == {"five_hour", "seven_day"}
-    assert agy.SUPPORTED_ROLES == {"dev", "fixer", "reviewer", "spec_reviewer"}
+    assert agy.SUPPORTED_ROLES == {"dev", "fixer", "reviewer", "spec_reviewer", "reviser"}
+    assert agy.SPEC_TEMPLATE == "agy-spec-prompt.md"
+    assert agy.SPEC_STAGE == "spec-reply"
     assert agy.valid_model("gemini-4-neon-medium")
     assert not agy.valid_model("claude-opus-5-5-medium")
     assert not agy.valid_model("gpt-oss-120b-medium")
@@ -205,6 +217,43 @@ def test_config_admits_agy_and_the_example_still_loads_without_it(tmp_path):
     root = Path(__file__).resolve().parents[1]
     plain = config.load(root / "config.example.toml", home=tmp_path / "home")
     assert "agy" not in plain.declared()
+
+
+def test_agy_reviser_with_a_spec_route_validates(tmp_path):
+    cfg = write(tmp_path, with_agy_reviser(full_text()))
+    assert cfg.allows("agy", "reviser")
+    assert cfg.models.route("spec", "agy").model == MODEL
+
+
+def test_agy_reviser_without_a_spec_route_fails_naming_the_route(tmp_path):
+    text = with_agy(full_text()).replace(
+        'roles = ["dev", "fixer", "reviewer", "spec_reviewer"]\nquota = "extra"',
+        'roles = ["dev", "fixer", "reviewer", "spec_reviewer", "reviser"]\nquota = "extra"',
+        1)
+    with pytest.raises(config.ConfigError, match=r"models\.routes\.spec\.agy"):
+        write(tmp_path, text)
+
+
+def test_coverage_passes_when_only_an_extra_vendor_holds_reviser(tmp_path):
+    text = with_agy_reviser(full_text())
+    text = text.replace(
+        'roles = ["dev", "fixer", "reviewer", "screenshot_reviewer", "spec_reviewer", "reviser", "retrospective", "scan"]',
+        'roles = ["dev", "fixer", "reviewer", "screenshot_reviewer", "spec_reviewer", "retrospective", "scan"]')
+    text = text.replace(
+        'roles = ["dev", "fixer", "reviewer", "screenshot_reviewer", "spec_reviewer", "reviser", "retrospective"]',
+        'roles = ["dev", "fixer", "reviewer", "screenshot_reviewer", "spec_reviewer", "retrospective"]')
+    text = text.replace(
+        '[models.routes.spec]\nagy = { model = "agy_dev" }\n'
+        'claude = { model = "claude_strong", effort = "medium" }\n'
+        'codex = { model = "codex_fast", effort = "medium" }\n',
+        '[models.routes.spec]\nagy = { model = "agy_dev" }\n')
+    text = text.replace(
+        '[models.routes.spec_followup]\n'
+        'claude = { model = "claude_fast", effort = "low" }\n',
+        '[models.routes.spec_followup]\n')
+    cfg = write(tmp_path, text)
+    assert cfg.for_role("reviser") == ("agy",)
+    assert "agy" in cfg.extra()
 
 
 @pytest.mark.parametrize("bad", ["claude-opus-5-5-high", "gpt-oss-120b-medium", "gemini-pro-orchestrator-neon"])
@@ -413,6 +462,31 @@ def test_a_denied_run_retries_once_and_the_second_prompt_quotes_the_denial(agy_r
     assert "--retry" not in begins[0]
 
 
+def test_a_denied_run_still_retries_when_maintenance_turns_on_mid_call(agy_runner, monkeypatch):
+    """#337: the same-lease denial retry is inside one dispatch call and does not recheck the flag."""
+    import time
+    from baton import agents
+    denied = [{"tool": "read_file", "path": "/outside/x"}]
+    real, armed = agents.run, []
+
+    def run_then_arm(request, *args, **kwargs):
+        result = real(request, *args, **kwargs)
+        if not armed:
+            armed.append(1)
+            (agy_runner.state_dir / "maintenance").write_text(
+                json.dumps({"expires": time.time() + 600, "reason": "reboot", "id": "t"}))
+        return result
+
+    monkeypatch.setattr(agents, "run", run_then_arm)
+    agy_runner.plans(
+        dict(stream=stream("", model=REVIEW_MODEL, denied=denied)),
+        dict(stream=stream("ok\nREVIEW: pass", model=REVIEW_MODEL)))
+    out = agy_runner.run("review")
+    assert (out["rc"], out["status"], out["outcome"]) == (0, "success", "REVIEW: pass")
+    assert agy_runner.calls() == ["agy", "agy"]
+    assert (agy_runner.state_dir / "maintenance").exists()
+
+
 def test_a_denied_action_is_sanitized_and_capped_in_the_retry_prompt(agy_runner):
     # U+2028 and a nested `<!-- baton` (revealed only after backtick removal) must not survive.
     nasty = ("line1\u2028line2 `code` nested-`<!-- baton` <!-- baton-marker --> " + ("x" * 400))
@@ -561,7 +635,8 @@ def test_a_denied_write_run_is_reset_and_outside_files_are_cleared_before_retry(
 
 @pytest.mark.parametrize("role,model,reply", [
     ("dev", MODEL, "RESULT: ready"), ("fix", MODEL, "RESULT: fixed"),
-    ("review", REVIEW_MODEL, "ok\nREVIEW: pass"), ("spec_review", REVIEW_MODEL, "ok\nSPEC: accept")])
+    ("review", REVIEW_MODEL, "ok\nREVIEW: pass"), ("spec_review", REVIEW_MODEL, "ok\nSPEC: accept"),
+    ("spec", MODEL, "done\nSPEC: revised")])
 def test_every_agy_role_prompt_carries_the_path_rule_and_allowed_commands(agy_runner, role, model, reply):
     agy_runner.plan(stream=stream(reply, model=model))
     assert agy_runner.run(role)["status"] == "success"
@@ -860,6 +935,7 @@ def test_allowlist_is_derived_from_the_ci_command():
     allow = lambda role, ci, hook=None: json.loads(agy_cli.permissions_settings(role, ci, hook))["permissions"]["allow"]
     reads = [f"command({name})" for name in agy_cli.READ_COMMANDS]
     assert allow("review", "task ci && rm -rf /") == reads   # read roles ignore the CI command
+    assert allow("spec", "task ci && rm -rf /") == reads   # reviser: read allowlist, no CI (#324)
     assert {"command(find)", "command(sort)", "command(grep)", "command(head)"} <= set(reads)   # PR #244
     assert not {"command(rm)", "command(sed)", "command(python3)", "command(task ci)"} & set(reads)
     got = allow("dev", "uv run --frozen pytest -q && task ci:changed BASE=x; FOO=1 bash bin/verify.sh | tee out",
@@ -870,16 +946,34 @@ def test_allowlist_is_derived_from_the_ci_command():
     assert all("*" not in rule for rule in got)
 
 
+def test_agy_spec_run_uses_accept_edits_read_allowlist_and_restores_on_failure(agy_runner):
+    start = agy_runner.head()
+    output = scratch.path(agy_runner.env.dirs, "spec", 9)
+    agy_runner.plan(stream=stream("", denied=[{"tool": "command(rm)"}]), commit=True)
+    out = dispatch.dispatch("agy", "spec", "p", "t", str(agy_runner.worktree),
+                            env=agy_runner.env, output=str(output))
+    assert out["status"] == "failure"
+    args = agy_runner.args()
+    assert args[args.index("--mode") + 1] == "accept-edits"
+    allow = json.loads(args[args.index("--settings") + 1])["permissions"]["allow"]
+    assert allow == [f"command({name})" for name in agy_cli.READ_COMMANDS]
+    assert "command(python3)" not in allow and "command(mkdir)" not in allow
+    added = [args[i + 1] for i, a in enumerate(args) if a == "--add-dir"]
+    assert str(output.parent) in added or str(agy_runner.env.dirs.scratch) in added
+    assert agy_runner.head() == start
+    assert not (agy_runner.worktree / "committed.txt").exists()
+
+
 # --- review independence and attribution ------------------------------------------------------
 
-def test_agy_never_reviews_its_own_head_on_the_same_model(tmp_path):
+def test_agy_calls_a_same_model_self_review_fresh_context(tmp_path):
     state, pr = str(tmp_path), 7
     vendors.record_author(state, pr, "agy")
     vendors.record_author_model(state, pr, "agy", MODEL)
-    assert vendors.review_allowed(state, pr, "agy", "gemini-4-neon-xhigh") is False
-    assert vendors.review_allowed(state, pr, "agy", REVIEW_MODEL) is True
     assert vendors.same_vendor_review_mode(state, pr, "agy", REVIEW_MODEL) == "same-vendor-different-model"
-    assert vendors.review_allowed(state, pr, "agy", "") is False
+    for same in ("gemini-4-neon-xhigh", ""):
+        assert vendors.same_vendor_review_mode(state, pr, "agy", same) == "same-model-fresh-context"
+        assert vendors.screenshot_allowed(state, pr, "agy", same) is False
 
 
 def test_agy_reviews_another_vendors_pr_and_others_review_agy(tmp_path):
@@ -906,12 +1000,12 @@ def test_agy_reviews_its_own_pr_on_a_distinct_model_when_every_other_reviewer_is
     assert (result["vendor"], rc, result["review_mode"]) == ("agy", 0, "same-vendor-different-model")
 
 
-def test_agy_is_not_picked_to_review_its_own_pr_on_the_writers_model(agy_runner):
+def test_agy_reviews_its_own_pr_when_its_review_model_wrote_it(agy_runner):
     state = str(agy_runner.state_dir)
     vendors.record_author(state, "21", "agy")
     vendors.record_author_model(state, "21", "agy", REVIEW_MODEL)   # the review route model wrote it
     result, rc = pick_review(agy_runner, "21")
-    assert result["vendor"] != "agy" and rc == 75
+    assert (result["vendor"], rc) == ("agy", 0)
 
 
 def test_dev_opening_attributes_the_pr_to_agy_with_the_verified_model(agy_runner):

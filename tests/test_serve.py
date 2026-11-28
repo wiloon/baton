@@ -311,6 +311,19 @@ def test_equal_priority_breaks_ties_by_rotation(tmp_path):
     assert world.spawned == [(0, APP, '3', False)]
 
 
+def test_equal_priority_higher_weight_starts_before_rotation(tmp_path):
+    # SHOP is second in rotation; weight = 5 makes it start first at equal priority (#300).
+    text = TWO.replace('gh_repo = "acme/shop"\n', 'gh_repo = "acme/shop"\nweight = 5\n', 1)
+    world = World(tmp_path, text, max_parallel=1)
+    world.listings = {
+        APP: _listing(APP, priority_issue=3, priority=1),
+        SHOP_: _listing(SHOP_, priority_issue=7, priority=1),
+    }
+    world.plan = {SHOP_: [(10, 0)]}
+    world.run(1)
+    assert world.spawned == [(0, SHOP_, '7', False)]
+
+
 def test_in_flight_work_takes_a_free_slot_before_any_new_issue(tmp_path):
     world = World(tmp_path, THREE, max_parallel=1)
     world.listings = {

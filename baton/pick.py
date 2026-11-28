@@ -25,7 +25,7 @@ def choose(env, role, current, mode, candidates, *, pr="", exclude="", issue="",
     vendor_role = ROUTE_ROLE.get(role, role)
     kwargs["tier"] = tiers.step(env, ROLE_ROUTE.get(vendor_role, vendor_role),
                                 issue or env.runtime.issue, pr or env.runtime.pr)
-    allowed = set(env.config.for_role(vendor_role, pool_only=vendor_role == "reviser"))
+    allowed = set(env.config.for_role(vendor_role))
     if not allowed and vendor_role not in ROLES:
         allowed = set(env.config.declared())
     candidates = [vendor for vendor in candidates if vendor in allowed]
@@ -42,10 +42,13 @@ def choose(env, role, current, mode, candidates, *, pr="", exclude="", issue="",
     if result.get("exhausted"):
         raise Exhausted(role, result.get("reason", ""))
     vendor = result["vendor"]
+    # A same-vendor fallback code review names how independent it is.
+    same = (f" review_mode={result['review_mode']} model={result['review_model']}"
+            if result.get("review_model") else "")
     try:
-        notify.log("selection: " + vendors.selection_details(state, pool, candidates, vendor, role, area=area))
+        notify.log("selection: " + vendors.selection_details(state, pool, candidates, vendor, role, area=area) + same)
     except (OSError, ValueError, KeyError, TypeError):
-        notify.log(f"selection: chosen={vendor} role={role} quota_details=unavailable")
+        notify.log(f"selection: chosen={vendor} role={role} quota_details=unavailable{same}")
     if result.get("quota_error"):
         notify.log("pool: quota.py failed (rc=2); using pool order")
     if vendor != current and not result.get("silent"):

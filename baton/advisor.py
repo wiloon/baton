@@ -101,10 +101,23 @@ class Decision:
     previous: bool = False
     answers: tuple = ()    # grounded answer set for answer_spec_questions, else ()
     backend: str = ""      # "claude" or "deepseek"; "" when no record names one
+    profile: dict = field(default_factory=dict)   # a ReplyTask's parsed reply, else {}
+    decision_id: str = ""  # set only by the call that created the record
 
     @property
     def extra_round(self):
         return self.action == "extra_round"
+
+
+@dataclass(frozen=True)
+class ReplyTask:
+    """A decision point whose action carries a structured "profile" reply field, with its own system text."""
+    action: str            # the action that carries the profile
+    system: str
+    version: str           # the prompt version
+    parse: object          # parse(raw profile, values to redact) -> stored dict; raises ValueError
+    fields: dict = field(default_factory=dict)   # extra record fields
+    withheld: tuple = ()   # sent text the decision record must not repeat
 
 
 def extract_questions(text):
@@ -158,7 +171,8 @@ def baseline_snapshot(snapshot):
     text = "\n".join(line for line in text.split("\n") if not (
         (m := CITATION_LINE.match(line)) and m["source"].startswith("document ")))
     cut = len(text)
-    for marker in ("\n\nDiff excerpt:\n", "\n\nCI log excerpt:\n", "\n\nLocal documents:\n"):
+    for marker in ("\n\nDiff excerpt:\n", "\n\nCI log excerpt:\n", "\n\nLocal documents:\n",
+                   "\n\nCommit subjects:\n"):
         at = text.find(marker)
         if 0 <= at < cut:
             cut = at
@@ -223,7 +237,8 @@ def format_citations(entries):
     return "Citation evidence:\n" + "\n".join(f"[{i}] ({source}): {text}" for i, source, text in entries)
 
 
-def augment_snapshot(env, baseline, *, diff_excerpt="", ci_log_excerpt="", document_excerpts=()):
+def augment_snapshot(env, baseline, *, diff_excerpt="", ci_log_excerpt="", document_excerpts=(),
+                     commit_subjects=""):
     """Append repository-opted-in excerpts; baseline alone when every flag is off (#125)."""
     env = session.resolve(env)
     repo = env.repo
@@ -236,6 +251,8 @@ def augment_snapshot(env, baseline, *, diff_excerpt="", ci_log_excerpt="", docum
         blocks = [f"Document {path}:\n{text}" for path, text in document_excerpts if path and text]
         if blocks:
             parts.append("Local documents:\n" + "\n\n".join(blocks))
+    if getattr(repo, "advisor_commit_subjects", False) and commit_subjects:
+        parts.append(f"Commit subjects:\n{commit_subjects}")
     return "\n\n".join(parts)
 
 
@@ -367,6 +384,16 @@ def saved_attempt(env, point, item, task_kind):
         return None
 
 
+def redaction_values(env):
+    """What advise() redacts, for a caller that must redact text before capping it."""
+    values = secret_values(env)
+    try:
+        key = credentials.load(settings(env).env_file, (KEY,)).get(KEY, "")
+    except credentials.CredentialError:
+        key = ""
+    return values | {key} if key else values
+
+
 def settings(env):
     """The [advisor] section (one seam for tests)."""
     return env.config.advisor
@@ -401,13 +428,13 @@ def user_message(snapshot, actions):
     return f"Allowed actions: {json.dumps(list(actions))}\n\n<snapshot>\n{snapshot}\n</snapshot>"
 
 
-def call_deepseek(cfg, key, snapshot, actions, *, category=None):
+def call_deepseek(cfg, key, snapshot, actions, *, category=None, system=None):
     """(parsed reply dict, usage dict); raises on transport, HTTP or format failure."""
     body = json.dumps({
         "model": cfg.model,
         "temperature": 0,
         "response_format": {"type": "json_object"},
-        "messages": [{"role": "system", "content": instructions(actions, category)},
+        "messages": [{"role": "system", "content": system or instructions(actions, category)},
                      {"role": "user", "content": user_message(snapshot, actions)}],
     }).encode()
     request = urllib.request.Request(cfg.base_url.rstrip("/") + "/chat/completions", data=body, method="POST",
@@ -495,9 +522,10 @@ def claude_usage(spent):
     return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
 
 
-def call_claude(cfg, env, snapshot, actions, *, category=None):
+def call_claude(cfg, env, snapshot, actions, *, category=None, system=None):
     """(parsed reply, usage dict) from one tool-less, isolated Claude Code call. No vendor lease."""
-    command = claude_cli.advisor_command(cfg.claude.model, cfg.claude.effort, instructions(actions, category))
+    command = claude_cli.advisor_command(cfg.claude.model, cfg.claude.effort,
+                                         system or instructions(actions, category))
     try:
         child = retrospective_analyst.environment(env.config, env.config.vendor("claude"))
     except credentials.CredentialError as error:
@@ -544,10 +572,11 @@ class Attempt:
     evidence: list = field(default_factory=list)
     answers: tuple = ()
     observed_only: bool = False   # a well-formed answer set with a non-grounded case: recorded, never executed
+    profile: dict = field(default_factory=dict)
 
 
 def attempt_backend(env, cfg, backend, key, key_failure, text, actions, *, category, values, sources, cut_rows,
-                    recordable):
+                    recordable, task=None):
     """One call to BACKEND and the validation every reply gets. Never raises."""
     claude = backend == "claude"
     result = Attempt(backend, cfg.claude.model if claude else cfg.model)
@@ -567,6 +596,9 @@ def attempt_backend(env, cfg, backend, key, key_failure, text, actions, *, categ
             result.actual_model = metadata.get("actual_model", "") if claude else ""
     try:
         options = {"category": category} if category else {}
+        if task:
+            options["system"] = task.system
+            values = values | set(task.withheld)
         reply, metadata = (call_claude(cfg, env, text, actions, **options) if claude
                            else call_deepseek(cfg, key, text, actions, **options))
         consumed(metadata)   # the call consumed these tokens even if the reply is rejected
@@ -604,6 +636,8 @@ def attempt_backend(env, cfg, backend, key, key_failure, text, actions, *, categ
                     raise ValueError("answer text was changed by redaction or exceeds the length limit")
             result.observed_only = any(row["case"] != "grounded" for row in answers)
             result.answers = tuple({**row, "text": redact(row["text"], values)[:600]} for row in answers)
+        if task and not result.failure and raw_action == task.action:
+            result.profile = task.parse(reply.get("profile"), values)
     except urllib.error.HTTPError as error:
         result.failure = f"HTTP {error.code}"
     except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as error:
@@ -623,11 +657,11 @@ def attempt_backend(env, cfg, backend, key, key_failure, text, actions, *, categ
 
 
 def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=None, rule=HANDOFF, mode=None,
-           category=None):
+           category=None, task=None):
     """The action to execute at POINT for ITEM (a PR or issue number). ACTIONS always contains
     HANDOFF. REVALIDATE() is called before a non-handoff action executes and must return True when
     the state still matches the snapshot. MODE overrides the configured global mode when the
-    caller already applied ADR 0008's ceiling (#125). Never raises."""
+    caller already applied ADR 0008's ceiling (#125). TASK is a ReplyTask. Never raises."""
     env = session.resolve(env)
     task_kind = task_kind or ("issue" if point.startswith("spec_") else "pr")
     actions = tuple(dict.fromkeys((HANDOFF, *actions)))
@@ -665,16 +699,17 @@ def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=No
                             backend=record.get("backend") or "deepseek")
     decision_id = uuid4().hex
     answering = "answer_spec_questions" in actions
-    version = (QUESTIONS_PROMPT_VERSION if answering
+    version = (task.version if task else QUESTIONS_PROMPT_VERSION if answering
                else OBSERVATION_PROMPT_VERSION if category else PROMPT_VERSION)
     record = {"kind": "decision", "ts": int(time.time()), "point": point, "repo": env.repo.gh_repo, "item": str(item),
               "task_kind": task_kind, "episode": pending[0]["episode"] if pending else decision_id,
               "decision_id": decision_id, "snapshot_sha": digest, "actions": list(actions),
-              "prompt_version": version, "mode": effective, "rule": rule}
+              "prompt_version": version, "mode": effective, "rule": rule, **(task.fields if task else {})}
     tries = []
     for backend in cfg.backend_order:
         tries.append(attempt_backend(env, cfg, backend, key, key_failure, text, actions, category=category,
-                                     values=values, sources=sources, cut_rows=cut_rows, recordable=recordable))
+                                     values=values, sources=sources, cut_rows=cut_rows, recordable=recordable,
+                                     task=task))
         if not tries[-1].failure:
             break
     # The backend that answered; else the last one actually called; else the first in order.
@@ -693,6 +728,7 @@ def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=No
                                        for name in ("backend", "model", "failure", "latency_ms", "usage")}
     advised, reason, evidence, answers = chosen.advised, chosen.reason, chosen.evidence, chosen.answers
     observed_only, usage = chosen.observed_only, chosen.usage
+    profile = {} if failure else chosen.profile
     executed = rule
     if not failure and advised != rule and effective == "live":
         try:
@@ -721,14 +757,15 @@ def advise(env, point, item, snapshot, actions, *, task_kind=None, revalidate=No
             recorded.append(saved)
         record.update(advised=advised, reason=reason, evidence=evidence, executed=executed, failure=failure,
                       latency_ms=int((time.monotonic() - started) * 1000), usage=usage,
-                      **({"answers": recorded} if recorded else {}))
+                      **({"answers": recorded} if recorded else {}), **({"profile": profile} if profile else {}))
         append(env, record)
     except OSError as error:
         executed, failure, answers = rule, f"could not persist advisor decision: {type(error).__name__}", ()
+        profile = {}
     notify.log(f"advisor {point} #{item}: advised={advised or '-'} executed={executed}"
                + (f" failure={failure}" if failure else ""))
     return Decision(executed, reason, tuple(evidence), advised, failure, True, answers=answers,
-                    backend=chosen.backend)
+                    backend=chosen.backend, profile=profile, decision_id=decision_id)
 
 
 def pending_items(env, task_kind):
@@ -775,7 +812,9 @@ def finish_episode(env, task_kind, item, result):
     points = {legacy}
     try:
         for decision in pending_decisions(env, task_kind, item):
-            if task_kind == "issue" and result == "accept" and not decision["point"].startswith("spec_"):
+            # An accept also ends the intake's pickup stage; the accept stage's own record stays open.
+            if (task_kind == "issue" and result == "accept" and not decision["point"].startswith("spec_")
+                    and (decision["point"], decision.get("stage")) != ("intake", "pickup")):
                 continue
             append(env, {**{key: decision[key] for key in ("point", "repo", "task_kind", "item", "episode", "decision_id")},
                          "kind": "outcome", "ts": int(time.time()), "result": result})
