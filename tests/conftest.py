@@ -367,12 +367,37 @@ def no_runner_credentials(monkeypatch):
         monkeypatch.delenv(key, raising=False)
 
 
+SYSTEM_TEMP = Path(tempfile.gettempdir())   # also holds FULL
+LOG_ROOTS = None   # where a runner log may be written; None: pytest's base temp and SYSTEM_TEMP
+
+
+class OutsideTempLog(BaseException):
+    """A test tried to write a runner log outside the temp roots (#380). Not an Exception, so no
+    handler in production code can swallow it."""
+
+
 @pytest.fixture(autouse=True)
-def typed_legacy_test_inputs(request, monkeypatch):
+def runner_logs_stay_temporary(monkeypatch, tmp_path_factory):
+    """Every in-process writer calls notify.append through the module, so none gets past this."""
+    from baton import notify
+    real, base = notify.append, tmp_path_factory.getbasetemp()
+
+    def append(logs, line):
+        roots = LOG_ROOTS if LOG_ROOTS is not None else (base, SYSTEM_TEMP)
+        target = Path(str(logs)).resolve()
+        if not any(target.is_relative_to(Path(root).resolve()) for root in roots):
+            raise OutsideTempLog(f"runner log directory outside the test temp root: {logs}")
+        real(logs, line)
+    monkeypatch.setattr(notify, 'append', append)
+
+
+@pytest.fixture(autouse=True)
+def typed_legacy_test_inputs(request, monkeypatch, tmp_path):
     """Port legacy test vectors at the test boundary, never in production loading.
 
     Existing regressions express overrides as Shell-era dictionaries. Convert those
     fixtures into typed dependencies while the assertions continue testing behavior.
+    Without LOGS, the logs directory is the test's own, never the one under HOME (#380).
     """
     if request.path.name in (
         'test_config.py', 'test_initialization.py', 'test_bootstrap.py', 'test_repos.py',
@@ -392,6 +417,10 @@ def typed_legacy_test_inputs(request, monkeypatch):
             env.update(value)
         home = Path(env.get('HOME', str(Path.home())))
         config = load(FULL, home=home)
+        if 'LOGS' not in env:
+            logs = tmp_path / 'default-logs'   # not 'logs': tests and `gh` make that one themselves
+            logs.mkdir(exist_ok=True)
+            config = replace(config, paths=replace(config.paths, logs=logs))
         sections = {}
         for name in (*SECTIONS, 'repo'):
             section = getattr(config, name) if name != 'repo' else config.repos[0]
