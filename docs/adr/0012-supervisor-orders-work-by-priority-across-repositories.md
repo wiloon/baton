@@ -25,8 +25,9 @@ ADR 0010's "Priority is per repository".
      `--serve-child --no-new-issue` (housekeeping; the resume bar below keeps it from resuming
      outranked work).
   3. One list of in-flight repositories and candidate issues, by (priority, in-flight before new,
-     rotation order of the repository, issue number): `--serve-child --no-new-issue` for an
-     in-flight repository, `--serve-child --issue N` for a candidate.
+     −weight of the repository for a candidate, rotation order of the repository, issue number):
+     `--serve-child --no-new-issue` for an in-flight repository, `--serve-child --issue N` for a
+     candidate.
   4. The remaining due repositories (nothing to rank, or the listing failed): `--serve-child`.
      A repository whose in-flight work is below the resume bar gets no turn here.
 - **In-flight work** is what the child's resume steps would find: an open PR labelled
@@ -34,8 +35,14 @@ ADR 0010's "Priority is per repository".
   `review-pending-*` / comment-post episodes, fix-push episodes, or pending specs.
   `slot-deferred-*`, recovery files, `ready-label-pending-*` and settlement records alone are not
   in-flight.
-- A running child is never signalled for a higher priority, and there is no per-repository weight
-  (#300 later).
+- **Weight** (`[[repos]] weight`, an integer ≥ 1, default 1, no expiry; #300) breaks ties between
+  candidates of one priority, higher first, in item 3 only; priority always beats it, and an
+  in-flight entry still goes before a new candidate of the same priority. In-flight entries and
+  items 1, 2 and 4 keep plain rotation. It has no effect when nothing is ranked (no contention), on
+  the legacy timer path or inside a child's own choice, and does not change quota spend or vendor
+  choice. The supervisor reads it through one accessor, where a runtime override can be added
+  (#293).
+- A running child is never signalled for a higher priority.
 
 ## Waiting steps yield to higher priority (#301)
 
@@ -109,6 +116,9 @@ The legacy `baton.timer` path (`walk()`) keeps plain rotation as the rollback pa
 - Issue #291, round 1. Status moved to accepted with the owner's decisions on supervisor
   selection, fresh state each pass, no preemption, no weight, and exit 81 for an assigned child
   that ran no item.
+- Issue #300, round 1. Added a per-repository weight, which #291 left for later: the owner wants
+  to favour one project for a period. It orders only candidates of equal priority.
 - Issue #301: a strictly higher-priority new issue now goes before another repository's waiting
   in-flight step (owner, 2026-11-26), replacing "in-flight first" and "no preemption". Spec
-  review added the never-preempted items, the resume bar and the cross-repository limit.
+  review added the never-preempted items, the resume bar and the cross-repository limit. The
+  weight from #300 stays a tie-break among candidates of equal priority.

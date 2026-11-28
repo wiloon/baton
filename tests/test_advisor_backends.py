@@ -5,6 +5,7 @@ no test here starts the real `claude`.
 """
 import contextlib
 import json
+import os
 import time
 import urllib.error
 from dataclasses import replace
@@ -12,8 +13,9 @@ from pathlib import Path
 
 import pytest
 
-from baton import advisor, capacity, quota, retrospective_analyst, vendor_policy
+from baton import advisor, quota, retrospective_analyst, vendor_policy
 from baton.config import Advisor
+from conftest import in_flight
 from test_advisor import EXCERPT, EXTRA, adv, answer_reply, questions_snapshot  # noqa: F401  (adv is a fixture)
 
 CLAUDE_USAGE = {"input_tokens": 100, "cache_read_input_tokens": 20, "cache_creation_input_tokens": 3,
@@ -48,7 +50,7 @@ def dual(adv, monkeypatch):  # noqa: F811
     monkeypatch.setattr(advisor, "settings", lambda env: replace(
         Advisor(env_file=adv.env_file, mode=adv.mode), **adv.overrides))
 
-    def process(command, prompt, workspace, env, seconds, max_bytes, lease_fd=None):
+    def process(command, prompt, workspace, env, seconds, max_bytes):
         adv.processes.append({"command": command, "prompt": prompt, "cwd": Path(workspace),
                               "listing": list(Path(workspace).iterdir()), "env": dict(env), "seconds": seconds})
         return adv.claude.pop(0)
@@ -166,14 +168,14 @@ def test_a_fenced_claude_reply_is_accepted(dual):
     assert d.extra_round and d.backend == "claude" and dual.calls == []
 
 
-@pytest.mark.parametrize("condition", ["lease held", "stale", "missing", "invalid"])
-def test_a_held_lease_and_unknown_quota_still_try_claude(dual, condition):
+@pytest.mark.parametrize("condition", ["run in flight", "stale", "missing", "invalid"])
+def test_a_run_in_flight_and_unknown_quota_still_try_claude(dual, condition):
     if condition == "stale":
         quota.record(state_dir(dual), "claude", {"five_hour": {"used": 1.0, "resets_at": 1}}, 1)
     if condition == "invalid":
         Path(state_dir(dual), "quota-claude.json").write_text("[1]")
     dual.claude = [ran()]
-    with capacity.lease(state_dir(dual), "claude") if condition == "lease held" else contextlib.nullcontext():
+    with in_flight(state_dir(dual), "claude") if condition == "run in flight" else contextlib.nullcontext():
         d = decide(dual)
     assert d.backend == "claude" and len(dual.processes) == 1
 
@@ -363,3 +365,30 @@ def test_the_digest_without_claude_lists_no_backends(dual):
     decide(dual)
     text = advisor.digest(dual.env, now=time.time() + 1)
     assert "15 total tokens" in text and "by backend" not in text
+
+
+@pytest.mark.parametrize("second_quotes, top", [([], None), (["snapshot 12", "second miss"], "second miss")],
+                         ids=["valid-second", "second-drops"])
+def test_a_rejected_first_backend_keeps_its_miss_in_fallback_from(dual, second_quotes, top):
+    dual.claude = [ran(claude_rows({**EXTRA, "evidence": ["first\nmiss"]}))]
+    dual.replies = [{**EXTRA, "evidence": second_quotes}]
+    d = decide(dual)
+    assert d.extra_round and d.backend == "deepseek" and len(dual.calls) == 1
+    [record] = dual.records()
+    assert record["fallback_from"]["evidence_miss"] == "first\nmiss"
+    assert "evidence_dropped" not in record["fallback_from"]
+    assert record.get("evidence_miss") == top and record.get("evidence_dropped") == (1 if top else None)
+    log = Path(os.environ["LOGS"], "runner.log").read_text()
+    assert "fallback_evidence_miss='first\\nmiss'" in log
+    assert (" evidence_miss=" in log) == bool(top)
+
+
+def test_a_first_backend_that_dropped_quotes_and_failed_keeps_the_count_in_fallback_from(dual):
+    reply = {**EXTRA, "action": "merge_now", "evidence": ["snapshot 12", "first miss"]}
+    dual.claude = [ran(claude_rows(reply))]
+    dual.replies = [EXTRA]
+    assert decide(dual).extra_round
+    [record] = dual.records()
+    assert record["fallback_from"]["evidence_dropped"] == 1
+    assert record["fallback_from"]["evidence_miss"] == "first miss"
+    assert "evidence_dropped" not in record and "evidence_miss" not in record

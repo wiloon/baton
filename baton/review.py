@@ -861,8 +861,8 @@ class Review:
         return prompts.render(self.self_dir / template, list(pairs.items()), env=self.env)
 
     def review_followup(self, round, reviewer):
-        """A later round mostly re-checks the fix commits, so it runs on the cheaper model. Codex keeps
-        its usual one on code Codex wrote: the two must be different models."""
+        """A later round mostly re-checks the fix commits, so it runs on the cheaper model. A
+        same-vendor reviewer keeps the base route (vendors.review_model)."""
         return round > 1 and not (vendors.same_vendor_review(reviewer)
                                   and reviewer in vendors.review_excluded(self.state, self.pr, self.fixed_by))
 
@@ -883,8 +883,8 @@ class Review:
                            issue=self.issue, fixed_by=self.fixed_by, pinned=continuity_pin(current))
 
     def review_allowed(self, vendor, model=""):
-        """Persisted authors survive restarts and role changes: a vendor that wrote the PR does
-        not review it. The PR goes to the owner otherwise."""
+        """Persisted authors survive restarts and role changes: a vendor that wrote the PR reviews
+        it only under a same-vendor policy. The PR goes to the owner otherwise."""
         cfg = self.env.config
         if vendor not in cfg.declared() or not cfg.allows(vendor, "reviewer"):
             self.handoff("reviewer_role_denied", f"PR #{self.pr} needs you",
@@ -940,7 +940,8 @@ class Review:
         self.values.update(round=round, step="review", reviewer=reviewer)
         followup = self.review_followup(round, reviewer)
         tier = tiers.step(self.env, "review", self.issue, pr)
-        expected = self.env.config.models.route("review", reviewer, followup=followup, tier=tier).model
+        expected, same_vendor = vendors.review_model(self.state, pr, reviewer, tier, followup, self.fixed_by,
+                                                     config=self.env.config)
         if not self.review_allowed(reviewer, expected):
             return self.failed(ALREADY, "RESULT: failed reviewer model may be a PR author")
         numstat = git(wt, "diff", "--numstat", "origin/main...HEAD") or ""
@@ -969,7 +970,7 @@ class Review:
         fields = {**path_field, "PR": str(pr),"ISSUE": self.issue or "unknown", "GH_REPO": self.repo, "WORKTREE": str(wt),
                   "ROUND": str(round), "MAX_ROUNDS": str(self.max_rounds), "ROUND_NOTE": note,
                   "CONTEXT_FILE": str(context), "NIT_RULE": nit_rule(self.repo, self.issue)}
-        runtime = self.env.with_runtime(review_followup=followup)
+        runtime = self.env.with_runtime(review_followup=followup, review_model=expected if same_vendor else "")
         if review_file is None:
             out = self.agent(reviewer, "review", self.render(adapter.REVIEW_TEMPLATE, **fields),
                              f"pr-{pr}-{reviewer}-review-{round}", env=runtime)
@@ -989,7 +990,7 @@ class Review:
         review_note = ""
         if vendors.same_vendor_review(reviewer) and reviewer in vendors.review_excluded(self.state, pr, self.fixed_by):
             mode = vendors.same_vendor_review_mode(self.state, pr, reviewer, model)
-            review_note = f"Review mode: {mode} ({reviewer}/{model}).\n\n"
+            review_note = f"Review mode: {mode} ({reviewer}/{model or 'unknown'}).\n\n"
         if review_file is None:
             reply = strip_markers(out["reply"] or "")
             body = "\n".join(line for line in reply.split("\n") if not MARKER_LINE.match(line)).rstrip("\n")[:REPLY_CAP]

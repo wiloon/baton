@@ -63,3 +63,9 @@ def test_a_repository_without_options_takes_only_targets():
 
 def test_a_repository_without_a_gate_hook_has_no_gate():
     assert e2e_gate.parse(body("tests/test_cart.py"), other(gate_hook=None)) == ""
+
+
+def test_author_marker_after_e2e_gate_is_ignored():
+    marker = "<!-- baton-author: vendor=claude model=claude-opus-5-5 -->"
+    assert e2e_gate.parse(f"Goal\n\n## E2E gate\nnone\n\n{marker}\n", REPO) == ""
+    assert e2e_gate.parse(f"Goal\n\n## E2E gate\ne2e/a.spec.ts --repeat-each=2\n{marker}\n", REPO) == "e2e/a.spec.ts --repeat-each=2"

@@ -240,7 +240,7 @@ def run(config, state, root, output, repo='', pipeline='', retry=False, held=Fal
                 report['analysis_attempts'] = mine
                 if not reason:
                     failed = {a['vendor'] for a in mine if a['state'] != 'success'}
-                    with analyst_pool.reserve(config, state, now, failed) as (analyst, available, selection):
+                    with analyst_pool.reserve(config, state, now, failed) as (analyst, selection):
                         report['selection'] = selection
                         reason = selection['reason']
                         if reason:
@@ -265,7 +265,7 @@ def run(config, state, root, output, repo='', pipeline='', retry=False, held=Fal
                             calls += 1
                             # Never run in a task checkout, and never register this call as a workload.
                             with tempfile.TemporaryDirectory(prefix='analyst-', dir=root) as directory:
-                                result = analyze(config, analyst, prompt, Path(directory), report['facts'], available.fileno())
+                                result = analyze(config, analyst, prompt, Path(directory), report['facts'])
                             windows = result.pop('quota_windows', {})
                             try:
                                 observed = time.time()

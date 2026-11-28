@@ -90,6 +90,9 @@ class Repo:
     screenshot_review: bool = False
     # false: every PR of this repository waits for the owner, whatever scheduling.auto_merge says.
     auto_merge: bool = True
+    # Tie-break among equal-priority candidates across repositories under baton serve (#300).
+    # Integer ≥ 1; higher goes first. Priority always beats it. Default 1; no expiry.
+    weight: int = 1
     # Globs relative to the repository root (fnmatch: * also matches /). A PR whose diff touches
     # one, under its old or new name, never auto-merges: it goes to the owner after review and
     # CI pass, and no advisor may release it (#131).

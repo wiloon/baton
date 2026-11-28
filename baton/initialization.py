@@ -30,6 +30,7 @@ class Runtime:
     no_new_issue: bool = False   # serve child: --no-new-issue
     spec_followup: bool = False
     review_followup: bool = False
+    review_model: str = ""       # a same-vendor review's model, over its route's
     fix_followup: bool = False
     tiers: dict = field(default_factory=dict)   # route -> the tier this step read (baton.tiers)
 

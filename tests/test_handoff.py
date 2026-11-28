@@ -110,7 +110,7 @@ def test_python_and_alloy_reason_filters_include_every_handoff_reason():
 def test_category_4_sites_have_direct_mode_and_no_recovery_actions():
     for reason in ("auto_merge_off", "owner_review_paths", "manual_checks", "spec_rejected",
                    "fix_needs_info", "dev_blocked", "reviewer_unavailable",
-                   "review_independence_denied", "reviewer_role_denied"):
+                   "review_independence_denied", "reviewer_role_denied", "spec_adr_head_moved"):
         entry = handoff.REASONS[reason]
         assert entry.category == 4 and entry.mode == "direct" and entry.actions == ()
 

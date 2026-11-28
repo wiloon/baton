@@ -129,7 +129,7 @@ def record_author(state, pr, vendor):
 
 
 def record_author_model(state, pr, vendor, model):
-    """Persist the model that actually wrote a PR; unknown is never review eligible."""
+    """Persist the model that actually wrote a PR; unknown is never proof of a distinct model."""
     path = state_path(state, pr, "author-models")
     rows = _lines(path)
     row = f"{vendor} {model or 'unknown'}"
@@ -142,7 +142,7 @@ def record_author_model(state, pr, vendor, model):
             and vendor in _lines(state_path(state, pr, "authors"))
             and state_path(state, pr, "contrib").exists()):
         # A pre-migration contribution has no model proof. A later fix cannot
-        # retroactively make the entire PR eligible for same-vendor review.
+        # retroactively prove which models wrote the entire PR.
         row = f"{unknown}\n{row}"
     with path.open("a") as file:
         file.write(row + "\n")
@@ -280,7 +280,7 @@ def review_excluded(state, pr, fixed_by=""):
 
 
 def same_vendor_review(vendor):
-    """VENDOR may review its own code on a proven model (SAME_VENDOR_REVIEW)."""
+    """VENDOR may review its own code as the last resort (SAME_VENDOR_REVIEW)."""
     adapter = agents.ADAPTERS.get(vendor)
     return bool(adapter and adapter.SAME_VENDOR_REVIEW)
 
@@ -308,22 +308,45 @@ def alternating_spec_vendor():
 
 
 def same_vendor_review_mode(state, pr, vendor, model):
-    """How a same-vendor reviewer may audit its own code: with a different model, or, as the last
-    resort, with the same model in a fresh session (every review run starts one). "" when the
-    adapter does not allow it or a model is not proven: unknown authors are never review eligible.
-    An adapter's distinct_models(a, b) compares aliases and IDs (Claude's "sonnet" is
-    claude-sonnet-*, and its Opus, Sonnet, Haiku and Fable families differ);
-    SAME_VENDOR_SAME_MODEL says whether the fresh-session last resort is allowed."""
+    """How a same-vendor reviewer audits its own code: with a different model when MODEL and
+    every writer's model are known and distinct, else with the same model in a fresh session
+    (every review run starts one), so the pipeline never stalls on review independence.
+    "unknown" and "auto" name no model. "" when the adapter has no same-vendor review."""
     if not same_vendor_review(vendor):
         return ""
+
+    def known(name):
+        return name.lower() not in ("", "unknown", "auto")
+
     written = [row.split(maxsplit=1)[1] for row in _lines(state_path(state, pr, "author-models"))
                if row.startswith(f"{vendor} ")]
-    if not (model and model != "unknown" and written and "unknown" not in written):
-        return ""
-    adapter = agents.ADAPTERS[vendor]
-    if all(models_distinct(vendor, model, author_model) for author_model in written):
+    if written and known(model) and all(known(name) and models_distinct(vendor, model, name) for name in written):
         return "same-vendor-different-model"
-    return "same-model-fresh-context" if getattr(adapter, "SAME_VENDOR_SAME_MODEL", False) else ""
+    return "same-model-fresh-context"
+
+
+def review_model(pr_state, pr, vendor, tier="standard", followup=False, fixed_by="", config=None):
+    """(model, mode) of VENDOR's code review of PR. A vendor that did not write it: the review
+    route's model and no mode. One that did: its first configured model distinct from every
+    writer's, else the review route's (ADR 0002). Only the model changes."""
+    config = config or session.resolve().config
+    if vendor not in review_excluded(pr_state, pr, fixed_by):
+        return config.models.route("review", vendor, followup=followup, tier=tier).model, ""
+    base = config.models.route("review", vendor, tier=tier).model
+    if same_vendor_review(vendor):
+        configured = [base]
+        for role, options in (("spec_review", {"tier": tier}), ("screenshot_review", {}),
+                              ("review", {"followup": True}), ("spec_review", {"followup": True})):
+            try:
+                configured.append(config.models.route(role, vendor, **options).model)
+            except StopIteration:
+                pass   # the vendor has no such route
+        configured += config.vendor(vendor).fallback_models
+        for model in configured:
+            mode = same_vendor_review_mode(pr_state, pr, vendor, model)
+            if mode == "same-vendor-different-model":
+                return model, mode
+    return base, same_vendor_review_mode(pr_state, pr, vendor, base)
 
 
 def review_allowed(state, pr, vendor, model="", fixed_by=""):
@@ -333,8 +356,8 @@ def review_allowed(state, pr, vendor, model="", fixed_by=""):
 
 
 def screenshot_allowed(state, pr, vendor, model="", fixed_by=""):
-    """The screenshot review may run on VENDOR: it did not write the PR, or it is Codex on a model
-    other than the one that wrote it (a same-model fresh session does not count)."""
+    """The screenshot review may run on VENDOR: it did not write the PR, or it reviews on a model
+    other than those that wrote it (a same-model fresh session does not count)."""
     if vendor not in review_excluded(state, pr, fixed_by):
         return True
     return same_vendor_review_mode(state, pr, vendor, model) == "same-vendor-different-model"
@@ -368,9 +391,8 @@ def _quota_pick(state, vendors, now, current=None, prefer=()):
                                 current=current, prefer=prefer)
 
 
-def _preferred(state, pool, tied, prefer, now):
-    """The first of TIED in PREFER order that may win: Cursor (outside the pool's balance)
-    always, a pool vendor when its headroom is within quota.TIE of the best tied pool vendor."""
+def _tie_choice(state, pool, tied, prefer, now):
+    """The winner among TIED by the shared preference, pool, then extra-pace policy."""
     try:
         chosen, _ = vendor_policy.choose(state, session.resolve().config.quota, pool, tied, now,
                                          prefer=prefer, extras=True)
@@ -385,7 +407,7 @@ def selection_details(state, pool, candidates, chosen, role, *, area="", now=Non
     prefer, label = preference(role, area)
     config = session.resolve().config.quota
     parts = [f"chosen={chosen} role={role} preference={label or role}:{','.join(prefer) or 'none'}",
-             "extra_policy=preference-before-pool-pace"]
+             "extra_policy=preference-then-pool-then-extra-pace"]
     for vendor in dict.fromkeys(candidates):
         snap = quota.load(state, vendor)
         cap = config.cap_of(vendor)
@@ -401,7 +423,7 @@ def selection_details(state, pool, candidates, chosen, role, *, area="", now=Non
 
 def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool",
          now=None, probe_only=False, review=False, fixed_by="", area="", other_model="", pr_state=None,
-         spec_followup=False, pinned=False, tier="standard"):
+         spec_followup=False, pinned=False, tier="standard", avoid_author=""):
     """TIER: the step's route tier, which sets the model same-vendor eligibility is judged on.
     STATE: the machine's cooldowns and quota; PR_STATE (default STATE): the repository's PR
     records (authors, contributions)."""
@@ -418,16 +440,22 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
     preferred = f"preferred for {prefer_label}: {' '.join(prefer)}; " if prefer else ""
     excluded = set(exclude)
     shots = role == "screenshot_reviewer"
-    fallbacks = {}
+    fallbacks, fallback_models = {}, {}
     if review:
-        excluded.update(review_excluded(pr_state, pr, fixed_by))
+        authors = review_excluded(pr_state, pr, fixed_by)
+        excluded.update(authors)
         for same in candidates:
-            if same not in excluded or not same_vendor_review(same):
+            if same not in authors or not same_vendor_review(same):
                 continue
-            mode = same_vendor_review_mode(pr_state, pr, same, config.models.route(
-                "screenshot_review" if shots else "review", same, tier=tier).model)
-            if mode and (not shots or mode == "same-vendor-different-model"):
-                fallbacks[same] = mode
+            if shots:
+                model = config.models.route("screenshot_review", same, tier=tier).model
+                mode = same_vendor_review_mode(pr_state, pr, same, model)
+                if mode != "same-vendor-different-model":
+                    continue
+            else:
+                model, mode = review_model(pr_state, pr, same, tier, fixed_by=fixed_by, config=config)
+                fallback_models[same] = model
+            fallbacks[same] = mode
         review_pool = [v for v in (candidates if shots else all_vendors(pool, extra=extra)) if v in eligible]
         if review_pool and all(v in excluded for v in review_pool) and not fallbacks:
             return {"vendor": "", "reason": "all eligible reviewers excluded by authorship",
@@ -444,6 +472,10 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
             model = session.resolve().config.models.route(route_role, same, followup=followup, tier=tier).model
             if models_distinct(same, model, other_model):
                 fallbacks[same] = "same-vendor-different-model"
+        if role == "spec_reviewer" and avoid_author and avoid_author in candidates and avoid_author not in excluded:
+            # ADR 0002 (#274): the issue's author vendor is a preference, never a hard exclusion.
+            excluded.add(avoid_author)
+            fallbacks[avoid_author] = "author-vendor"
     ordered = ([current, *candidates] if by == "pool" else candidates)
     ready, blocked, probe = [], {}, []
     horizons = {}   # blocked vendor -> vendor_policy.SHORT or LONG
@@ -492,6 +524,8 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
             result = {"vendor": ready[0], "reason": "", "probe": [], "blocked": blocked, "quota_error": True}
             if review:
                 result["review_mode"] = fallbacks.get(ready[0], "cross-vendor")
+            if ready[0] in fallback_models:
+                result["review_model"] = fallback_models[ready[0]]
             return result, 0
         if not chosen:
             return {"vendor": "", "reason": f"quota limits: {summary}",
@@ -501,6 +535,8 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
         result = {"vendor": chosen, "reason": preferred + summary, "probe": [], "blocked": blocked}
         if review:
             result["review_mode"] = fallbacks.get(chosen, "cross-vendor")
+        if chosen in fallback_models:
+            result["review_model"] = fallback_models[chosen]
         return result, 0
 
     # Contribution picks check each pool vendor's quota independently. A quota
@@ -536,21 +572,13 @@ def pick(state, pool, role, candidates, current="", pr="", exclude=(), by="pool"
         chosen, preferred = current, ""
     elif len(tied) < 2:
         preferred = ""
-    elif prefer:
-        chosen = _preferred(state, pool, tied, prefer, now)
     else:
-        pool_tied = [v for v in tied if v in pool]
-        if len(pool_tied) > 1:
-            try:
-                best, _ = _quota_pick(state, pool_tied, now)
-                if best:
-                    chosen = best
-            except Exception:
-                pass
+        chosen = _tie_choice(state, pool, tied, prefer, now)
     lines = "".join(f" {v}={counts[v]}" for v in eligible)
     skipped = "".join(f"; {v}: {why}" for v, why in blocked.items())
+    model = {"review_model": fallback_models[chosen]} if chosen in fallback_models else {}
     return {"vendor": chosen, "reason": f"{preferred}lines:{lines}{skipped}",
-            "review_mode": fallbacks.get(chosen, "cross-vendor"),
+            "review_mode": fallbacks.get(chosen, "cross-vendor"), **model,
             "probe": [], "blocked": blocked}, 0
 
 

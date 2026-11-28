@@ -16,7 +16,8 @@ import sys
 import urllib.error
 import urllib.request
 
-from . import credentials, md, notify as notifier
+from . import credentials, md, notify as notifier, vendors
+from .common import format_author_marker, prepend_author_marker, strip_markers
 from .notify import log, notify
 from .pr import body as pr_body, create_issue, gh, missing_requested_labels, view, why
 
@@ -26,6 +27,7 @@ ISSUE_BODY_MAX = 60000
 REVIEW_MARKER = "<!-- baton-review "
 SCREENSHOT_REVIEW_MARKER = "<!-- baton-screenshot-review "
 FIX_MARKER = "<!-- baton-fix "
+BY_RE = re.compile(r"\bby=([A-Za-z0-9_-]+)\b")
 ADOPTED = re.compile(r"`?:?\s+adopted\b", re.I)
 FILED_BUGS_MARKER = "<!-- baton-filed-bugs -->"
 LINEAR_ERROR_MAX = 500
@@ -123,13 +125,55 @@ def open_bug_keys():
     return {md.bug_key(t["title"]) for t in json.loads(listed.stdout or "[]")} if listed.returncode == 0 else set()
 
 
-def file_bug(pr, src, text):
+def _pr_author(pr):
+    """(vendor, model) when vendors.record_author holds exactly one configured vendor, else ('', '')."""
+    env = session.resolve()
+    state = str(env.dirs.state)
+    authors = [line.strip() for line in vendors._lines(vendors.state_path(state, pr, "authors")) if line.strip()]
+    if len(authors) != 1 or authors[0] not in env.config.declared():
+        return "", ""
+    vendor = authors[0]
+    models = [row.split(maxsplit=1)[1] for row in vendors._lines(vendors.state_path(state, pr, "author-models"))
+              if row.startswith(f"{vendor} ") and len(row.split(maxsplit=1)) == 2]
+    unique = list(dict.fromkeys(models))
+    return vendor, (unique[0] if len(unique) == 1 else "unknown")
+
+
+def _comment_author(text):
+    """(vendor, 'unknown') from a review or screenshot review comment's by= marker, else ('', '')."""
+    first = (text or "").split("\n", 1)[0]
+    match = BY_RE.search(first)
+    if not match:
+        return "", ""
+    vendor = match.group(1)
+    if vendor not in session.resolve().config.declared():
+        return "", ""
+    return vendor, "unknown"
+
+
+def _combined_author(authors):
+    """(vendor, model) when every item came from the same configured vendor, else ('', '')."""
+    if not authors:
+        return "", ""
+    vendors_seen = {v for v, _ in authors}
+    if len(vendors_seen) != 1 or "" in vendors_seen:
+        return "", ""
+    vendor = next(iter(vendors_seen))
+    models = {m for _, m in authors if m and m != "unknown"}
+    return vendor, (next(iter(models)) if len(models) == 1 and all(m == next(iter(models)) for _, m in authors) else "unknown")
+
+
+def file_bug(pr, src, text, *, author=("", "")):
     """The new issue's number, or None when gh failed."""
-    bug = text.split("\n", 1)[0].split(" — ", 1)[0]
+    clean = strip_markers(text).rstrip("\n")
+    bug = clean.split("\n", 1)[0].split(" — ", 1)[0]
     labels = ("needs-triage",)
+    body = f"{clean}\n\nFound while working on {src}, outside its scope."
+    if author[0]:
+        body = prepend_author_marker(body, format_author_marker(author[0], author[1]))
     created, applied = create_issue(
         repo(), title=bug[:120], labels=labels,
-        body=f"{text}\n\nFound while working on {src}, outside its scope.",
+        body=body,
         allow_unlabelled=True, context=f"PR #{pr}: side bug")
     if created.returncode != 0:
         log(f"PR #{pr}: filing a side bug failed: {bug}{why(created)}")
@@ -151,17 +195,18 @@ def file_pr_bugs(pr, issue):
         return
     done.touch()   # before filing: a half-filed PR is logged, never filed twice
     src = f"PR #{pr}" + (f" (issue #{issue})" if issue else "")
+    author = _pr_author(pr)
     seen, filed = open_bug_keys(), []
     for kind, text in md.items(md.section("Follow-ups", pr_body(pr) or "")):
         if kind != "bug":
             continue
-        bug = text.split("\n", 1)[0].split(" — ", 1)[0]
+        bug = strip_markers(text).split("\n", 1)[0].split(" — ", 1)[0]
         key = md.bug_key(bug)
         if key in seen or NAMED_ISSUE.match(text):
             log(f"PR #{pr}: side bug already filed: {bug}")
             continue
         seen.add(key)
-        if number := file_bug(pr, src, text):
+        if number := file_bug(pr, src, text, author=author):
             with open(done, "a") as file:
                 file.write(key + "\n")
             filed.append(f"- #{number} {bug}")
@@ -194,30 +239,39 @@ def follow_ups(pr, issue):
     except OSError:
         pass
 
+    pr_author = _pr_author(pr)
+    followup_authors = []
     other = ""
-    noted = md.section("Follow-ups", body) + "\n".join(review_sections(reviews, "Follow-ups"))
-    for kind, text in md.items(noted):
-        if kind == "bug":
-            bug = text.split("\n", 1)[0].split(" — ", 1)[0]
-            key = md.bug_key(bug)
-            if key in seen or NAMED_ISSUE.match(text):
-                log(f"PR #{pr}: side bug already filed: {bug}")
-                continue
-            seen.add(key)
-            file_bug(pr, src, text)
-        elif not drop_nits and worth_filing(pr, ranges, adopted, text):
-            other += f"- {text}\n"
+    noted_sources = [(pr_author, md.section("Follow-ups", body))]
+    for review in reviews:
+        noted_sources.append((_comment_author(review), "\n".join(review_sections([review], "Follow-ups"))))
+    for source_author, section_text in noted_sources:
+        for kind, text in md.items(section_text):
+            if kind == "bug":
+                bug = strip_markers(text).split("\n", 1)[0].split(" — ", 1)[0]
+                key = md.bug_key(bug)
+                if key in seen or NAMED_ISSUE.match(text):
+                    log(f"PR #{pr}: side bug already filed: {bug}")
+                    continue
+                seen.add(key)
+                file_bug(pr, src, text, author=source_author)
+            elif not drop_nits and worth_filing(pr, ranges, adopted, text):
+                other += f"- {strip_markers(text)}\n"
+                followup_authors.append(source_author)
 
     # Each review comment's Nits; a later round lists only what is new.
     nit_reviews = [text for text in own if text.startswith((REVIEW_MARKER, SCREENSHOT_REVIEW_MARKER))]
-    lines = ["" if line == "## Nits" else line for line in review_sections(nit_reviews, "Nits")]
-    lines = [line for line in lines if not re.fullmatch(r"\s*none\.?\s*", line, re.I)]
-    while lines and not lines[0]:
-        lines.pop(0)
     nits = ""
-    for _, text in md.items("\n".join(lines).rstrip("\n")):
-        if worth_filing(pr, ranges, adopted, text):
-            nits += f"- {text}\n"
+    for review in nit_reviews:
+        source_author = _comment_author(review)
+        lines = ["" if line == "## Nits" else line for line in review_sections([review], "Nits")]
+        lines = [line for line in lines if not re.fullmatch(r"\s*none\.?\s*", line, re.I)]
+        while lines and not lines[0]:
+            lines.pop(0)
+        for _, text in md.items("\n".join(lines).rstrip("\n")):
+            if worth_filing(pr, ranges, adopted, text):
+                nits += f"- {strip_markers(text)}\n"
+                followup_authors.append(source_author)
 
     if drop_nits:
         if nits or other:
@@ -229,6 +283,9 @@ def follow_ups(pr, issue):
             "None changes behaviour the PR shipped; pick any subset or close this.\n"
             + (f"\n## Review nits\n\n{nits}\n" if nits else "")
             + (f"\n## Noted while implementing or reviewing\n\n{other}" if other else "") + "\n")
+    vendor, model = _combined_author(followup_authors)
+    if vendor:
+        text = prepend_author_marker(text, format_author_marker(vendor, model))
     text = text.encode()[:ISSUE_BODY_MAX].decode(errors="ignore").rstrip("\n")
     created, applied = create_issue(
         repo(), title=f"Follow-ups from #{pr}: {title[:110]}", labels=("follow-up",), body=text,

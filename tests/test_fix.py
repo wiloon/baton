@@ -432,6 +432,25 @@ def test_a_verified_fix_is_recorded_pushed_and_its_checks_refreshed(run):
     assert (state / f"pr-{PR}-contrib").read_text().startswith("codex ")
 
 
+@pytest.mark.parametrize("model", ["grok-4.7-high", "unknown"])
+def test_a_cursor_fix_records_the_model_that_wrote_it(run, model):
+    """#221: a Cursor fix left out of the writer models could pass as a different-model review."""
+    run.agent(cursor_plan("RESULT: fixed", model=model))
+    assert run.fix("cursor")["rc"] == 0 and run.pushed()
+    assert (run.root / "state" / f"pr-{PR}-author-models").read_text() == f"cursor {model}\n"
+
+
+def test_a_resumed_cursor_fix_records_the_saved_model(run, monkeypatch):
+    clock, _ = _flaky_edits(monkeypatch)
+    request = BODY.replace("## Checks to verify\nnone", "## Checks to verify\n- /billing: badge")
+    run.agent(cursor_plan("## Checks to verify\n- /billing: badge\n\nRESULT: fixed", request=request,
+                          model="grok-4.7-high"))
+    assert run.fix("cursor")["rc"] == 75
+    clock["now"] = 1_060
+    assert run.fix("cursor")["rc"] == 0
+    assert (run.root / "state" / f"pr-{PR}-author-models").read_text() == "cursor grok-4.7-high\n"
+
+
 @pytest.mark.parametrize("fixer", ["codex", "cursor"])
 def test_the_fixer_sees_the_current_origin_main(run, fixer):
     other = run.root / "other"

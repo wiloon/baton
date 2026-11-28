@@ -32,7 +32,7 @@ any open design finding or disagreement of the review loop that no current check
 ```
 
 "No usable verdicts" covers every case where the runner can't be sure: no screenshot review in
-the last round (setting off, owner-authored PR, Cursor review), a `## Checks` section without
+the last round (setting off, owner-authored PR), a `## Checks` section without
 exactly one valid verdict per check, a PR description whose checks changed after the review,
 a description whose checks section is missing, repeated or empty (no item to verify), and one
 that carries both the old and the new heading. Missing information never merges: zero items
@@ -118,3 +118,5 @@ There is no per-repository way around this gate (issue #95).
   findings carried to "Checks to try", the saved remainder computed from the gate's body, the
   tracker never dropping a recorded finding) are withdrawn with the `defer` path itself. With
   one gate, a check blocked by a design finding always goes to the owner before the merge.
+- Issue #384: a Cursor code review is no longer a case of "no usable verdicts", because the code
+  reviewer's vendor no longer decides whether the screenshot review runs (ADR 0005).

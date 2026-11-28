@@ -13,6 +13,7 @@ import pytest
 
 from baton import capacity, config, retrospectives as retro
 from baton.retrospective_evidence import Ledger, digest, markdown, subject
+from conftest import in_flight
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -227,8 +228,7 @@ def test_repositories_episodes_and_workload_concurrency(host):
     seed(host.state, 'active', issue=99)
     with (host.state/'lock').open('w') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        with capacity.lease(host.state, 'codex') as acquired:
-            assert acquired
+        with in_flight(host.state, 'codex'):
             result=host.run(pipeline=a)
     assert result[0]['state']=='success'
     assert host.run(repo='acme/other')[0]['pipeline_id']==b
@@ -298,7 +298,7 @@ def test_capacity_pause_credentials_quota_and_activation_budget(host):
     assert host.run()[0]['reason']=='retrospectives_paused'
     assert host.report(pipe)['evidence']['task']['pipeline_id']==pipe
     pause.unlink()
-    with capacity.lease(host.state,'claude'):
+    with in_flight(host.state,'claude'):
         assert host.run()[0]['reason']=='vendor_capacity'
     (host.state/'credential-claude.json').unlink()
     assert host.run()[0]['reason']=='credential_unavailable'
@@ -446,7 +446,7 @@ def test_two_public_workers_serialize_and_do_not_duplicate_calls(host):
         second=subprocess.run(command,capture_output=True,text=True,timeout=10)
         assert second.returncode==0
         assert json.loads(second.stdout)['state']=='busy'
-        assert capacity.busy(host.state,'claude')
+        assert not capacity.busy(host.state,'claude')   # an analysis holds no vendor lock
         out,err=first.communicate(timeout=10)
         assert first.returncode==0,err
         assert json.loads(out)['state']=='success'
@@ -492,7 +492,7 @@ def test_real_producer_events_and_attempts_are_consumed_read_only(host, monkeypa
 
 def test_unchanged_capacity_deferral_does_not_grow_report_history(host):
     pipe=seed(host.state)
-    with capacity.lease(host.state,'claude'):
+    with in_flight(host.state,'claude'):
         assert host.run()[0]['reason']=='vendor_capacity'
         before=list(host.output.glob('**/report.json'))
         assert host.run()[0]['state']=='unchanged'
@@ -501,7 +501,50 @@ def test_unchanged_capacity_deferral_does_not_grow_report_history(host):
     assert len(host.calls())==1
 
 
-def enable_vendors(host, vendors=('claude', 'codex', 'cursor')):
+def test_a_dispatch_blocks_the_analyst_but_an_analysis_does_not_block_a_dispatch(host, monkeypatch, tmp_path):
+    from baton import dispatch, retrospective_analyst, session
+    seed(host.state)
+    work_tree = tmp_path/'wt'
+    subprocess.run(['git', 'init', '-q', str(work_tree)], check=True)
+    started, during_dispatch, during_analysis = [], [], []
+
+    def workload(request, cooldown_hours):
+        started.append(request.vendor)
+        raise RuntimeError('stop here')   # dispatch reports an adapter failure
+
+    def mid_run(request, cooldown_hours):
+        during_dispatch.append((host.run()[0]['reason'], len(host.calls())))   # the retrospectives entry point
+        workload(request, cooldown_hours)
+
+    monkeypatch.setattr(dispatch.agents, 'run', mid_run)
+    monkeypatch.setattr(dispatch.agents, 'preflight', lambda *_: '')
+    # notify.log calls naked session.resolve(); the autouse fixture builds that from LOGS.
+    logs = tmp_path / 'logs'
+    logs.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv('LOGS', str(logs))
+    c = replace(host.config, paths=replace(host.config.paths, logs=logs))
+    env = session.create(c, repo=c.repos[0])
+    env.dirs.logs.mkdir(parents=True, exist_ok=True)
+
+    def run_claude():
+        return dispatch.dispatch('claude', 'review', 'p', 't', str(work_tree), env=env)
+
+    run_claude()
+    assert started == ['claude'] and during_dispatch == [('vendor_capacity', 0)]
+
+    real = retrospective_analyst.bounded_process
+
+    def analysis(*args, **kwargs):
+        monkeypatch.setattr(dispatch.agents, 'run', workload)
+        during_analysis.append((run_claude()['defer'], len(started)))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(retrospective_analyst, 'bounded_process', analysis)
+    assert host.run()[0]['state'] == 'success'
+    assert during_analysis == [('', 2)]
+
+
+def enable_vendors(host,vendors=('claude', 'codex', 'cursor')):
     baseline = config.load(ROOT / 'config.example.toml')
     kept = tuple(v for v in baseline.vendors if v.id in vendors)
     pool = tuple(v.id for v in kept if v.quota == 'pool')
@@ -537,7 +580,7 @@ def test_claude_quota_exhaustion_selects_sol_and_preserves_shared_accounting(hos
 def test_unavailable_pool_selects_explicit_grok_not_auto(host):
     pipe=seed(host.state)
     enable_vendors(host)
-    with capacity.lease(host.state,'claude'),capacity.lease(host.state,'codex'):
+    with in_flight(host.state,'claude'),in_flight(host.state,'codex'):
         assert host.run()[0]['state']=='success'
     attempt=host.report(pipe)['analysis_attempts'][0]
     assert attempt['vendor']=='cursor' and attempt['requested_model']=='grok-4.7-high'
@@ -611,19 +654,36 @@ def test_review_and_retrospective_share_quota_pace_and_preference_policy(host):
         chosen,rc=vendors.pick(str(host.state),['claude','codex'],'review',
             ['claude','codex','cursor'],by='contrib',now=int(time.time()))
         assert rc==0
-        with analyst_pool.reserve(host.config,host.state,time.time()) as (analyst,lease,selection):
+        with analyst_pool.reserve(host.config,host.state,time.time()) as (analyst,selection):
             assert analyst.vendor==chosen['vendor']=='codex'
     finally:session._active.reset(token)
 
 
 def test_all_vendors_unavailable_preserve_evidence_without_calls(host):
     pipe=seed(host.state);enable_vendors(host)
-    with capacity.lease(host.state,'claude'),capacity.lease(host.state,'codex'),capacity.lease(host.state,'cursor'):
+    with in_flight(host.state,'claude'),in_flight(host.state,'codex'),in_flight(host.state,'cursor'):
         assert host.run()[0]['reason']=='vendor_capacity'
     report=host.report(pipe)
     assert set(report['selection']['blocked'])=={'claude','codex','cursor'}
     assert report['evidence']['usage']['input_tokens']['value']==10
     assert not host.calls()
+
+
+def test_extra_analysts_are_reserved_by_quota_pace(host):
+    from baton import analyst_pool
+    enable_vendors(host, ('codex', 'cursor'))
+    # Both outside the pool: candidate order puts the near-exhausted one first.
+    host.config = replace(host.config, preferences=(),
+                          vendors=tuple(replace(v, quota='extra', cap=0.999) for v in host.config.vendors),
+                          quota=replace(host.config.quota, vendor_pool=(), vendor_extra=('codex', 'cursor'),
+                                        caps=(('codex', 0.999), ('cursor', 0.999))))
+    for vendor, used in (('codex', 0.993), ('cursor', 0.276)):
+        path = host.state/f'quota-{vendor}.json'
+        row = json.loads(path.read_text())
+        row['windows']['seven_day']['used'] = used
+        path.write_text(json.dumps(row))
+    with analyst_pool.reserve(host.config, host.state, time.time()) as (analyst, selection):
+        assert analyst.vendor == 'cursor'
 
 
 def test_explicit_retrospective_preference_matches_review_extra_policy(host):
@@ -638,9 +698,9 @@ def test_daily_budget_is_shared_across_successful_vendors(host):
     first=seed(host.state);second=seed(host.state);third=seed(host.state);fourth=seed(host.state)
     enable_vendors(host)
     assert host.run(pipeline=first)[0]['state']=='success'
-    with capacity.lease(host.state,'claude'):
+    with in_flight(host.state,'claude'):
         assert host.run(pipeline=second)[0]['state']=='success'
-    with capacity.lease(host.state,'claude'),capacity.lease(host.state,'codex'):
+    with in_flight(host.state,'claude'),in_flight(host.state,'codex'):
         assert host.run(pipeline=third)[0]['state']=='success'
     assert host.run(pipeline=fourth)[0]['reason']=='daily_budget'
     assert [c['vendor'] for c in host.calls()]==['claude','codex','cursor']

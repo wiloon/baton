@@ -52,7 +52,11 @@ new issue, and `max_pending_prs` limits new issues, with one exception: `P0`, fo
 running step is never interrupted, and a `P0` that cannot run now does not hold up other work.
 Under `baton serve`, priority is global across repositories: when free slots are contended the
 supervisor lists each due repository and starts the best ready work first (`P0` anywhere before
-`P1`, and so on; equal priority keeps rotation). In-flight work of a repository keeps its slot
+`P1`, and so on). Equal priority is broken by each repository's `weight` (an integer ≥ 1 in
+`[[repos]]`, default 1; higher first), then by rotation. Priority always beats weight: a `P1` in a
+weight-1 repository goes before a `P2` in a weight-5 one. Weight does not expire, does not change
+quota spend or vendor choice, and has no effect when free slots are not contended, on the legacy
+timer path, or inside a child's own `next_issue()`. In-flight work of a repository keeps its slot
 ahead of any new issue elsewhere
 ([ADR 0012](docs/adr/0012-supervisor-orders-work-by-priority-across-repositories.md)). The legacy
 timer path still turns per repository. A run by hand on one issue or PR has no `P0` step
@@ -87,7 +91,9 @@ the closed work back in, is not pushed and the issue is handed to you.
 
 **Picking a vendor.** For each run, baton drops the vendors that are resting after a limit or an
 auth failure, that are over their quota caps, or, for a review, that wrote any of the PR (when
-every vendor did, the same vendor reviews on a different model). That same-vendor fallback waits
+no other vendor can review, a vendor reviews its own code: on a different model when one is
+configured, otherwise on the same model in a fresh session; the screenshot review still needs a
+different model). That same-vendor fallback waits
 while another vendor is only briefly blocked, such as a full 5-hour window, and runs only when
 the others are out for the week, logged out, or resting past `same_vendor_wait_max_minutes`
 ([ADR 0002](docs/adr/0002-same-vendor-review-waits-for-short-blocks.md)). From the rest it takes the one
@@ -251,7 +257,8 @@ calls an agent CLI. Each tick is a child process for one repository, which honou
 
 - **`[scheduling] max_parallel`** (default 1): children running at once, across all repositories,
   never two for one repository. Under contention the supervisor prefers in-flight work, then an
-  hour-idle housekeeping turn, then the best candidate by priority, then plain rotation.
+  hour-idle housekeeping turn, then the best candidate by priority (equal priority: higher
+  `[[repos]] weight`, then rotation), then plain rotation.
 - **`[serve] poll_seconds`** (default 60, at least 10): how often it looks, and how long a
   repository waits after its tick exits. After a merged partial slice the next tick starts at once,
   at most `chain_max` times in a row. An assigned child that ran no item exits 81: due at once, and
@@ -292,11 +299,14 @@ a redacted snapshot and the allowed actions (`extra_round` or `handoff`).
 first and DeepSeek is the fallback. `["deepseek"]` uses DeepSeek only; `["claude"]` has no fallback.
 Listing `claude` is the grant for the advisor: Claude must be declared under `[vendors]` but needs
 no role. The call is a tool-less, isolated one-shot (`[advisor] claude = { model, effort }`, default
-`claude_strong` at `medium`) that takes no vendor lease; its quota use and quota, auth and busy
+`claude_strong` at `medium`) that does not mark Claude as running a workload; its quota use and quota, auth and busy
 rejections are accounted like any Claude run. Claude is skipped when it is undeclared, at its cap or
 five-hour limit, in cooldown, or its credential has expired. The next backend is tried once when one
 is skipped, fails or returns an unusable reply, never after a valid `handoff` or other well-formed
-outcome. Records, handoff notes and answer comments name the backend that answered. In `mode = "live"` the
+outcome. Records, handoff notes and answer comments name the backend that answered. An evidence
+quote must be in the sent snapshot (runs of whitespace aside): mismatching quotes are dropped while
+at least one matches, and the record and `runner.log` keep the first one, redacted and cut, as
+`evidence_miss` (except for a snapshot with opted-in excerpts). In `mode = "live"` the
 runner revalidates the state and grants at most one extra round per task episode. Failed
 review, fix, spec, implementation, local verification and worktree steps can also send a
 redacted step snapshot. Where the role and task allow it, `retry_step` repeats the failed step
@@ -412,9 +422,13 @@ Migrate legacy flat model keys before validating a host config. Run records dist
 the requested model from the actual model when the CLI reports it.
 
 Each vendor choice logs its preference order, weekly usage/cap, time to reset, pace score and
-quota/cooldown gate. Lower pace scores mean further behind the weekly spending pace. Cursor is
-an extra vendor outside pool balancing: a configured preference can choose it before comparing
-pool pace. This policy remains subject to quota limits and independent-review eligibility.
+quota/cooldown gate. Lower pace scores mean further behind the weekly spending pace. Extra
+vendors such as Cursor are outside pool balancing. Review-style picks among equal candidates
+choose in three steps: a vendor named by the preference wins, in its order (an extra whatever
+its pace, a pool vendor only when pool pace selects it); otherwise the best eligible pool vendor
+by pace; otherwise, among extras only, the best by pace. Pace scores within the tie margin
+keep candidate order. This policy remains subject to quota limits and independent-review
+eligibility.
 
 ## Telemetry
 

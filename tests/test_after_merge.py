@@ -107,6 +107,7 @@ def test_nits_on_the_prs_own_code_are_not_filed(gh, tmp_path):
     [issue] = gh.created()
     assert issue["title"] == "Follow-ups from #1: t" and issue["label"] == "follow-up"
     assert issue["body"] == (
+        "<!-- baton-author: vendor=codex model=unknown -->\n"
         "Non-blocking items PR #1 (issue #2) found in code it left untouched. "
         "None changes behaviour the PR shipped; pick any subset or close this.\n\n## Review nits\n\n"
         "- `billing_startup_test.go:15-20`: repeated sequence, but outside the PR's hunks.\n"
@@ -564,3 +565,59 @@ def test_follow_ups_non_label_error_on_retry_skips_unlabelled_fallback(gh, tmp_p
     assert gh.created() == []
     assert not any(c[:2] == ["issue", "create"] and "--label" not in c for c in gh.calls())
     assert any("HTTP 403: still forbidden" in line for line in log_lines(tmp_path))
+
+
+def test_file_pr_bugs_adds_author_marker_only_for_single_pr_author(gh, tmp_path):
+    from baton import vendors
+    state = str(tmp_path / "state")
+    vendors.record_author(state, "10", "claude")
+    vendors.record_author_model(state, "10", "claude", "claude-sonnet-4-6")
+    gh.set(body="## Follow-ups\n- [bug] Crash on empty — a.py:1\n  <!-- baton-author: vendor=codex model=fake -->")
+    after_merge.file_pr_bugs("10", "5")
+    [issue] = gh.created()
+    assert issue["body"].startswith("<!-- baton-author: vendor=claude model=claude-sonnet-4-6 -->\n")
+    assert "vendor=codex" not in issue["body"]
+
+    # Multiple PR authors -> no marker
+    vendors.record_author(state, "11", "claude")
+    vendors.record_author(state, "11", "codex")
+    gh.set(body="## Follow-ups\n- [bug] Another bug — b.py:2")
+    after_merge.file_pr_bugs("11", "6")
+    assert not gh.created()[-1]["body"].startswith("<!-- baton-author:")
+
+
+def test_follow_ups_author_markers_for_side_bugs_nits_and_owner_actions(gh, tmp_path):
+    from baton import vendors
+    state = str(tmp_path / "state")
+    vendors.record_author(state, "20", "claude")
+    gh.set(
+        title="feat: example",
+        body="## Follow-ups\n- [nit] tidy helper\n\n## Before release\n- rotate secret",
+        comments=comments(
+            "<!-- baton-review round=1 by=codex -->\n## Follow-ups\n- [bug] Race in cache — c.py:9\n## Nits\n- rename var",
+        ),
+    )
+    after_merge.follow_ups("20", "7")
+    after_merge.owner_actions("20", "7")
+    created = gh.created()
+    bug_issue = next(c for c in created if c["title"] == "Race in cache")
+    assert bug_issue["body"].startswith("<!-- baton-author: vendor=codex model=unknown -->\n")
+    # Combined follow-up has items from both claude (PR body) and codex (review nits) -> no marker
+    fu_issue = next(c for c in created if c["title"].startswith("Follow-ups from #20:"))
+    assert "<!-- baton-author:" not in fu_issue["body"]
+    # Owner-actions (ready-for-human) gets no marker
+    owner_issue = next(c for c in created if c["title"].startswith("Before the next release:"))
+    assert "<!-- baton-author:" not in owner_issue["body"]
+
+    # Single-vendor follow-up issue (only codex review + screenshot review nits) -> carries codex marker
+    gh.set(
+        title="feat: single",
+        body="## Follow-ups\nnone",
+        comments=comments(
+            "<!-- baton-review round=1 by=codex -->\n## Nits\n- nit one",
+            "<!-- baton-screenshot-review round=1 by=codex -->\n## Nits\n- nit two",
+        ),
+    )
+    after_merge.follow_ups("21", "8")
+    single_fu = next(c for c in gh.created() if c["title"].startswith("Follow-ups from #21:"))
+    assert single_fu["body"].startswith("<!-- baton-author: vendor=codex model=unknown -->\n")

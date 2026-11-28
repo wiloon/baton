@@ -30,7 +30,6 @@ ROUTE_FIELDS = frozenset({"model", "effort"})
 EMPTY_MODEL_OK = False
 RECORDS_AUTHOR_MODEL = False
 SAME_VENDOR_REVIEW = False
-SAME_VENDOR_SAME_MODEL = False
 DEFAULT_MAX_MINUTES = 30
 PREFLIGHT_CHECKS = (("stub-agent", "--version"),)
 VERSION_EXECUTABLE = "stub-agent"

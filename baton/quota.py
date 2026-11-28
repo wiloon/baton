@@ -56,7 +56,7 @@ def atomic_json(path, value):
 
 @contextmanager
 def locked(state, vendor):
-    """Short storage lock, independent of the lease held during model execution."""
+    """Short storage lock: runs of one vendor may be in flight together."""
     path = Path(state) / 'quota-locks' / vendor
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open('a') as file:
