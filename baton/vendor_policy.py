@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 
-from . import capacity, quota, statefile
+from . import quota, statefile
 
 
 SHORT, LONG = 'short', 'long'
@@ -59,9 +59,7 @@ def cooldown_horizon(state, settings, vendor, until, now):
     return SHORT if until - now <= settings.same_vendor_wait_max_minutes * 60 else LONG
 
 
-def availability(state, settings, vendor, now, *, strict=False, leased=False):
-    if not leased and capacity.busy(state, vendor):
-        return Availability('vendor_capacity', 'vendor capacity reserved', horizon=SHORT)
+def availability(state, settings, vendor, now, *, strict=False):
     if (until := cooldown_until(state, vendor, now)) is not None:
         return Availability('vendor_cooldown', cooldown(state, vendor, now),
                             horizon=cooldown_horizon(state, settings, vendor, until, now))
@@ -88,8 +86,14 @@ def availability(state, settings, vendor, now, *, strict=False, leased=False):
 
 
 def choose(state, settings, pool, candidates, now, *, prefer=(), current='', extras=False):
-    """Quota pace within the pool; preferences break close ties. For review-style
-    selection, extras keep the existing preference-before-pool-pace behavior.
+    """Quota pace within the pool; preferences break close ties. With extras=True
+    (review-style selection):
+
+    1. A vendor named by PREFER wins, in its order: an extra whatever its pace, a pool
+       vendor only when quota pace over the pool candidates selects it.
+    2. Otherwise the best eligible pool vendor by quota pace.
+    3. Otherwise quota pace over the eligible extras.
+
     Candidates must already pass role-specific eligibility and availability checks.
     """
     candidates = list(dict.fromkeys(candidates))
@@ -102,14 +106,16 @@ def choose(state, settings, pool, candidates, now, *, prefer=(), current='', ext
     best, summary = quota.pick(pooled, snapshots, caps, limits, now, current, prefer)
     eligible = [v for v in candidates if not quota.assess(
         snapshots[v], caps[v], limits[v], now)[1]]
-    ordered = quota.preference_order(eligible, prefer)
-    chosen = next((v for v in ordered if v not in pool or v == best), None)
+    chosen = next((v for v in dict.fromkeys(prefer or ())
+                   if v in eligible and (v not in pool or v == best)), best)
+    if chosen is None:
+        chosen, _ = quota.pick(eligible, snapshots, caps, limits, now)
     return chosen, summary
 
 
 def observe_failure(state, vendor, result, now):
     """Persist explicit vendor failures using the existing global gate file formats.
-    Called while holding the vendor lease; analysis never emits workload notifications.
+    Safe beside other runs of the vendor; analysis never emits workload notifications.
     """
     if result['state'] == 'auth':
         quota.credential(state, vendor, 'auth_expired', now)

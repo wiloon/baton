@@ -127,7 +127,9 @@ The analyst role uses only Opus (Claude Code), GPT Sol (Codex) and Grok 4.7 (Cur
 The shared vendor-policy module supplies review-style quota pacing, preferences, cooldowns and
 capacity checks to both workload reviews and retrospectives; author/contribution constraints
 remain review-specific. Retro candidates additionally require fresh authenticated capacity.
-A nonblocking per-vendor lease is shared with workload dispatch and quota probes. Selection,
+A vendor with a workload run in flight is not chosen for analysis; workload runs of one vendor do
+not exclude each other, quota probes exclude only each other, and an analysis holds no vendor lock
+([ADR 0013](../adr/0013-concurrent-runs-of-one-vendor.md)). Selection,
 per-vendor rejection reasons and requested/observed models are recorded. Sonnet and Auto are not
 eligible and no implicit weaker-model fallback is configured. A failed vendor is deprioritized
 on the next activation without resetting the shared retry/daily/call budgets. Each adapter uses

@@ -268,7 +268,7 @@ def test_a_bad_env_file_fails_the_analysis_without_starting_claude(host):
 def test_the_advisor_claude_call_gets_the_token_and_redacts_it(host, monkeypatch):
     seen = []
 
-    def process(command, prompt, workspace, env, seconds, max_bytes, lease_fd=None):
+    def process(command, prompt, workspace, env, seconds, max_bytes):
         seen.append((command, env))
         return "success", b"", 0, {}
     monkeypatch.setattr(retrospective_analyst, "bounded_process", process)

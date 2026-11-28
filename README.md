@@ -299,11 +299,14 @@ a redacted snapshot and the allowed actions (`extra_round` or `handoff`).
 first and DeepSeek is the fallback. `["deepseek"]` uses DeepSeek only; `["claude"]` has no fallback.
 Listing `claude` is the grant for the advisor: Claude must be declared under `[vendors]` but needs
 no role. The call is a tool-less, isolated one-shot (`[advisor] claude = { model, effort }`, default
-`claude_strong` at `medium`) that takes no vendor lease; its quota use and quota, auth and busy
+`claude_strong` at `medium`) that does not mark Claude as running a workload; its quota use and quota, auth and busy
 rejections are accounted like any Claude run. Claude is skipped when it is undeclared, at its cap or
 five-hour limit, in cooldown, or its credential has expired. The next backend is tried once when one
 is skipped, fails or returns an unusable reply, never after a valid `handoff` or other well-formed
-outcome. Records, handoff notes and answer comments name the backend that answered. In `mode = "live"` the
+outcome. Records, handoff notes and answer comments name the backend that answered. An evidence
+quote must be in the sent snapshot (runs of whitespace aside): mismatching quotes are dropped while
+at least one matches, and the record and `runner.log` keep the first one, redacted and cut, as
+`evidence_miss` (except for a snapshot with opted-in excerpts). In `mode = "live"` the
 runner revalidates the state and grants at most one extra round per task episode. Failed
 review, fix, spec, implementation, local verification and worktree steps can also send a
 redacted step snapshot. Where the role and task allow it, `retry_step` repeats the failed step
@@ -419,9 +422,13 @@ Migrate legacy flat model keys before validating a host config. Run records dist
 the requested model from the actual model when the CLI reports it.
 
 Each vendor choice logs its preference order, weekly usage/cap, time to reset, pace score and
-quota/cooldown gate. Lower pace scores mean further behind the weekly spending pace. Cursor is
-an extra vendor outside pool balancing: a configured preference can choose it before comparing
-pool pace. This policy remains subject to quota limits and independent-review eligibility.
+quota/cooldown gate. Lower pace scores mean further behind the weekly spending pace. Extra
+vendors such as Cursor are outside pool balancing. Review-style picks among equal candidates
+choose in three steps: a vendor named by the preference wins, in its order (an extra whatever
+its pace, a pool vendor only when pool pace selects it); otherwise the best eligible pool vendor
+by pace; otherwise, among extras only, the best by pace. Pace scores within the tie margin
+keep candidate order. This policy remains subject to quota limits and independent-review
+eligibility.
 
 ## Telemetry
 

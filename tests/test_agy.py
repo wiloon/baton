@@ -463,7 +463,7 @@ def test_a_denied_run_retries_once_and_the_second_prompt_quotes_the_denial(agy_r
 
 
 def test_a_denied_run_still_retries_when_maintenance_turns_on_mid_call(agy_runner, monkeypatch):
-    """#337: the same-lease denial retry is inside one dispatch call and does not recheck the flag."""
+    """#337: the same-run denial retry is inside one dispatch call and does not recheck the flag."""
     import time
     from baton import agents
     denied = [{"tool": "read_file", "path": "/outside/x"}]
@@ -692,11 +692,13 @@ NOW = epoch("2026-11-25T12:00:00Z")
 
 
 def gemini(five=0.956117570400238, week=0.42058518528938293, five_reset="2026-11-26T03:06:19Z",
-           week_reset="2026-12-01T03:23:36Z", status="SUCCESS", drop=(), extra=None, **fields):
+           week_reset="2026-12-01T03:23:36Z", status="SUCCESS", drop=(), omit_reset=(), extra=None, **fields):
     buckets = [{"id": "gemini-weekly", "window": "weekly", "remaining_fraction": week, "reset_time": week_reset},
                {"id": "gemini-5h", "window": "5h", "remaining_fraction": five, "reset_time": five_reset}]
     for bucket in buckets:
         bucket.update(extra or {})
+        if bucket["window"] in omit_reset:
+            del bucket["reset_time"]
     buckets = [b for b in buckets if b["window"] not in drop]
     return json.dumps({"status": status, "num_turns": 0, **fields,
                        "command": {"name": "usage", "data": {"groups": [
@@ -767,6 +769,31 @@ def test_an_unused_gemini_window_resets_one_window_length_from_now(agy_runner):
         assert got[("quota_used_ratio", window)] == 0
 
 
+def test_a_null_reset_time_means_no_reset_is_pending(agy_runner):
+    # Exhausted weekly with a reset; 5h still has headroom but reset_time is null (#366).
+    state = str(agy_runner.state_dir)
+    windows = agy_cli.refresh_quota(
+        state, NOW,
+        run=answering(gemini(week=0, five=0.97, week_reset="2026-12-03T07:01:53Z", five_reset=None)))
+    assert windows["seven_day"] == {"used": 1, "resets_at": epoch("2026-12-03T07:01:53Z")}
+    assert windows["five_hour"]["resets_at"] == NOW + quota.WINDOW_SECONDS["five_hour"]
+    assert windows["five_hour"]["used"] == pytest.approx(1 - 0.97)
+    saved = json.loads((agy_runner.state_dir / "quota-agy.json").read_text())
+    assert saved["windows"]["seven_day"]["used"] == 1
+    assert saved["windows"]["seven_day"]["resets_at"] == epoch("2026-12-03T07:01:53Z")
+    assert saved["windows"]["five_hour"]["resets_at"] == NOW + quota.WINDOW_SECONDS["five_hour"]
+    snap = quota.load(state, "agy")
+    _, reason = quota.assess(snap, 0.9, 0.9, NOW)
+    assert reason
+    assert quota.horizon(snap, 0.9, 0.9, NOW) == "long"
+
+
+def test_a_null_weekly_reset_time_resets_one_window_length_from_now(agy_runner):
+    state = str(agy_runner.state_dir)
+    windows = agy_cli.refresh_quota(state, NOW, run=answering(gemini(week_reset=None)))
+    assert windows["seven_day"]["resets_at"] == NOW + quota.WINDOW_SECONDS["seven_day"]
+
+
 FAILURES = {
     "timeout": raising(subprocess.TimeoutExpired(["agy"], 30)),
     "missing": raising(FileNotFoundError("agy")),
@@ -777,7 +804,9 @@ FAILURES = {
         {"name": "Claude and GPT models", "buckets": []}]}}})),
     "no-5h": answering(gemini(drop=("5h",))),
     "no-weekly": answering(gemini(drop=("weekly",))),
-    "no-reset": answering(gemini(week_reset=None)),
+    "numeric-reset": answering(gemini(week_reset=1764500000)),
+    "missing-reset": answering(gemini(omit_reset=("weekly",))),
+    "no-zone": answering(gemini(week_reset="2026-12-03T07:01:53")),
     "bad-reset": answering(gemini(five_reset="soon")),
     "string-fraction": answering(gemini(five="0.5")),
     "bool-fraction": answering(gemini(week=True)),

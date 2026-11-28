@@ -10,6 +10,7 @@ import sys
 import pytest
 
 from baton import dispatch, hooks
+from conftest import in_flight
 from test_agents import CODEX_STREAM, FAKE_CLI, claude_stream, lines
 
 FAKE_TELEMETRY = f"""#!{sys.executable}
@@ -303,14 +304,33 @@ def test_ci_result_is_unknown_when_the_head_moved(runner, tmp_path, monkeypatch)
     assert call[call.index("--ci-result") + 1] == "unknown"
 
 
-def test_vendor_lease_defers_workload_without_starting_or_counting(runner):
-    from baton import capacity
-    with capacity.lease(runner.state_dir, 'claude') as available:
-        assert available
+def test_a_run_in_flight_does_not_defer_another_run_of_its_vendor(runner):
+    runner.plan(stream=claude_stream("fine\nREVIEW: pass"))
+    with in_flight(runner.state_dir, 'claude'):
         out = runner.run()
-    assert out['rc'] == 75 and out['defer'] == 'vendor capacity reserved'
-    assert not list(runner.state_dir.glob('runs-*'))
-    assert not (runner.root/'fake/calls').exists()
+    assert (out['rc'], out['outcome'], out['defer']) == (0, 'REVIEW: pass', '')
+
+
+def test_a_run_in_flight_does_not_stop_a_probe_and_a_probe_does_not_stop_a_run(runner, monkeypatch):
+    from baton import settle
+    runner.plan(stream=claude_stream("fine\nREVIEW: pass"))
+    real_run, probes, during_probe = dispatch.agents.run, [], []
+
+    def probe_request(state, logs, vendor, model, settings=None):
+        probes.append(vendor)
+        monkeypatch.setattr(dispatch.agents, "run", real_run)
+        during_probe.append(runner.run())
+
+    def run_and_probe(*args):
+        monkeypatch.setattr(settle, "_probe", probe_request)
+        probes.append(settle.probe(str(runner.state_dir), str(runner.root / "logs"), "claude", "m",
+                                   needed=lambda: True))
+        return real_run(*args)
+
+    monkeypatch.setattr(dispatch.agents, "run", run_and_probe)
+    out = runner.run()
+    assert probes == ["claude", True] and out["outcome"] == "REVIEW: pass"
+    assert [(o["outcome"], o["defer"]) for o in during_probe] == [("REVIEW: pass", "")]
 
 
 def test_a_claude_screenshot_review_gets_its_own_route_and_budget(runner):
@@ -480,9 +500,9 @@ def test_an_adapter_error_still_names_the_tier(runner, monkeypatch):
 # --- maintenance drain (#337) -----------------------------------------------------------------
 
 def test_maintenance_deferral_does_not_lend_a_slot():
-    from baton.common import Deferred, LEASE_REASON, MAINTENANCE_PREFIX
+    from baton.common import Deferred, MAINTENANCE_PREFIX
     assert Deferred("codex", f"{MAINTENANCE_PREFIX}reboot").lends_slot is False
-    assert Deferred("codex", LEASE_REASON).lends_slot is False
+    assert Deferred("codex", "vendor capacity reserved").lends_slot is True
     assert Deferred("codex", "quota exhausted").lends_slot is True
     assert Deferred("codex", f"{MAINTENANCE_PREFIX}x", lends_slot=True).lends_slot is True
 

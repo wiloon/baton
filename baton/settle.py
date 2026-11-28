@@ -118,8 +118,9 @@ def probe(state, logs, vendor, model, *, needed=None, settings=None):
             settings = session.resolve().config.vendor(vendor)
         except ConfigError:
             settings = None   # undeclared: no env_file to use
-    with capacity.lease(state, vendor) as available:
-        if available and (needed is None or needed()):
+    # Probes exclude each other only; runs of the vendor neither stop one nor wait for it.
+    with capacity.probing(state, vendor) as held:
+        if held and (needed is None or needed()):
             _probe(state, logs, vendor, model, settings)
             return True
     return False
