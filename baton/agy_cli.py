@@ -173,6 +173,9 @@ def _run_quota(command, *, cwd, env, timeout):
 
 
 def _reset_epoch(value):
+    # Explicit JSON null: no reset is pending (same as a never-used window's epoch-0 time).
+    if value is None:
+        return NO_RESET
     if not isinstance(value, str):
         raise QuotaError(f"agy quota: reset_time {value!r} is not a time")
     try:
@@ -186,7 +189,8 @@ def _reset_epoch(value):
 
 def parse_quota(answer, now):
     """{five_hour, seven_day} of the Gemini group of a `/quota` JSON answer; raises QuotaError
-    unless both windows parse. A never-used window resets one window length from NOW."""
+    unless both windows parse. A never-used window, or one with reset_time null, resets one
+    window length from NOW. A missing reset_time key is a format error."""
     from . import quota
     try:
         groups = answer["command"]["data"]["groups"]
@@ -203,7 +207,9 @@ def parse_quota(answer, now):
         if (isinstance(remaining, bool) or not isinstance(remaining, (int, float)) or not math.isfinite(remaining)
                 or not 0 <= remaining <= 1):
             raise QuotaError(f"agy quota: {window} remaining_fraction {remaining!r} is not a fraction")
-        reset = _reset_epoch(bucket.get("reset_time"))
+        if "reset_time" not in bucket:
+            raise QuotaError(f"agy quota: {window} has no reset_time")
+        reset = _reset_epoch(bucket["reset_time"])
         if reset == NO_RESET:
             reset = int(now) + quota.WINDOW_SECONDS[name]
         windows[name] = {"used": 1 - remaining, "resets_at": reset}
