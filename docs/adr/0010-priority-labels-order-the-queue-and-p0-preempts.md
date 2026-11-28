@@ -41,3 +41,6 @@ controls how many there are.
 - Issue #290: an unlabelled issue ranks after `P3` (it ranked as `P2`); scan findings are
   candidates only with the owner's `ready-for-agent`.
 - Issue #291: under the resident supervisor, priority is global across repositories (ADR 0012).
+- Issue #307: the per-repository milestone filter (`agent_milestone`) is removed and no
+  milestone-based selection remains, because a second gate hid ready issues from the queue
+  (owner, 2026-11-26).
