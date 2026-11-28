@@ -13,7 +13,7 @@ from contextlib import redirect_stdout
 from io import StringIO
 
 from baton import config, vendors
-from conftest import full_text
+from conftest import full_text, in_flight
 from test_adapter_capabilities import with_stub
 
 NOW = 1_793_000_000
@@ -62,14 +62,22 @@ class VendorTests(unittest.TestCase):
         self.assertEqual(rc, 75)
         self.assertIn("quota limits: claude=blocked(week 70% >= cap 70%)", result["reason"])
 
-    def test_occupied_vendor_is_skipped_for_workloads_and_probes(self):
-        from baton import capacity
-        with capacity.lease(self.state, 'claude'):
+    def test_a_vendor_with_a_run_in_flight_is_still_picked_and_probed(self):
+        with in_flight(self.state, 'claude'):
             result, rc = self.pick(current='claude')
-            self.assertEqual((result['vendor'], rc), ('codex', 0))
-            self.assertEqual(result['blocked']['claude'], 'vendor capacity reserved')
+            self.assertEqual((result['vendor'], rc, result['blocked']), ('claude', 0, {}))
             result, _ = vendors.pick(self.state, POOL, 'dev', POOL, now=NOW, probe_only=True)
-            self.assertNotIn('claude', result['probe'])
+            self.assertIn('claude', result['probe'])
+
+    def test_a_run_in_flight_overshoots_until_the_snapshot_reaches_a_cap(self):
+        # #299: admission is a check at pick time; nothing is reserved for runs in flight.
+        with in_flight(self.state, 'claude'):
+            self.snap("claude", 0.69, five=0.89)
+            self.assertEqual(self.pick(by="contrib", candidates=["claude"])[0]["vendor"], "claude")
+            for week, five in ((0.70, 0.0), (0.0, 0.90)):
+                self.snap("claude", week, five)
+                result, rc = self.pick(by="contrib", candidates=["claude"])
+                self.assertEqual((rc, result["vendor"]), (75, ""))
 
     def test_probe_candidates_skip_cooldown_and_exclusions(self):
         Path(self.state, "claude-cooldown-until").write_text(str(NOW + 3600))
@@ -550,14 +558,12 @@ class VendorTests(unittest.TestCase):
         quota.credential(self.state, "claude", "authenticated", NOW + 1)
         self.assertEqual(self.review("25")[1], 75)
 
-    def test_a_vendor_holding_its_capacity_lease_is_waited_for(self):
-        from baton import capacity
+    def test_a_cross_vendor_reviewer_with_a_run_in_flight_is_picked(self):
         self.codex_pr("23")
         Path(self.state, "cursor-cooldown-until").write_text(str(NOW + LONG_REST))
-        with capacity.lease(self.state, "claude"):
+        with in_flight(self.state, "claude"):
             result, rc = self.review("23")
-        self.assertEqual(rc, 75)
-        self.assertIn("waiting for claude (vendor capacity reserved)", result["reason"])
+        self.assertEqual((rc, result["vendor"]), (0, "claude"))
 
     def test_stale_quota_is_waited_for_before_same_vendor_review(self):
         self.codex_pr("24")

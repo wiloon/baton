@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 
-from . import capacity, quota, statefile
+from . import quota, statefile
 
 
 SHORT, LONG = 'short', 'long'
@@ -59,9 +59,7 @@ def cooldown_horizon(state, settings, vendor, until, now):
     return SHORT if until - now <= settings.same_vendor_wait_max_minutes * 60 else LONG
 
 
-def availability(state, settings, vendor, now, *, strict=False, leased=False):
-    if not leased and capacity.busy(state, vendor):
-        return Availability('vendor_capacity', 'vendor capacity reserved', horizon=SHORT)
+def availability(state, settings, vendor, now, *, strict=False):
     if (until := cooldown_until(state, vendor, now)) is not None:
         return Availability('vendor_cooldown', cooldown(state, vendor, now),
                             horizon=cooldown_horizon(state, settings, vendor, until, now))
@@ -117,7 +115,7 @@ def choose(state, settings, pool, candidates, now, *, prefer=(), current='', ext
 
 def observe_failure(state, vendor, result, now):
     """Persist explicit vendor failures using the existing global gate file formats.
-    Called while holding the vendor lease; analysis never emits workload notifications.
+    Safe beside other runs of the vendor; analysis never emits workload notifications.
     """
     if result['state'] == 'auth':
         quota.credential(state, vendor, 'auth_expired', now)

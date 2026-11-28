@@ -7,7 +7,6 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-LEASE_REASON = "vendor capacity reserved"
 MAINTENANCE_PREFIX = "maintenance: "
 
 
@@ -19,7 +18,7 @@ class Deferred(Exception):
         super().__init__(f"{vendor}: {reason}")
         self.vendor, self.reason = vendor, reason
         if lends_slot is None:
-            lends_slot = reason != LEASE_REASON and not reason.startswith(MAINTENANCE_PREFIX)
+            lends_slot = not reason.startswith(MAINTENANCE_PREFIX)
         self.lends_slot = lends_slot
 
 

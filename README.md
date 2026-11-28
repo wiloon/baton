@@ -299,7 +299,7 @@ a redacted snapshot and the allowed actions (`extra_round` or `handoff`).
 first and DeepSeek is the fallback. `["deepseek"]` uses DeepSeek only; `["claude"]` has no fallback.
 Listing `claude` is the grant for the advisor: Claude must be declared under `[vendors]` but needs
 no role. The call is a tool-less, isolated one-shot (`[advisor] claude = { model, effort }`, default
-`claude_strong` at `medium`) that takes no vendor lease; its quota use and quota, auth and busy
+`claude_strong` at `medium`) that does not mark Claude as running a workload; its quota use and quota, auth and busy
 rejections are accounted like any Claude run. Claude is skipped when it is undeclared, at its cap or
 five-hour limit, in cooldown, or its credential has expired. The next backend is tried once when one
 is skipped, fails or returns an unusable reply, never after a valid `handoff` or other well-formed
