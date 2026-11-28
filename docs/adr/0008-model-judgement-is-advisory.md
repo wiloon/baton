@@ -174,3 +174,6 @@ advisor action per reason and task episode, and a recurrence after that action g
   isolated, takes no vendor lease, goes first regardless of authorship (owner, 2026-11-26) and is
   granted by the backend order rather than a vendor role, so implementations can't differ on
   quota, independence or authorization.
+- Issue #364 (spec round 1): add the conflict fix as a bounded rule step ahead of the merge
+  failure decision points, because every such hand-off made the owner do the same merge by hand.
+  An ADR accept does not survive a fixer's resolution, since the reviewer never saw that text.
