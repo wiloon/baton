@@ -41,8 +41,8 @@ only reviews eligible same-repository PRs from its configured trusted accounts; 
 
 ## Development checks
 
-The production runner targets Linux with systemd, Bash, jq and GNU coreutils. macOS can run most
-offline tests; GNU sed comparisons are skipped when GNU sed is unavailable. `uv` installs the
+The production runner targets Linux with systemd, Bash, jq and GNU coreutils. The offline suite
+passes on macOS; GNU sed comparisons are skipped when GNU sed is unavailable. `uv` installs the
 Python version pinned in `.python-version`.
 
 ```sh
