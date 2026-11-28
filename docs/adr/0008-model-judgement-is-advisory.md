@@ -57,6 +57,18 @@ otherwise hands off. One deadline, saved before the update is sent, bounds the r
 and every call in it. A restart doesn't extend the deadline, and an answer that arrives after it
 validates nothing. Other merge recovery keeps its decision point.
 
+A **conflict fix** is also a rule, and the one rule recovery that runs an agent. When a merge step
+finds that the PR conflicts with its base branch, the runner merges the base branch into the PR,
+never rebasing, and has a fixer resolve what git can't. This happens before the `merge_failed` or
+`spec_adr_merge_failed` decision point, which is reached only when the conflict fix fails or is not
+allowed. The push is conditional on the validated head. The result is reviewed and CI-gated again.
+It is bounded: one attempt for a pair of PR head and base head; for an implementation PR, none once
+the passing review round is past the round limit (including a granted extra round); for an ADR PR,
+at most one fixer resolution. A conflict or resolution touching `owner_review_paths` goes to the
+owner. An ADR PR's spec accept survives only a head verified as a clean merge, as above. A head the
+fixer resolved voids the accept, and the spec is reviewed again by a reviewer independent of that
+fixer.
+
 After a fix, a rejected or failed PR description request is a recoverable runner outcome. A
 failed request that can be resumed may first use the safe retry budget. If it still can't be
 applied, the runner discards it, reports why, and uses the usual evidence of progress to decide
